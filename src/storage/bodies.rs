@@ -2,8 +2,11 @@
 
 use crate::domain::{BodyId, DomainError, DomainResult, ErrorCode};
 use crate::storage::Db;
+use rusqlite::blob::ZeroBlob;
 use rusqlite::params;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 const COMPRESS_THRESHOLD: usize = 1024;
 
@@ -22,7 +25,11 @@ pub struct StoredBody {
 }
 
 impl Db {
-    pub async fn store_body(&self, data: Vec<u8>, mime_class: Option<String>) -> DomainResult<StoredBody> {
+    pub async fn store_body(
+        &self,
+        data: Vec<u8>,
+        mime_class: Option<String>,
+    ) -> DomainResult<StoredBody> {
         self.with_conn(move |conn| store_body_conn(conn, &data, mime_class.as_deref()))
             .await
     }
@@ -70,7 +77,13 @@ pub fn store_body_conn(
     if let Ok((id, stored_length, codec)) = conn.query_row(
         "SELECT id, stored_length, codec FROM bodies WHERE sha256=?1 LIMIT 1",
         params![hash],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     ) {
         return Ok(StoredBody {
             id: BodyId(id),
@@ -113,6 +126,96 @@ pub fn store_body_conn(
     })
 }
 
+pub fn store_body_file_conn(
+    conn: &rusqlite::Connection,
+    path: &Path,
+    mime_class: Option<&str>,
+) -> DomainResult<StoredBody> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        DomainError::new(
+            ErrorCode::StorageError,
+            format!("open body spool {}: {error}", path.display()),
+        )
+    })?;
+    let length = file.metadata().map_err(storage_io_error)?.len();
+    let original_length = i64::try_from(length).map_err(|_| {
+        DomainError::new(
+            ErrorCode::BodyTooLarge,
+            "body spool length exceeds SQLite limits",
+        )
+    })?;
+    let blob_length = i32::try_from(length).map_err(|_| {
+        DomainError::new(
+            ErrorCode::BodyTooLarge,
+            "body spool exceeds SQLite incremental BLOB limit",
+        )
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(storage_io_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let hash = hex::encode(hasher.finalize());
+
+    if let Ok((id, stored_length, codec)) = conn.query_row(
+        "SELECT id, stored_length, codec FROM bodies WHERE sha256=?1 LIMIT 1",
+        params![hash],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    ) {
+        return Ok(StoredBody {
+            id: BodyId(id),
+            sha256: hash,
+            original_length,
+            stored_length,
+            codec,
+        });
+    }
+
+    file.seek(SeekFrom::Start(0)).map_err(storage_io_error)?;
+    conn.execute(
+        "INSERT INTO bodies (sha256, original_length, stored_length, codec, mime_class, content)
+         VALUES (?1, ?2, ?3, 'raw', ?4, ?5)",
+        params![
+            hash,
+            original_length,
+            original_length,
+            mime_class,
+            ZeroBlob(blob_length)
+        ],
+    )
+    .map_err(storage_error)?;
+    let id = conn.last_insert_rowid();
+    let mut blob = conn
+        .blob_open(rusqlite::MAIN_DB, "bodies", "content", id, false)
+        .map_err(storage_error)?;
+    let copied = std::io::copy(&mut file, &mut blob).map_err(storage_io_error)?;
+    if copied != length {
+        return Err(DomainError::new(
+            ErrorCode::StorageError,
+            format!("short body spool copy: expected {length}, copied {copied}"),
+        ));
+    }
+
+    Ok(StoredBody {
+        id: BodyId(id),
+        sha256: hash,
+        original_length,
+        stored_length: original_length,
+        codec: "raw".into(),
+    })
+}
+
 fn decode_body(codec: &str, content: &[u8]) -> DomainResult<Vec<u8>> {
     match codec {
         "raw" => Ok(content.to_vec()),
@@ -123,4 +226,12 @@ fn decode_body(codec: &str, content: &[u8]) -> DomainResult<Vec<u8>> {
             format!("unknown body codec {other}"),
         )),
     }
+}
+
+fn storage_error(error: rusqlite::Error) -> DomainError {
+    DomainError::new(ErrorCode::StorageError, error.to_string())
+}
+
+fn storage_io_error(error: std::io::Error) -> DomainError {
+    DomainError::new(ErrorCode::StorageError, error.to_string())
 }

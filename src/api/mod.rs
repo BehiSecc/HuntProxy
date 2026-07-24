@@ -20,13 +20,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+pub async fn bind_api(addr: std::net::SocketAddr) -> DomainResult<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| DomainError::new(ErrorCode::Unavailable, format!("api bind {addr}: {e}")))
+}
 
 pub async fn serve_api(state: Arc<AppState>, cancel: CancellationToken) -> DomainResult<()> {
+    let listener = bind_api(state.config.api_listen).await?;
+    serve_api_listener(state, listener, cancel).await
+}
+
+pub async fn serve_api_listener(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+    cancel: CancellationToken,
+) -> DomainResult<()> {
     let app = router(state.clone());
-    let addr = state.config.api_listen;
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        DomainError::new(ErrorCode::Unavailable, format!("api bind {addr}: {e}"))
-    })?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
     tracing::info!(%addr, "api/ui listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel.cancelled().await })
@@ -37,61 +50,78 @@ pub async fn serve_api(state: Arc<AppState>, cancel: CancellationToken) -> Domai
 pub async fn serve_uds(state: Arc<AppState>, cancel: CancellationToken) -> DomainResult<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let path = state.config.socket_path();
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        let listener = tokio::net::UnixListener::bind(&path).map_err(|e| {
-            DomainError::new(ErrorCode::Unavailable, format!("uds bind: {e}"))
-        })?;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        tracing::info!(path=%path.display(), "private socket listening");
-        let app = router(state);
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                accept = listener.accept() => {
-                    match accept {
-                        Ok((stream, _)) => {
-                            let app = app.clone();
-                            tokio::spawn(async move {
-                                let io = hyper_util::rt::TokioIo::new(stream);
-                                let hyper_service = hyper::service::service_fn(
-                                    move |request: axum::http::Request<hyper::body::Incoming>| {
-                                        let app = app.clone();
-                                        async move {
-                                            match tower::ServiceExt::oneshot(app, request.map(axum::body::Body::new)).await {
-                                                Ok(res) => Ok::<_, std::convert::Infallible>(res),
-                                                Err(_) => Ok(axum::response::Response::builder()
-                                                    .status(500)
-                                                    .body(axum::body::Body::from("internal"))
-                                                    .unwrap()),
-                                            }
-                                        }
-                                    },
-                                );
-                                let _ = hyper::server::conn::http1::Builder::new()
-                                    .serve_connection(io, hyper_service)
-                                    .await;
-                            });
-                        }
-                        Err(e) => tracing::warn!(error=%e, "uds accept failed"),
-                    }
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&path);
+        let listener = bind_uds(&state.config.socket_path())?;
+        serve_uds_listener(state, listener, cancel).await?;
     }
     Ok(())
 }
 
-fn router(state: Arc<AppState>) -> Router {
+#[cfg(unix)]
+pub fn bind_uds(path: &std::path::Path) -> DomainResult<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .map_err(|e| DomainError::new(ErrorCode::Unavailable, format!("uds bind: {e}")))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| DomainError::new(ErrorCode::Unavailable, format!("uds permissions: {e}")))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+pub async fn serve_uds_listener(
+    state: Arc<AppState>,
+    listener: tokio::net::UnixListener,
+    cancel: CancellationToken,
+) -> DomainResult<()> {
+    let path = state.config.socket_path();
+    tracing::info!(path=%path.display(), "private socket listening");
+    let app = private_router(state);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _)) => {
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            let io = hyper_util::rt::TokioIo::new(stream);
+                            let hyper_service = hyper::service::service_fn(
+                                move |request: axum::http::Request<hyper::body::Incoming>| {
+                                    let app = app.clone();
+                                    async move {
+                                        match tower::ServiceExt::oneshot(app, request.map(axum::body::Body::new)).await {
+                                            Ok(res) => Ok::<_, std::convert::Infallible>(res),
+                                            Err(_) => Ok(axum::response::Response::builder()
+                                                .status(500)
+                                                .body(axum::body::Body::from("internal"))
+                                                .unwrap()),
+                                        }
+                                    }
+                                },
+                            );
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, hyper_service)
+                                .await;
+                        });
+                    }
+                    Err(e) => tracing::warn!(error=%e, "uds accept failed"),
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/version", get(version))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route("/api/v1/projects/{id}", get(get_project))
+        .route("/api/v1/projects/{id}/scope", post(update_project_scope))
         .route(
             "/api/v1/projects/{id}/capture-sessions",
             get(list_capture_sessions).post(create_capture_session),
@@ -107,14 +137,16 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/projects/{id}/history", get(history))
         .route("/api/v1/projects/{id}/exchanges/{eid}", get(get_exchange))
         .route(
-            "/api/v1/projects/{id}/exchanges/{eid}/body",
-            get(get_body),
+            "/api/v1/projects/{id}/exchanges/{eid}/annotation",
+            get(get_annotation).post(upsert_annotation),
         )
+        .route("/api/v1/projects/{id}/exchanges/{eid}/body", get(get_body))
         .route(
             "/api/v1/projects/{id}/reply-tabs",
             get(list_reply_tabs).post(upsert_reply_tab),
         )
         .route("/api/v1/projects/{id}/reply-send", post(reply_send))
+        .route("/api/v1/projects/{id}/reply-send-raw", post(reply_send_raw))
         .route(
             "/api/v1/projects/{id}/fuzz-jobs",
             get(list_fuzz_jobs).post(start_fuzz),
@@ -122,6 +154,10 @@ fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/projects/{id}/fuzz-jobs/{jid}/cancel",
             post(cancel_fuzz),
+        )
+        .route(
+            "/api/v1/projects/{id}/fuzz-jobs/{jid}/cases",
+            get(list_fuzz_cases),
         )
         .route(
             "/api/v1/projects/{id}/browser-sessions",
@@ -135,11 +171,55 @@ fn router(state: Arc<AppState>) -> Router {
             "/api/v1/projects/{id}/browser-sessions/{bid}/stop",
             post(stop_browser),
         )
+        .route(
+            "/api/v1/projects/{id}/browser-sessions/{bid}/switch-chromium",
+            post(switch_browser_to_chromium),
+        )
         .route("/api/v1/projects/{id}/events", get(events))
         .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/codec", post(codec_transform))
         .route("/", get(ui_index))
         .with_state(state)
+}
+
+fn private_router(state: Arc<AppState>) -> Router {
+    router(state.clone()).merge(
+        Router::new()
+            .route("/internal/mcp/call", post(internal_mcp_call))
+            .with_state(state),
+    )
+}
+
+#[derive(Deserialize)]
+struct InternalMcpCall {
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+async fn internal_mcp_call(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<InternalMcpCall>,
+) -> Response {
+    match crate::mcp::call_tool(state, &body.name, body.arguments).await {
+        Ok(result) => Json(serde_json::json!({
+            "result": result,
+            "error": null,
+        }))
+        .into_response(),
+        Err(error) => {
+            let status = status_for_error(&error);
+            let envelope = ErrorEnvelope::from(&error);
+            (
+                status,
+                Json(serde_json::json!({
+                    "result": null,
+                    "error": envelope,
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -172,7 +252,14 @@ async fn create_project(
     Json(req): Json<CreateProjectRequest>,
 ) -> Response {
     match state.db.create_project(req).await {
-        Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
+        Ok(project) => {
+            let _ = state.events.send(AppEvent {
+                project_id: project.id.get(),
+                kind: "project".into(),
+                payload: serde_json::json!({ "project_id": project.id.get() }),
+            });
+            (StatusCode::CREATED, Json(project)).into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -181,6 +268,21 @@ async fn get_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>) ->
     match state.db.get_project(ProjectId(id)).await {
         Ok(p) => Json(p).into_response(),
         Err(e) => error_response(e),
+    }
+}
+
+async fn update_project_scope(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(scope): Json<ScopePolicy>,
+) -> Response {
+    match state
+        .db
+        .update_project_scope(ProjectId(id), scope, None)
+        .await
+    {
+        Ok(project) => Json(project).into_response(),
+        Err(error) => error_response(error),
     }
 }
 
@@ -199,7 +301,14 @@ async fn create_capture_session(
         })
         .await
     {
-        Ok(s) => (StatusCode::CREATED, Json(s)).into_response(),
+        Ok(session) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "capture".into(),
+                payload: serde_json::json!({ "session_id": session.id.get(), "state": "created" }),
+            });
+            (StatusCode::CREATED, Json(session)).into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -223,7 +332,14 @@ async fn revoke_capture_session(
         .revoke_capture_session(ProjectId(id), CaptureSessionId(sid))
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "capture".into(),
+                payload: serde_json::json!({ "session_id": sid, "state": "revoked" }),
+            });
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -237,7 +353,14 @@ async fn renew_capture_session(
         .renew_capture_session(ProjectId(id), CaptureSessionId(sid))
         .await
     {
-        Ok(s) => Json(s).into_response(),
+        Ok(session) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "capture".into(),
+                payload: serde_json::json!({ "session_id": session.id.get(), "state": "renewed" }),
+            });
+            Json(session).into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -264,18 +387,20 @@ async fn history(
         None => (None, None),
     };
 
-    if let Some(text) = &q.q {
-        if let Err(e) = parse_text_query(text).and_then(|n| {
-            crate::history::validate_filter(&n)?;
-            Ok(n)
+    let filter = match q.q.as_deref() {
+        Some(text) if !text.trim().is_empty() => match parse_text_query(text).and_then(|node| {
+            crate::history::validate_filter(&node)?;
+            Ok(node)
         }) {
-            return error_response(e);
-        }
-    }
+            Ok(filter) => Some(filter),
+            Err(error) => return error_response(error),
+        },
+        _ => None,
+    };
 
     match state
         .db
-        .list_history(ProjectId(id), limit, before_started, before_id)
+        .list_history_filtered(ProjectId(id), filter, limit, before_started, before_id)
         .await
     {
         Ok((items, next)) => {
@@ -300,8 +425,66 @@ async fn get_exchange(
         .get_exchange_detail(ProjectId(id), ExchangeId(eid), opts)
         .await
     {
-        Ok(d) => Json(d).into_response(),
+        Ok(detail) => {
+            let annotation = match state
+                .db
+                .get_annotation(ProjectId(id), ExchangeId(eid))
+                .await
+            {
+                Ok(annotation) => annotation,
+                Err(error) => return error_response(error),
+            };
+            let mut value = match serde_json::to_value(detail) {
+                Ok(value) => value,
+                Err(error) => {
+                    return error_response(DomainError::new(
+                        ErrorCode::Internal,
+                        error.to_string(),
+                    ));
+                }
+            };
+            if let Some(object) = value.as_object_mut() {
+                object.insert("annotation".into(), serde_json::json!(annotation));
+            }
+            Json(value).into_response()
+        }
         Err(e) => error_response(e),
+    }
+}
+
+async fn get_annotation(
+    State(state): State<Arc<AppState>>,
+    Path((id, eid)): Path<(i64, i64)>,
+) -> Response {
+    match state
+        .db
+        .get_annotation(ProjectId(id), ExchangeId(eid))
+        .await
+    {
+        Ok(annotation) => Json(serde_json::json!({ "annotation": annotation })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn upsert_annotation(
+    State(state): State<Arc<AppState>>,
+    Path((id, eid)): Path<(i64, i64)>,
+    Json(update): Json<AnnotationUpdate>,
+) -> Response {
+    match state
+        .db
+        .upsert_annotation(ProjectId(id), ExchangeId(eid), update)
+        .await
+    {
+        Ok(annotation) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "annotation".into(),
+                payload: serde_json::json!({ "exchange_id": eid }),
+            });
+            Json(annotation).into_response()
+        }
+        Err(error) => error_response(error),
     }
 }
 
@@ -454,12 +637,74 @@ async fn reply_send(
         )
         .await
     {
-        Ok((eid, diff)) => Json(serde_json::json!({
-            "exchange_id": eid.get(),
-            "diff": diff
-        }))
-        .into_response(),
+        Ok(result) => {
+            if let Some(exchange_id) = result.exchange_id {
+                let _ = state.events.send(AppEvent {
+                    project_id: id,
+                    kind: "exchange".into(),
+                    payload: serde_json::json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
+                });
+            }
+            Json(result).into_response()
+        }
         Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RawReplySendBody {
+    target_url: String,
+    request: String,
+    #[serde(default)]
+    encoding: Option<String>,
+    tab_id: Option<i64>,
+}
+
+async fn reply_send_raw(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RawReplySendBody>,
+) -> Response {
+    let request_bytes = match body.encoding.as_deref().unwrap_or("utf8") {
+        "utf8" => body.request.into_bytes(),
+        "base64" => match base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            body.request.as_bytes(),
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return error_response(DomainError::invalid(format!(
+                    "invalid base64 request: {error}"
+                )))
+            }
+        },
+        _ => return error_response(DomainError::invalid("encoding must be utf8 or base64")),
+    };
+    match state
+        .reply
+        .send_raw_http1(
+            ProjectId(id),
+            body.tab_id.map(ReplyTabId),
+            &body.target_url,
+            request_bytes,
+        )
+        .await
+    {
+        Ok(result) => {
+            if let Some(exchange_id) = result.exchange_id {
+                let _ = state.events.send(AppEvent {
+                    project_id: id,
+                    kind: "exchange".into(),
+                    payload: serde_json::json!({
+                        "exchange_id": exchange_id.get(),
+                        "source": "reply",
+                        "mode": "raw_http1"
+                    }),
+                });
+            }
+            Json(result).into_response()
+        }
+        Err(error) => error_response(error),
     }
 }
 
@@ -486,18 +731,66 @@ async fn start_fuzz(
         .start(ProjectId(id), body.template, body.confirm.unwrap_or(false))
         .await
     {
-        Ok(j) => (StatusCode::CREATED, Json(j)).into_response(),
+        Ok(job) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "fuzz".into(),
+                payload: serde_json::json!({ "job_id": job.id.get(), "state": job.state }),
+            });
+            (StatusCode::CREATED, Json(job)).into_response()
+        }
         Err(e) => error_response(e),
     }
 }
 
 async fn cancel_fuzz(
     State(state): State<Arc<AppState>>,
-    Path((_id, jid)): Path<(i64, i64)>,
+    Path((id, jid)): Path<(i64, i64)>,
 ) -> Response {
-    match state.fuzzer.cancel(FuzzJobId(jid)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match state
+        .fuzzer
+        .cancel_for_project(ProjectId(id), FuzzJobId(jid))
+        .await
+    {
+        Ok(()) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "fuzz".into(),
+                payload: serde_json::json!({ "job_id": jid, "state": "cancelling" }),
+            });
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct FuzzCasesQuery {
+    limit: Option<u32>,
+    before_case_index: Option<u64>,
+}
+
+async fn list_fuzz_cases(
+    State(state): State<Arc<AppState>>,
+    Path((id, jid)): Path<(i64, i64)>,
+    Query(query): Query<FuzzCasesQuery>,
+) -> Response {
+    match state
+        .fuzzer
+        .list_cases(
+            ProjectId(id),
+            FuzzJobId(jid),
+            query.limit.unwrap_or(100).min(500),
+            query.before_case_index,
+        )
+        .await
+    {
+        Ok((cases, next)) => Json(serde_json::json!({
+            "cases": cases,
+            "next_before_case_index": next,
+        }))
+        .into_response(),
+        Err(error) => error_response(error),
     }
 }
 
@@ -521,7 +814,14 @@ async fn start_browser(
         _ => EnginePolicy::Auto,
     };
     match state.browser.start(ProjectId(id), body.url, policy).await {
-        Ok(s) => (StatusCode::CREATED, Json(s)).into_response(),
+        Ok(session) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "browser".into(),
+                payload: serde_json::json!({ "session_id": session.id.get(), "state": session.state }),
+            });
+            (StatusCode::CREATED, Json(session)).into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -536,7 +836,14 @@ async fn browser_action(
         .action(ProjectId(id), BrowserSessionId(bid), action)
         .await
     {
-        Ok(r) => Json(r).into_response(),
+        Ok(result) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "browser".into(),
+                payload: serde_json::json!({ "session_id": bid, "action": "completed", "ok": result.ok }),
+            });
+            Json(result).into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -550,8 +857,41 @@ async fn stop_browser(
         .stop(ProjectId(id), BrowserSessionId(bid))
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "browser".into(),
+                payload: serde_json::json!({ "session_id": bid, "state": "stopped" }),
+            });
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => error_response(e),
+    }
+}
+
+async fn switch_browser_to_chromium(
+    State(state): State<Arc<AppState>>,
+    Path((id, bid)): Path<(i64, i64)>,
+) -> Response {
+    match state
+        .browser
+        .switch_to_chromium(ProjectId(id), BrowserSessionId(bid))
+        .await
+    {
+        Ok(session) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "browser".into(),
+                payload: serde_json::json!({
+                    "session_id": bid,
+                    "state": session.state,
+                    "engine": session.engine,
+                    "checkpoint_status": session.checkpoint_status,
+                }),
+            });
+            Json(session).into_response()
+        }
+        Err(error) => error_response(error),
     }
 }
 
@@ -653,7 +993,12 @@ async fn ui_index() -> impl IntoResponse {
 
 fn error_response(e: DomainError) -> Response {
     let env = ErrorEnvelope::from(&e);
-    let status = match e.code() {
+    let status = status_for_error(&e);
+    (status, Json(env)).into_response()
+}
+
+fn status_for_error(e: &DomainError) -> StatusCode {
+    match e.code() {
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
         ErrorCode::InvalidArgument | ErrorCode::PlaceholderInvalid => StatusCode::BAD_REQUEST,
         ErrorCode::Unauthorized | ErrorCode::ProxyAuthRequired => StatusCode::UNAUTHORIZED,
@@ -661,8 +1006,7 @@ fn error_response(e: DomainError) -> Response {
         ErrorCode::Conflict | ErrorCode::RevisionConflict => StatusCode::CONFLICT,
         ErrorCode::RateLimited | ErrorCode::ConcurrencyLimited => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, Json(env)).into_response()
+    }
 }
 
 // silence unused import warning for AppEvent in some builds

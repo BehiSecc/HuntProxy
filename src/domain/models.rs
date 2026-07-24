@@ -2,8 +2,8 @@
 
 use super::ids::*;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 use time::serde::rfc3339;
+use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -26,10 +26,6 @@ pub struct ScopePolicy {
     pub ports: Vec<u16>,
     /// Empty means any path.
     pub path_prefixes: Vec<String>,
-    pub allow_loopback: bool,
-    pub allow_private_network: bool,
-    pub allow_link_local: bool,
-    pub allow_metadata: bool,
 }
 
 impl Default for ScopePolicy {
@@ -39,10 +35,6 @@ impl Default for ScopePolicy {
             host_patterns: vec![],
             ports: vec![],
             path_prefixes: vec![],
-            allow_loopback: false,
-            allow_private_network: false,
-            allow_link_local: false,
-            allow_metadata: false,
         }
     }
 }
@@ -74,7 +66,8 @@ impl Default for ProjectLimits {
     }
 }
 
-/// Result of scope resolution — transports dial only approved addresses.
+/// Result of target resolution. Addresses are pinned for the lifetime of one
+/// send so the transport cannot silently perform a second DNS lookup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatedDial {
     pub hostname: String,
@@ -136,6 +129,15 @@ pub struct Annotation {
     pub revision: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationUpdate {
+    pub display_title: Option<String>,
+    pub note: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub expected_revision: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolPreference {
@@ -182,8 +184,8 @@ pub struct HeaderPatch {
 }
 
 mod serde_bytes_or_string {
-    use serde::{Deserialize, Deserializer, Serializer};
     use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -235,6 +237,46 @@ pub enum FuzzJobState {
     Interrupted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzCaseState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FuzzCasePayload {
+    pub insertion_point: String,
+    pub location: String,
+    pub encoding: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzCaseResult {
+    pub id: i64,
+    pub job_id: FuzzJobId,
+    pub project_id: ProjectId,
+    pub case_index: u64,
+    pub state: FuzzCaseState,
+    pub payloads: Vec<FuzzCasePayload>,
+    pub exchange_id: Option<ExchangeId>,
+    pub status_code: Option<u16>,
+    pub response_length: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+    pub body_hash: Option<String>,
+    #[serde(with = "rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "rfc3339::option")]
+    pub finished_at: Option<OffsetDateTime>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuzzJob {
     pub id: FuzzJobId,
@@ -245,6 +287,7 @@ pub struct FuzzJob {
     pub estimated_cases: u64,
     pub completed_cases: u64,
     pub failed_cases: u64,
+    pub error: Option<String>,
     #[serde(with = "rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "rfc3339")]
@@ -297,7 +340,7 @@ pub struct BrowserSession {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
-    /// Target URL used to derive initial scope.
+    /// Target URL used as project metadata; it does not implicitly enable scope.
     pub target_url: String,
     #[serde(default)]
     pub advanced: Option<ScopePolicy>,

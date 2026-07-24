@@ -1,510 +1,758 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>bb — HTTP workbench</title>
+  <title>HuntProxy — HTTP workbench for your hackbots</title>
   <style>
     :root {
       color-scheme: light dark;
-      --bg: Canvas;
-      --fg: CanvasText;
-      --muted: color-mix(in srgb, CanvasText 55%, Canvas);
-      --border: color-mix(in srgb, CanvasText 18%, Canvas);
-      --accent: #2f6fed;
-      --danger: #c62828;
-      --ok: #2e7d32;
-      --panel: color-mix(in srgb, Canvas 92%, CanvasText 8%);
-      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      --sans: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      --bg: #f6f7f9;
+      --panel: #fff;
+      --panel-2: #f1f3f6;
+      --text: #17191d;
+      --muted: #68707c;
+      --border: #dfe3e8;
+      --accent: #326cf4;
+      --accent-soft: #e8efff;
+      --danger: #c03535;
+      --success: #16834b;
+      --warning: #a46600;
+      --radius: 10px;
+      font: 14px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #101217;
+        --panel: #171a20;
+        --panel-2: #20242c;
+        --text: #edf0f5;
+        --muted: #9da6b3;
+        --border: #303640;
+        --accent: #7299ff;
+        --accent-soft: #202f56;
+        --danger: #ff7e7e;
+        --success: #5bd795;
+        --warning: #f2bd65;
+      }
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0; font-family: var(--sans); background: var(--bg); color: var(--fg);
-      min-height: 100vh; display: flex; flex-direction: column;
-    }
+    body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); }
+    button, input, select, textarea { font: inherit; color: inherit; }
+    button { cursor: pointer; }
     header {
-      display: flex; align-items: center; gap: 1rem; padding: .6rem 1rem;
-      border-bottom: 1px solid var(--border); flex-wrap: wrap;
+      height: 58px; display: flex; align-items: center; gap: 1rem; padding: 0 1rem;
+      background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10;
     }
-    header h1 { font-size: 1.05rem; margin: 0; font-weight: 650; }
-    header .muted { color: var(--muted); font-size: .85rem; }
-    nav { display: flex; gap: .25rem; flex-wrap: wrap; }
-    nav button, .btn {
-      background: transparent; border: 1px solid var(--border); color: var(--fg);
-      padding: .35rem .7rem; border-radius: 6px; cursor: pointer; font: inherit;
+    .brand { display: flex; align-items: baseline; gap: .55rem; white-space: nowrap; }
+    .brand strong { font-size: 1.05rem; }
+    .brand span { color: var(--muted); font-size: .78rem; }
+    nav { display: flex; gap: .3rem; overflow-x: auto; margin-left: auto; }
+    nav button, .tab-button {
+      border: 0; background: transparent; padding: .55rem .75rem; border-radius: 7px; white-space: nowrap;
     }
-    nav button.active, .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-    .btn:disabled { opacity: .5; cursor: not-allowed; }
-    .btn.danger { border-color: var(--danger); color: var(--danger); }
-    main { flex: 1; display: grid; grid-template-columns: 220px 1fr; min-height: 0; }
-    @media (max-width: 800px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--border); } }
-    aside { border-right: 1px solid var(--border); padding: .75rem; overflow: auto; }
-    section.panel { padding: .75rem 1rem; overflow: auto; min-height: 0; }
+    nav button.active, .tab-button.active { color: var(--accent); background: var(--accent-soft); }
+    .health { color: var(--muted); font-size: .8rem; white-space: nowrap; }
+    main { display: grid; grid-template-columns: 255px minmax(0, 1fr); min-height: calc(100vh - 58px); }
+    aside { padding: 1rem; background: var(--panel); border-right: 1px solid var(--border); }
+    .workspace { padding: 1rem; min-width: 0; }
+    .panel { display: block; }
     .hidden { display: none !important; }
-    label { display: block; font-size: .8rem; color: var(--muted); margin: .4rem 0 .15rem; }
+    h2 { margin: 0 0 .8rem; font-size: 1.05rem; }
+    h3 { margin: 1rem 0 .45rem; font-size: .82rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    label { display: block; margin: .55rem 0 .25rem; color: var(--muted); font-size: .8rem; }
     input, select, textarea {
-      width: 100%; padding: .45rem .55rem; border: 1px solid var(--border);
-      border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit;
+      width: 100%; border: 1px solid var(--border); background: var(--panel); border-radius: 7px;
+      padding: .58rem .65rem; outline: none;
     }
-    textarea { font-family: var(--mono); min-height: 120px; }
-    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-    th, td { text-align: left; padding: .35rem .4rem; border-bottom: 1px solid var(--border); vertical-align: top; }
-    th { color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; letter-spacing: .02em; }
-    tr:hover { background: var(--panel); cursor: pointer; }
-    tr.selected { background: color-mix(in srgb, var(--accent) 18%, Canvas); }
-    .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: end; margin: .5rem 0; }
-    .row > * { flex: 1; min-width: 120px; }
-    .status { font-size: .85rem; color: var(--muted); min-height: 1.2em; }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent); }
+    textarea { min-height: 90px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .row { display: flex; gap: .55rem; align-items: end; }
+    .row > * { flex: 1; min-width: 0; }
+    .row .fit { flex: 0 0 auto; }
+    .btn { border: 1px solid var(--border); background: var(--panel); border-radius: 7px; padding: .55rem .75rem; }
+    .btn:hover { border-color: var(--accent); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+    .btn.danger { color: var(--danger); }
+    .btn:disabled { cursor: not-allowed; opacity: .5; }
+    .stack { display: grid; gap: .55rem; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: .85rem; min-width: 0; }
+    .split { display: grid; grid-template-columns: minmax(420px, 1.2fr) minmax(320px, .8fr); gap: .8rem; }
+    .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .6rem; }
+    .toolbar { display: flex; align-items: end; gap: .55rem; margin-bottom: .75rem; flex-wrap: wrap; }
+    .toolbar .grow { flex: 1 1 280px; }
+    .status { min-height: 1.2rem; color: var(--muted); margin-top: .45rem; font-size: .82rem; }
+    .status.ok { color: var(--success); }
     .status.err { color: var(--danger); }
-    .status.ok { color: var(--ok); }
-    .pill { display: inline-block; padding: .1rem .4rem; border-radius: 999px; background: var(--panel); font-size: .75rem; }
-    .pill.redacted { background: color-mix(in srgb, var(--danger) 15%, Canvas); color: var(--danger); }
-    pre, .mono { font-family: var(--mono); font-size: .82rem; white-space: pre-wrap; word-break: break-word; }
-    .split { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
-    @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
-    .card { border: 1px solid var(--border); border-radius: 8px; padding: .75rem; background: var(--panel); }
-    h2 { font-size: 1rem; margin: 0 0 .5rem; }
-    h3 { font-size: .9rem; margin: .75rem 0 .35rem; color: var(--muted); }
-    .empty { color: var(--muted); padding: 2rem 0; text-align: center; }
+    .status.warn { color: var(--warning); }
+    .mono { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    pre { margin: .35rem 0; max-height: 280px; overflow: auto; background: var(--panel-2); border-radius: 7px; padding: .65rem; }
+    .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+    table { width: 100%; border-collapse: collapse; min-width: 720px; }
+    th, td { padding: .58rem .65rem; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+    th { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; background: var(--panel); }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover, tbody tr.selected { background: var(--accent-soft); }
+    .pill { display: inline-flex; border-radius: 999px; padding: .12rem .45rem; background: var(--panel-2); color: var(--muted); font-size: .72rem; }
+    .pill.browser { color: #7a4fc7; }
+    .pill.reply { color: #286bc5; }
+    .pill.fuzzer { color: #b05a18; }
+    .pill.proxy { color: #24825a; }
+    .pill.redacted { color: var(--danger); }
+    .empty { padding: 2rem; text-align: center; color: var(--muted); }
+    .tabs { display: flex; gap: .25rem; overflow-x: auto; border-bottom: 1px solid var(--border); margin-bottom: .8rem; padding-bottom: .35rem; }
+    .tab-button { border: 1px solid transparent; }
+    .tab-button.active { border-color: var(--border); }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
+    .detail-grid h3 { margin-top: .35rem; }
+    .annotation { border-top: 1px solid var(--border); margin-top: .75rem; padding-top: .55rem; }
+    .muted { color: var(--muted); }
+    .small { font-size: .78rem; }
+    .live-dot { width: 7px; height: 7px; display: inline-block; border-radius: 50%; background: var(--muted); margin-right: .3rem; }
+    .live-dot.on { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent); }
+    @media (max-width: 1000px) {
+      main { grid-template-columns: 220px minmax(0, 1fr); }
+      .split, .detail-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-width: 720px) {
+      header { height: auto; min-height: 58px; flex-wrap: wrap; padding: .65rem; }
+      nav { order: 3; width: 100%; margin: 0; }
+      main { display: block; }
+      aside { border-right: 0; border-bottom: 1px solid var(--border); }
+      .workspace { padding: .7rem; }
+      .three { grid-template-columns: 1fr; }
+      .row { flex-wrap: wrap; }
+      .row > * { flex: 1 1 180px; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>bb</h1>
-    <span class="muted" id="health">connecting…</span>
-    <nav>
-      <button type="button" data-tab="history" class="active">History</button>
-      <button type="button" data-tab="reply">Reply</button>
-      <button type="button" data-tab="fuzzer">Fuzzer</button>
-      <button type="button" data-tab="browser">Browser</button>
+    <div class="brand"><strong>HuntProxy</strong><span>HTTP workbench for your hackbots</span></div>
+    <div class="health" id="health">connecting…</div>
+    <nav aria-label="Workbench">
+      <button type="button" data-view="history" class="active">History</button>
+      <button type="button" data-view="reply">Reply</button>
+      <button type="button" data-view="fuzzer">Fuzzer</button>
+      <button type="button" data-view="browser">Browser</button>
+      <button type="button" data-view="codec">Codec</button>
     </nav>
   </header>
+
   <main>
     <aside>
       <h2>Project</h2>
       <label for="projectSelect">Active project</label>
       <select id="projectSelect"></select>
-      <div class="row">
-        <button type="button" class="btn primary" id="btnRefreshProjects">Refresh</button>
+      <div class="row" style="margin-top:.55rem">
+        <button class="btn" id="refreshProjects">Refresh</button>
       </div>
+
       <h3>Create project</h3>
-      <label for="projName">Name</label>
-      <input id="projName" placeholder="demo" />
-      <label for="projUrl">Target URL</label>
-      <input id="projUrl" placeholder="https://example.com" />
+      <label for="projectName">Name</label>
+      <input id="projectName" placeholder="Acme portal" />
+      <label for="projectUrl">Target URL</label>
+      <input id="projectUrl" placeholder="https://app.example.com" />
+      <label for="scopeHosts">Capture hosts <span class="muted">(optional)</span></label>
+      <input id="scopeHosts" placeholder="example.com, *.example.com" />
+      <p class="small muted">Empty saves all traffic. Scope never blocks requests.</p>
+      <button class="btn primary" id="createProject" style="width:100%;margin-top:.55rem">Create</button>
+      <button class="btn" id="saveScope" style="width:100%;margin-top:.4rem">Save capture scope</button>
+
+      <h3>Proxy credential</h3>
+      <p class="small muted">Copy once. The raw token is never stored.</p>
       <div class="row">
-        <button type="button" class="btn primary" id="btnCreateProject">Create</button>
+        <button class="btn" id="newCredential">Create</button>
+        <button class="btn" id="renewCredential">Renew</button>
       </div>
-      <h3>Capture credential</h3>
-      <p class="muted" style="font-size:.8rem">Copy-once external proxy token. Shown only at create/renew.</p>
-      <div class="row">
-        <button type="button" class="btn" id="btnNewCred">New credential</button>
-        <button type="button" class="btn" id="btnRenewCred">Renew last</button>
-      </div>
-      <pre class="mono" id="credOut"></pre>
+      <pre class="mono hidden" id="credentialOutput"></pre>
       <div class="status" id="sideStatus"></div>
     </aside>
 
-    <section class="panel" id="tab-history">
-      <div class="row">
-        <div>
-          <label for="filterQ">Filter</label>
-          <input id="filterQ" placeholder="host:example.com method:GET status>=400" />
+    <div class="workspace">
+      <section id="view-history" class="panel">
+        <div class="toolbar">
+          <div class="grow">
+            <label for="historyFilter">Filter</label>
+            <input id="historyFilter" placeholder="host:example.com method:GET status>=400 source:fuzzer" />
+          </div>
+          <button class="btn primary fit" id="loadHistory">Load</button>
+          <span class="small muted fit"><span class="live-dot" id="liveDot"></span><span id="liveText">offline</span></span>
         </div>
-        <div style="flex:0">
-          <label>&nbsp;</label>
-          <button type="button" class="btn primary" id="btnLoadHistory">Load</button>
-        </div>
-      </div>
-      <div class="status" id="histStatus"></div>
-      <div class="split">
-        <div>
-          <table>
-            <thead>
-              <tr><th>ID</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Src</th></tr>
-            </thead>
-            <tbody id="histBody"></tbody>
-          </table>
-          <div class="empty hidden" id="histEmpty">No exchanges yet. Point a browser at the proxy with a capture credential.</div>
-        </div>
-        <div class="card" id="inspector">
-          <h2>Inspector</h2>
-          <label><input type="checkbox" id="showNoisy" /> Show noisy headers</label>
-          <div class="status" id="inspStatus">Select an exchange</div>
-          <h3>Request headers</h3>
-          <pre class="mono" id="reqHeaders"></pre>
-          <h3>Response headers</h3>
-          <pre class="mono" id="respHeaders"></pre>
-          <div class="row">
-            <button type="button" class="btn" id="btnToReply" disabled>Send to Reply</button>
+        <div class="status" id="historyStatus"></div>
+        <div class="split">
+          <div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>ID</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Length</th><th>Time</th><th>Source</th></tr></thead>
+                <tbody id="historyRows"></tbody>
+              </table>
+            </div>
+            <div class="empty hidden" id="historyEmpty">No matching exchanges.</div>
+          </div>
+          <div class="card">
+            <div class="row">
+              <h2 style="margin:0">Inspector</h2>
+              <label class="fit" style="margin:0"><input type="checkbox" id="showNoisy" style="width:auto" /> noisy headers</label>
+            </div>
+            <div class="status" id="inspectorStatus">Select an exchange.</div>
+            <div class="detail-grid">
+              <div><h3>Request headers</h3><pre class="mono" id="requestHeaders">—</pre></div>
+              <div><h3>Response headers</h3><pre class="mono" id="responseHeaders">—</pre></div>
+              <div><h3>Request body</h3><pre class="mono" id="requestBody">—</pre></div>
+              <div><h3>Response body</h3><pre class="mono" id="responseBody">—</pre></div>
+            </div>
+            <div class="annotation">
+              <div class="row">
+                <div><label for="annotationTitle">Title</label><input id="annotationTitle" /></div>
+                <div><label for="annotationLabels">Labels</label><input id="annotationLabels" placeholder="auth, interesting" /></div>
+              </div>
+              <label for="annotationNote">Note</label>
+              <textarea id="annotationNote" style="min-height:65px"></textarea>
+              <div class="row">
+                <button class="btn primary" id="saveAnnotation" disabled>Save annotation</button>
+                <button class="btn" id="sendToReply" disabled>Send to Reply</button>
+              </div>
+              <div class="status" id="annotationStatus"></div>
+            </div>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="panel hidden" id="tab-reply">
-      <h2>Reply</h2>
-      <div class="row">
-        <div>
-          <label for="replyMethod">Method</label>
-          <input id="replyMethod" value="GET" />
+      <section id="view-reply" class="panel hidden">
+        <div class="tabs" id="replyTabs"></div>
+        <div class="toolbar"><button class="btn" id="newReplyTab">+ New tab</button><span class="status" id="replyStatus"></span></div>
+        <div class="card">
+          <div class="three">
+            <div><label for="replyName">Tab name</label><input id="replyName" /></div>
+            <div><label for="replyMethod">Method</label><input id="replyMethod" value="GET" /></div>
+            <div><label for="replyProtocol">Protocol</label><select id="replyProtocol"><option value="auto">Auto</option><option value="h1">HTTP/1.1</option><option value="h2">HTTP/2</option></select></div>
+          </div>
+          <label for="replyUrl">URL</label><input id="replyUrl" placeholder="https://example.com/path" />
+          <div class="detail-grid">
+            <div><label for="replyHeaders">Header overrides</label><textarea id="replyHeaders" placeholder="X-Test: value"></textarea></div>
+            <div><label for="replyBody">Body override</label><textarea id="replyBody"></textarea></div>
+          </div>
+          <label><input type="checkbox" id="replyClearBody" style="width:auto" /> Clear inherited body</label>
+          <div class="row">
+            <button class="btn" id="saveReply">Save tab</button>
+            <button class="btn primary" id="sendReply">Send</button>
+          </div>
+          <details style="margin-top:1rem">
+            <summary>Raw HTTP/1.1 mode</summary>
+            <p class="small muted">Sends these bytes directly for CRLF and protocol testing. This mode does not normalize headers or support HTTP/2.</p>
+            <label for="rawReplyUrl">Connection target</label>
+            <input id="rawReplyUrl" placeholder="https://example.com/" />
+            <label for="rawReplyRequest">Exact HTTP/1.1 request</label>
+            <textarea id="rawReplyRequest" class="mono" style="min-height:180px" placeholder="GET / HTTP/1.1&#10;Host: example.com&#10;Connection: close&#10;&#10;"></textarea>
+            <label><input type="checkbox" id="rawReplyCrlf" checked style="width:auto" /> Convert editor line breaks to CRLF</label>
+            <button class="btn primary" id="sendRawReply">Send raw HTTP/1.1</button>
+          </details>
+          <pre class="mono hidden" id="replyResult"></pre>
         </div>
-        <div style="flex:3">
-          <label for="replyUrl">URL</label>
-          <input id="replyUrl" placeholder="https://example.com/" />
-        </div>
-      </div>
-      <label for="replyHeaders">Header overrides (Name: value per line)</label>
-      <textarea id="replyHeaders" placeholder="X-Test: 1"></textarea>
-      <label for="replyBody">Body override</label>
-      <textarea id="replyBody"></textarea>
-      <div class="row">
-        <button type="button" class="btn primary" id="btnSendReply">Send</button>
-      </div>
-      <div class="status" id="replyStatus"></div>
-      <pre class="mono" id="replyResult"></pre>
-    </section>
+      </section>
 
-    <section class="panel hidden" id="tab-fuzzer">
-      <h2>Fuzzer</h2>
-      <div class="row">
-        <div>
-          <label for="fuzzStrategy">Strategy</label>
-          <select id="fuzzStrategy">
-            <option value="sniper">Sniper</option>
-            <option value="battering_ram">Battering ram</option>
-            <option value="pitchfork">Pitchfork</option>
-            <option value="cluster_bomb">Cluster bomb</option>
-          </select>
+      <section id="view-fuzzer" class="panel hidden">
+        <div class="split">
+          <div class="card">
+            <h2>New fuzz job</h2>
+            <p class="small muted">Uses the current Reply tab. Put markers such as <code>§p0§</code> in its URL, headers, or body.</p>
+            <label for="fuzzStrategy">Strategy</label><select id="fuzzStrategy"><option value="sniper">Sniper</option><option value="battering_ram">Battering ram</option><option value="pitchfork">Pitchfork</option><option value="cluster_bomb">Cluster bomb</option></select>
+            <label for="fuzzPoints">Insertion points — one <code>name|location</code> per line</label>
+            <textarea id="fuzzPoints" style="min-height:65px">p0|url</textarea>
+            <label for="fuzzWords">Wordlists — separate lists with a line containing <code>---</code></label>
+            <textarea id="fuzzWords">admin
+test
+../</textarea>
+            <label for="fuzzTransforms">Transforms applied to payloads</label>
+            <input id="fuzzTransforms" placeholder="url_encode,base64_encode" />
+            <button class="btn primary" id="startFuzz" style="width:100%;margin-top:.65rem">Start</button>
+            <div class="status" id="fuzzStatus"></div>
+          </div>
+          <div class="card">
+            <div class="row"><h2 style="margin:0">Jobs</h2><button class="btn fit" id="refreshFuzz">Refresh</button></div>
+            <div class="table-wrap"><table><thead><tr><th>ID</th><th>State</th><th>Progress</th><th>Failed</th><th>Action</th></tr></thead><tbody id="fuzzJobs"></tbody></table></div>
+            <h3>Selected job cases</h3>
+            <div class="table-wrap"><table><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Exchange</th><th>Error</th></tr></thead><tbody id="fuzzCases"></tbody></table></div>
+          </div>
         </div>
-        <div>
-          <label for="fuzzPoint">Insertion (url / body / header:Name)</label>
-          <input id="fuzzPoint" value="url" />
-        </div>
-      </div>
-      <label for="fuzzWords">Wordlist (one per line)</label>
-      <textarea id="fuzzWords">1
-2
-3</textarea>
-      <div class="row">
-        <button type="button" class="btn primary" id="btnStartFuzz">Start</button>
-        <button type="button" class="btn danger" id="btnCancelFuzz">Cancel last</button>
-      </div>
-      <div class="status" id="fuzzStatus"></div>
-      <pre class="mono" id="fuzzResult"></pre>
-    </section>
+      </section>
 
-    <section class="panel hidden" id="tab-browser">
-      <h2>Browser</h2>
-      <div class="card" id="browserStatus"></div>
-      <label for="browserUrl">URL</label>
-      <input id="browserUrl" placeholder="https://example.com" />
-      <div class="row">
-        <button type="button" class="btn primary" id="btnStartBrowser">Start (Auto)</button>
-        <button type="button" class="btn" id="btnStopBrowser">Stop</button>
-      </div>
-      <div class="status" id="browserMsg"></div>
-      <pre class="mono" id="browserOut"></pre>
-    </section>
+      <section id="view-browser" class="panel hidden">
+        <div class="split">
+          <div class="card">
+            <h2>Browser session</h2>
+            <pre class="mono" id="browserInstallStatus">Checking runtime…</pre>
+            <label for="browserUrl">URL</label><input id="browserUrl" placeholder="https://app.example.com" />
+            <div class="row">
+              <button class="btn primary" id="startBrowser">Start Auto</button>
+              <button class="btn" id="switchBrowser" disabled>Switch to Chromium</button>
+              <button class="btn danger" id="stopBrowser" disabled>Stop</button>
+            </div>
+            <div class="status" id="browserStatus"></div>
+          </div>
+          <div class="card">
+            <h2>Action</h2>
+            <label for="browserAction">Action</label>
+            <select id="browserAction"><option value="navigate">Navigate</option><option value="snapshot">Snapshot</option><option value="click">Click</option><option value="fill">Fill</option><option value="select">Select</option><option value="press">Press</option><option value="wait">Wait</option><option value="back">Back</option><option value="forward">Forward</option></select>
+            <label for="browserValue">URL / value / key / wait value</label><input id="browserValue" />
+            <label for="browserLocator">Locator JSON</label><textarea id="browserLocator" style="min-height:60px" placeholder='{"role":"button","name":"Log in"}'></textarea>
+            <button class="btn primary" id="runBrowserAction" disabled>Run action</button>
+            <pre class="mono" id="browserOutput">—</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-codec" class="panel hidden">
+        <div class="split">
+          <div class="card">
+            <h2>Encoder / decoder</h2>
+            <label for="codecInput">Input</label><textarea id="codecInput"></textarea>
+            <label for="codecSteps">Pipeline</label>
+            <input id="codecSteps" placeholder="url_encode,base64_encode" />
+            <p class="small muted">raw, hex_encode/decode, base64_encode/decode, base64_url_encode/decode, url_encode/decode, html_encode/decode</p>
+            <button class="btn primary" id="runCodec">Transform</button>
+            <div class="status" id="codecStatus"></div>
+          </div>
+          <div class="card"><h2>Output</h2><pre class="mono" id="codecOutput">—</pre></div>
+        </div>
+      </section>
+    </div>
   </main>
 
   <script>
+    const $ = (id) => document.getElementById(id);
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
     const state = {
       projectId: null,
-      lastCredId: null,
+      lastCredentialId: null,
       selectedExchange: null,
-      lastFuzzJob: null,
+      selectedDetail: null,
+      replyTabs: [],
+      activeReplyTab: null,
+      selectedFuzzJob: null,
       browserSession: null,
-      baseExchangeId: null,
+      events: null,
+      fuzzTimer: null,
     };
 
-    async function api(path, opts = {}) {
-      const res = await fetch(path, {
-        headers: { 'content-type': 'application/json', ...(opts.headers || {}) },
-        ...opts,
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { 'content-type': 'application/json', ...(options.headers || {}) },
       });
-      const text = await res.text();
+      const text = await response.text();
       let data = null;
       try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
-      if (!res.ok) {
-        const msg = (data && (data.message || data.code)) || res.statusText;
-        throw new Error(msg);
-      }
+      if (!response.ok) throw new Error(data?.message || data?.code || response.statusText);
       return data;
     }
 
-    function setStatus(el, msg, kind) {
-      el.textContent = msg || '';
-      el.className = 'status' + (kind ? ' ' + kind : '');
+    function status(id, message = '', kind = '') {
+      const el = $(id);
+      el.textContent = message;
+      el.className = `status${kind ? ` ${kind}` : ''}`;
     }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[c]);
+    }
+
+    function bytes(value) { return Array.from(encoder.encode(value || '')); }
+    function text(value) { return Array.isArray(value) ? decoder.decode(new Uint8Array(value)) : (value || ''); }
+    function decodeBase64(value) {
+      if (!value) return '';
+      const raw = atob(value);
+      return decoder.decode(Uint8Array.from(raw, c => c.charCodeAt(0)));
+    }
+
+    function activateView(name) {
+      document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+      document.querySelectorAll('.workspace > section').forEach(s => s.classList.toggle('hidden', s.id !== `view-${name}`));
+      if (name === 'fuzzer') loadFuzzJobs();
+      if (name === 'browser') loadBrowserStatus();
+    }
+    document.querySelectorAll('nav button').forEach(b => b.onclick = () => activateView(b.dataset.view));
 
     async function refreshHealth() {
       try {
-        const h = await api('/api/v1/health');
-        document.getElementById('health').textContent =
-          `ok · schema ${h.schema} · ${h.api}`;
-      } catch (e) {
-        document.getElementById('health').textContent = 'disconnected';
-      }
+        const result = await api('/api/v1/health');
+        $('health').textContent = `ready · schema ${result.schema}`;
+      } catch { $('health').textContent = 'disconnected'; }
     }
 
-    async function refreshProjects() {
-      const data = await api('/api/v1/projects');
-      const sel = document.getElementById('projectSelect');
-      const cur = state.projectId;
-      sel.innerHTML = '';
-      for (const p of data.projects || []) {
-        const o = document.createElement('option');
-        o.value = p.id;
-        o.textContent = `${p.id}: ${p.name}`;
-        sel.appendChild(o);
-      }
-      if (cur) sel.value = cur;
-      state.projectId = sel.value ? Number(sel.value) : null;
+    async function loadProjects(preferred) {
+      const result = await api('/api/v1/projects');
+      const select = $('projectSelect');
+      const current = preferred || state.projectId;
+      select.innerHTML = (result.projects || []).map(p => `<option value="${p.id}">${p.id}: ${escapeHtml(p.name)}</option>`).join('');
+      if (current && result.projects?.some(p => Number(p.id) === Number(current))) select.value = current;
+      state.projectId = select.value ? Number(select.value) : null;
+      await projectChanged();
     }
 
-    document.querySelectorAll('nav button').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        document.querySelectorAll('section.panel').forEach(s => s.classList.add('hidden'));
-        document.getElementById('tab-' + btn.dataset.tab).classList.remove('hidden');
-      });
-    });
-
-    document.getElementById('btnRefreshProjects').onclick = () =>
-      refreshProjects().catch(e => setStatus(sideStatus, e.message, 'err'));
-    document.getElementById('projectSelect').onchange = (e) => {
-      state.projectId = Number(e.target.value);
-    };
-
-    const sideStatus = document.getElementById('sideStatus');
-
-    document.getElementById('btnCreateProject').onclick = async () => {
-      try {
-        const name = document.getElementById('projName').value.trim();
-        const target_url = document.getElementById('projUrl').value.trim();
-        const p = await api('/api/v1/projects', {
-          method: 'POST',
-          body: JSON.stringify({ name, target_url }),
-        });
-        setStatus(sideStatus, `Created project ${p.id} (scope from ${target_url})`, 'ok');
-        await refreshProjects();
-        document.getElementById('projectSelect').value = p.id;
-        state.projectId = p.id;
-      } catch (e) {
-        setStatus(sideStatus, e.message, 'err');
-      }
-    };
-
-    document.getElementById('btnNewCred').onclick = async () => {
-      if (!state.projectId) return setStatus(sideStatus, 'Select a project', 'err');
-      try {
-        const s = await api(`/api/v1/projects/${state.projectId}/capture-sessions`, { method: 'POST' });
-        state.lastCredId = s.id;
-        document.getElementById('credOut').textContent =
-          `id=${s.id}\nBearer: ${s.bearer_presentation}\nBasic: ${s.basic_presentation}\nexpires: ${s.expires_at || 'session'}\n(copy now — not shown again)`;
-        setStatus(sideStatus, 'Credential created (copy once)', 'ok');
-      } catch (e) {
-        setStatus(sideStatus, e.message, 'err');
-      }
-    };
-
-    document.getElementById('btnRenewCred').onclick = async () => {
-      if (!state.projectId || !state.lastCredId) return setStatus(sideStatus, 'No credential to renew', 'err');
-      try {
-        const s = await api(`/api/v1/projects/${state.projectId}/capture-sessions/${state.lastCredId}/renew`, { method: 'POST' });
-        state.lastCredId = s.id;
-        document.getElementById('credOut').textContent =
-          `id=${s.id}\nBearer: ${s.bearer_presentation}\nBasic: ${s.basic_presentation}\n(renewed)`;
-        setStatus(sideStatus, 'Credential renewed; previous revoked', 'ok');
-      } catch (e) {
-        setStatus(sideStatus, e.message, 'err');
-      }
-    };
-
-    async function loadHistory() {
-      if (!state.projectId) return setStatus(histStatus, 'Select a project', 'err');
-      const q = document.getElementById('filterQ').value.trim();
-      const qs = new URLSearchParams({ limit: '100' });
-      if (q) qs.set('q', q);
-      const data = await api(`/api/v1/projects/${state.projectId}/history?` + qs);
-      const tbody = document.getElementById('histBody');
-      tbody.innerHTML = '';
-      const items = data.items || [];
-      document.getElementById('histEmpty').classList.toggle('hidden', items.length > 0);
-      for (const it of items) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${it.exchange_id}</td><td>${it.method}</td><td>${escapeHtml(it.host)}</td><td class="mono">${escapeHtml(it.path)}</td><td>${it.status_code ?? it.completion}</td><td>${it.source}</td>`;
-        tr.onclick = () => selectExchange(it.exchange_id, tr);
-        tbody.appendChild(tr);
-      }
-      setStatus(histStatus, `${items.length} exchanges`, 'ok');
-    }
-
-    const histStatus = document.getElementById('histStatus');
-    document.getElementById('btnLoadHistory').onclick = () =>
-      loadHistory().catch(e => setStatus(histStatus, e.message, 'err'));
-
-    async function selectExchange(eid, tr) {
-      document.querySelectorAll('#histBody tr').forEach(r => r.classList.remove('selected'));
-      if (tr) tr.classList.add('selected');
-      state.selectedExchange = eid;
-      state.baseExchangeId = eid;
-      document.getElementById('btnToReply').disabled = false;
-      const noisy = document.getElementById('showNoisy').checked;
-      const d = await api(`/api/v1/projects/${state.projectId}/exchanges/${eid}?include_noisy_headers=${noisy}`);
-      document.getElementById('inspStatus').textContent =
-        `${d.summary.method} ${d.summary.scheme}://${d.summary.authority}${d.summary.path} · redacted=${d.redacted_count} noisy_hidden=${d.noisy_hidden_count}`;
-      document.getElementById('reqHeaders').textContent = formatHeaders(d.request_headers);
-      document.getElementById('respHeaders').textContent = formatHeaders(d.response_headers);
-      document.getElementById('replyMethod').value = d.summary.method;
-      document.getElementById('replyUrl').value =
-        `${d.summary.scheme}://${d.summary.authority}${d.summary.path}${d.summary.query ? '?' + d.summary.query : ''}`;
-    }
-
-    function formatHeaders(hs) {
-      return (hs || []).map(h => {
-        const flag = h.redacted ? '  <redacted>' : '';
-        return `${h.name}: ${h.value}${flag}`;
-      }).join('\n') || '(none)';
-    }
-
-    document.getElementById('showNoisy').onchange = () => {
-      if (state.selectedExchange) selectExchange(state.selectedExchange).catch(() => {});
-    };
-    document.getElementById('btnToReply').onclick = () => {
-      document.querySelector('nav button[data-tab="reply"]').click();
-    };
-
-    const replyStatus = document.getElementById('replyStatus');
-    document.getElementById('btnSendReply').onclick = async () => {
-      if (!state.projectId) return setStatus(replyStatus, 'Select a project', 'err');
-      try {
-        const header_overrides = [];
-        for (const line of document.getElementById('replyHeaders').value.split('\n')) {
-          const m = line.match(/^([^:]+):\s*(.*)$/);
-          if (m) header_overrides.push({ name: m[1].trim(), value: m[2] });
-        }
-        const bodyText = document.getElementById('replyBody').value;
-        const draft = {
-          method: document.getElementById('replyMethod').value,
-          url: document.getElementById('replyUrl').value,
-          header_overrides,
-          header_tombstones: [],
-          body_override: bodyText ? Array.from(new TextEncoder().encode(bodyText)) : null,
-          body_cleared: false,
-        };
-        // body_override as string is easier — API accepts string via our serde
-        draft.body_override = bodyText || null;
-        const r = await api(`/api/v1/projects/${state.projectId}/reply-send`, {
-          method: 'POST',
-          body: JSON.stringify({
-            base_exchange_id: state.baseExchangeId,
-            draft: {
-              method: draft.method,
-              url: draft.url,
-              header_overrides,
-              header_tombstones: [],
-              body_cleared: !bodyText && !!state.baseExchangeId ? false : !bodyText,
-            },
-          }),
-        });
-        // attach body if present via second path — simplify: include as utf8 in override using base64 form
-        setStatus(replyStatus, `Sent → exchange ${r.exchange_id}`, 'ok');
-        document.getElementById('replyResult').textContent = JSON.stringify(r, null, 2);
-        await loadHistory();
-      } catch (e) {
-        setStatus(replyStatus, e.message, 'err');
-      }
-    };
-
-    const fuzzStatus = document.getElementById('fuzzStatus');
-    document.getElementById('btnStartFuzz').onclick = async () => {
-      if (!state.projectId) return setStatus(fuzzStatus, 'Select a project', 'err');
-      try {
-        const words = document.getElementById('fuzzWords').value.split('\n').map(s => s.trim()).filter(Boolean);
-        const location = document.getElementById('fuzzPoint').value;
-        const strategy = document.getElementById('fuzzStrategy').value;
-        const template = {
-          base_exchange_id: state.baseExchangeId,
-          draft: {
-            method: document.getElementById('replyMethod').value || 'GET',
-            url: document.getElementById('replyUrl').value,
-            header_overrides: [],
-            header_tombstones: [],
-            body_cleared: false,
-          },
-          insertion_points: [{ name: 'p0', location }],
-          wordlists: [words],
-          transforms: [],
-          strategy,
-        };
-        const job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, {
-          method: 'POST',
-          body: JSON.stringify({ template, confirm: true }),
-        });
-        state.lastFuzzJob = job.id;
-        setStatus(fuzzStatus, `Job ${job.id} started · estimated ${job.estimated_cases}`, 'ok');
-        document.getElementById('fuzzResult').textContent = JSON.stringify(job, null, 2);
-      } catch (e) {
-        setStatus(fuzzStatus, e.message, 'err');
-      }
-    };
-    document.getElementById('btnCancelFuzz').onclick = async () => {
-      if (!state.projectId || !state.lastFuzzJob) return;
-      try {
-        await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${state.lastFuzzJob}/cancel`, { method: 'POST' });
-        setStatus(fuzzStatus, 'Cancel requested', 'ok');
-      } catch (e) {
-        setStatus(fuzzStatus, e.message, 'err');
-      }
-    };
-
-    const browserMsg = document.getElementById('browserMsg');
-    async function refreshBrowserStatus() {
+    async function projectChanged() {
+      state.selectedExchange = null;
+      state.selectedDetail = null;
+      $('saveAnnotation').disabled = true;
+      $('sendToReply').disabled = true;
+      connectEvents();
       if (!state.projectId) return;
       try {
-        const s = await api(`/api/v1/projects/${state.projectId}/browser-sessions`);
-        document.getElementById('browserStatus').textContent = JSON.stringify(s, null, 2);
-      } catch (e) {
-        document.getElementById('browserStatus').textContent = e.message;
-      }
+        const project = await api(`/api/v1/projects/${state.projectId}`);
+        $('scopeHosts').value = (project.scope?.host_patterns || []).join(', ');
+      } catch (_) {}
+      await Promise.allSettled([loadHistory(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus()]);
     }
-    document.getElementById('btnStartBrowser').onclick = async () => {
-      if (!state.projectId) return setStatus(browserMsg, 'Select a project', 'err');
+
+    $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
+    $('refreshProjects').onclick = () => loadProjects().catch(e => status('sideStatus', e.message, 'err'));
+    $('createProject').onclick = async () => {
       try {
-        const url = document.getElementById('browserUrl').value.trim();
-        const s = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, {
+        const hosts = $('scopeHosts').value.split(',').map(v => v.trim()).filter(Boolean);
+        const advanced = hosts.length ? { schemes: ['http', 'https'], host_patterns: hosts, ports: [], path_prefixes: [] } : null;
+        const project = await api('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name: $('projectName').value.trim(), target_url: $('projectUrl').value.trim(), advanced }) });
+        status('sideStatus', `Created project ${project.id}`, 'ok');
+        await loadProjects(project.id);
+      } catch (e) { status('sideStatus', e.message, 'err'); }
+    };
+    $('saveScope').onclick = async () => {
+      if (!state.projectId) return status('sideStatus', 'Select a project', 'err');
+      const hosts = $('scopeHosts').value.split(',').map(v => v.trim()).filter(Boolean);
+      try {
+        await api(`/api/v1/projects/${state.projectId}/scope`, {
           method: 'POST',
-          body: JSON.stringify({ url, engine_policy: 'auto' }),
+          body: JSON.stringify({ schemes: ['http', 'https'], host_patterns: hosts, ports: [], path_prefixes: [] }),
         });
-        state.browserSession = s.id;
-        setStatus(browserMsg, `Session ${s.id} · ${s.engine}`, 'ok');
-        document.getElementById('browserOut').textContent = JSON.stringify(s, null, 2);
-        await refreshBrowserStatus();
-      } catch (e) {
-        setStatus(browserMsg, e.message, 'err');
-      }
+        status('sideStatus', hosts.length ? 'Capture scope saved' : 'Capture scope cleared; saving all traffic', 'ok');
+      } catch (e) { status('sideStatus', e.message, 'err'); }
     };
-    document.getElementById('btnStopBrowser').onclick = async () => {
-      if (!state.projectId || !state.browserSession) return;
+    $('newCredential').onclick = async () => {
+      if (!state.projectId) return status('sideStatus', 'Select a project', 'err');
       try {
-        await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession}/stop`, { method: 'POST' });
-        setStatus(browserMsg, 'Stopped', 'ok');
-      } catch (e) {
-        setStatus(browserMsg, e.message, 'err');
-      }
+        const result = await api(`/api/v1/projects/${state.projectId}/capture-sessions`, { method: 'POST' });
+        state.lastCredentialId = result.id;
+        $('credentialOutput').classList.remove('hidden');
+        $('credentialOutput').textContent = `Bearer ${result.token_once}\nBasic ${result.basic_presentation}\nExpires ${result.expires_at || 'with session'}`;
+        status('sideStatus', 'Credential created. Copy it now.', 'ok');
+      } catch (e) { status('sideStatus', e.message, 'err'); }
+    };
+    $('renewCredential').onclick = async () => {
+      if (!state.projectId || !state.lastCredentialId) return status('sideStatus', 'Create a credential first', 'err');
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/capture-sessions/${state.lastCredentialId}/renew`, { method: 'POST' });
+        state.lastCredentialId = result.id;
+        $('credentialOutput').classList.remove('hidden');
+        $('credentialOutput').textContent = `Bearer ${result.token_once}\nBasic ${result.basic_presentation}`;
+        status('sideStatus', 'Credential renewed. Copy it now.', 'ok');
+      } catch (e) { status('sideStatus', e.message, 'err'); }
     };
 
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    function connectEvents() {
+      state.events?.close();
+      $('liveDot').classList.remove('on'); $('liveText').textContent = 'offline';
+      if (!state.projectId) return;
+      const source = new EventSource(`/api/v1/projects/${state.projectId}/events`);
+      state.events = source;
+      source.addEventListener('ready', () => { $('liveDot').classList.add('on'); $('liveText').textContent = 'live'; });
+      for (const event of ['exchange', 'annotation', 'fuzz', 'browser', 'capture']) {
+        source.addEventListener(event, () => {
+          if (event === 'exchange' || event === 'annotation') loadHistory();
+          if (event === 'fuzz') loadFuzzJobs();
+          if (event === 'browser') loadBrowserStatus();
+        });
+      }
+      source.addEventListener('lagged', () => projectChanged());
+      source.onerror = () => { $('liveDot').classList.remove('on'); $('liveText').textContent = 'reconnecting'; };
     }
 
+    async function loadHistory() {
+      if (!state.projectId) return;
+      try {
+        const q = new URLSearchParams({ limit: '100' });
+        if ($('historyFilter').value.trim()) q.set('q', $('historyFilter').value.trim());
+        const result = await api(`/api/v1/projects/${state.projectId}/history?${q}`);
+        const items = result.items || [];
+        $('historyRows').innerHTML = items.map(item => `<tr data-id="${item.exchange_id}" class="${state.selectedExchange === item.exchange_id ? 'selected' : ''}">
+          <td>${item.exchange_id}</td><td>${escapeHtml(item.method)}</td><td>${escapeHtml(item.host)}</td><td title="${escapeHtml(item.path)}">${escapeHtml(item.path.slice(0, 38))}</td>
+          <td>${item.status_code ?? '—'}</td><td>${item.response_length ?? '—'}</td><td>${item.duration_ms == null ? '—' : `${item.duration_ms} ms`}</td>
+          <td><span class="pill ${item.source}">${escapeHtml(item.source)}</span></td></tr>`).join('');
+        $('historyEmpty').classList.toggle('hidden', items.length > 0);
+        status('historyStatus', `${items.length} exchange${items.length === 1 ? '' : 's'}`);
+      } catch (e) { status('historyStatus', e.message, 'err'); }
+    }
+    $('loadHistory').onclick = loadHistory;
+    $('historyFilter').onkeydown = e => { if (e.key === 'Enter') loadHistory(); };
+    $('historyRows').onclick = e => {
+      const row = e.target.closest('tr[data-id]');
+      if (row) selectExchange(Number(row.dataset.id));
+    };
+    $('showNoisy').onchange = () => state.selectedExchange && selectExchange(state.selectedExchange);
+
+    function formatHeaders(headers) {
+      return (headers || []).map(h => `${h.name}: ${h.value}${h.redacted ? '  <redacted>' : ''}`).join('\n') || '—';
+    }
+    async function loadExchangeBody(exchangeId, side) {
+      const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}/body?side=${side}&max_bytes=131072`);
+      const content = decodeBase64(result.data);
+      return `${content}${result.truncated ? `\n\n[truncated; ${result.total_length} bytes total]` : ''}` || '—';
+    }
+    async function selectExchange(exchangeId) {
+      try {
+        const noisy = $('showNoisy').checked;
+        const [detail, requestBody, responseBody] = await Promise.all([
+          api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}?include_noisy_headers=${noisy}`),
+          loadExchangeBody(exchangeId, 'request'), loadExchangeBody(exchangeId, 'response'),
+        ]);
+        state.selectedExchange = exchangeId; state.selectedDetail = detail;
+        $('requestHeaders').textContent = formatHeaders(detail.request_headers);
+        $('responseHeaders').textContent = formatHeaders(detail.response_headers);
+        $('requestBody').textContent = requestBody; $('responseBody').textContent = responseBody;
+        $('annotationTitle').value = detail.annotation?.display_title || detail.summary.display_title || '';
+        $('annotationLabels').value = (detail.annotation?.labels || detail.summary.labels || []).join(', ');
+        $('annotationNote').value = detail.annotation?.note || '';
+        $('saveAnnotation').disabled = false; $('sendToReply').disabled = false;
+        status('inspectorStatus', `${detail.summary.method} ${detail.summary.scheme}://${detail.summary.authority}${detail.summary.path} · ${detail.protocol}`);
+        document.querySelectorAll('#historyRows tr').forEach(r => r.classList.toggle('selected', Number(r.dataset.id) === exchangeId));
+      } catch (e) { status('inspectorStatus', e.message, 'err'); }
+    }
+
+    $('saveAnnotation').onclick = async () => {
+      if (!state.selectedExchange) return;
+      try {
+        const annotation = await api(`/api/v1/projects/${state.projectId}/exchanges/${state.selectedExchange}/annotation`, {
+          method: 'POST', body: JSON.stringify({
+            display_title: $('annotationTitle').value.trim() || null,
+            note: $('annotationNote').value || null,
+            labels: $('annotationLabels').value.split(',').map(s => s.trim()).filter(Boolean),
+            expected_revision: state.selectedDetail?.annotation?.revision || 0,
+          }),
+        });
+        if (state.selectedDetail) state.selectedDetail.annotation = annotation;
+        status('annotationStatus', 'Annotation saved', 'ok');
+        loadHistory();
+      } catch (e) { status('annotationStatus', e.message, 'err'); }
+    };
+
+    async function loadReplyTabs(selectId) {
+      if (!state.projectId) return;
+      const result = await api(`/api/v1/projects/${state.projectId}/reply-tabs`);
+      state.replyTabs = result.tabs || [];
+      if (selectId) state.activeReplyTab = state.replyTabs.find(t => Number(t.id) === Number(selectId)) || null;
+      else if (state.activeReplyTab) state.activeReplyTab = state.replyTabs.find(t => Number(t.id) === Number(state.activeReplyTab.id)) || null;
+      else state.activeReplyTab = state.replyTabs[0] || null;
+      renderReplyTabs(); fillReplyForm();
+    }
+    function renderReplyTabs() {
+      $('replyTabs').innerHTML = state.replyTabs.map(tab => `<button class="tab-button ${state.activeReplyTab?.id === tab.id ? 'active' : ''}" data-id="${tab.id}">${escapeHtml(tab.name)}</button>`).join('');
+    }
+    function fillReplyForm() {
+      const tab = state.activeReplyTab;
+      $('replyName').value = tab?.name || 'Request';
+      $('replyMethod').value = tab?.draft?.method || 'GET';
+      $('replyUrl').value = tab?.draft?.url || '';
+      $('replyProtocol').value = tab?.protocol || 'auto';
+      $('replyHeaders').value = (tab?.draft?.header_overrides || []).map(h => `${h.name}: ${text(h.value)}`).join('\n');
+      $('replyBody').value = text(tab?.draft?.body_override);
+      $('replyClearBody').checked = !!tab?.draft?.body_cleared;
+    }
+    $('replyTabs').onclick = e => {
+      const button = e.target.closest('[data-id]');
+      if (!button) return;
+      state.activeReplyTab = state.replyTabs.find(t => Number(t.id) === Number(button.dataset.id));
+      renderReplyTabs(); fillReplyForm();
+    };
+    $('newReplyTab').onclick = () => {
+      state.activeReplyTab = null; renderReplyTabs(); fillReplyForm(); $('replyName').value = `Request ${state.replyTabs.length + 1}`;
+    };
+    function replyDraftFromForm() {
+      const overrides = [];
+      for (const line of $('replyHeaders').value.split('\n')) {
+        const match = line.match(/^([^:]+):\s*(.*)$/);
+        if (match) overrides.push({ name: match[1].trim(), value: bytes(match[2]) });
+      }
+      const bodyValue = $('replyBody').value;
+      return {
+        method: $('replyMethod').value.trim() || null,
+        url: $('replyUrl').value.trim() || null,
+        header_overrides: overrides,
+        header_tombstones: [],
+        body_override: bodyValue ? bytes(bodyValue) : null,
+        body_cleared: $('replyClearBody').checked,
+      };
+    }
+    async function saveReplyTab() {
+      const payload = {
+        id: state.activeReplyTab?.id || null,
+        name: $('replyName').value.trim() || 'Request',
+        base_exchange_id: state.activeReplyTab?.base_exchange_id || null,
+        protocol: $('replyProtocol').value,
+        draft: replyDraftFromForm(),
+        revision: state.activeReplyTab?.revision || null,
+      };
+      const tab = await api(`/api/v1/projects/${state.projectId}/reply-tabs`, { method: 'POST', body: JSON.stringify(payload) });
+      await loadReplyTabs(tab.id);
+      return tab;
+    }
+    $('saveReply').onclick = async () => {
+      try { await saveReplyTab(); status('replyStatus', 'Tab saved', 'ok'); }
+      catch (e) { status('replyStatus', e.message, 'err'); }
+    };
+    $('sendReply').onclick = async () => {
+      if (!state.projectId) return status('replyStatus', 'Select a project', 'err');
+      try {
+        const tab = await saveReplyTab();
+        const result = await api(`/api/v1/projects/${state.projectId}/reply-send`, { method: 'POST', body: JSON.stringify({ tab_id: tab.id, protocol: $('replyProtocol').value }) });
+        $('replyResult').classList.remove('hidden'); $('replyResult').textContent = JSON.stringify(result, null, 2);
+        status('replyStatus', result.exchange_id ? `Sent as exchange ${result.exchange_id}` : 'Sent (outside capture scope)', 'ok');
+        if (result.exchange_id) loadHistory();
+      } catch (e) { status('replyStatus', e.message, 'err'); }
+    };
+    $('sendRawReply').onclick = async () => {
+      if (!state.projectId) return status('replyStatus', 'Select a project', 'err');
+      const targetUrl = $('rawReplyUrl').value.trim();
+      if (!targetUrl) return status('replyStatus', 'Enter a connection target', 'err');
+      let request = $('rawReplyRequest').value;
+      if ($('rawReplyCrlf').checked) request = request.replace(/\r?\n/g, '\r\n');
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/reply-send-raw`, {
+          method: 'POST',
+          body: JSON.stringify({ target_url: targetUrl, request, encoding: 'utf8', tab_id: state.activeReplyTab?.id || null }),
+        });
+        $('replyResult').classList.remove('hidden'); $('replyResult').textContent = JSON.stringify(result, null, 2);
+        status('replyStatus', result.exchange_id ? `Raw request saved as exchange ${result.exchange_id}` : 'Raw request sent (outside capture scope)', 'ok');
+        if (result.exchange_id) loadHistory();
+      } catch (e) { status('replyStatus', e.message, 'err'); }
+    };
+    $('sendToReply').onclick = async () => {
+      if (!state.selectedDetail) return;
+      const s = state.selectedDetail.summary;
+      try {
+        const tab = await api(`/api/v1/projects/${state.projectId}/reply-tabs`, { method: 'POST', body: JSON.stringify({
+          name: `${s.method} ${s.host}${s.path}`.slice(0, 48), base_exchange_id: s.exchange_id, protocol: 'auto', revision: null,
+          draft: { method: s.method, url: `${s.scheme}://${s.authority}${s.path}${s.query ? `?${s.query}` : ''}`, header_overrides: [], header_tombstones: [], body_override: null, body_cleared: false },
+        }) });
+        await loadReplyTabs(tab.id); activateView('reply');
+      } catch (e) { status('annotationStatus', e.message, 'err'); }
+    };
+
+    function parseWordlists() {
+      return $('fuzzWords').value.split(/^---\s*$/m).map(block => block.split('\n').map(s => s.trim()).filter(Boolean)).filter(list => list.length);
+    }
+    function parsePoints() {
+      return $('fuzzPoints').value.split('\n').map(line => {
+        const [name, location] = line.split('|').map(s => s.trim());
+        return name && location ? { name, location } : null;
+      }).filter(Boolean);
+    }
+    $('startFuzz').onclick = async () => {
+      if (!state.projectId || !state.activeReplyTab) return status('fuzzStatus', 'Save or select a Reply tab first', 'err');
+      try {
+        await saveReplyTab();
+        const template = {
+          base_exchange_id: state.activeReplyTab.base_exchange_id,
+          draft: replyDraftFromForm(), insertion_points: parsePoints(), wordlists: parseWordlists(),
+          transforms: $('fuzzTransforms').value.split(',').map(s => s.trim()).filter(Boolean), strategy: $('fuzzStrategy').value,
+        };
+        const job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, { method: 'POST', body: JSON.stringify({ template, confirm: true }) });
+        state.selectedFuzzJob = job.id; status('fuzzStatus', `Job ${job.id} started`, 'ok'); await loadFuzzJobs();
+      } catch (e) { status('fuzzStatus', e.message, 'err'); }
+    };
+    async function loadFuzzJobs() {
+      if (!state.projectId) return;
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`);
+        const jobs = result.jobs || [];
+        $('fuzzJobs').innerHTML = jobs.map(j => `<tr data-id="${j.id}"><td>${j.id}</td><td>${escapeHtml(j.state)}</td><td>${j.completed_cases}/${j.estimated_cases}</td><td>${j.failed_cases}</td><td><button class="btn" data-view-cases="${j.id}">Cases</button> <button class="btn danger" data-cancel="${j.id}" ${['completed','failed','interrupted'].includes(j.state) ? 'disabled' : ''}>Cancel</button></td></tr>`).join('');
+        if (state.selectedFuzzJob) loadFuzzCases(state.selectedFuzzJob);
+        clearTimeout(state.fuzzTimer);
+        if (jobs.some(j => ['queued','running','cancelling'].includes(j.state))) state.fuzzTimer = setTimeout(loadFuzzJobs, 1200);
+      } catch (e) { status('fuzzStatus', e.message, 'err'); }
+    }
+    async function loadFuzzCases(jobId) {
+      state.selectedFuzzJob = Number(jobId);
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/cases?limit=250`);
+        $('fuzzCases').innerHTML = (result.cases || []).map(c => {
+          const payload = c.payload_summary || JSON.stringify(c.payloads || []);
+          return `<tr><td>${c.case_index}</td><td title="${escapeHtml(payload)}">${escapeHtml(payload.slice(0, 60))}</td><td>${c.status_code ?? c.state ?? '—'}</td><td>${c.response_length ?? '—'}</td><td>${c.exchange_id ?? '—'}</td><td>${escapeHtml(c.error || '')}</td></tr>`;
+        }).join('');
+      } catch (e) { status('fuzzStatus', e.message, 'err'); }
+    }
+    $('fuzzJobs').onclick = async e => {
+      const cases = e.target.closest('[data-view-cases]');
+      const cancel = e.target.closest('[data-cancel]');
+      if (cases) loadFuzzCases(cases.dataset.viewCases);
+      if (cancel) {
+        try { await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${cancel.dataset.cancel}/cancel`, { method: 'POST' }); await loadFuzzJobs(); }
+        catch (err) { status('fuzzStatus', err.message, 'err'); }
+      }
+    };
+    $('refreshFuzz').onclick = loadFuzzJobs;
+
+    async function loadBrowserStatus() {
+      if (!state.projectId) return;
+      try { $('browserInstallStatus').textContent = JSON.stringify(await api(`/api/v1/projects/${state.projectId}/browser-sessions`), null, 2); }
+      catch (e) { $('browserInstallStatus').textContent = e.message; }
+    }
+    $('startBrowser').onclick = async () => {
+      if (!state.projectId) return status('browserStatus', 'Select a project', 'err');
+      try {
+        const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, { method: 'POST', body: JSON.stringify({ url: $('browserUrl').value.trim(), engine_policy: 'auto' }) });
+        state.browserSession = session; $('switchBrowser').disabled = false; $('stopBrowser').disabled = false; $('runBrowserAction').disabled = false;
+        status('browserStatus', `Session ${session.id} running with ${session.engine}`, 'ok');
+        $('browserOutput').textContent = JSON.stringify(session, null, 2);
+      } catch (e) { status('browserStatus', e.message, 'err'); }
+    };
+    $('switchBrowser').onclick = async () => {
+      if (!state.browserSession) return;
+      try {
+        const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession.id}/switch-chromium`, { method: 'POST' });
+        state.browserSession = session; status('browserStatus', `Migrated to Chromium: ${session.checkpoint_status}`, session.checkpoint_status === 'ok' ? 'ok' : 'warn');
+        $('browserOutput').textContent = JSON.stringify(session, null, 2);
+      } catch (e) { status('browserStatus', e.message, 'err'); }
+    };
+    $('stopBrowser').onclick = async () => {
+      if (!state.browserSession) return;
+      try {
+        await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession.id}/stop`, { method: 'POST' });
+        state.browserSession = null; $('switchBrowser').disabled = true; $('stopBrowser').disabled = true; $('runBrowserAction').disabled = true;
+        status('browserStatus', 'Session stopped', 'ok');
+      } catch (e) { status('browserStatus', e.message, 'err'); }
+    };
+    $('runBrowserAction').onclick = async () => {
+      if (!state.browserSession) return;
+      try {
+        const type = $('browserAction').value; const value = $('browserValue').value;
+        let locator = null;
+        if ($('browserLocator').value.trim()) locator = JSON.parse($('browserLocator').value);
+        let action;
+        if (type === 'navigate') action = { type, url: value || $('browserUrl').value };
+        else if (type === 'snapshot') action = { type, format: 'accessibility', max_bytes: 262144 };
+        else if (type === 'click') action = { type, locator };
+        else if (type === 'fill' || type === 'select') action = { type, locator, value };
+        else if (type === 'press') action = { type, locator, key: value };
+        else if (type === 'wait') action = { type, for_what: 'selector', value };
+        else action = { type };
+        const result = await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession.id}/action`, { method: 'POST', body: JSON.stringify(action) });
+        $('browserOutput').textContent = JSON.stringify(result, null, 2); status('browserStatus', result.message || 'Action complete', result.ok ? 'ok' : 'err');
+      } catch (e) { status('browserStatus', e.message, 'err'); }
+    };
+
+    $('runCodec').onclick = async () => {
+      try {
+        const steps = $('codecSteps').value.split(',').map(s => s.trim()).filter(Boolean);
+        const result = await api('/api/v1/codec', { method: 'POST', body: JSON.stringify({ input_text: $('codecInput').value, steps }) });
+        $('codecOutput').textContent = result.output_text ?? `base64:${result.output_base64}`;
+        status('codecStatus', `${result.length} output bytes`, 'ok');
+      } catch (e) { status('codecStatus', e.message, 'err'); }
+    };
+
+    window.addEventListener('beforeunload', () => state.events?.close());
     (async () => {
       await refreshHealth();
-      try { await refreshProjects(); } catch (e) { setStatus(sideStatus, e.message, 'err'); }
+      try { await loadProjects(); } catch (e) { status('sideStatus', e.message, 'err'); }
       setInterval(refreshHealth, 10000);
     })();
   </script>

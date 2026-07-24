@@ -1,28 +1,31 @@
 //! SQLite storage, migrations, body spool, backup, retention.
 
+mod annotations;
+mod audit;
+mod bodies;
+mod browser_store;
 mod db;
+mod exchanges;
+mod fuzz_store;
 mod migrations;
 mod projects;
-mod exchanges;
-mod bodies;
-mod sessions;
 mod reply_store;
-mod fuzz_store;
-mod browser_store;
-mod audit;
+mod sessions;
 
+pub use bodies::*;
 pub use db::*;
+pub use exchanges::*;
 pub use migrations::*;
 pub use projects::*;
-pub use exchanges::*;
-pub use bodies::*;
 pub use sessions::*;
 // side-effect modules register `impl Db` methods
 #[allow(unused_imports)]
-pub use reply_store::*;
+pub use annotations::*;
 #[allow(unused_imports)]
-pub use fuzz_store::*;
+pub use audit::*;
 #[allow(unused_imports)]
 pub use browser_store::*;
 #[allow(unused_imports)]
-pub use audit::*;
+pub use fuzz_store::*;
+#[allow(unused_imports)]
+pub use reply_store::*;

@@ -3,6 +3,7 @@
 use crate::app::AppState;
 use crate::browser::BrowserAction;
 use crate::codec::{apply_pipeline, Transform};
+use crate::config::Config;
 use crate::domain::*;
 use crate::fuzzer::FuzzTemplate;
 use crate::history::parse_text_query;
@@ -13,8 +14,35 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
+#[async_trait::async_trait]
+trait ToolBackend: Send + Sync {
+    async fn call(&self, name: &str, args: Value) -> DomainResult<Value>;
+}
+
+struct LocalToolBackend {
+    state: Arc<AppState>,
+}
+
+#[async_trait::async_trait]
+impl ToolBackend for LocalToolBackend {
+    async fn call(&self, name: &str, args: Value) -> DomainResult<Value> {
+        call_tool(self.state.clone(), name, args).await
+    }
+}
+
+struct DaemonToolBackend {
+    config: Config,
+}
+
+#[async_trait::async_trait]
+impl ToolBackend for DaemonToolBackend {
+    async fn call(&self, name: &str, args: Value) -> DomainResult<Value> {
+        call_daemon_tool(&self.config, name, args).await
+    }
+}
+
 const PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_NAME: &str = "bb";
+const SERVER_NAME: &str = "HuntProxy";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
@@ -44,9 +72,21 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
+#[derive(Debug, Serialize)]
+struct DaemonToolRequest<'a> {
+    name: &'a str,
+    arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonToolResponse {
+    result: Option<Value>,
+    error: Option<ErrorEnvelope>,
+}
+
 fn tool_defs() -> Value {
     json!([
-        {"name":"projects","description":"List or create projects","inputSchema":{"type":"object","properties":{"action":{"type":"string"},"name":{"type":"string"},"target_url":{"type":"string"}},"required":["action"]}},
+        {"name":"projects","description":"List, create, or set optional capture scope","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"history_search","description":"Search exchange history","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string"},"limit":{"type":"integer"}},"required":["project_id"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
@@ -54,23 +94,33 @@ fn tool_defs() -> Value {
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List/create reply tabs","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":{"type":"object"}},"required":["project_id","action"]}},
         {"name":"reply_send","description":"Send a reply draft","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":{"type":"object"}},"required":["project_id"]}},
+        {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a fuzz job","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":{"type":"object"},"confirm_large":{"type":"boolean"}},"required":["project_id","template"]}},
-        {"name":"fuzz_manage","description":"List/cancel fuzz jobs","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"job_id":{"type":"integer"}},"required":["project_id","action"]}},
+        {"name":"fuzz_manage","description":"List, inspect, or cancel fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"job_id":{"type":"integer"},"limit":{"type":"integer"},"before_case_index":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"browser_start","description":"Start browser session","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string"}},"required":["project_id"]}},
         {"name":"browser_action","description":"Run browser action","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":{"type":"object"}},"required":["project_id","session_id","action"]}},
         {"name":"browser_manage","description":"Stop browser session","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string"}},"required":["project_id","session_id","op"]}},
         {"name":"codec_transform","description":"Apply codec transforms","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
-        {"name":"exchange_annotate","description":"Set display title","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":"string"}},"required":["project_id","exchange_id"]}}
+        {"name":"exchange_annotate","description":"Set an exchange title, note, and labels","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
     ])
 }
 
 pub async fn run_stdio_mcp(state: Arc<AppState>) -> DomainResult<()> {
-    run_stdio(state).await
+    run_stdio_backend(Arc::new(LocalToolBackend { state })).await
+}
+
+/// Run the stdio MCP adapter as a thin client of the single daemon owner.
+pub async fn run_stdio_mcp_client(config: Config) -> DomainResult<()> {
+    run_stdio_backend(Arc::new(DaemonToolBackend { config })).await
 }
 
 pub async fn run_stdio(state: Arc<AppState>) -> DomainResult<()> {
-    eprintln!("bb mcp: starting stdio JSON-RPC server");
+    run_stdio_mcp(state).await
+}
+
+async fn run_stdio_backend(backend: Arc<dyn ToolBackend>) -> DomainResult<()> {
+    eprintln!("HuntProxy mcp: starting stdio JSON-RPC server");
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::new();
@@ -104,7 +154,7 @@ pub async fn run_stdio(state: Arc<AppState>) -> DomainResult<()> {
             }
         };
         let id = req.id.clone();
-        match handle_rpc(state.clone(), &req).await {
+        match handle_rpc(backend.clone(), &req).await {
             Ok(Some(value)) => write_response(JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -135,7 +185,84 @@ fn write_response(resp: JsonRpcResponse) {
     }
 }
 
-async fn handle_rpc(state: Arc<AppState>, req: &JsonRpcRequest) -> DomainResult<Option<Value>> {
+#[cfg(unix)]
+async fn call_daemon_tool(config: &Config, name: &str, args: Value) -> DomainResult<Value> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::client::conn::http1;
+    use hyper::Request;
+    use hyper_util::rt::TokioIo;
+
+    let stream = tokio::net::UnixStream::connect(config.socket_path())
+        .await
+        .map_err(|e| {
+            DomainError::new(
+                ErrorCode::DaemonNotRunning,
+                format!("connect daemon socket: {e}"),
+            )
+        })?;
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| DomainError::new(ErrorCode::ProtocolError, e.to_string()))?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::debug!(%error, "MCP daemon connection closed");
+        }
+    });
+
+    let payload = serde_json::to_vec(&DaemonToolRequest {
+        name,
+        arguments: args,
+    })
+    .map_err(|e| DomainError::new(ErrorCode::ProtocolError, e.to_string()))?;
+    let request = Request::post("/internal/mcp/call")
+        .header(hyper::header::HOST, "localhost")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(payload)))
+        .map_err(|e| DomainError::new(ErrorCode::ProtocolError, e.to_string()))?;
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| DomainError::new(ErrorCode::ProtocolError, e.to_string()))?
+        .to_bytes();
+    let envelope: DaemonToolResponse = serde_json::from_slice(&bytes)
+        .map_err(|e| DomainError::new(ErrorCode::ProtocolError, e.to_string()))?;
+    if status.is_success() {
+        return envelope
+            .result
+            .ok_or_else(|| DomainError::new(ErrorCode::ProtocolError, "daemon omitted result"));
+    }
+    let error = envelope.error.unwrap_or(ErrorEnvelope {
+        code: ErrorCode::Unavailable.as_str().into(),
+        message: format!("daemon returned HTTP {status}"),
+        details: None,
+        request_id: None,
+    });
+    Err(DomainError::with_details(
+        ErrorCode::Unavailable,
+        error.message,
+        json!({ "daemon_code": error.code, "details": error.details }),
+    ))
+}
+
+#[cfg(not(unix))]
+async fn call_daemon_tool(_config: &Config, _name: &str, _args: Value) -> DomainResult<Value> {
+    Err(DomainError::new(
+        ErrorCode::Unavailable,
+        "the private daemon MCP bridge currently requires a Unix-domain socket",
+    ))
+}
+
+async fn handle_rpc(
+    backend: Arc<dyn ToolBackend>,
+    req: &JsonRpcRequest,
+) -> DomainResult<Option<Value>> {
     match req.method.as_str() {
         "initialize" => Ok(Some(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -156,7 +283,7 @@ async fn handle_rpc(state: Arc<AppState>, req: &JsonRpcRequest) -> DomainResult<
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let result = call_tool(state, name, args).await?;
+            let result = backend.call(name, args).await?;
             Ok(Some(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                 "structuredContent": result,
@@ -175,10 +302,21 @@ fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
     Ok(ProjectId(id))
 }
 
-async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResult<Value> {
+fn emit_event(state: &AppState, project_id: ProjectId, kind: &str, payload: Value) {
+    let _ = state.events.send(crate::app::AppEvent {
+        project_id: project_id.get(),
+        kind: kind.into(),
+        payload,
+    });
+}
+
+pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResult<Value> {
     match name {
         "projects" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
             match action {
                 "list" => Ok(json!(state.db.list_projects().await?)),
                 "create" => {
@@ -190,27 +328,57 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                         .get("target_url")
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| DomainError::invalid("target_url required"))?;
+                    let scope = args
+                        .get("scope")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|error| DomainError::invalid(format!("invalid scope: {error}")))?;
+                    let project = state
+                        .db
+                        .create_project(CreateProjectRequest {
+                            name: pname.into(),
+                            target_url: target_url.into(),
+                            advanced: scope,
+                        })
+                        .await?;
+                    emit_event(
+                        &state,
+                        project.id,
+                        "project",
+                        json!({ "project_id": project.id.get() }),
+                    );
+                    Ok(json!(project))
+                }
+                "set_scope" => {
+                    let project_id = require_project_id(&args)?;
+                    let scope: ScopePolicy = args
+                        .get("scope")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|error| DomainError::invalid(format!("invalid scope: {error}")))?
+                        .unwrap_or_default();
                     Ok(json!(
                         state
                             .db
-                            .create_project(CreateProjectRequest {
-                                name: pname.into(),
-                                target_url: target_url.into(),
-                                advanced: None,
-                            })
+                            .update_project_scope(project_id, scope, None)
                             .await?
                     ))
                 }
-                _ => Err(DomainError::invalid("action must be list|create")),
+                _ => Err(DomainError::invalid("action must be list|create|set_scope")),
             }
         }
         "capture_sessions" => {
             let project_id = require_project_id(&args)?;
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
             match action {
                 "list" => Ok(json!(state.db.list_capture_sessions(project_id).await?)),
-                "create" => Ok(json!(
-                    state
+                "create" => {
+                    let session = state
                         .db
                         .create_capture_session(CreateCaptureSession {
                             project_id,
@@ -219,8 +387,15 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                             is_browser_bound: false,
                             ttl: None,
                         })
-                        .await?
-                )),
+                        .await?;
+                    emit_event(
+                        &state,
+                        project_id,
+                        "capture",
+                        json!({ "session_id": session.id.get(), "state": "created" }),
+                    );
+                    Ok(json!(session))
+                }
                 "revoke" => {
                     let sid = args
                         .get("session_id")
@@ -230,6 +405,12 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                         .db
                         .revoke_capture_session(project_id, CaptureSessionId(sid))
                         .await?;
+                    emit_event(
+                        &state,
+                        project_id,
+                        "capture",
+                        json!({ "session_id": sid, "state": "revoked" }),
+                    );
                     Ok(json!({ "ok": true }))
                 }
                 "renew" => {
@@ -237,23 +418,39 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                         .get("session_id")
                         .and_then(|v| v.as_i64())
                         .ok_or_else(|| DomainError::invalid("session_id required"))?;
-                    Ok(json!(
-                        state
-                            .db
-                            .renew_capture_session(project_id, CaptureSessionId(sid))
-                            .await?
-                    ))
+                    let session = state
+                        .db
+                        .renew_capture_session(project_id, CaptureSessionId(sid))
+                        .await?;
+                    emit_event(
+                        &state,
+                        project_id,
+                        "capture",
+                        json!({ "session_id": session.id.get(), "state": "renewed" }),
+                    );
+                    Ok(json!(session))
                 }
-                _ => Err(DomainError::invalid("action must be list|create|revoke|renew")),
+                _ => Err(DomainError::invalid(
+                    "action must be list|create|revoke|renew",
+                )),
             }
         }
         "history_search" => {
             let project_id = require_project_id(&args)?;
-            if let Some(q) = args.get("q").and_then(|v| v.as_str()) {
-                let _ = parse_text_query(q)?;
+            let filter = args
+                .get("q")
+                .and_then(|value| value.as_str())
+                .filter(|query| !query.trim().is_empty())
+                .map(parse_text_query)
+                .transpose()?;
+            if let Some(filter) = &filter {
+                crate::history::validate_filter(filter)?;
             }
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
-            let (items, next) = state.db.list_history(project_id, limit, None, None).await?;
+            let (items, next) = state
+                .db
+                .list_history_filtered(project_id, filter, limit, None, None)
+                .await?;
             Ok(json!({ "items": items, "next": next }))
         }
         "exchange_get" => {
@@ -262,16 +459,17 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .get("exchange_id")
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
-            Ok(json!(
-                state
-                    .db
-                    .get_exchange_detail(
-                        project_id,
-                        ExchangeId(eid),
-                        PresentationOptions::default(),
-                    )
-                    .await?
-            ))
+            let detail = state
+                .db
+                .get_exchange_detail(project_id, ExchangeId(eid), PresentationOptions::default())
+                .await?;
+            let annotation = state.db.get_annotation(project_id, ExchangeId(eid)).await?;
+            let mut value = serde_json::to_value(detail)
+                .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("annotation".into(), json!(annotation));
+            }
+            Ok(value)
         }
         "exchange_body" => {
             let project_id = require_project_id(&args)?;
@@ -279,11 +477,18 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .get("exchange_id")
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
-            let side = match args.get("side").and_then(|v| v.as_str()).unwrap_or("response") {
+            let side = match args
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("response")
+            {
                 "request" => MessageSide::Request,
                 _ => MessageSide::Response,
             };
-            let max = args.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let max = args
+                .get("max_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096) as usize;
             let body = state
                 .db
                 .load_raw_body(project_id, ExchangeId(eid), side)
@@ -312,7 +517,11 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                     "header is not in the sensitive set; use exchange_get",
                 ));
             }
-            let side = match args.get("side").and_then(|v| v.as_str()).unwrap_or("request") {
+            let side = match args
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("request")
+            {
                 "response" => MessageSide::Response,
                 _ => MessageSide::Request,
             };
@@ -340,7 +549,10 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
         }
         "reply_tabs" => {
             let project_id = require_project_id(&args)?;
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
             match action {
                 "list" => Ok(json!(state.db.list_reply_tabs(project_id).await?)),
                 "create" | "upsert" => {
@@ -387,7 +599,7 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .transpose()
                 .map_err(|e| DomainError::invalid(e.to_string()))?
                 .unwrap_or_default();
-            let (eid, diff) = state
+            let result = state
                 .reply
                 .send(
                     project_id,
@@ -400,7 +612,66 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                     0,
                 )
                 .await?;
-            Ok(json!({ "exchange_id": eid.get(), "diff": diff }))
+            if let Some(exchange_id) = result.exchange_id {
+                emit_event(
+                    &state,
+                    project_id,
+                    "exchange",
+                    json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
+                );
+            }
+            serde_json::to_value(result)
+                .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))
+        }
+        "reply_send_raw" => {
+            let project_id = require_project_id(&args)?;
+            let target_url = args
+                .get("target_url")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| DomainError::invalid("target_url required"))?;
+            let request = args
+                .get("request")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| DomainError::invalid("request required"))?;
+            let request_bytes = match args
+                .get("encoding")
+                .and_then(|value| value.as_str())
+                .unwrap_or("utf8")
+            {
+                "utf8" => request.as_bytes().to_vec(),
+                "base64" => base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    request.as_bytes(),
+                )
+                .map_err(|error| {
+                    DomainError::invalid(format!("invalid base64 request: {error}"))
+                })?,
+                _ => return Err(DomainError::invalid("encoding must be utf8 or base64")),
+            };
+            let result = state
+                .reply
+                .send_raw_http1(
+                    project_id,
+                    args.get("tab_id")
+                        .and_then(|value| value.as_i64())
+                        .map(ReplyTabId),
+                    target_url,
+                    request_bytes,
+                )
+                .await?;
+            if let Some(exchange_id) = result.exchange_id {
+                emit_event(
+                    &state,
+                    project_id,
+                    "exchange",
+                    json!({
+                        "exchange_id": exchange_id.get(),
+                        "source": "reply",
+                        "mode": "raw_http1"
+                    }),
+                );
+            }
+            Ok(json!(result))
         }
         "fuzz_start" => {
             let project_id = require_project_id(&args)?;
@@ -414,13 +685,21 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .get("confirm_large")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            Ok(json!(
-                state.fuzzer.start(project_id, template, confirm).await?
-            ))
+            let job = state.fuzzer.start(project_id, template, confirm).await?;
+            emit_event(
+                &state,
+                project_id,
+                "fuzz",
+                json!({ "job_id": job.id.get(), "state": job.state }),
+            );
+            Ok(json!(job))
         }
         "fuzz_manage" => {
             let project_id = require_project_id(&args)?;
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
             match action {
                 "list" => Ok(json!(state.fuzzer.list(project_id).await?)),
                 "cancel" => {
@@ -428,7 +707,16 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                         .get("job_id")
                         .and_then(|v| v.as_i64())
                         .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    state.fuzzer.cancel(FuzzJobId(jid)).await?;
+                    state
+                        .fuzzer
+                        .cancel_for_project(project_id, FuzzJobId(jid))
+                        .await?;
+                    emit_event(
+                        &state,
+                        project_id,
+                        "fuzz",
+                        json!({ "job_id": jid, "state": "cancelling" }),
+                    );
                     Ok(json!({ "ok": true }))
                 }
                 "get" => {
@@ -438,7 +726,26 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                         .ok_or_else(|| DomainError::invalid("job_id required"))?;
                     Ok(json!(state.fuzzer.get(project_id, FuzzJobId(jid)).await?))
                 }
-                _ => Err(DomainError::invalid("action must be list|cancel|get")),
+                "cases" => {
+                    let jid = args
+                        .get("job_id")
+                        .and_then(|value| value.as_i64())
+                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let limit = args
+                        .get("limit")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(100)
+                        .min(500) as u32;
+                    let before = args
+                        .get("before_case_index")
+                        .and_then(|value| value.as_u64());
+                    let (cases, next) = state
+                        .fuzzer
+                        .list_cases(project_id, FuzzJobId(jid), limit, before)
+                        .await?;
+                    Ok(json!({ "cases": cases, "next_before_case_index": next }))
+                }
+                _ => Err(DomainError::invalid("action must be list|cancel|get|cases")),
             }
         }
         "browser_start" => {
@@ -480,10 +787,7 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .get("session_id")
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| DomainError::invalid("session_id required"))?;
-            let op = args
-                .get("op")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stop");
+            let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("stop");
             match op {
                 "stop" | "close" => {
                     state
@@ -505,7 +809,9 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                         .switch_to_chromium(project_id, BrowserSessionId(sid))
                         .await?
                 )),
-                _ => Err(DomainError::invalid("op must be stop|status|switch_chromium")),
+                _ => Err(DomainError::invalid(
+                    "op must be stop|status|switch_chromium",
+                )),
             }
         }
         "codec_transform" => {
@@ -518,11 +824,10 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .and_then(|v| v.as_str())
                 .unwrap_or("utf8");
             let bytes = match encoding {
-                "base64" => base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    input,
-                )
-                .map_err(|e| DomainError::invalid(e.to_string()))?,
+                "base64" => {
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, input)
+                        .map_err(|e| DomainError::invalid(e.to_string()))?
+                }
                 "hex" => hex::decode(input).map_err(|e| DomainError::invalid(e.to_string()))?,
                 _ => input.as_bytes().to_vec(),
             };
@@ -559,17 +864,13 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
             let detail = state
                 .db
-                .get_exchange_detail(
-                    project_id,
-                    ExchangeId(eid),
-                    PresentationOptions::default(),
-                )
+                .get_exchange_detail(project_id, ExchangeId(eid), PresentationOptions::default())
                 .await?;
-            let path = state.config.export_dir.join(format!(
-                "exchange_{}_{}.json",
-                project_id.get(),
-                eid
-            ));
+            let path =
+                state
+                    .config
+                    .export_dir
+                    .join(format!("exchange_{}_{}.json", project_id.get(), eid));
             crate::config::create_private_dir(&state.config.export_dir)?;
             let data = serde_json::to_vec_pretty(&detail)
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
@@ -593,35 +894,47 @@ async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResul
                 .get("exchange_id")
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
-            let _ = state
+            let display_title = args
+                .get("display_title")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let note = args
+                .get("note")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let labels = args
+                .get("labels")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let expected_revision = args
+                .get("expected_revision")
+                .and_then(|value| value.as_i64());
+            let annotation = state
                 .db
-                .get_exchange_detail(
+                .upsert_annotation(
                     project_id,
                     ExchangeId(eid),
-                    PresentationOptions::default(),
+                    AnnotationUpdate {
+                        display_title,
+                        note,
+                        labels,
+                        expected_revision,
+                    },
                 )
                 .await?;
-            if let Some(t) = args.get("display_title").and_then(|v| v.as_str()) {
-                let t = t.to_string();
-                state
-                    .db
-                    .with_conn(move |conn| {
-                        conn.execute(
-                            "UPDATE exchanges SET display_title=?1 WHERE project_id=?2 AND exchange_id=?3",
-                            rusqlite::params![t, project_id.get(), eid],
-                        )
-                        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                        Ok(())
-                    })
-                    .await?;
-            }
-            Ok(json!({
-                "ok": true,
-                "project_id": project_id.get(),
-                "exchange_id": eid,
-            }))
+            let _ = state.events.send(crate::app::AppEvent {
+                project_id: project_id.get(),
+                kind: "annotation".into(),
+                payload: json!({ "exchange_id": eid }),
+            });
+            Ok(json!(annotation))
         }
         other => Err(DomainError::invalid(format!("unknown tool {other}"))),
     }
 }
-

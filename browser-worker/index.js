@@ -1,158 +1,613 @@
 #!/usr/bin/env node
 /**
- * bb browser worker — versioned NDJSON JSON-RPC over stdio.
- * Logs only scrubbed metadata to stderr. Never log cookies/headers/payloads.
+ * HuntProxy browser worker — versioned NDJSON JSON-RPC over stdio.
+ *
+ * Stdout is protocol-only. Stderr contains scrubbed lifecycle metadata and
+ * never request data, DOM content, cookies, credentials, or storage values.
  */
-import { chromium } from "playwright-core";
-import { createInterface } from "node:readline";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 
 const PROTOCOL = 1;
 const sessions = new Map();
-let nextId = 1;
+
+function loadPlaywright() {
+  const candidates = [];
+  if (process.env.BB_PLAYWRIGHT_CORE_PATH) {
+    candidates.push(process.env.BB_PLAYWRIGHT_CORE_PATH);
+  }
+  const workerDir = path.dirname(fileURLToPath(import.meta.url));
+  candidates.push(
+    path.join(workerDir, "node_modules", "playwright-core"),
+    path.join(process.cwd(), "node_modules", "playwright-core"),
+    "playwright-core",
+  );
+
+  const requireFromWorker = createRequire(path.join(workerDir, "package.json"));
+  const requireFromCwd = createRequire(path.join(process.cwd(), "package.json"));
+  let lastError;
+  for (const candidate of candidates) {
+    try {
+      if (path.isAbsolute(candidate)) {
+        const packagePath = fs.statSync(candidate).isDirectory()
+          ? path.join(candidate, "index.js")
+          : candidate;
+        return requireFromWorker(packagePath);
+      }
+      try {
+        return requireFromWorker(candidate);
+      } catch {
+        return requireFromCwd(candidate);
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`playwright-core unavailable: ${lastError?.message || "not found"}`);
+}
+
+const { chromium } = loadPlaywright();
 
 function respond(id, result, error) {
-  const msg = error
+  const message = error
     ? { jsonrpc: "2.0", id, error }
     : { jsonrpc: "2.0", id, result };
-  process.stdout.write(JSON.stringify(msg) + "\n");
+  process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
 function logMeta(event, fields = {}) {
-  process.stderr.write(JSON.stringify({ event, ...fields }) + "\n");
+  process.stderr.write(`${JSON.stringify({ event, ...fields })}\n`);
+}
+
+function rpcError(code, message) {
+  return { code, message };
+}
+
+function existingChromiumExecutable() {
+  const candidates = [
+    process.env.BB_CHROME_EXECUTABLE,
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  ].filter(Boolean);
+  try {
+    const bundled = chromium.executablePath();
+    if (bundled) candidates.unshift(bundled);
+  } catch {
+    // playwright-core commonly has no downloaded browser.
+  }
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+function chromiumProxy(proxy) {
+  if (!proxy?.server) return undefined;
+  return {
+    server: proxy.server,
+    username: proxy.username || undefined,
+    password: proxy.password || undefined,
+    bypass: "<-loopback>",
+  };
+}
+
+async function launchChromium(proxy, caCertPath) {
+  const executablePath = existingChromiumExecutable();
+  if (!executablePath) {
+    throw rpcError(
+      -32003,
+      "Chromium executable not found; install Chromium or set BB_CHROME_EXECUTABLE",
+    );
+  }
+  const browser = await chromium.launch({
+    executablePath,
+    headless: true,
+    proxy: chromiumProxy(proxy),
+    args: [
+      "--disable-quic",
+      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+      "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+      "--proxy-bypass-list=<-loopback>",
+    ],
+  });
+  const context = await browser.newContext({
+    serviceWorkers: "block",
+    ignoreHTTPSErrors: Boolean(caCertPath),
+  });
+  const page = await context.newPage();
+  return { browser, context, page, lightpandaProc: null };
+}
+
+async function waitForCdp(endpoint, child, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw rpcError(-32004, "Lightpanda exited before CDP became ready");
+    }
+    try {
+      const response = await fetch(`${endpoint}/json/version`, {
+        signal: AbortSignal.timeout(750),
+      });
+      if (response.ok) return;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw rpcError(
+    -32004,
+    `Lightpanda CDP did not become ready: ${lastError?.message || "timeout"}`,
+  );
+}
+
+async function availableLoopbackPort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : null;
+  await new Promise((resolve) => server.close(resolve));
+  if (!port) throw rpcError(-32004, "could not allocate a Lightpanda CDP port");
+  return port;
+}
+
+async function launchLightpanda(proxy, caCertPath) {
+  const lightpanda = process.env.LIGHTPANDA_PATH || "lightpanda";
+  const port = await availableLoopbackPort();
+  const args = ["serve", "--host", "127.0.0.1", "--port", String(port)];
+  if (proxy?.server) args.push("--http-proxy", proxy.server);
+  if (proxy?.bearer_token) {
+    args.push("--proxy-bearer-token", proxy.bearer_token);
+  }
+  if (caCertPath) args.push("--ca-cert", caCertPath);
+
+  const lightpandaProc = spawn(lightpanda, args, {
+    env: {
+      ...process.env,
+      LIGHTPANDA_DISABLE_TELEMETRY: "true",
+    },
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  const endpoint = `http://127.0.0.1:${port}`;
+  try {
+    await waitForCdp(endpoint, lightpandaProc);
+    const browser = await chromium.connectOverCDP(endpoint, { timeout: 15_000 });
+    // Lightpanda's default CDP context is not usable; create an explicit one.
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    return { browser, context, page, lightpandaProc };
+  } catch (error) {
+    lightpandaProc.kill("SIGTERM");
+    throw error;
+  }
+}
+
+async function launchEngine(engine, proxy, caCertPath) {
+  return engine === "lightpanda"
+    ? launchLightpanda(proxy, caCertPath)
+    : launchChromium(proxy, caCertPath);
+}
+
+async function extractCheckpoint(session) {
+  const url = session.page.url();
+  const origin = (() => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return null;
+    }
+  })();
+  const cookies = await session.context.cookies(origin ? [origin] : undefined);
+  const storage = await session.page
+    .evaluate(() => {
+      const collect = (source) => {
+        const output = {};
+        for (let index = 0; index < source.length; index += 1) {
+          const key = source.key(index);
+          output[key] = source.getItem(key);
+        }
+        return output;
+      };
+      return {
+        local_storage: collect(localStorage),
+        session_storage: collect(sessionStorage),
+      };
+    })
+    .catch(() => ({ local_storage: {}, session_storage: {} }));
+  const privateState = {
+    cookies,
+    origin,
+    local_storage: storage.local_storage || {},
+    session_storage: storage.session_storage || {},
+  };
+  const stateHash = createHash("sha256")
+    .update(JSON.stringify(privateState))
+    .digest("hex");
+  return {
+    url,
+    origin,
+    cookie_count: cookies.length,
+    local_keys: Object.keys(privateState.local_storage).length,
+    session_keys: Object.keys(privateState.session_storage).length,
+    state_hash: stateHash,
+    _private: privateState,
+  };
+}
+
+function normalizeCookiesForChromium(cookies, currentUrl) {
+  return cookies.map((cookie) => {
+    const normalized = {
+      name: cookie.name,
+      value: cookie.value,
+      httpOnly: Boolean(cookie.httpOnly),
+      secure: Boolean(cookie.secure),
+      sameSite: ["Strict", "Lax", "None"].includes(cookie.sameSite)
+        ? cookie.sameSite
+        : "Lax",
+    };
+    const domain = String(cookie.domain || "").replace(/^\./, "");
+    const cookiePath = cookie.path || "/";
+    if (domain && domain !== "localhost" && domain !== "127.0.0.1") {
+      normalized.domain = cookie.domain;
+      normalized.path = cookiePath;
+    } else {
+      let base;
+      try {
+        base = new URL(currentUrl);
+      } catch {
+        base = new URL("http://127.0.0.1/");
+      }
+      base.pathname = cookiePath;
+      base.search = "";
+      base.hash = "";
+      normalized.url = base.toString();
+    }
+    if (typeof cookie.expires === "number" && cookie.expires > 0) {
+      normalized.expires = cookie.expires;
+    }
+    return normalized;
+  });
+}
+
+function cookieKey(cookie) {
+  return `${cookie.name}\u0000${String(cookie.domain || "").replace(/^\./, "")}\u0000${cookie.path || "/"}`;
+}
+
+function cookieProjection(cookie) {
+  return {
+    value: cookie.value,
+    httpOnly: Boolean(cookie.httpOnly),
+    secure: Boolean(cookie.secure),
+    sameSite: cookie.sameSite || "Lax",
+  };
+}
+
+function compareCookies(expected, actual) {
+  const actualMap = new Map(actual.map((cookie) => [cookieKey(cookie), cookieProjection(cookie)]));
+  let matched = 0;
+  for (const cookie of expected) {
+    const found = actualMap.get(cookieKey(cookie));
+    if (found && JSON.stringify(found) === JSON.stringify(cookieProjection(cookie))) matched += 1;
+  }
+  return { expected: expected.length, matched, verified: matched === expected.length };
+}
+
+function compareStorage(expected, actual) {
+  const expectedEntries = Object.entries(expected || {}).sort();
+  const matched = expectedEntries.filter(([key, value]) => actual?.[key] === value).length;
+  return {
+    expected: expectedEntries.length,
+    matched,
+    verified: matched === expectedEntries.length,
+  };
+}
+
+function locatorFor(page, descriptor = {}) {
+  const exact = Boolean(descriptor.exact);
+  if (descriptor.role) {
+    const options = { exact };
+    if (descriptor.name != null) options.name = descriptor.name;
+    return page.getByRole(descriptor.role, options);
+  }
+  if (descriptor.test_id) return page.getByTestId(descriptor.test_id);
+  if (descriptor.text != null) return page.getByText(descriptor.text, { exact });
+  if (descriptor.css) return page.locator(descriptor.css);
+  throw rpcError(-32602, "locator requires role, test_id, text, or css");
+}
+
+async function performWait(page, forWhat, value) {
+  switch (forWhat) {
+    case "timeout": {
+      const milliseconds = Number(value);
+      if (!Number.isFinite(milliseconds) || milliseconds < 0 || milliseconds > 60_000) {
+        throw rpcError(-32602, "wait timeout must be between 0 and 60000 milliseconds");
+      }
+      await page.waitForTimeout(milliseconds);
+      return { waited_ms: milliseconds };
+    }
+    case "url":
+      await page.waitForURL(value, { timeout: 30_000 });
+      return { url: page.url() };
+    case "selector":
+      await page.locator(value).waitFor({ state: "visible", timeout: 30_000 });
+      return { selector: value, state: "visible" };
+    case "text":
+      await page.getByText(value).first().waitFor({ state: "visible", timeout: 30_000 });
+      return { text: value, state: "visible" };
+    case "load_state":
+      await page.waitForLoadState(value || "domcontentloaded", { timeout: 30_000 });
+      return { load_state: value || "domcontentloaded" };
+    default:
+      throw rpcError(-32602, "wait for_what must be timeout|url|selector|text|load_state");
+  }
+}
+
+async function executeAction(session, action = {}) {
+  switch (action.type) {
+    case "navigate": {
+      await session.page.goto(action.url, {
+        waitUntil: "domcontentloaded",
+        timeout: action.timeout_ms || 30_000,
+      });
+      return { message: "navigation completed", data: { url: session.page.url() } };
+    }
+    case "snapshot": {
+      let content;
+      if (action.format === "dom") {
+        content = await session.page.content();
+      } else if (typeof session.page.locator("body").ariaSnapshot === "function") {
+        content = await session.page.locator("body").ariaSnapshot();
+      } else {
+        content = await session.page.content();
+      }
+      const maxBytes = Math.max(0, Math.min(Number(action.max_bytes || 200_000), 2_000_000));
+      const bytes = Buffer.from(String(content), "utf8");
+      return {
+        message: "snapshot captured",
+        data: {
+          format: action.format || "accessibility",
+          content: bytes.subarray(0, maxBytes).toString("utf8"),
+          truncated: bytes.length > maxBytes,
+          total_bytes: bytes.length,
+        },
+      };
+    }
+    case "click":
+      await locatorFor(session.page, action.locator).click({ timeout: 30_000 });
+      return { message: "element clicked", data: { url: session.page.url() } };
+    case "fill":
+      await locatorFor(session.page, action.locator).fill(action.value ?? "", { timeout: 30_000 });
+      return { message: "field filled", data: null };
+    case "select":
+      await locatorFor(session.page, action.locator).selectOption(action.value, { timeout: 30_000 });
+      return { message: "option selected", data: null };
+    case "press":
+      if (action.locator) {
+        await locatorFor(session.page, action.locator).press(action.key, { timeout: 30_000 });
+      } else {
+        await session.page.keyboard.press(action.key);
+      }
+      return { message: "key pressed", data: null };
+    case "wait":
+      return {
+        message: "wait completed",
+        data: await performWait(session.page, action.for_what, action.value),
+      };
+    case "back":
+      await session.page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      return { message: "went back", data: { url: session.page.url() } };
+    case "forward":
+      await session.page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      return { message: "went forward", data: { url: session.page.url() } };
+    default:
+      throw rpcError(-32602, `unsupported browser action: ${action.type || "missing"}`);
+  }
+}
+
+async function migrateToChromium(sessionId, session) {
+  if (session.engine !== "lightpanda") {
+    throw rpcError(-32602, "only Lightpanda sessions can migrate to Chromium");
+  }
+  const sourceCheckpoint = await extractCheckpoint(session);
+  const source = sourceCheckpoint._private;
+  const replacement = await launchChromium(session.proxy, session.caCertPath);
+  try {
+    const cookies = normalizeCookiesForChromium(source.cookies, sourceCheckpoint.url);
+    if (cookies.length) await replacement.context.addCookies(cookies);
+    await replacement.context.addInitScript(
+      ({ expectedOrigin, localValues, sessionValues }) => {
+        if (expectedOrigin && location.origin !== expectedOrigin) return;
+        for (const [key, value] of Object.entries(localValues || {})) {
+          try { localStorage.setItem(key, value); } catch {}
+        }
+        for (const [key, value] of Object.entries(sessionValues || {})) {
+          try { sessionStorage.setItem(key, value); } catch {}
+        }
+      },
+      {
+        expectedOrigin: source.origin,
+        localValues: source.local_storage,
+        sessionValues: source.session_storage,
+      },
+    );
+    if (sourceCheckpoint.url && sourceCheckpoint.url !== "about:blank") {
+      await replacement.page.goto(sourceCheckpoint.url, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+    }
+    const restoredCheckpoint = await extractCheckpoint(replacement);
+    const restored = restoredCheckpoint._private;
+    const cookieVerification = compareCookies(source.cookies, restored.cookies);
+    const localVerification = compareStorage(source.local_storage, restored.local_storage);
+    const sessionVerification = compareStorage(source.session_storage, restored.session_storage);
+    const verified =
+      cookieVerification.verified &&
+      localVerification.verified &&
+      sessionVerification.verified;
+
+    await closeRuntime(session);
+    sessions.set(sessionId, {
+      ...replacement,
+      engine: "chromium",
+      proxy: session.proxy,
+      caCertPath: session.caCertPath,
+    });
+    return {
+      ok: true,
+      status: verified ? "migrated" : "migrated_partial",
+      verified,
+      verification: {
+        cookies: cookieVerification,
+        local_storage: localVerification,
+        session_storage: sessionVerification,
+      },
+      checkpoint: restoredCheckpoint,
+    };
+  } catch (error) {
+    await closeRuntime(replacement);
+    throw error;
+  }
 }
 
 async function handle(req) {
-  const { id, method, params } = req;
+  const { id, method, params = {} } = req;
   try {
     switch (method) {
       case "hello":
-        return respond(id, { protocol: PROTOCOL, engines: ["lightpanda", "chromium"] });
+        return respond(id, {
+          protocol: PROTOCOL,
+          engines: ["lightpanda", "chromium"],
+          capabilities: ["actions", "checkpoints", "lightpanda_to_chromium"],
+        });
       case "session.start": {
-        const engine = params?.engine || "chromium";
-        const sid = nextId++;
-        let browser;
-        let lightpandaProc = null;
-        if (engine === "lightpanda") {
-          const port = 9222 + (sid % 1000);
-          lightpandaProc = spawn(
-            process.env.LIGHTPANDA_PATH || "lightpanda",
-            ["serve", "--host", "127.0.0.1", "--port", String(port)],
-            {
-              env: { ...process.env, LIGHTPANDA_DISABLE_TELEMETRY: "true" },
-              stdio: ["ignore", "ignore", "pipe"],
-            }
-          );
-          await new Promise((r) => setTimeout(r, 400));
-          browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-          const context = await browser.newContext();
-          const page = await context.newPage();
-          sessions.set(sid, { engine, browser, context, page, lightpandaProc });
-        } else {
-          browser = await chromium.launch({
-            headless: true,
-            channel: process.env.BB_CHROME_CHANNEL || undefined,
-          });
-          const context = await browser.newContext({
-            serviceWorkers: "block",
-          });
-          const page = await context.newPage();
-          sessions.set(sid, { engine, browser, context, page, lightpandaProc: null });
+        const sessionId = Number(params.session_id);
+        if (!Number.isSafeInteger(sessionId) || sessionId <= 0) {
+          throw rpcError(-32602, "session_id must be a positive integer");
         }
-        logMeta("session.start", { sid, engine });
-        return respond(id, { session_id: sid, engine });
+        if (sessions.has(sessionId)) await closeSession(sessionId);
+        const engine = params.engine || "chromium";
+        if (!new Set(["lightpanda", "chromium"]).has(engine)) {
+          throw rpcError(-32602, "engine must be lightpanda or chromium");
+        }
+        const caCertPath = params.ca_cert_path || null;
+        const runtime = await launchEngine(engine, params.proxy || null, caCertPath);
+        const session = { ...runtime, engine, proxy: params.proxy || null, caCertPath };
+        sessions.set(sessionId, session);
+        try {
+          if (params.url && params.url !== "about:blank") {
+            await session.page.goto(params.url, {
+              waitUntil: "domcontentloaded",
+              timeout: params.timeout_ms || 30_000,
+            });
+          }
+          const checkpoint = await extractCheckpoint(session);
+          logMeta("session.start", { session_id: sessionId, engine });
+          return respond(id, { session_id: sessionId, engine, checkpoint });
+        } catch (error) {
+          await closeSession(sessionId);
+          throw error;
+        }
       }
       case "session.action": {
-        const s = sessions.get(params.session_id);
-        if (!s) throw { code: -32001, message: "session not found" };
-        const action = params.action || {};
-        let data = null;
-        if (action.type === "navigate") {
-          await s.page.goto(action.url, { timeout: params.timeout_ms || 30000 });
-          data = { url: s.page.url() };
-        } else if (action.type === "snapshot") {
-          const content =
-            action.format === "dom"
-              ? await s.page.content()
-              : await s.page.accessibility.snapshot();
-          const text = typeof content === "string" ? content : JSON.stringify(content);
-          const max = action.max_bytes || 200_000;
-          data = {
-            untrusted: true,
-            content: text.slice(0, max),
-            truncated: text.length > max,
-          };
-        } else if (action.type === "close") {
-          await closeSession(params.session_id);
-          data = { closed: true };
-        } else {
-          data = { ok: true, note: "action stub", type: action.type };
-        }
-        return respond(id, { ok: true, untrusted: true, data });
-      }
-      case "session.checkpoint": {
-        const s = sessions.get(params.session_id);
-        if (!s) throw { code: -32001, message: "session not found" };
-        const cookies = await s.context.cookies();
-        const storage = await s.page.evaluate(() => ({
-          local: { ...localStorage },
-          session: { ...sessionStorage },
-        }));
-        // Return only counts/hashes — values stay in worker/daemon memory path
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        const result = await executeAction(session, params.action || {});
+        // Every successful action is checkpointed before acknowledgement.
+        const checkpoint = await extractCheckpoint(session);
+        logMeta("session.action", { session_id: sessionId, action: params.action?.type });
         return respond(id, {
-          cookie_count: cookies.length,
-          local_keys: Object.keys(storage.local || {}).length,
-          session_keys: Object.keys(storage.session || {}).length,
-          url: s.page.url(),
-          // values for daemon in-memory only (not logged)
-          _private: { cookies, storage },
+          ok: true,
+          untrusted: true,
+          message: result.message,
+          data: result.data,
+          checkpoint,
         });
       }
+      case "session.checkpoint": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        return respond(id, { checkpoint: await extractCheckpoint(session) });
+      }
+      case "session.migrate_to_chromium": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        const result = await migrateToChromium(sessionId, session);
+        logMeta("session.migrate", {
+          session_id: sessionId,
+          status: result.status,
+          verified: result.verified,
+        });
+        return respond(id, result);
+      }
       case "session.stop": {
-        await closeSession(params.session_id);
+        const sessionId = Number(params.session_id);
+        await closeSession(sessionId);
         return respond(id, { stopped: true });
       }
       default:
-        throw { code: -32601, message: `method not found: ${method}` };
+        throw rpcError(-32601, `method not found: ${method}`);
     }
-  } catch (e) {
-    const err =
-      e && e.code
-        ? e
-        : { code: -32000, message: String(e?.message || e) };
-    logMeta("error", { method, code: err.code });
-    return respond(id, null, err);
+  } catch (error) {
+    const normalized = error?.code
+      ? error
+      : rpcError(-32000, String(error?.message || error));
+    logMeta("error", { method, code: normalized.code });
+    return respond(id, null, normalized);
   }
 }
 
-async function closeSession(sid) {
-  const s = sessions.get(sid);
-  if (!s) return;
-  try {
-    await s.context?.close();
-  } catch {}
-  try {
-    await s.browser?.close();
-  } catch {}
-  try {
-    s.lightpandaProc?.kill("SIGTERM");
-  } catch {}
-  sessions.delete(sid);
-  logMeta("session.stop", { sid });
+async function closeRuntime(runtime) {
+  try { await runtime.page?.close(); } catch {}
+  try { await runtime.context?.close(); } catch {}
+  try { await runtime.browser?.close(); } catch {}
+  try { runtime.lightpandaProc?.kill("SIGTERM"); } catch {}
 }
 
-const rl = createInterface({ input: process.stdin });
-rl.on("line", (line) => {
+async function closeSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  sessions.delete(sessionId);
+  await closeRuntime(session);
+  logMeta("session.stop", { session_id: sessionId });
+}
+
+let queue = Promise.resolve();
+const readline = createInterface({ input: process.stdin });
+readline.on("line", (line) => {
   if (!line.trim()) return;
-  let req;
+  let request;
   try {
-    req = JSON.parse(line);
+    request = JSON.parse(line);
   } catch {
-    return respond(null, null, { code: -32700, message: "parse error" });
+    respond(null, null, rpcError(-32700, "parse error"));
+    return;
   }
-  handle(req);
+  queue = queue.then(() => handle(request)).catch(() => undefined);
 });
-rl.on("close", async () => {
-  for (const sid of [...sessions.keys()]) await closeSession(sid);
+readline.on("close", async () => {
+  await queue;
+  for (const sessionId of [...sessions.keys()]) await closeSession(sessionId);
   process.exit(0);
 });
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    for (const sessionId of [...sessions.keys()]) await closeSession(sessionId);
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  });
+}

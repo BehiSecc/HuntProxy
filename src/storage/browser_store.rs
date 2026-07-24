@@ -61,6 +61,43 @@ impl Db {
         .await
     }
 
+    /// Persist only non-secret rolling-checkpoint metadata.
+    pub async fn update_browser_checkpoint_metadata(
+        &self,
+        project_id: ProjectId,
+        id: BrowserSessionId,
+        current_url: Option<String>,
+        checkpoint_status: String,
+        checkpoint_hash: String,
+        checkpoint_version: u64,
+    ) -> DomainResult<()> {
+        let ts = now_rfc3339();
+        self.with_conn(move |conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE browser_sessions
+                     SET current_url=?1, checkpoint_status=?2, checkpoint_hash=?3,
+                         checkpoint_version=?4, updated_at=?5
+                     WHERE id=?6 AND project_id=?7",
+                    params![
+                        current_url,
+                        checkpoint_status,
+                        checkpoint_hash,
+                        checkpoint_version as i64,
+                        ts,
+                        id.get(),
+                        project_id.get()
+                    ],
+                )
+                .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+            if updated == 0 {
+                return Err(DomainError::not_found("browser session"));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn get_browser_session(
         &self,
         project_id: ProjectId,

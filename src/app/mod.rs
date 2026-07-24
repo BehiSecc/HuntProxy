@@ -8,8 +8,8 @@ use crate::reply::{PlaceholderKey, ReplyService};
 use crate::storage::Db;
 use crate::transport::{build_default_transport, SemanticTransport};
 use serde::Serialize;
-use std::fs::File;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -35,19 +35,29 @@ pub struct AppState {
 
 pub async fn run_daemon(config: Config) -> DomainResult<()> {
     config.ensure_layout()?;
-    acquire_daemon_lock(&config)?;
+    let _daemon_lock = acquire_daemon_lock(&config)?;
 
     let state = bootstrap_state(config.clone()).await?;
     let shutdown = state.shutdown.clone();
+
+    // Bind every public/private listener before spawning any server. This makes
+    // readiness atomic: a port/socket conflict fails startup and is never
+    // reported as a ready daemon.
+    let api_listener = crate::api::bind_api(config.api_listen).await?;
+    let proxy_listener = crate::proxy::bind_proxy(config.proxy_listen).await?;
+    #[cfg(unix)]
+    let uds_listener = crate::api::bind_uds(&config.socket_path())?;
+
+    let mut servers = tokio::task::JoinSet::new();
 
     // API
     {
         let st = state.clone();
         let token = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::api::serve_api(st, token).await {
-                tracing::error!(error = %e, "api server exited");
-            }
+        servers.spawn(async move {
+            crate::api::serve_api_listener(st, api_listener, token)
+                .await
+                .map_err(|error| ("api", error))
         });
     }
 
@@ -55,21 +65,22 @@ pub async fn run_daemon(config: Config) -> DomainResult<()> {
     {
         let st = state.clone();
         let token = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::proxy::serve_proxy(st, token).await {
-                tracing::error!(error = %e, "proxy server exited");
-            }
+        servers.spawn(async move {
+            crate::proxy::serve_proxy_listener(st, proxy_listener, token)
+                .await
+                .map_err(|error| ("proxy", error))
         });
     }
 
     // Private UDS
+    #[cfg(unix)]
     {
         let st = state.clone();
         let token = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::api::serve_uds(st, token).await {
-                tracing::error!(error = %e, "private socket exited");
-            }
+        servers.spawn(async move {
+            crate::api::serve_uds_listener(st, uds_listener, token)
+                .await
+                .map_err(|error| ("private socket", error))
         });
     }
 
@@ -79,16 +90,39 @@ pub async fn run_daemon(config: Config) -> DomainResult<()> {
         "daemon ready"
     );
 
-    tokio::select! {
-        _ = shutdown.cancelled() => {}
+    let server_error = tokio::select! {
+        _ = shutdown.cancelled() => None,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("ctrl-c received, shutting down");
             state.shutdown.cancel();
+            None
         }
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        result = servers.join_next() => {
+            state.shutdown.cancel();
+            match result {
+                Some(Ok(Err((name, error)))) => Some(DomainError::new(
+                    ErrorCode::Unavailable,
+                    format!("{name} server exited: {error}"),
+                )),
+                Some(Err(error)) => Some(DomainError::new(
+                    ErrorCode::Unavailable,
+                    format!("server task failed: {error}"),
+                )),
+                Some(Ok(Ok(()))) => Some(DomainError::new(
+                    ErrorCode::Unavailable,
+                    "server exited unexpectedly",
+                )),
+                None => Some(DomainError::new(ErrorCode::Unavailable, "no server tasks")),
+            }
+        }
+    };
+    state.shutdown.cancel();
+    while servers.join_next().await.is_some() {}
     cleanup_daemon_files(&config);
-    Ok(())
+    match server_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
@@ -96,6 +130,10 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
     let interrupted = db.mark_browser_sessions_interrupted().await.unwrap_or(0);
     if interrupted > 0 {
         tracing::warn!(count = interrupted, "marked browser sessions interrupted");
+    }
+    let interrupted_fuzz = db.mark_fuzz_jobs_interrupted().await.unwrap_or(0);
+    if interrupted_fuzz > 0 {
+        tracing::warn!(count = interrupted_fuzz, "marked fuzz jobs interrupted");
     }
 
     let transport = build_default_transport(config.max_body_bytes);
@@ -122,7 +160,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         reply.clone(),
         PlaceholderKey::from_bytes(key_bytes),
     ));
-    let browser = Arc::new(BrowserService::new(
+    let browser = Arc::new(BrowserService::new_with_proxy_and_ca(
         db.clone(),
         config.lightpanda_path.clone(),
         config.node_path.clone(),
@@ -134,6 +172,8 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
                 None
             }
         }),
+        format!("http://{}", config.proxy_listen),
+        Some(config.ca_cert_path()),
     ));
     let (events, _) = broadcast::channel(256);
     Ok(Arc::new(AppState {
@@ -148,40 +188,46 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
     }))
 }
 
-fn acquire_daemon_lock(config: &Config) -> DomainResult<()> {
+#[derive(Debug)]
+struct DaemonLock {
+    #[cfg(unix)]
+    _file: nix::fcntl::Flock<File>,
+    #[cfg(not(unix))]
+    _file: File,
+}
+
+fn acquire_daemon_lock(config: &Config) -> DomainResult<DaemonLock> {
     let lock_path = config.daemon_lock_path();
-    if lock_path.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&lock_path) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                #[cfg(unix)]
-                {
-                    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
-                        return Err(DomainError::new(
-                            ErrorCode::DaemonAlreadyRunning,
-                            format!("daemon already running (pid {pid})"),
-                        ));
-                    }
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&lock_path);
-        let _ = std::fs::remove_file(config.socket_path());
-    }
-    let mut f = File::create(&lock_path).map_err(|e| {
-        DomainError::new(ErrorCode::StorageError, format!("daemon lock: {e}"))
-    })?;
-    writeln!(f, "{}", std::process::id()).ok();
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| DomainError::new(ErrorCode::StorageError, format!("daemon lock: {e}")))?;
+    #[cfg(unix)]
+    let mut file = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|_| DomainError::new(ErrorCode::DaemonAlreadyRunning, "daemon already running"))?;
+    #[cfg(not(unix))]
+    let mut file = file;
+    file.set_len(0)
+        .map_err(|e| DomainError::new(ErrorCode::StorageError, format!("daemon lock: {e}")))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| DomainError::new(ErrorCode::StorageError, format!("daemon lock: {e}")))?;
+    writeln!(file, "{}", std::process::id())
+        .map_err(|e| DomainError::new(ErrorCode::StorageError, format!("daemon lock: {e}")))?;
+    file.sync_data()
+        .map_err(|e| DomainError::new(ErrorCode::StorageError, format!("daemon lock: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
     }
-    Ok(())
+    Ok(DaemonLock { _file: file })
 }
 
 fn cleanup_daemon_files(config: &Config) {
     let _ = std::fs::remove_file(config.socket_path());
-    let _ = std::fs::remove_file(config.daemon_lock_path());
 }
 
 pub async fn stop_daemon(config: &Config) -> DomainResult<()> {
@@ -245,4 +291,25 @@ pub fn daemon_status(config: &Config) -> DomainResult<serde_json::Value> {
         "api_listen": config.api_listen.to_string(),
         "proxy_listen": config.proxy_listen.to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_lock_is_exclusive_and_reusable() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.ensure_layout().unwrap();
+
+        let first = acquire_daemon_lock(&config).unwrap();
+        let second = acquire_daemon_lock(&config).unwrap_err();
+        assert_eq!(second.code(), ErrorCode::DaemonAlreadyRunning);
+        drop(first);
+        acquire_daemon_lock(&config).unwrap();
+    }
 }

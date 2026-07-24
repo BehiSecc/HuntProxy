@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FilterNode {
-    And { and: Vec<FilterNode> },
-    Or { or: Vec<FilterNode> },
-    Not { not: Box<FilterNode> },
+    And {
+        and: Vec<FilterNode>,
+    },
+    Or {
+        or: Vec<FilterNode>,
+    },
+    Not {
+        not: Box<FilterNode>,
+    },
     Term {
         field: String,
         op: String,
@@ -40,7 +46,17 @@ const ALLOWED_FIELDS: &[&str] = &[
 ];
 
 const ALLOWED_OPS: &[&str] = &[
-    "eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "starts_with", "ends_with", "exists",
+    "eq",
+    "ne",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "in",
+    "contains",
+    "starts_with",
+    "ends_with",
+    "exists",
 ];
 
 const MAX_TERMS: usize = 32;
@@ -68,10 +84,14 @@ fn validate_filter_depth(node: &FilterNode, depth: usize, terms: &mut usize) -> 
                 return Err(DomainError::invalid("too many filter terms"));
             }
             if !ALLOWED_FIELDS.contains(&field.as_str()) {
-                return Err(DomainError::invalid(format!("unknown filter field: {field}")));
+                return Err(DomainError::invalid(format!(
+                    "unknown filter field: {field}"
+                )));
             }
             if !ALLOWED_OPS.contains(&op.as_str()) {
-                return Err(DomainError::invalid(format!("unknown filter operator: {op}")));
+                return Err(DomainError::invalid(format!(
+                    "unknown filter operator: {op}"
+                )));
             }
         }
     }
@@ -92,8 +112,7 @@ fn compile_node(node: &FilterNode, binds: &mut Vec<String>) -> DomainResult<Stri
             if and.is_empty() {
                 return Ok("1=1".into());
             }
-            let parts: DomainResult<Vec<_>> =
-                and.iter().map(|n| compile_node(n, binds)).collect();
+            let parts: DomainResult<Vec<_>> = and.iter().map(|n| compile_node(n, binds)).collect();
             Ok(format!("({})", parts?.join(" AND ")))
         }
         FilterNode::Or { or } => {
@@ -121,7 +140,8 @@ fn col(field: &str) -> DomainResult<&'static str> {
         "request_size" => "request_length",
         "response_size" => "response_length",
         "duration" => "duration_ms",
-        "title" | "page_title" => "page_title",
+        "title" => "COALESCE(display_title, page_title)",
+        "page_title" => "page_title",
         "display_title" => "display_title",
         "parent" => "parent_exchange_id",
         "browser_session" => "browser_session_id",
@@ -143,12 +163,7 @@ fn compile_term(
     binds: &mut Vec<String>,
 ) -> DomainResult<String> {
     if field == "label" {
-        let v = value_as_string(value)?;
-        binds.push(v);
-        let idx = binds.len();
-        return Ok(format!(
-            "exchange_id IN (SELECT el.exchange_id FROM exchange_labels el JOIN labels l ON l.id=el.label_id WHERE l.name=?{idx} AND el.project_id=exchanges.project_id)"
-        ));
+        return compile_label_term(op, value, binds);
     }
     let c = col(field)?;
     match op {
@@ -177,16 +192,16 @@ fn compile_term(
             Ok(format!("{c}<=?{}", binds.len()))
         }
         "contains" => {
-            binds.push(format!("%{}%", value_as_string(value)?));
-            Ok(format!("{c} LIKE ?{}", binds.len()))
+            binds.push(format!("%{}%", escape_like(&value_as_string(value)?)));
+            Ok(format!("{c} LIKE ?{} ESCAPE '\\'", binds.len()))
         }
         "starts_with" => {
-            binds.push(format!("{}%", value_as_string(value)?));
-            Ok(format!("{c} LIKE ?{}", binds.len()))
+            binds.push(format!("{}%", escape_like(&value_as_string(value)?)));
+            Ok(format!("{c} LIKE ?{} ESCAPE '\\'", binds.len()))
         }
         "ends_with" => {
-            binds.push(format!("%{}", value_as_string(value)?));
-            Ok(format!("{c} LIKE ?{}", binds.len()))
+            binds.push(format!("%{}", escape_like(&value_as_string(value)?)));
+            Ok(format!("{c} LIKE ?{} ESCAPE '\\'", binds.len()))
         }
         "in" => {
             let arr = value
@@ -214,6 +229,73 @@ fn compile_term(
     }
 }
 
+fn compile_label_term(
+    op: &str,
+    value: &serde_json::Value,
+    binds: &mut Vec<String>,
+) -> DomainResult<String> {
+    let prefix = "EXISTS (SELECT 1 FROM exchange_labels el JOIN labels l ON l.id=el.label_id AND l.project_id=el.project_id WHERE el.project_id=exchanges.project_id AND el.exchange_id=exchanges.exchange_id";
+    match op {
+        "eq" | "ne" => {
+            binds.push(value_as_string(value)?);
+            let exists = format!("{prefix} AND l.name=?{})", binds.len());
+            Ok(if op == "ne" {
+                format!("NOT ({exists})")
+            } else {
+                exists
+            })
+        }
+        "contains" | "starts_with" | "ends_with" => {
+            let value = escape_like(&value_as_string(value)?);
+            let pattern = match op {
+                "contains" => format!("%{value}%"),
+                "starts_with" => format!("{value}%"),
+                _ => format!("%{value}"),
+            };
+            binds.push(pattern);
+            Ok(format!(
+                "{prefix} AND l.name LIKE ?{} ESCAPE '\\')",
+                binds.len()
+            ))
+        }
+        "in" => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| DomainError::invalid("in operator requires array"))?;
+            if values.is_empty() {
+                return Ok("1=0".into());
+            }
+            let mut placeholders = Vec::with_capacity(values.len());
+            for value in values {
+                binds.push(value_as_string(value)?);
+                placeholders.push(format!("?{}", binds.len()));
+            }
+            Ok(format!(
+                "{prefix} AND l.name IN ({}))",
+                placeholders.join(",")
+            ))
+        }
+        "exists" => {
+            let clause = format!("{prefix})");
+            Ok(if value.as_bool().unwrap_or(true) {
+                clause
+            } else {
+                format!("NOT ({clause})")
+            })
+        }
+        _ => Err(DomainError::invalid(format!(
+            "operator {op} is not supported for label"
+        ))),
+    }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn value_as_string(v: &serde_json::Value) -> DomainResult<String> {
     match v {
         serde_json::Value::String(s) => Ok(s.clone()),
@@ -235,9 +317,8 @@ pub fn parse_text_query(input: &str) -> DomainResult<FilterNode> {
     }
     let mut terms = Vec::new();
     for part in input.split_whitespace() {
-        let term = parse_one_term(part).map_err(|e| {
-            DomainError::invalid(format!("filter parse error at `{part}`: {e}"))
-        })?;
+        let term = parse_one_term(part)
+            .map_err(|e| DomainError::invalid(format!("filter parse error at `{part}`: {e}")))?;
         terms.push(term);
     }
     Ok(FilterNode::And { and: terms })
@@ -301,6 +382,7 @@ pub struct ResponseDiff {
     pub text_diff: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn diff_exchanges(
     parent_status: Option<u16>,
     child_status: Option<u16>,

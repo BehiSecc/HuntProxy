@@ -1,17 +1,20 @@
-//! bb CLI entry points.
+//! HuntProxy CLI entry points.
 
-use bb::app::{self, bootstrap_state, AppState};
+use bb::app;
 use bb::config::Config;
 use bb::domain::{CreateProjectRequest, DomainError, DomainResult, ErrorCode};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "bb", version, about = "Local-first agent-safe HTTP workbench")]
+#[command(
+    name = "HuntProxy",
+    version,
+    about = "Local-first agent-safe HTTP workbench"
+)]
 struct Cli {
     #[arg(long, global = true, env = "BB_DATA_DIR")]
     data_dir: Option<PathBuf>,
@@ -51,10 +54,7 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ProjectCmd {
-    Create {
-        name: String,
-        target_url: String,
-    },
+    Create { name: String, target_url: String },
     List,
 }
 
@@ -97,7 +97,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!("  CA cert:  {}", cfg.ca_cert_path().display());
             println!("  config:   {}", cfg.data_dir.join("config.toml").display());
             println!();
-            println!("Next: bb serve");
+            println!("Next: HuntProxy serve");
             println!("  UI:    http://{}", cfg.api_listen);
             println!("  proxy: {}", cfg.proxy_listen);
             Ok(())
@@ -108,7 +108,10 @@ async fn run(cli: Cli) -> DomainResult<()> {
             if !cfg.data_dir.exists() {
                 return Err(DomainError::new(
                     ErrorCode::ConfigInvalid,
-                    format!("data dir missing; run: bb init --data-dir {}", cfg.data_dir.display()),
+                    format!(
+                        "data dir missing; run: HuntProxy init --data-dir {}",
+                        cfg.data_dir.display()
+                    ),
                 ));
             }
             // Ensure CA exists
@@ -116,7 +119,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 generate_ca(&cfg)?;
             }
             println!(
-                "bb serve\n  UI:    http://{}\n  proxy: {}\n  data:  {}",
+                "HuntProxy serve\n  UI:    http://{}\n  proxy: {}\n  data:  {}",
                 cfg.api_listen,
                 cfg.proxy_listen,
                 cfg.data_dir.display()
@@ -128,20 +131,28 @@ async fn run(cli: Cli) -> DomainResult<()> {
             init_logging_stderr("warn");
             let cfg = Config::load(cli.data_dir.clone())?;
             ensure_daemon(&cfg).await?;
-            // Prefer talking through in-process if we can attach; for MVP run bridge via local socket
-            // by bootstrapping a thin state against the same data dir through HTTP UDS is complex;
-            // run MCP tools against daemon HTTP API on loopback.
-            let state = connect_or_local(cfg).await?;
-            bb::mcp::run_stdio_mcp(state).await
+            bb::mcp::run_stdio_mcp_client(cfg).await
         }
         Commands::Doctor => {
             init_logging("error");
             let cfg = Config::load(cli.data_dir)?;
-            println!("bb doctor");
+            println!("HuntProxy doctor");
             println!("  data_dir: {}", cfg.data_dir.display());
-            println!("  db:       {} exists={}", cfg.db_path().display(), cfg.db_path().exists());
-            println!("  ca:       {} exists={}", cfg.ca_cert_path().display(), cfg.ca_cert_path().exists());
-            println!("  socket:   {} exists={}", cfg.socket_path().display(), cfg.socket_path().exists());
+            println!(
+                "  db:       {} exists={}",
+                cfg.db_path().display(),
+                cfg.db_path().exists()
+            );
+            println!(
+                "  ca:       {} exists={}",
+                cfg.ca_cert_path().display(),
+                cfg.ca_cert_path().exists()
+            );
+            println!(
+                "  socket:   {} exists={}",
+                cfg.socket_path().display(),
+                cfg.socket_path().exists()
+            );
             println!("  api:      {}", cfg.api_listen);
             println!("  proxy:    {}", cfg.proxy_listen);
             if let Some(p) = &cfg.lightpanda_path {
@@ -214,23 +225,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
             match cmd {
                 BrowserCmd::Install => {
                     println!("Installing browser-worker dependencies…");
-                    let worker = PathBuf::from("browser-worker");
-                    std::fs::create_dir_all(&worker).ok();
-                    if !worker.join("package.json").exists() {
-                        std::fs::write(
-                            worker.join("package.json"),
-                            r#"{
-  "name": "bb-browser-worker",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "playwright-core": "1.49.1"
-  }
-}
-"#,
-                        )
-                        .ok();
-                    }
+                    let worker = bb::browser::prepare_browser_worker_installation()?;
                     let status = std::process::Command::new("npm")
                         .args(["install"])
                         .current_dir(&worker)
@@ -242,7 +237,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
                             "npm install failed",
                         ));
                     }
-                    println!("Worker deps installed in browser-worker/");
+                    println!("Worker deps installed in {}", worker.display());
                     println!("Lightpanda: install from https://github.com/lightpanda-io/browser or place on PATH");
                     println!("Chromium: system Chrome or `npx playwright install chromium`");
                     Ok(())
@@ -253,8 +248,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
 }
 
 fn init_logging(level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -262,8 +256,7 @@ fn init_logging(level: &str) {
 }
 
 fn init_logging_stderr(level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -272,8 +265,8 @@ fn init_logging_stderr(level: &str) {
 }
 
 fn generate_ca(cfg: &Config) -> DomainResult<()> {
-    use rcgen::{CertificateParams, KeyPair, IsCa, BasicConstraints};
-    let mut params = CertificateParams::new(vec!["bb local CA".into()])
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    let mut params = CertificateParams::new(vec!["HuntProxy local CA".into()])
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let key = KeyPair::generate()
@@ -287,24 +280,39 @@ fn generate_ca(cfg: &Config) -> DomainResult<()> {
 }
 
 async fn ensure_daemon(cfg: &Config) -> DomainResult<()> {
-    if cfg.socket_path().exists() {
-        if daemon_get(cfg, "/api/v1/health").await.is_ok() {
-            return Ok(());
-        }
+    if cfg.socket_path().exists() && daemon_get(cfg, "/api/v1/health").await.is_ok() {
+        return Ok(());
     }
     if !cfg.auto_start_daemon {
         return Err(DomainError::new(
             ErrorCode::DaemonNotRunning,
-            "daemon not running; start with bb serve",
+            "daemon not running; start with HuntProxy serve",
         ));
     }
-    // Bootstrap lock
+    // Serialize auto-start attempts. Re-check health after acquiring the lock:
+    // another CLI may have started the daemon while this process was waiting.
     let boot = cfg.bootstrap_lock_path();
-    let _guard = std::fs::OpenOptions::new()
+    let boot_file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .write(true)
+        .truncate(false)
         .open(&boot)
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+    #[cfg(unix)]
+    let _bootstrap_lock = tokio::task::spawn_blocking(move || {
+        nix::fcntl::Flock::lock(boot_file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, error)| error)
+    })
+    .await
+    .map_err(|e| DomainError::new(ErrorCode::Internal, format!("bootstrap lock task: {e}")))?
+    .map_err(|e| DomainError::new(ErrorCode::StorageError, format!("bootstrap lock: {e}")))?;
+    #[cfg(not(unix))]
+    let _bootstrap_lock = boot_file;
+
+    if daemon_get(cfg, "/api/v1/health").await.is_ok() {
+        return Ok(());
+    }
 
     let bin = std::env::current_exe()
         .map_err(|e| DomainError::new(ErrorCode::Internal, e.to_string()))?;
@@ -341,32 +349,6 @@ async fn ensure_daemon(cfg: &Config) -> DomainResult<()> {
             cfg.data_dir.display()
         ),
     ))
-}
-
-async fn connect_or_local(cfg: Config) -> DomainResult<Arc<AppState>> {
-    // For MCP, open our own DB-backed state in-process only if daemon is us;
-    // safest: always use in-process AppState when MCP is primary — but plan says
-    // MCP is thin bridge. For MVP correctness of tools, bootstrap AppState sharing data dir
-    // is wrong (double owner). Instead proxy tool calls via HTTP to daemon.
-    // Simplest working approach: run tools against HTTP API.
-    // We still need AppState for mcp module — so create a client-backed facade later.
-    // Interim: if we auto-started daemon, attach by opening read-only is not supported.
-    // Use local AppState ONLY when daemon not used — actually plan forbids dual owners.
-    // So: reimplement mcp to call HTTP. For speed, bootstrap AppState with same data dir
-    // is unsafe. We'll call HTTP from a thin wrapper state.
-
-    // Practical MVP: MCP opens AppState (same process as tools) when invoked as
-    // `bb mcp` after ensuring daemon for proxy/UI; MCP itself uses DB — CONFLICT.
-    // Fix: MCP uses HTTP API only via LocalClientState.
-
-    // Minimal: use AppState in-process and do NOT auto-start separate daemon when MCP owns state.
-    // If socket exists, prefer HTTP bridge without opening DB.
-    if cfg.socket_path().exists() && daemon_get(&cfg, "/api/v1/health").await.is_ok() {
-        // Still need AppState for current mcp impl — open db (second owner) is bad.
-        // Fall through to in-process for now with warning to stderr.
-        eprintln!("bb mcp: using in-process state (daemon also running may conflict on writes)");
-    }
-    bootstrap_state(cfg).await
 }
 
 async fn daemon_get(cfg: &Config, path: &str) -> DomainResult<String> {
@@ -418,17 +400,16 @@ async fn simple_http(method: &str, url: &str, body: Option<&str>) -> DomainResul
         .await
         .map_err(|e| DomainError::new(ErrorCode::ProtocolError, e.to_string()))?;
     let text = String::from_utf8_lossy(&buf);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
     if text.starts_with("HTTP/1.1 2") || text.starts_with("HTTP/1.0 2") {
         Ok(body)
     } else {
         Err(DomainError::new(
             ErrorCode::Unavailable,
-            format!("daemon HTTP error: {}", body.chars().take(200).collect::<String>()),
+            format!(
+                "daemon HTTP error: {}",
+                body.chars().take(200).collect::<String>()
+            ),
         ))
     }
 }

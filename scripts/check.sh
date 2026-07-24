@@ -7,17 +7,20 @@ echo "== fmt =="
 cargo fmt --check
 
 echo "== clippy =="
-cargo clippy --all-targets -- -D warnings || cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 
 echo "== test =="
-cargo test --lib
+cargo test --all-targets
+
+echo "== browser worker syntax =="
+node --check browser-worker/index.js
 
 echo "== build =="
 cargo build --release
 
 if command -v cargo-deny >/dev/null 2>&1; then
   echo "== deny =="
-  cargo deny check || true
+  cargo deny check
 else
   echo "== deny skipped (cargo-deny not installed) =="
 fi

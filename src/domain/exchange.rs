@@ -2,8 +2,8 @@
 
 use super::ids::*;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 use time::serde::rfc3339;
+use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

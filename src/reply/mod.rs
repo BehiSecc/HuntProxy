@@ -1,11 +1,17 @@
 //! Reply drafts, placeholder resolution, send orchestration.
 
+mod raw;
+
+pub use raw::*;
+
 use crate::domain::*;
 use crate::history::{diff_exchanges, ResponseDiff};
-use crate::policy::{is_sensitive_header, present_headers, PresentationOptions, REDACTED_PLACEHOLDER};
-use crate::storage::{NewExchange, Db};
-use crate::transport::{OutboundRequest, ProtocolMode, SemanticTransport};
-use crate::policy::{check_url_in_scope, resolve_validated_dial, TargetRef};
+use crate::policy::{
+    is_sensitive_header, present_headers, PresentationOptions, REDACTED_PLACEHOLDER,
+};
+use crate::policy::{resolve_validated_dial, url_is_in_scope, TargetRef};
+use crate::storage::{Db, NewExchange};
+use crate::transport::{OutboundBody, OutboundRequest, ProtocolMode, SemanticTransport};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -102,7 +108,10 @@ impl PlaceholderKey {
             .map_err(|_| DomainError::new(ErrorCode::PlaceholderInvalid, "rev"))?;
         let payload = format!("{project_id}:{exchange_id}:{side}:{header}:{rev}");
         let expected = self.mac(&payload);
-        if !bool::from(subtle::ConstantTimeEq::ct_eq(expected.as_bytes(), sig.as_bytes())) {
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(
+            expected.as_bytes(),
+            sig.as_bytes(),
+        )) {
             return Err(DomainError::new(
                 ErrorCode::PlaceholderInvalid,
                 "placeholder mac mismatch",
@@ -167,7 +176,10 @@ pub async fn materialize_request(
     key: &PlaceholderKey,
 ) -> DomainResult<MaterializedRequest> {
     let mut method = draft.method.clone().unwrap_or_else(|| "GET".into());
-    let mut url = draft.url.clone().unwrap_or_else(|| "http://localhost/".into());
+    let mut url = draft
+        .url
+        .clone()
+        .unwrap_or_else(|| "http://localhost/".into());
     let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
     let mut body = draft.body_override.clone();
 
@@ -278,6 +290,64 @@ pub struct MaterializedRequest {
     pub body: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplySendContext {
+    pub source: ExchangeSource,
+    pub lineage: ExchangeLineage,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EphemeralReplyResponse {
+    pub protocol: String,
+    pub status_code: u16,
+    pub headers: Vec<PresentedHeader>,
+    pub body_base64: String,
+    pub body_truncated: bool,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplySendResult {
+    pub exchange_id: Option<ExchangeId>,
+    pub diff: Option<ResponseDiff>,
+    /// Present only when capture scope excludes the exchange.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<EphemeralReplyResponse>,
+    #[serde(skip)]
+    pub response_length: i64,
+    #[serde(skip)]
+    pub response_body_hash: String,
+    #[serde(skip)]
+    pub duration_ms: i64,
+    #[serde(skip)]
+    pub status_code: u16,
+}
+
+impl ReplySendContext {
+    pub fn reply(base_exchange_id: Option<ExchangeId>, tab_id: Option<ReplyTabId>) -> Self {
+        Self {
+            source: ExchangeSource::Reply,
+            lineage: ExchangeLineage {
+                parent_exchange_id: base_exchange_id,
+                reply_tab_id: tab_id,
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn fuzzer(base_exchange_id: Option<ExchangeId>, job_id: FuzzJobId, case_id: i64) -> Self {
+        Self {
+            source: ExchangeSource::Fuzzer,
+            lineage: ExchangeLineage {
+                parent_exchange_id: base_exchange_id,
+                fuzz_job_id: Some(job_id),
+                fuzz_case_id: Some(case_id),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 pub struct ReplyService {
     pub db: Arc<Db>,
     pub transport: Arc<dyn SemanticTransport>,
@@ -299,7 +369,27 @@ impl ReplyService {
         draft: &ReplyDraft,
         protocol: ProtocolPreference,
         follow_redirects: u32,
-    ) -> DomainResult<(ExchangeId, Option<ResponseDiff>)> {
+    ) -> DomainResult<ReplySendResult> {
+        self.send_with_context(
+            project_id,
+            base_exchange_id,
+            draft,
+            protocol,
+            follow_redirects,
+            ReplySendContext::reply(base_exchange_id, tab_id),
+        )
+        .await
+    }
+
+    pub async fn send_with_context(
+        &self,
+        project_id: ProjectId,
+        base_exchange_id: Option<ExchangeId>,
+        draft: &ReplyDraft,
+        protocol: ProtocolPreference,
+        follow_redirects: u32,
+        context: ReplySendContext,
+    ) -> DomainResult<ReplySendResult> {
         let project = self.db.get_project(project_id).await?;
         let mat = materialize_request(
             &self.db,
@@ -310,41 +400,14 @@ impl ReplyService {
         )
         .await?;
 
-        // Scope check
-        check_url_in_scope(&mat.url, &project.scope)?;
-        let dial = resolve_validated_dial(
-            &mat.url,
-            &project.scope,
-            Duration::from_secs(60),
-        )
-        .await?;
+        // Scope controls persistence only; it never blocks egress.
+        let should_capture = url_is_in_scope(&mat.url, &project.scope)?;
+        let dial =
+            resolve_validated_dial(&mat.url, &project.scope, Duration::from_secs(60)).await?;
 
-        let method = mat
-            .method
-            .parse::<http::Method>()
-            .unwrap_or(http::Method::GET);
-        let out = self
-            .transport
-            .send(
-                &dial,
-                OutboundRequest {
-                    method,
-                    url: mat.url.clone(),
-                    headers: mat.headers.clone(),
-                    body: mat.body.clone().map(bytes::Bytes::from),
-                    protocol: match protocol {
-                        ProtocolPreference::Auto => ProtocolMode::Auto,
-                        ProtocolPreference::H1 => ProtocolMode::Http1,
-                        ProtocolPreference::H2 => ProtocolMode::Http2,
-                    },
-                    connect_timeout: Duration::from_secs(10),
-                    total_timeout: Duration::from_secs(60),
-                    max_body_bytes: project.limits.max_body_bytes,
-                    preserve_identity_headers: true,
-                },
-            )
-            .await?;
-
+        let method = mat.method.parse::<http::Method>().map_err(|error| {
+            DomainError::invalid(format!("invalid HTTP method {}: {error}", mat.method))
+        })?;
         let target = TargetRef::from_url(&mat.url)?;
         let req_headers: Vec<HeaderEntry> = mat
             .headers
@@ -356,6 +419,84 @@ impl ReplyService {
                 ordinal: i as u32,
             })
             .collect();
+        let started = std::time::Instant::now();
+        let out = self
+            .transport
+            .send(
+                &dial,
+                OutboundRequest {
+                    method,
+                    url: mat.url.clone(),
+                    headers: mat.headers.clone(),
+                    body: mat
+                        .body
+                        .clone()
+                        .map(bytes::Bytes::from)
+                        .map(OutboundBody::Bytes)
+                        .unwrap_or(OutboundBody::Empty),
+                    protocol: match protocol {
+                        ProtocolPreference::Auto => ProtocolMode::Auto,
+                        ProtocolPreference::H1 => ProtocolMode::Http1,
+                        ProtocolPreference::H2 => ProtocolMode::Http2,
+                    },
+                    connect_timeout: Duration::from_secs(10),
+                    total_timeout: Duration::from_secs(60),
+                    max_body_bytes: project.limits.max_body_bytes,
+                    preserve_identity_headers: true,
+                },
+            )
+            .await;
+        let out = match out {
+            Ok(out) => out,
+            Err(error) => {
+                let completion = match error.code() {
+                    ErrorCode::Timeout => CompletionState::Timeout,
+                    ErrorCode::ProtocolError => CompletionState::ProtocolError,
+                    ErrorCode::Cancelled => CompletionState::Cancelled,
+                    _ => CompletionState::ConnectionError,
+                };
+                let insert = if should_capture {
+                    self.db
+                        .insert_exchange(NewExchange {
+                            project_id,
+                            source: context.source,
+                            protocol: "unknown".into(),
+                            method: mat.method.clone(),
+                            scheme: target.scheme.clone(),
+                            authority: target.authority(),
+                            host: target.host.clone(),
+                            port: target.port,
+                            path: target.path.clone(),
+                            query: target.query.clone(),
+                            status_code: None,
+                            mime: None,
+                            completion,
+                            capture_quality: CaptureQuality::Semantic,
+                            header_representation: HeaderRepresentation::Semantic,
+                            body_representation: BodyRepresentation::SemanticEncoded,
+                            cache_provenance: CacheProvenance::None,
+                            transport_provenance: Some(self.transport.provenance()),
+                            transport_profile: Some(self.transport.profile_name().into()),
+                            request_headers: req_headers.clone(),
+                            response_headers: Vec::new(),
+                            request_body: mat.body.clone(),
+                            response_body: None,
+                            duration_ms: Some(started.elapsed().as_millis() as i64),
+                            lineage: context.lineage.clone(),
+                            page_title: None,
+                            error_message: Some(error.to_string()),
+                        })
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                };
+                if let Err(storage_error) = insert {
+                    tracing::warn!(%storage_error, "failed to preserve failed Reply exchange");
+                }
+                return Err(error);
+            }
+        };
         let resp_headers: Vec<HeaderEntry> = out
             .headers
             .iter()
@@ -372,48 +513,71 @@ impl ReplyService {
             .find(|h| h.name.eq_ignore_ascii_case("content-type"))
             .map(|h| String::from_utf8_lossy(&h.value).into_owned());
 
-        let authority = target.authority();
-        let exchange_id = self
-            .db
-            .insert_exchange(NewExchange {
-                project_id,
-                source: ExchangeSource::Reply,
+        let response_length = out.body.len() as i64;
+        let response_body_hash = crate::storage::sha256_hex(&out.body);
+        let duration_ms = out.duration.as_millis() as i64;
+        let status_code = out.status.as_u16();
+        let ephemeral_response = (!should_capture).then(|| {
+            let presented = present_headers(&resp_headers, &PresentationOptions::default());
+            EphemeralReplyResponse {
                 protocol: out.protocol.clone(),
-                method: mat.method.clone(),
-                scheme: target.scheme,
-                authority,
-                host: target.host,
-                port: target.port,
-                path: target.path,
-                query: target.query,
-                status_code: Some(out.status.as_u16()),
-                mime,
-                completion: CompletionState::Complete,
-                capture_quality: CaptureQuality::Semantic,
-                header_representation: HeaderRepresentation::Semantic,
-                body_representation: BodyRepresentation::SemanticEncoded,
-                cache_provenance: CacheProvenance::None,
-                transport_provenance: Some(out.transport_provenance),
-                transport_profile: Some(out.transport_profile.clone()),
-                request_headers: req_headers.clone(),
-                response_headers: resp_headers.clone(),
-                request_body: mat.body.clone(),
-                response_body: Some(out.body.to_vec()),
-                duration_ms: Some(out.duration.as_millis() as i64),
-                lineage: ExchangeLineage {
-                    parent_exchange_id: base_exchange_id,
-                    reply_tab_id: tab_id,
-                    ..Default::default()
-                },
-                page_title: None,
-                error_message: None,
-            })
-            .await?;
+                status_code,
+                headers: presented.headers,
+                body_base64: base64::engine::general_purpose::STANDARD.encode(&out.body),
+                body_truncated: out.body_truncated,
+                duration_ms,
+            }
+        });
+
+        let authority = target.authority();
+        let exchange_id = if should_capture {
+            Some(
+                self.db
+                    .insert_exchange(NewExchange {
+                        project_id,
+                        source: context.source,
+                        protocol: out.protocol.clone(),
+                        method: mat.method.clone(),
+                        scheme: target.scheme,
+                        authority,
+                        host: target.host,
+                        port: target.port,
+                        path: target.path,
+                        query: target.query,
+                        status_code: Some(out.status.as_u16()),
+                        mime,
+                        completion: if out.body_truncated {
+                            CompletionState::TruncatedByPolicy
+                        } else {
+                            CompletionState::Complete
+                        },
+                        capture_quality: CaptureQuality::Semantic,
+                        header_representation: HeaderRepresentation::Semantic,
+                        body_representation: BodyRepresentation::SemanticEncoded,
+                        cache_provenance: CacheProvenance::None,
+                        transport_provenance: Some(out.transport_provenance),
+                        transport_profile: Some(out.transport_profile.clone()),
+                        request_headers: req_headers.clone(),
+                        response_headers: resp_headers.clone(),
+                        request_body: mat.body.clone(),
+                        response_body: Some(out.body.to_vec()),
+                        duration_ms: Some(duration_ms),
+                        lineage: context.lineage.clone(),
+                        page_title: None,
+                        error_message: out
+                            .body_truncated
+                            .then(|| "response body truncated by project body limit".into()),
+                    })
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         let _ = follow_redirects; // redirects: post-MVP partial — off by default in callers
 
         let mut diff = None;
-        if let Some(parent_id) = base_exchange_id {
+        if let (Some(parent_id), Some(exchange_id)) = (base_exchange_id, exchange_id) {
             if let Ok(parent) = self
                 .db
                 .get_exchange_detail(project_id, parent_id, PresentationOptions::default())
@@ -450,18 +614,130 @@ impl ReplyService {
             }
         }
 
-        let _ = self
-            .db
-            .audit(
-                Some(project_id),
-                "reply_send",
-                Some("reply"),
-                Some("exchange"),
-                Some(&exchange_id.to_string()),
-                serde_json::json!({ "parent": base_exchange_id.map(|i| i.get()) }),
-            )
-            .await;
+        if let Some(exchange_id) = exchange_id {
+            let _ = self
+                .db
+                .audit(
+                    Some(project_id),
+                    if context.source == ExchangeSource::Fuzzer {
+                        "fuzz_send"
+                    } else {
+                        "reply_send"
+                    },
+                    Some(if context.source == ExchangeSource::Fuzzer {
+                        "fuzzer"
+                    } else {
+                        "reply"
+                    }),
+                    Some("exchange"),
+                    Some(&exchange_id.to_string()),
+                    serde_json::json!({ "parent": base_exchange_id.map(|i| i.get()) }),
+                )
+                .await;
+        }
 
-        Ok((exchange_id, diff))
+        Ok(ReplySendResult {
+            exchange_id,
+            diff,
+            response: ephemeral_response,
+            response_length,
+            response_body_hash,
+            duration_ms,
+            status_code,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::transport::OutboundResponse;
+
+    struct CannedTransport;
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for CannedTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            _request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            Ok(OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                body: bytes::Bytes::from_static(b"ephemeral"),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test".into(),
+                duration: Duration::from_millis(2),
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_reply_is_sent_but_not_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: directory.path().to_path_buf(),
+            spool_dir: directory.path().join("spool"),
+            export_dir: directory.path().join("exports"),
+            runtime_dir: directory.path().join("runtime"),
+            ..Config::default()
+        };
+        config.ensure_layout().unwrap();
+        let db = Arc::new(Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "capture filter".into(),
+                target_url: "https://example.com".into(),
+                advanced: Some(ScopePolicy {
+                    schemes: vec!["https".into()],
+                    host_patterns: vec!["example.com".into()],
+                    ports: vec![],
+                    path_prefixes: vec![],
+                }),
+            })
+            .await
+            .unwrap();
+        let service = ReplyService {
+            db: db.clone(),
+            transport: Arc::new(CannedTransport),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+        };
+
+        let result = service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("http://127.0.0.1:1234/outside".into()),
+                    ..Default::default()
+                },
+                ProtocolPreference::H1,
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.exchange_id.is_none());
+        assert_eq!(result.response.unwrap().status_code, 200);
+        assert!(db
+            .list_history(project.id, 10, None, None)
+            .await
+            .unwrap()
+            .0
+            .is_empty());
     }
 }

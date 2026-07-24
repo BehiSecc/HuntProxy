@@ -2,7 +2,7 @@
 
 ## What was built
 
-`bb` — a local-first, agent-safe HTTP workbench (modular Rust monolith) with:
+`HuntProxy` — a local-first, agent-safe HTTP workbench (modular Rust monolith) with:
 
 | Area | Status |
 |------|--------|
@@ -27,10 +27,10 @@
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release
-./target/release/bb init --data-dir ~/.local/share/bb
-./target/release/bb serve --data-dir ~/.local/share/bb
+./target/release/HuntProxy init --data-dir ~/.local/share/huntproxy
+./target/release/HuntProxy serve --data-dir ~/.local/share/huntproxy
 # UI http://127.0.0.1:17890
-# Agent: bb mcp --data-dir ~/.local/share/bb
+# Agent: HuntProxy mcp --data-dir ~/.local/share/huntproxy
 ```
 
 ## Verification performed
@@ -38,10 +38,10 @@ cargo build --release
 | Check | Result |
 |-------|--------|
 | `cargo test --lib` | 23 passed |
-| `bb init` + `bb serve` + `/api/v1/health` | OK |
+| `HuntProxy init` + `HuntProxy serve` + `/api/v1/health` | OK |
 | Create project + capture session | OK |
-| `bb doctor` | OK |
-| `bb stop` | OK |
+| `HuntProxy doctor` | OK |
+| `HuntProxy stop` | OK |
 | Lightpanda CDP + cookie/storage → Chromium | Spike 16/16 PASS |
 | Hudsucker ValidatedDial CONNECT / streaming | Spike 9/9 PASS |
 | Wreq + primp ValidatedDial / H1+H2 | Spike 11/11 PASS each |

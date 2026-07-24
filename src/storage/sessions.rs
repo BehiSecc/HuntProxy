@@ -48,7 +48,12 @@ impl Db {
         let expires = if req.is_browser_bound {
             None
         } else {
-            Some(created + req.ttl.unwrap_or(Duration::seconds(DEFAULT_EXTERNAL_TTL_SECS)))
+            Some(
+                created
+                    + req
+                        .ttl
+                        .unwrap_or(Duration::seconds(DEFAULT_EXTERNAL_TTL_SECS)),
+            )
         };
         let created_s = now_rfc3339();
         let expires_s = expires.map(|e| {
@@ -99,10 +104,7 @@ impl Db {
     }
 
     /// Authenticate proxy credential. Returns session if valid.
-    pub async fn auth_capture_token(
-        &self,
-        token: &str,
-    ) -> DomainResult<CaptureSession> {
+    pub async fn auth_capture_token(&self, token: &str) -> DomainResult<CaptureSession> {
         let token = token.to_string();
         self.with_conn(move |conn| {
             let mut stmt = conn
@@ -270,15 +272,18 @@ impl Db {
 /// Parse Proxy-Authorization header into token.
 pub fn extract_proxy_token(header_value: &str) -> Option<String> {
     let v = header_value.trim();
-    if let Some(rest) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
+    if let Some(rest) = v
+        .strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))
+    {
         return Some(rest.trim().to_string());
     }
-    if let Some(rest) = v.strip_prefix("Basic ").or_else(|| v.strip_prefix("basic ")) {
-        let decoded = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            rest.trim(),
-        )
-        .ok()?;
+    if let Some(rest) = v
+        .strip_prefix("Basic ")
+        .or_else(|| v.strip_prefix("basic "))
+    {
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, rest.trim()).ok()?;
         let s = String::from_utf8(decoded).ok()?;
         // username:password — password is the token
         if let Some((user, pass)) = s.split_once(':') {

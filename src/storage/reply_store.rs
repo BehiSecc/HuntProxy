@@ -6,6 +6,7 @@ use crate::storage::Db;
 use rusqlite::params;
 
 impl Db {
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_reply_tab(
         &self,
         project_id: ProjectId,
@@ -27,8 +28,9 @@ impl Db {
         let base_id = base_exchange_id.map(|e| e.get());
 
         self.with_conn(move |conn| {
-            if let Some(id) = tab_id {
-                let current: i64 = conn
+            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tab = if let Some(id) = tab_id {
+                let current: i64 = tx
                     .query_row(
                         "SELECT revision FROM reply_tabs WHERE id=?1 AND project_id=?2",
                         params![id.get(), project_id.get()],
@@ -47,18 +49,18 @@ impl Db {
                     }
                 }
                 let new_rev = current + 1;
-                conn.execute(
+                tx.execute(
                     "UPDATE reply_tabs SET name=?1, base_exchange_id=?2, revision=?3, protocol=?4, draft_json=?5, updated_at=?6
                      WHERE id=?7 AND project_id=?8",
                     params![name, base_id, new_rev, protocol_s, draft_json, ts, id.get(), project_id.get()],
                 )
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                conn.execute(
+                tx.execute(
                     "INSERT INTO reply_revisions (tab_id, revision, draft_json, created_at) VALUES (?1,?2,?3,?4)",
                     params![id.get(), new_rev, draft_json, ts],
                 )
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                Ok(ReplyTab {
+                ReplyTab {
                     id,
                     project_id,
                     name,
@@ -68,21 +70,21 @@ impl Db {
                     draft,
                     created_at: parse_time(&ts),
                     updated_at: parse_time(&ts),
-                })
+                }
             } else {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO reply_tabs (project_id, name, base_exchange_id, revision, protocol, draft_json, created_at, updated_at)
                      VALUES (?1,?2,?3,1,?4,?5,?6,?7)",
                     params![project_id.get(), name, base_id, protocol_s, draft_json, ts, ts],
                 )
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                let id = conn.last_insert_rowid();
-                conn.execute(
+                let id = tx.last_insert_rowid();
+                tx.execute(
                     "INSERT INTO reply_revisions (tab_id, revision, draft_json, created_at) VALUES (?1,1,?2,?3)",
                     params![id, draft_json, ts],
                 )
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                Ok(ReplyTab {
+                ReplyTab {
                     id: ReplyTabId(id),
                     project_id,
                     name,
@@ -92,8 +94,10 @@ impl Db {
                     draft,
                     created_at: parse_time(&ts),
                     updated_at: parse_time(&ts),
-                })
-            }
+                }
+            };
+            tx.commit().map_err(storage_error)?;
+            Ok(tab)
         })
         .await
     }
@@ -147,4 +151,8 @@ impl Db {
             .find(|t| t.id == id)
             .ok_or_else(|| DomainError::not_found("reply tab"))
     }
+}
+
+fn storage_error(error: rusqlite::Error) -> DomainError {
+    DomainError::new(ErrorCode::StorageError, error.to_string())
 }

@@ -4,7 +4,7 @@
 
 ```bash
 cargo build --release
-# artifact: target/release/bb
+# artifact: target/release/HuntProxy
 ```
 
 Targets planned for CI: Linux glibc amd64/arm64, macOS amd64/arm64.
@@ -14,7 +14,7 @@ Targets planned for CI: Linux glibc amd64/arm64, macOS amd64/arm64.
 ```ruby
 class Bb < Formula
   desc "Local-first agent-safe HTTP workbench"
-  homepage "https://github.com/example/bb"
+  homepage "https://github.com/example/HuntProxy"
   url "…"
   sha256 "…"
   depends_on "rust" => :build
@@ -27,8 +27,8 @@ end
 ## Docker
 
 ```bash
-docker build -t bb:local .
-docker run --rm -p 17890:17890 -p 17891:17891 -v bb-data:/data bb:local
+docker build -t huntproxy:local .
+docker run --rm -p 17890:17890 -p 17891:17891 -v huntproxy-data:/data huntproxy:local
 ```
 
 Browser engines (Lightpanda/Chromium) remain optional installable artifacts.

@@ -103,7 +103,7 @@ impl Db {
     }
 
     pub async fn schema_version(&self) -> DomainResult<i32> {
-        self.with_conn(|c| migrations::schema_version(c)).await
+        self.with_conn(migrations::schema_version).await
     }
 }
 

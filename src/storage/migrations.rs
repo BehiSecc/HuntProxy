@@ -3,10 +3,13 @@
 use crate::domain::{DomainError, DomainResult, ErrorCode};
 use rusqlite::Connection;
 
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "001_init",
-    include_str!("../../migrations/001_init.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("001_init", include_str!("../../migrations/001_init.sql")),
+    (
+        "002_backend_correctness",
+        include_str!("../../migrations/002_backend_correctness.sql"),
+    ),
+];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))

@@ -55,20 +55,11 @@ pub const NOISY_HEADERS: &[&str] = &[
 
 pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PresentationOptions {
     pub include_noisy_headers: bool,
     /// When true, return noisy header names without values in a side channel (not implemented as values).
     pub include_noisy_names: bool,
-}
-
-impl Default for PresentationOptions {
-    fn default() -> Self {
-        Self {
-            include_noisy_headers: false,
-            include_noisy_names: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,10 +103,7 @@ pub fn present_headers(entries: &[HeaderEntry], opts: &PresentationOptions) -> P
             out.redacted_count += 1;
             (REDACTED_PLACEHOLDER.to_string(), true)
         } else {
-            (
-                String::from_utf8_lossy(&h.value).into_owned(),
-                false,
-            )
+            (String::from_utf8_lossy(&h.value).into_owned(), false)
         };
 
         out.headers.push(PresentedHeader {

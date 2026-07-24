@@ -20,7 +20,6 @@ pub enum ErrorCode {
     // scope / network
     ScopeDenied,
     DnsBlocked,
-    PrivateNetworkBlocked,
     RateLimited,
     ConcurrencyLimited,
     BodyTooLarge,
@@ -66,7 +65,6 @@ impl ErrorCode {
             Self::Timeout => "timeout",
             Self::ScopeDenied => "scope_denied",
             Self::DnsBlocked => "dns_blocked",
-            Self::PrivateNetworkBlocked => "private_network_blocked",
             Self::RateLimited => "rate_limited",
             Self::ConcurrencyLimited => "concurrency_limited",
             Self::BodyTooLarge => "body_too_large",

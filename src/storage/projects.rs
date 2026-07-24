@@ -1,7 +1,6 @@
 //! Project CRUD.
 
 use crate::domain::*;
-use crate::policy::derive_scope_from_target;
 use crate::storage::Db;
 use rusqlite::params;
 use time::OffsetDateTime;
@@ -19,11 +18,10 @@ pub fn parse_time(s: &str) -> OffsetDateTime {
 
 impl Db {
     pub async fn create_project(&self, req: CreateProjectRequest) -> DomainResult<Project> {
-        let scope = if let Some(advanced) = req.advanced {
-            advanced
-        } else {
-            derive_scope_from_target(&req.target_url)?
-        };
+        // The initial target remains required, but does not silently become a
+        // capture restriction. Scope is an explicit, optional capture filter.
+        crate::policy::TargetRef::from_url(&req.target_url)?;
+        let scope = req.advanced.unwrap_or_default();
         let limits = ProjectLimits::default();
         let name = req.name.trim().to_string();
         if name.is_empty() {
