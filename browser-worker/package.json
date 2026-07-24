@@ -1,0 +1,10 @@
+{
+  "name": "bb-browser-worker",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Pinned Playwright sidecar for Lightpanda and Chromium",
+  "dependencies": {
+    "playwright-core": "1.49.1"
+  }
+}

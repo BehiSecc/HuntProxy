@@ -1,0 +1,418 @@
+//! History filtering, pagination, summaries, diffs.
+
+use crate::domain::{DomainError, DomainResult};
+use serde::{Deserialize, Serialize};
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FilterNode {
+    And { and: Vec<FilterNode> },
+    Or { or: Vec<FilterNode> },
+    Not { not: Box<FilterNode> },
+    Term {
+        field: String,
+        op: String,
+        value: serde_json::Value,
+    },
+}
+
+const ALLOWED_FIELDS: &[&str] = &[
+    "host",
+    "authority",
+    "path",
+    "method",
+    "protocol",
+    "status",
+    "mime",
+    "source",
+    "label",
+    "request_size",
+    "response_size",
+    "duration",
+    "title",
+    "page_title",
+    "display_title",
+    "parent",
+    "browser_session",
+    "reply_tab",
+    "fuzz_job",
+    "time",
+    "error",
+];
+
+const ALLOWED_OPS: &[&str] = &[
+    "eq", "ne", "gt", "gte", "lt", "lte", "in", "contains", "starts_with", "ends_with", "exists",
+];
+
+const MAX_TERMS: usize = 32;
+const MAX_DEPTH: usize = 6;
+const MAX_INPUT_LEN: usize = 2048;
+
+pub fn validate_filter(node: &FilterNode) -> DomainResult<()> {
+    validate_filter_depth(node, 0, &mut 0)
+}
+
+fn validate_filter_depth(node: &FilterNode, depth: usize, terms: &mut usize) -> DomainResult<()> {
+    if depth > MAX_DEPTH {
+        return Err(DomainError::invalid("filter nesting too deep"));
+    }
+    match node {
+        FilterNode::And { and } | FilterNode::Or { or: and } => {
+            for c in and {
+                validate_filter_depth(c, depth + 1, terms)?;
+            }
+        }
+        FilterNode::Not { not } => validate_filter_depth(not, depth + 1, terms)?,
+        FilterNode::Term { field, op, .. } => {
+            *terms += 1;
+            if *terms > MAX_TERMS {
+                return Err(DomainError::invalid("too many filter terms"));
+            }
+            if !ALLOWED_FIELDS.contains(&field.as_str()) {
+                return Err(DomainError::invalid(format!("unknown filter field: {field}")));
+            }
+            if !ALLOWED_OPS.contains(&op.as_str()) {
+                return Err(DomainError::invalid(format!("unknown filter operator: {op}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compile filter AST to parameterized SQL WHERE clause (without leading WHERE).
+pub fn filter_to_sql(node: &FilterNode) -> DomainResult<(String, Vec<String>)> {
+    validate_filter(node)?;
+    let mut binds = Vec::new();
+    let sql = compile_node(node, &mut binds)?;
+    Ok((sql, binds))
+}
+
+fn compile_node(node: &FilterNode, binds: &mut Vec<String>) -> DomainResult<String> {
+    match node {
+        FilterNode::And { and } => {
+            if and.is_empty() {
+                return Ok("1=1".into());
+            }
+            let parts: DomainResult<Vec<_>> =
+                and.iter().map(|n| compile_node(n, binds)).collect();
+            Ok(format!("({})", parts?.join(" AND ")))
+        }
+        FilterNode::Or { or } => {
+            if or.is_empty() {
+                return Ok("1=0".into());
+            }
+            let parts: DomainResult<Vec<_>> = or.iter().map(|n| compile_node(n, binds)).collect();
+            Ok(format!("({})", parts?.join(" OR ")))
+        }
+        FilterNode::Not { not } => Ok(format!("NOT ({})", compile_node(not, binds)?)),
+        FilterNode::Term { field, op, value } => compile_term(field, op, value, binds),
+    }
+}
+
+fn col(field: &str) -> DomainResult<&'static str> {
+    Ok(match field {
+        "host" => "host",
+        "authority" => "authority",
+        "path" => "path",
+        "method" => "method",
+        "protocol" => "protocol",
+        "status" => "status_code",
+        "mime" => "mime",
+        "source" => "source",
+        "request_size" => "request_length",
+        "response_size" => "response_length",
+        "duration" => "duration_ms",
+        "title" | "page_title" => "page_title",
+        "display_title" => "display_title",
+        "parent" => "parent_exchange_id",
+        "browser_session" => "browser_session_id",
+        "reply_tab" => "reply_tab_id",
+        "fuzz_job" => "fuzz_job_id",
+        "time" => "started_at",
+        "error" => "error_message",
+        "label" => "exchange_id", // special-cased
+        other => {
+            return Err(DomainError::invalid(format!("unsupported field {other}")));
+        }
+    })
+}
+
+fn compile_term(
+    field: &str,
+    op: &str,
+    value: &serde_json::Value,
+    binds: &mut Vec<String>,
+) -> DomainResult<String> {
+    if field == "label" {
+        let v = value_as_string(value)?;
+        binds.push(v);
+        let idx = binds.len();
+        return Ok(format!(
+            "exchange_id IN (SELECT el.exchange_id FROM exchange_labels el JOIN labels l ON l.id=el.label_id WHERE l.name=?{idx} AND el.project_id=exchanges.project_id)"
+        ));
+    }
+    let c = col(field)?;
+    match op {
+        "eq" => {
+            binds.push(value_as_string(value)?);
+            Ok(format!("{c}=?{}", binds.len()))
+        }
+        "ne" => {
+            binds.push(value_as_string(value)?);
+            Ok(format!("{c}!=?{}", binds.len()))
+        }
+        "gt" => {
+            binds.push(value_as_string(value)?);
+            Ok(format!("{c}>?{}", binds.len()))
+        }
+        "gte" => {
+            binds.push(value_as_string(value)?);
+            Ok(format!("{c}>=?{}", binds.len()))
+        }
+        "lt" => {
+            binds.push(value_as_string(value)?);
+            Ok(format!("{c}<?{}", binds.len()))
+        }
+        "lte" => {
+            binds.push(value_as_string(value)?);
+            Ok(format!("{c}<=?{}", binds.len()))
+        }
+        "contains" => {
+            binds.push(format!("%{}%", value_as_string(value)?));
+            Ok(format!("{c} LIKE ?{}", binds.len()))
+        }
+        "starts_with" => {
+            binds.push(format!("{}%", value_as_string(value)?));
+            Ok(format!("{c} LIKE ?{}", binds.len()))
+        }
+        "ends_with" => {
+            binds.push(format!("%{}", value_as_string(value)?));
+            Ok(format!("{c} LIKE ?{}", binds.len()))
+        }
+        "in" => {
+            let arr = value
+                .as_array()
+                .ok_or_else(|| DomainError::invalid("in operator requires array"))?;
+            if arr.is_empty() {
+                return Ok("1=0".into());
+            }
+            let mut placeholders = Vec::new();
+            for v in arr {
+                binds.push(value_as_string(v)?);
+                placeholders.push(format!("?{}", binds.len()));
+            }
+            Ok(format!("{c} IN ({})", placeholders.join(",")))
+        }
+        "exists" => {
+            let exists = value.as_bool().unwrap_or(true);
+            if exists {
+                Ok(format!("{c} IS NOT NULL"))
+            } else {
+                Ok(format!("{c} IS NULL"))
+            }
+        }
+        other => Err(DomainError::invalid(format!("unsupported op {other}"))),
+    }
+}
+
+fn value_as_string(v: &serde_json::Value) -> DomainResult<String> {
+    match v {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Bool(b) => Ok(b.to_string()),
+        serde_json::Value::Null => Ok(String::new()),
+        _ => Err(DomainError::invalid("unsupported filter value type")),
+    }
+}
+
+/// Small text syntax: `host:example.com method:GET status>=400`
+pub fn parse_text_query(input: &str) -> DomainResult<FilterNode> {
+    if input.len() > MAX_INPUT_LEN {
+        return Err(DomainError::invalid("filter text too long"));
+    }
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(FilterNode::And { and: vec![] });
+    }
+    let mut terms = Vec::new();
+    for part in input.split_whitespace() {
+        let term = parse_one_term(part).map_err(|e| {
+            DomainError::invalid(format!("filter parse error at `{part}`: {e}"))
+        })?;
+        terms.push(term);
+    }
+    Ok(FilterNode::And { and: terms })
+}
+
+fn parse_one_term(part: &str) -> Result<FilterNode, String> {
+    if let Some((field, rest)) = part.split_once(">=") {
+        return Ok(term(field, "gte", rest));
+    }
+    if let Some((field, rest)) = part.split_once("<=") {
+        return Ok(term(field, "lte", rest));
+    }
+    if let Some((field, rest)) = part.split_once("!=") {
+        return Ok(term(field, "ne", rest));
+    }
+    if let Some((field, rest)) = part.split_once('>') {
+        return Ok(term(field, "gt", rest));
+    }
+    if let Some((field, rest)) = part.split_once('<') {
+        return Ok(term(field, "lt", rest));
+    }
+    if let Some((field, rest)) = part.split_once(':') {
+        if let Some(v) = rest.strip_prefix('*') {
+            if let Some(v) = v.strip_suffix('*') {
+                return Ok(term(field, "contains", v));
+            }
+            return Ok(term(field, "ends_with", v));
+        }
+        if let Some(v) = rest.strip_suffix('*') {
+            return Ok(term(field, "starts_with", v));
+        }
+        return Ok(term(field, "eq", rest));
+    }
+    Err("expected field:value or field>=value".into())
+}
+
+fn term(field: &str, op: &str, value: &str) -> FilterNode {
+    let value = if let Ok(n) = value.parse::<i64>() {
+        serde_json::json!(n)
+    } else {
+        serde_json::json!(value)
+    };
+    FilterNode::Term {
+        field: field.to_string(),
+        op: op.to_string(),
+        value,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseDiff {
+    pub status_changed: bool,
+    pub parent_status: Option<u16>,
+    pub child_status: Option<u16>,
+    pub length_delta: Option<i64>,
+    pub mime_changed: bool,
+    pub body_hash_equal: Option<bool>,
+    pub header_added: Vec<String>,
+    pub header_removed: Vec<String>,
+    pub header_changed: Vec<String>,
+    pub text_diff: Option<String>,
+}
+
+pub fn diff_exchanges(
+    parent_status: Option<u16>,
+    child_status: Option<u16>,
+    parent_len: Option<i64>,
+    child_len: Option<i64>,
+    parent_mime: Option<&str>,
+    child_mime: Option<&str>,
+    parent_hash: Option<&str>,
+    child_hash: Option<&str>,
+    parent_headers: &[(String, String)],
+    child_headers: &[(String, String)],
+    parent_body_text: Option<&str>,
+    child_body_text: Option<&str>,
+) -> ResponseDiff {
+    let mut parent_map: std::collections::BTreeMap<String, String> = parent_headers
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect();
+    let child_map: std::collections::BTreeMap<String, String> = child_headers
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect();
+
+    let mut header_added = Vec::new();
+    let mut header_removed = Vec::new();
+    let mut header_changed = Vec::new();
+    for (k, v) in &child_map {
+        match parent_map.remove(k) {
+            None => header_added.push(k.clone()),
+            Some(pv) if pv != *v => header_changed.push(k.clone()),
+            _ => {}
+        }
+    }
+    for k in parent_map.keys() {
+        header_removed.push(k.clone());
+    }
+
+    let text_diff = match (parent_body_text, child_body_text) {
+        (Some(a), Some(b)) if a.len() < 64 * 1024 && b.len() < 64 * 1024 => {
+            Some(bounded_line_diff(a, b, 50))
+        }
+        _ => None,
+    };
+
+    ResponseDiff {
+        status_changed: parent_status != child_status,
+        parent_status,
+        child_status,
+        length_delta: match (parent_len, child_len) {
+            (Some(a), Some(b)) => Some(b - a),
+            _ => None,
+        },
+        mime_changed: parent_mime != child_mime,
+        body_hash_equal: match (parent_hash, child_hash) {
+            (Some(a), Some(b)) => Some(a == b),
+            _ => None,
+        },
+        header_added,
+        header_removed,
+        header_changed,
+        text_diff,
+    }
+}
+
+fn bounded_line_diff(a: &str, b: &str, max_lines: usize) -> String {
+    let al: Vec<&str> = a.lines().collect();
+    let bl: Vec<&str> = b.lines().collect();
+    let mut out = String::new();
+    let max = al.len().max(bl.len()).min(max_lines);
+    for i in 0..max {
+        let left = al.get(i).copied().unwrap_or("");
+        let right = bl.get(i).copied().unwrap_or("");
+        if left != right {
+            out.push_str(&format!("- {left}\n+ {right}\n"));
+        }
+    }
+    if al.len().max(bl.len()) > max_lines {
+        out.push_str(&format!("... truncated after {max_lines} lines\n"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_query_and_sql() {
+        let n = parse_text_query("host:example.com method:GET status>=400").unwrap();
+        validate_filter(&n).unwrap();
+        let (sql, binds) = filter_to_sql(&n).unwrap();
+        assert!(sql.contains("host"));
+        assert!(sql.contains("method"));
+        assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        let n = FilterNode::Term {
+            field: "drop_table".into(),
+            op: "eq".into(),
+            value: serde_json::json!("x"),
+        };
+        assert!(validate_filter(&n).is_err());
+    }
+
+    #[test]
+    fn sql_injection_stays_bound() {
+        // Text query splits on whitespace; injection payload is a single token.
+        let n = parse_text_query("host:a';DROP_TABLE_projects;--").unwrap();
+        let (sql, binds) = filter_to_sql(&n).unwrap();
+        assert!(!sql.to_lowercase().contains("drop"));
+        assert!(binds[0].contains("DROP"));
+    }
+}

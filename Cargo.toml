@@ -1,0 +1,105 @@
+[package]
+name = "bb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Local-first agent-safe HTTP workbench for authorized web application testing"
+publish = false
+default-run = "bb"
+
+[[bin]]
+name = "bb"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+bytes = "1"
+async-trait = "0.1"
+
+# HTTP / proxy
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+http = "1"
+axum = { version = "0.8", features = ["macros", "multipart"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "set-header"] }
+# hudsucker = { version = "0.25", default-features = false, features = ["http2", "rcgen-ca", "rustls-client"] }  # optional; enabled after spike-validated integration
+
+# Semantic egress — exact-pinned permissive prerelease (Apache-2.0)
+# wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["webpki-roots", "tokio-rt", "stream", "prefix-symbols"] }  # optional; enabled after spike-validated integration
+# wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation", "tokio-rt"] }  # optional; enabled after spike-validated integration
+
+# TLS / CA
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.13"
+webpki-roots = "0.26"
+
+# SQLite — deadpool-sqlite 0.13 pulls rusqlite 0.38
+deadpool-sqlite = { version = "0.13", default-features = false, features = ["rt_tokio_1"] }
+rusqlite = { version = "0.38", features = ["bundled", "blob", "backup", "functions", "limits"] }
+
+# MCP — exact stable 2.2 per technical plan (avoid 3.0 beta)
+# rmcp = { version = "=2.2.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }  # optional; enabled after spike-validated integration
+
+# Parsing / codecs
+winnow = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+hex = "0.4"
+percent-encoding = "2"
+zstd = "0.13"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+mime = "0.3"
+url = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-human-readable"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# CLI / errors / logging
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+directories = "5"
+rand = "0.8"
+parking_lot = "0.12"
+dashmap = "6"
+arc-swap = "1"
+once_cell = "1"
+regex = "1"
+html-escape = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+nix = { version = "0.29", features = ["signal", "process", "fs"] }
+libc = "0.2"
+
+# Embedded UI
+rust-embed = { version = "8", features = ["interpolate-folder-path", "mime-guess"] }
+mime_guess = "2"
+
+async-stream = "0.3"
+
+tokio-stream = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+tokio-test = "0.4"
+wiremock = "0.6"
+assert_cmd = "2"
+predicates = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "cookies"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

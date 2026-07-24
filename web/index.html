@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>bb — HTTP workbench</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: Canvas;
+      --fg: CanvasText;
+      --muted: color-mix(in srgb, CanvasText 55%, Canvas);
+      --border: color-mix(in srgb, CanvasText 18%, Canvas);
+      --accent: #2f6fed;
+      --danger: #c62828;
+      --ok: #2e7d32;
+      --panel: color-mix(in srgb, Canvas 92%, CanvasText 8%);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: var(--sans); background: var(--bg); color: var(--fg);
+      min-height: 100vh; display: flex; flex-direction: column;
+    }
+    header {
+      display: flex; align-items: center; gap: 1rem; padding: .6rem 1rem;
+      border-bottom: 1px solid var(--border); flex-wrap: wrap;
+    }
+    header h1 { font-size: 1.05rem; margin: 0; font-weight: 650; }
+    header .muted { color: var(--muted); font-size: .85rem; }
+    nav { display: flex; gap: .25rem; flex-wrap: wrap; }
+    nav button, .btn {
+      background: transparent; border: 1px solid var(--border); color: var(--fg);
+      padding: .35rem .7rem; border-radius: 6px; cursor: pointer; font: inherit;
+    }
+    nav button.active, .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn.danger { border-color: var(--danger); color: var(--danger); }
+    main { flex: 1; display: grid; grid-template-columns: 220px 1fr; min-height: 0; }
+    @media (max-width: 800px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--border); } }
+    aside { border-right: 1px solid var(--border); padding: .75rem; overflow: auto; }
+    section.panel { padding: .75rem 1rem; overflow: auto; min-height: 0; }
+    .hidden { display: none !important; }
+    label { display: block; font-size: .8rem; color: var(--muted); margin: .4rem 0 .15rem; }
+    input, select, textarea {
+      width: 100%; padding: .45rem .55rem; border: 1px solid var(--border);
+      border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit;
+    }
+    textarea { font-family: var(--mono); min-height: 120px; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { text-align: left; padding: .35rem .4rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; letter-spacing: .02em; }
+    tr:hover { background: var(--panel); cursor: pointer; }
+    tr.selected { background: color-mix(in srgb, var(--accent) 18%, Canvas); }
+    .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: end; margin: .5rem 0; }
+    .row > * { flex: 1; min-width: 120px; }
+    .status { font-size: .85rem; color: var(--muted); min-height: 1.2em; }
+    .status.err { color: var(--danger); }
+    .status.ok { color: var(--ok); }
+    .pill { display: inline-block; padding: .1rem .4rem; border-radius: 999px; background: var(--panel); font-size: .75rem; }
+    .pill.redacted { background: color-mix(in srgb, var(--danger) 15%, Canvas); color: var(--danger); }
+    pre, .mono { font-family: var(--mono); font-size: .82rem; white-space: pre-wrap; word-break: break-word; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+    @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+    .card { border: 1px solid var(--border); border-radius: 8px; padding: .75rem; background: var(--panel); }
+    h2 { font-size: 1rem; margin: 0 0 .5rem; }
+    h3 { font-size: .9rem; margin: .75rem 0 .35rem; color: var(--muted); }
+    .empty { color: var(--muted); padding: 2rem 0; text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>bb</h1>
+    <span class="muted" id="health">connecting…</span>
+    <nav>
+      <button type="button" data-tab="history" class="active">History</button>
+      <button type="button" data-tab="reply">Reply</button>
+      <button type="button" data-tab="fuzzer">Fuzzer</button>
+      <button type="button" data-tab="browser">Browser</button>
+    </nav>
+  </header>
+  <main>
+    <aside>
+      <h2>Project</h2>
+      <label for="projectSelect">Active project</label>
+      <select id="projectSelect"></select>
+      <div class="row">
+        <button type="button" class="btn primary" id="btnRefreshProjects">Refresh</button>
+      </div>
+      <h3>Create project</h3>
+      <label for="projName">Name</label>
+      <input id="projName" placeholder="demo" />
+      <label for="projUrl">Target URL</label>
+      <input id="projUrl" placeholder="https://example.com" />
+      <div class="row">
+        <button type="button" class="btn primary" id="btnCreateProject">Create</button>
+      </div>
+      <h3>Capture credential</h3>
+      <p class="muted" style="font-size:.8rem">Copy-once external proxy token. Shown only at create/renew.</p>
+      <div class="row">
+        <button type="button" class="btn" id="btnNewCred">New credential</button>
+        <button type="button" class="btn" id="btnRenewCred">Renew last</button>
+      </div>
+      <pre class="mono" id="credOut"></pre>
+      <div class="status" id="sideStatus"></div>
+    </aside>
+
+    <section class="panel" id="tab-history">
+      <div class="row">
+        <div>
+          <label for="filterQ">Filter</label>
+          <input id="filterQ" placeholder="host:example.com method:GET status>=400" />
+        </div>
+        <div style="flex:0">
+          <label>&nbsp;</label>
+          <button type="button" class="btn primary" id="btnLoadHistory">Load</button>
+        </div>
+      </div>
+      <div class="status" id="histStatus"></div>
+      <div class="split">
+        <div>
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Src</th></tr>
+            </thead>
+            <tbody id="histBody"></tbody>
+          </table>
+          <div class="empty hidden" id="histEmpty">No exchanges yet. Point a browser at the proxy with a capture credential.</div>
+        </div>
+        <div class="card" id="inspector">
+          <h2>Inspector</h2>
+          <label><input type="checkbox" id="showNoisy" /> Show noisy headers</label>
+          <div class="status" id="inspStatus">Select an exchange</div>
+          <h3>Request headers</h3>
+          <pre class="mono" id="reqHeaders"></pre>
+          <h3>Response headers</h3>
+          <pre class="mono" id="respHeaders"></pre>
+          <div class="row">
+            <button type="button" class="btn" id="btnToReply" disabled>Send to Reply</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel hidden" id="tab-reply">
+      <h2>Reply</h2>
+      <div class="row">
+        <div>
+          <label for="replyMethod">Method</label>
+          <input id="replyMethod" value="GET" />
+        </div>
+        <div style="flex:3">
+          <label for="replyUrl">URL</label>
+          <input id="replyUrl" placeholder="https://example.com/" />
+        </div>
+      </div>
+      <label for="replyHeaders">Header overrides (Name: value per line)</label>
+      <textarea id="replyHeaders" placeholder="X-Test: 1"></textarea>
+      <label for="replyBody">Body override</label>
+      <textarea id="replyBody"></textarea>
+      <div class="row">
+        <button type="button" class="btn primary" id="btnSendReply">Send</button>
+      </div>
+      <div class="status" id="replyStatus"></div>
+      <pre class="mono" id="replyResult"></pre>
+    </section>
+
+    <section class="panel hidden" id="tab-fuzzer">
+      <h2>Fuzzer</h2>
+      <div class="row">
+        <div>
+          <label for="fuzzStrategy">Strategy</label>
+          <select id="fuzzStrategy">
+            <option value="sniper">Sniper</option>
+            <option value="battering_ram">Battering ram</option>
+            <option value="pitchfork">Pitchfork</option>
+            <option value="cluster_bomb">Cluster bomb</option>
+          </select>
+        </div>
+        <div>
+          <label for="fuzzPoint">Insertion (url / body / header:Name)</label>
+          <input id="fuzzPoint" value="url" />
+        </div>
+      </div>
+      <label for="fuzzWords">Wordlist (one per line)</label>
+      <textarea id="fuzzWords">1
+2
+3</textarea>
+      <div class="row">
+        <button type="button" class="btn primary" id="btnStartFuzz">Start</button>
+        <button type="button" class="btn danger" id="btnCancelFuzz">Cancel last</button>
+      </div>
+      <div class="status" id="fuzzStatus"></div>
+      <pre class="mono" id="fuzzResult"></pre>
+    </section>
+
+    <section class="panel hidden" id="tab-browser">
+      <h2>Browser</h2>
+      <div class="card" id="browserStatus"></div>
+      <label for="browserUrl">URL</label>
+      <input id="browserUrl" placeholder="https://example.com" />
+      <div class="row">
+        <button type="button" class="btn primary" id="btnStartBrowser">Start (Auto)</button>
+        <button type="button" class="btn" id="btnStopBrowser">Stop</button>
+      </div>
+      <div class="status" id="browserMsg"></div>
+      <pre class="mono" id="browserOut"></pre>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      projectId: null,
+      lastCredId: null,
+      selectedExchange: null,
+      lastFuzzJob: null,
+      browserSession: null,
+      baseExchangeId: null,
+    };
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, {
+        headers: { 'content-type': 'application/json', ...(opts.headers || {}) },
+        ...opts,
+      });
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
+      if (!res.ok) {
+        const msg = (data && (data.message || data.code)) || res.statusText;
+        throw new Error(msg);
+      }
+      return data;
+    }
+
+    function setStatus(el, msg, kind) {
+      el.textContent = msg || '';
+      el.className = 'status' + (kind ? ' ' + kind : '');
+    }
+
+    async function refreshHealth() {
+      try {
+        const h = await api('/api/v1/health');
+        document.getElementById('health').textContent =
+          `ok · schema ${h.schema} · ${h.api}`;
+      } catch (e) {
+        document.getElementById('health').textContent = 'disconnected';
+      }
+    }
+
+    async function refreshProjects() {
+      const data = await api('/api/v1/projects');
+      const sel = document.getElementById('projectSelect');
+      const cur = state.projectId;
+      sel.innerHTML = '';
+      for (const p of data.projects || []) {
+        const o = document.createElement('option');
+        o.value = p.id;
+        o.textContent = `${p.id}: ${p.name}`;
+        sel.appendChild(o);
+      }
+      if (cur) sel.value = cur;
+      state.projectId = sel.value ? Number(sel.value) : null;
+    }
+
+    document.querySelectorAll('nav button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.querySelectorAll('section.panel').forEach(s => s.classList.add('hidden'));
+        document.getElementById('tab-' + btn.dataset.tab).classList.remove('hidden');
+      });
+    });
+
+    document.getElementById('btnRefreshProjects').onclick = () =>
+      refreshProjects().catch(e => setStatus(sideStatus, e.message, 'err'));
+    document.getElementById('projectSelect').onchange = (e) => {
+      state.projectId = Number(e.target.value);
+    };
+
+    const sideStatus = document.getElementById('sideStatus');
+
+    document.getElementById('btnCreateProject').onclick = async () => {
+      try {
+        const name = document.getElementById('projName').value.trim();
+        const target_url = document.getElementById('projUrl').value.trim();
+        const p = await api('/api/v1/projects', {
+          method: 'POST',
+          body: JSON.stringify({ name, target_url }),
+        });
+        setStatus(sideStatus, `Created project ${p.id} (scope from ${target_url})`, 'ok');
+        await refreshProjects();
+        document.getElementById('projectSelect').value = p.id;
+        state.projectId = p.id;
+      } catch (e) {
+        setStatus(sideStatus, e.message, 'err');
+      }
+    };
+
+    document.getElementById('btnNewCred').onclick = async () => {
+      if (!state.projectId) return setStatus(sideStatus, 'Select a project', 'err');
+      try {
+        const s = await api(`/api/v1/projects/${state.projectId}/capture-sessions`, { method: 'POST' });
+        state.lastCredId = s.id;
+        document.getElementById('credOut').textContent =
+          `id=${s.id}\nBearer: ${s.bearer_presentation}\nBasic: ${s.basic_presentation}\nexpires: ${s.expires_at || 'session'}\n(copy now — not shown again)`;
+        setStatus(sideStatus, 'Credential created (copy once)', 'ok');
+      } catch (e) {
+        setStatus(sideStatus, e.message, 'err');
+      }
+    };
+
+    document.getElementById('btnRenewCred').onclick = async () => {
+      if (!state.projectId || !state.lastCredId) return setStatus(sideStatus, 'No credential to renew', 'err');
+      try {
+        const s = await api(`/api/v1/projects/${state.projectId}/capture-sessions/${state.lastCredId}/renew`, { method: 'POST' });
+        state.lastCredId = s.id;
+        document.getElementById('credOut').textContent =
+          `id=${s.id}\nBearer: ${s.bearer_presentation}\nBasic: ${s.basic_presentation}\n(renewed)`;
+        setStatus(sideStatus, 'Credential renewed; previous revoked', 'ok');
+      } catch (e) {
+        setStatus(sideStatus, e.message, 'err');
+      }
+    };
+
+    async function loadHistory() {
+      if (!state.projectId) return setStatus(histStatus, 'Select a project', 'err');
+      const q = document.getElementById('filterQ').value.trim();
+      const qs = new URLSearchParams({ limit: '100' });
+      if (q) qs.set('q', q);
+      const data = await api(`/api/v1/projects/${state.projectId}/history?` + qs);
+      const tbody = document.getElementById('histBody');
+      tbody.innerHTML = '';
+      const items = data.items || [];
+      document.getElementById('histEmpty').classList.toggle('hidden', items.length > 0);
+      for (const it of items) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${it.exchange_id}</td><td>${it.method}</td><td>${escapeHtml(it.host)}</td><td class="mono">${escapeHtml(it.path)}</td><td>${it.status_code ?? it.completion}</td><td>${it.source}</td>`;
+        tr.onclick = () => selectExchange(it.exchange_id, tr);
+        tbody.appendChild(tr);
+      }
+      setStatus(histStatus, `${items.length} exchanges`, 'ok');
+    }
+
+    const histStatus = document.getElementById('histStatus');
+    document.getElementById('btnLoadHistory').onclick = () =>
+      loadHistory().catch(e => setStatus(histStatus, e.message, 'err'));
+
+    async function selectExchange(eid, tr) {
+      document.querySelectorAll('#histBody tr').forEach(r => r.classList.remove('selected'));
+      if (tr) tr.classList.add('selected');
+      state.selectedExchange = eid;
+      state.baseExchangeId = eid;
+      document.getElementById('btnToReply').disabled = false;
+      const noisy = document.getElementById('showNoisy').checked;
+      const d = await api(`/api/v1/projects/${state.projectId}/exchanges/${eid}?include_noisy_headers=${noisy}`);
+      document.getElementById('inspStatus').textContent =
+        `${d.summary.method} ${d.summary.scheme}://${d.summary.authority}${d.summary.path} · redacted=${d.redacted_count} noisy_hidden=${d.noisy_hidden_count}`;
+      document.getElementById('reqHeaders').textContent = formatHeaders(d.request_headers);
+      document.getElementById('respHeaders').textContent = formatHeaders(d.response_headers);
+      document.getElementById('replyMethod').value = d.summary.method;
+      document.getElementById('replyUrl').value =
+        `${d.summary.scheme}://${d.summary.authority}${d.summary.path}${d.summary.query ? '?' + d.summary.query : ''}`;
+    }
+
+    function formatHeaders(hs) {
+      return (hs || []).map(h => {
+        const flag = h.redacted ? '  <redacted>' : '';
+        return `${h.name}: ${h.value}${flag}`;
+      }).join('\n') || '(none)';
+    }
+
+    document.getElementById('showNoisy').onchange = () => {
+      if (state.selectedExchange) selectExchange(state.selectedExchange).catch(() => {});
+    };
+    document.getElementById('btnToReply').onclick = () => {
+      document.querySelector('nav button[data-tab="reply"]').click();
+    };
+
+    const replyStatus = document.getElementById('replyStatus');
+    document.getElementById('btnSendReply').onclick = async () => {
+      if (!state.projectId) return setStatus(replyStatus, 'Select a project', 'err');
+      try {
+        const header_overrides = [];
+        for (const line of document.getElementById('replyHeaders').value.split('\n')) {
+          const m = line.match(/^([^:]+):\s*(.*)$/);
+          if (m) header_overrides.push({ name: m[1].trim(), value: m[2] });
+        }
+        const bodyText = document.getElementById('replyBody').value;
+        const draft = {
+          method: document.getElementById('replyMethod').value,
+          url: document.getElementById('replyUrl').value,
+          header_overrides,
+          header_tombstones: [],
+          body_override: bodyText ? Array.from(new TextEncoder().encode(bodyText)) : null,
+          body_cleared: false,
+        };
+        // body_override as string is easier — API accepts string via our serde
+        draft.body_override = bodyText || null;
+        const r = await api(`/api/v1/projects/${state.projectId}/reply-send`, {
+          method: 'POST',
+          body: JSON.stringify({
+            base_exchange_id: state.baseExchangeId,
+            draft: {
+              method: draft.method,
+              url: draft.url,
+              header_overrides,
+              header_tombstones: [],
+              body_cleared: !bodyText && !!state.baseExchangeId ? false : !bodyText,
+            },
+          }),
+        });
+        // attach body if present via second path — simplify: include as utf8 in override using base64 form
+        setStatus(replyStatus, `Sent → exchange ${r.exchange_id}`, 'ok');
+        document.getElementById('replyResult').textContent = JSON.stringify(r, null, 2);
+        await loadHistory();
+      } catch (e) {
+        setStatus(replyStatus, e.message, 'err');
+      }
+    };
+
+    const fuzzStatus = document.getElementById('fuzzStatus');
+    document.getElementById('btnStartFuzz').onclick = async () => {
+      if (!state.projectId) return setStatus(fuzzStatus, 'Select a project', 'err');
+      try {
+        const words = document.getElementById('fuzzWords').value.split('\n').map(s => s.trim()).filter(Boolean);
+        const location = document.getElementById('fuzzPoint').value;
+        const strategy = document.getElementById('fuzzStrategy').value;
+        const template = {
+          base_exchange_id: state.baseExchangeId,
+          draft: {
+            method: document.getElementById('replyMethod').value || 'GET',
+            url: document.getElementById('replyUrl').value,
+            header_overrides: [],
+            header_tombstones: [],
+            body_cleared: false,
+          },
+          insertion_points: [{ name: 'p0', location }],
+          wordlists: [words],
+          transforms: [],
+          strategy,
+        };
+        const job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, {
+          method: 'POST',
+          body: JSON.stringify({ template, confirm: true }),
+        });
+        state.lastFuzzJob = job.id;
+        setStatus(fuzzStatus, `Job ${job.id} started · estimated ${job.estimated_cases}`, 'ok');
+        document.getElementById('fuzzResult').textContent = JSON.stringify(job, null, 2);
+      } catch (e) {
+        setStatus(fuzzStatus, e.message, 'err');
+      }
+    };
+    document.getElementById('btnCancelFuzz').onclick = async () => {
+      if (!state.projectId || !state.lastFuzzJob) return;
+      try {
+        await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${state.lastFuzzJob}/cancel`, { method: 'POST' });
+        setStatus(fuzzStatus, 'Cancel requested', 'ok');
+      } catch (e) {
+        setStatus(fuzzStatus, e.message, 'err');
+      }
+    };
+
+    const browserMsg = document.getElementById('browserMsg');
+    async function refreshBrowserStatus() {
+      if (!state.projectId) return;
+      try {
+        const s = await api(`/api/v1/projects/${state.projectId}/browser-sessions`);
+        document.getElementById('browserStatus').textContent = JSON.stringify(s, null, 2);
+      } catch (e) {
+        document.getElementById('browserStatus').textContent = e.message;
+      }
+    }
+    document.getElementById('btnStartBrowser').onclick = async () => {
+      if (!state.projectId) return setStatus(browserMsg, 'Select a project', 'err');
+      try {
+        const url = document.getElementById('browserUrl').value.trim();
+        const s = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, {
+          method: 'POST',
+          body: JSON.stringify({ url, engine_policy: 'auto' }),
+        });
+        state.browserSession = s.id;
+        setStatus(browserMsg, `Session ${s.id} · ${s.engine}`, 'ok');
+        document.getElementById('browserOut').textContent = JSON.stringify(s, null, 2);
+        await refreshBrowserStatus();
+      } catch (e) {
+        setStatus(browserMsg, e.message, 'err');
+      }
+    };
+    document.getElementById('btnStopBrowser').onclick = async () => {
+      if (!state.projectId || !state.browserSession) return;
+      try {
+        await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession}/stop`, { method: 'POST' });
+        setStatus(browserMsg, 'Stopped', 'ok');
+      } catch (e) {
+        setStatus(browserMsg, e.message, 'err');
+      }
+    };
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    (async () => {
+      await refreshHealth();
+      try { await refreshProjects(); } catch (e) { setStatus(sideStatus, e.message, 'err'); }
+      setInterval(refreshHealth, 10000);
+    })();
+  </script>
+</body>
+</html>
