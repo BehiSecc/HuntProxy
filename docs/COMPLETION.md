@@ -27,17 +27,17 @@
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release
-./target/release/HuntProxy init --data-dir ~/.local/share/huntproxy
-./target/release/HuntProxy serve --data-dir ~/.local/share/huntproxy
+./target/release/HuntProxy init
+./target/release/HuntProxy serve
 # UI http://127.0.0.1:17890
-# Agent: HuntProxy mcp --data-dir ~/.local/share/huntproxy
+# Agent: HuntProxy mcp
 ```
 
 ## Verification performed
 
 | Check | Result |
 |-------|--------|
-| `cargo test --lib` | 23 passed |
+| `cargo test --all-targets` | 58 unit + 3 integration passed |
 | `HuntProxy init` + `HuntProxy serve` + `/api/v1/health` | OK |
 | Create project + capture session | OK |
 | `HuntProxy doctor` | OK |
@@ -60,10 +60,3 @@ Not fully measured on a dedicated VPS profile in this session. Runtime path uses
 6. **`cargo deny` / multi-platform release CI** — `deny.toml` present; CI workflows and Homebreww formula not published.
 7. **Fingerprint field-predicate gates vs TrackMe** — not run in this session (spike-level only).
 8. **Project license** — intentionally not chosen; owner decision required before publication.
-
-## Commits
-
-- `757c8f6` Phase 0 Lightpanda spike  
-- `3efe24f` Phase 0 Hudsucker spike  
-- `3546357` Phase 0 transport spike  
-- `42a8b1b` MVP application (phases 1–6 scaffold)  

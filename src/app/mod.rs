@@ -10,7 +10,6 @@ use crate::transport::{build_default_transport, SemanticTransport};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -160,18 +159,16 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         reply.clone(),
         PlaceholderKey::from_bytes(key_bytes),
     ));
+    let managed_worker = config.browser_worker_path.clone().or_else(|| {
+        crate::browser::prepare_browser_worker_installation(&config.data_dir)
+            .ok()
+            .map(|directory| directory.join("index.js"))
+    });
     let browser = Arc::new(BrowserService::new_with_proxy_and_ca(
         db.clone(),
         config.lightpanda_path.clone(),
         config.node_path.clone(),
-        config.browser_worker_path.clone().or_else(|| {
-            let p = PathBuf::from("browser-worker/index.js");
-            if p.exists() {
-                Some(p)
-            } else {
-                None
-            }
-        }),
+        managed_worker,
         format!("http://{}", config.proxy_listen),
         Some(config.ca_cert_path()),
     ));

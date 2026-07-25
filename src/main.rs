@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
     about = "Local-first agent-safe HTTP workbench"
 )]
 struct Cli {
-    #[arg(long, global = true, env = "BB_DATA_DIR")]
+    #[arg(long, global = true, env = "HUNTPROXY_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -60,7 +60,11 @@ enum ProjectCmd {
 
 #[derive(Subcommand, Debug)]
 enum BrowserCmd {
-    Install,
+    Install {
+        /// Also ask Playwright to install Linux browser system dependencies.
+        #[arg(long)]
+        with_deps: bool,
+    },
 }
 
 #[tokio::main]
@@ -105,15 +109,6 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Serve { foreground: _ } => {
             let cfg = Config::load(cli.data_dir)?;
             init_logging(&cfg.log_level);
-            if !cfg.data_dir.exists() {
-                return Err(DomainError::new(
-                    ErrorCode::ConfigInvalid,
-                    format!(
-                        "data dir missing; run: HuntProxy init --data-dir {}",
-                        cfg.data_dir.display()
-                    ),
-                ));
-            }
             // Ensure CA exists
             if !cfg.ca_cert_path().exists() {
                 generate_ca(&cfg)?;
@@ -223,11 +218,12 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Browser { cmd } => {
             init_logging("info");
             match cmd {
-                BrowserCmd::Install => {
+                BrowserCmd::Install { with_deps } => {
+                    let cfg = Config::load(cli.data_dir)?;
                     println!("Installing browser-worker dependencies…");
-                    let worker = bb::browser::prepare_browser_worker_installation()?;
+                    let worker = bb::browser::prepare_browser_worker_installation(&cfg.data_dir)?;
                     let status = std::process::Command::new("npm")
-                        .args(["install"])
+                        .args(["ci"])
                         .current_dir(&worker)
                         .status()
                         .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
@@ -237,9 +233,27 @@ async fn run(cli: Cli) -> DomainResult<()> {
                             "npm install failed",
                         ));
                     }
-                    println!("Worker deps installed in {}", worker.display());
-                    println!("Lightpanda: install from https://github.com/lightpanda-io/browser or place on PATH");
-                    println!("Chromium: system Chrome or `npx playwright install chromium`");
+                    let playwright_cli = worker.join("node_modules/playwright-core/cli.js");
+                    let mut args = vec!["install"];
+                    if with_deps {
+                        args.push("--with-deps");
+                    }
+                    args.push("chromium");
+                    println!("Installing Playwright Chromium…");
+                    let status = std::process::Command::new("node")
+                        .arg(playwright_cli)
+                        .args(args)
+                        .current_dir(&worker)
+                        .env("PLAYWRIGHT_BROWSERS_PATH", "0")
+                        .status()
+                        .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
+                    if !status.success() {
+                        return Err(DomainError::new(
+                            ErrorCode::Unavailable,
+                            "Playwright Chromium installation failed",
+                        ));
+                    }
+                    println!("Browser runtime installed in {}", worker.display());
                     Ok(())
                 }
             }

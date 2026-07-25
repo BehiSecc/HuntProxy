@@ -2,7 +2,6 @@
 
 use crate::domain::*;
 use crate::storage::{CreateCaptureSession, Db};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -20,6 +19,7 @@ const WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
 const EMBEDDED_WORKER: &str = include_str!("../../browser-worker/index.js");
 const EMBEDDED_WORKER_PACKAGE: &str = include_str!("../../browser-worker/package.json");
+const EMBEDDED_WORKER_LOCK: &str = include_str!("../../browser-worker/package-lock.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserInstallStatus {
@@ -159,6 +159,9 @@ impl WorkerProcess {
         }
         if let Some(path) = playwright_core_path {
             command.env("BB_PLAYWRIGHT_CORE_PATH", path);
+            if path.join(".local-browsers").is_dir() {
+                command.env("PLAYWRIGHT_BROWSERS_PATH", "0");
+            }
         }
         if let Some(path) = chromium_path {
             command.env("BB_CHROME_EXECUTABLE", path);
@@ -961,6 +964,11 @@ fn existing_path(configured: Option<PathBuf>, executable_name: &str) -> Option<P
     configured
         .filter(|path| path.exists())
         .or_else(|| which(executable_name))
+        .or_else(|| {
+            let executable = std::env::current_exe().ok()?;
+            let sibling = executable.parent()?.join(executable_name);
+            sibling.is_file().then_some(sibling)
+        })
         .map(|path| path.canonicalize().unwrap_or(path))
 }
 
@@ -974,6 +982,9 @@ fn chromium_executable(playwright_core_path: Option<&Path>) -> Option<PathBuf> {
         std::env::var_os(name)
             .map(PathBuf::from)
             .filter(|path| path.exists())
+    })
+    .or_else(|| {
+        playwright_core_path.and_then(|path| find_chromium_binary(&path.join(".local-browsers"), 8))
     })
     .or_else(|| {
         [
@@ -1032,7 +1043,7 @@ fn find_playwright_chromium(playwright_core_path: Option<&Path>) -> Option<PathB
         browser_directories.sort_by(|left, right| right.cmp(left));
         browser_directories
             .into_iter()
-            .find_map(|directory| find_chromium_binary(&directory, 4))
+            .find_map(|directory| find_chromium_binary(&directory, 8))
     })
 }
 
@@ -1082,20 +1093,23 @@ fn resolve_worker_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
             candidates.push(bin_dir.join("../share/bb/browser-worker/index.js"));
         }
     }
+    if let Ok(materialized) = materialize_embedded_worker(&crate::config::default_data_dir()) {
+        candidates.push(materialized);
+    }
     if let Ok(current) = std::env::current_dir() {
         candidates.push(current.join("browser-worker/index.js"));
     }
     if let Some(found) = candidates.into_iter().find(|path| path.is_file()) {
         return Some(found.canonicalize().unwrap_or(found));
     }
-    materialize_embedded_worker().ok()
+    None
 }
 
 /// Materialize the version-matched worker and package manifest in a stable,
 /// per-user location. The CLI install command should run `npm install` in the
 /// returned directory instead of relying on its current working directory.
-pub fn prepare_browser_worker_installation() -> DomainResult<PathBuf> {
-    let worker = materialize_embedded_worker().map_err(|error| {
+pub fn prepare_browser_worker_installation(data_dir: &Path) -> DomainResult<PathBuf> {
+    let worker = materialize_embedded_worker(data_dir).map_err(|error| {
         DomainError::new(
             ErrorCode::StorageError,
             format!("prepare browser worker: {error}"),
@@ -1107,17 +1121,15 @@ pub fn prepare_browser_worker_installation() -> DomainResult<PathBuf> {
         .ok_or_else(|| DomainError::new(ErrorCode::Internal, "worker directory unavailable"))
 }
 
-fn materialize_embedded_worker() -> std::io::Result<PathBuf> {
-    let project_dirs = ProjectDirs::from("dev", "bb", "bb")
-        .ok_or_else(|| std::io::Error::other("user data directory unavailable"))?;
-    let directory = project_dirs
-        .data_local_dir()
-        .join(format!("browser-worker-{}", env!("CARGO_PKG_VERSION")));
+fn materialize_embedded_worker(data_dir: &Path) -> std::io::Result<PathBuf> {
+    let directory = data_dir.join(format!("browser-worker-{}", env!("CARGO_PKG_VERSION")));
     std::fs::create_dir_all(&directory)?;
     let worker_path = directory.join("index.js");
     let package_path = directory.join("package.json");
+    let lock_path = directory.join("package-lock.json");
     write_if_changed(&worker_path, EMBEDDED_WORKER.as_bytes())?;
     write_if_changed(&package_path, EMBEDDED_WORKER_PACKAGE.as_bytes())?;
+    write_if_changed(&lock_path, EMBEDDED_WORKER_LOCK.as_bytes())?;
     Ok(worker_path)
 }
 
@@ -1200,5 +1212,26 @@ mod tests {
         let worker = directory.path().join("index.js");
         std::fs::write(&worker, "// worker").unwrap();
         assert_eq!(resolve_worker_path(Some(worker.clone())), Some(worker));
+    }
+
+    #[test]
+    fn browser_worker_installation_uses_selected_data_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker_dir = prepare_browser_worker_installation(directory.path()).unwrap();
+        assert!(worker_dir.starts_with(directory.path()));
+        assert!(worker_dir.join("index.js").is_file());
+        assert!(worker_dir.join("package.json").is_file());
+        assert!(worker_dir.join("package-lock.json").is_file());
+    }
+
+    #[test]
+    fn chromium_finder_handles_nested_macos_app_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory
+            .path()
+            .join("chromium-1148/chrome-mac/Chromium.app/Contents/MacOS/Chromium");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "browser").unwrap();
+        assert_eq!(find_chromium_binary(directory.path(), 8), Some(executable));
     }
 }

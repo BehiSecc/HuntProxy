@@ -12,8 +12,8 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/HuntProxy /usr/local/bin/HuntProxy
-ENV BB_DATA_DIR=/data
+ENV HUNTPROXY_DATA_DIR=/data
 VOLUME /data
 EXPOSE 17890 17891
 ENTRYPOINT ["HuntProxy"]
-CMD ["serve", "--data-dir", "/data", "--foreground"]
+CMD ["serve", "--foreground"]

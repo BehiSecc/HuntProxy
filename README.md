@@ -1,77 +1,94 @@
-# HuntProxy — local-first HTTP workbench
+# HuntProxy
 
-`HuntProxy` is an agent-safe, open-source HTTP testing workbench for **authorized** targets. Primary loop:
+An HTTP workbench for your hackbots. HuntProxy captures, searches, replays,
+fuzzes, and browses authorized web targets through one local Rust service.
 
-```text
-capture → search → inspect safely → derive → send/fuzz/browse → compare → preserve evidence
-```
+## Install
 
-## Install (from source)
-
-```bash
-# Requires Rust stable (see rust-toolchain.toml)
-export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --release
-# binary: target/release/HuntProxy
-```
-
-Optional browsers:
+From a source checkout:
 
 ```bash
-HuntProxy browser install   # worker deps (playwright-core)
-# Lightpanda: place `lightpanda` on PATH
-# Chromium: system Chrome or `npx playwright install chromium`
+./install.sh
 ```
 
-## Quick start
+The installer supports Linux and macOS on x86_64 and ARM64. It installs
+HuntProxy, Node.js when needed, Lightpanda, Playwright, and Chromium, then
+initializes `~/.huntproxy`. After release binaries are published, the same
+script can be piped to Bash with the platform's binary URL:
 
 ```bash
-HuntProxy init --data-dir ~/.local/share/huntproxy
-HuntProxy serve --data-dir ~/.local/share/huntproxy
+curl -fsSL <INSTALL.SH-URL> | HUNTPROXY_BINARY_URL=<BINARY-URL> bash
 ```
 
-- **Web UI:** http://127.0.0.1:17890  
-- **Proxy:** 127.0.0.1:17891 (requires project capture credential)  
-- **Doctor:** `HuntProxy doctor --data-dir ~/.local/share/huntproxy`
-- **Stop:** `HuntProxy stop --data-dir ~/.local/share/huntproxy`
-
-### Connect an agent (stdio MCP)
+Then start the workbench:
 
 ```bash
-HuntProxy mcp --data-dir ~/.local/share/huntproxy
+HuntProxy serve
 ```
 
-MCP protocol is on **stdout**; logs on **stderr**. Every project-scoped tool requires an explicit `project_id`.
+- Web UI: http://127.0.0.1:17890
+- Proxy: `127.0.0.1:17891`
+- Diagnostics: `HuntProxy doctor`
+- Stop: `HuntProxy stop`
 
-### Capture traffic
+`--data-dir` is optional. The default is `~/.huntproxy`, which HuntProxy
+creates automatically.
 
-1. Create a project in the UI (name + target URL). Capture scope is optional; an empty scope saves all traffic.
-2. Click **Create** under Proxy credential and copy the Bearer or Basic presentation (shown once).
-3. Point a browser/client at `127.0.0.1:17891` with that credential.
-4. History updates live; secrets are redacted as `<redacted>`.
+## MCP
 
-Capture scope is only a History/database filter. Reply, Fuzzer, Browser, and proxy traffic may contact any user-directed destination, including private and loopback addresses. Reply also provides an explicit raw HTTP/1.1 mode for sending exact bytes and CRLF test cases without header normalization.
+Generic JSON configuration:
 
-## Architecture
+```json
+{
+  "mcpServers": {
+    "huntproxy": {
+      "command": "HuntProxy",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
-One Rust binary (`HuntProxy serve`) owns SQLite, the proxy, jobs, and browser children. CLI and stdio MCP are adapters over a private local socket / loopback API.
+Codex configuration (`~/.codex/config.toml`):
 
-See `plans/` for the full product, technical, research, and verification specs. ADRs live in `docs/adr/`.
+```toml
+[mcp_servers.huntproxy]
+command = "HuntProxy"
+args = ["mcp"]
+```
 
-## License
+`HuntProxy mcp` starts the local daemon automatically. Project-scoped tools
+require an explicit `project_id`.
 
-No project license file has been selected yet. Fingerprint dependencies use the exact-pinned permissive Apache-2.0 prerelease path documented in `docs/adr/0001-semantic-transport.md`. **Final licensing is an owner decision before public distribution.**
+If your MCP client cannot find `HuntProxy`, use the absolute path printed by
+the installer (normally `/home/you/.local/bin/HuntProxy`); MCP clients do not
+always inherit your shell's `PATH`.
+
+## Examples
+
+```bash
+HuntProxy project create demo https://example.com
+HuntProxy project list
+HuntProxy doctor
+```
+
+`HuntProxy serve` stays in the foreground. In the UI, create a project and a
+Proxy credential before sending traffic through `127.0.0.1:17891`.
+
+Example agent tasks:
+
+- “Create a project for `https://example.com` and inspect its login flow.”
+- “Show POST requests in project 1 and compare their responses.”
+- “Send this exact raw HTTP/1.1 request with CRLF using `reply_send_raw`.”
+
+Capture scope is optional. Empty scope saves everything; configured scope only
+controls what is stored in History. It never restricts destinations. Sensitive
+header values are redacted from normal agent output while remaining usable for
+replay and fuzzing.
 
 ## Development
 
 ```bash
-cargo test --lib
-cargo fmt
-cargo clippy --all-targets -- -D warnings   # when clean
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
-
-Phase 0 spikes (results under `spikes/*/RESULT.md`):
-
-- Hudsucker proxy / ValidatedDial CONNECT
-- Wreq + primp transport comparison
-- Lightpanda CDP + cookie/storage migration to Chromium

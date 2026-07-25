@@ -1,7 +1,6 @@
 //! Configuration, data paths, and validation.
 
 use crate::domain::{DomainError, DomainResult, ErrorCode};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
@@ -72,6 +71,7 @@ impl Config {
             cfg.export_dir = cfg.data_dir.join("exports");
             cfg.runtime_dir = cfg.data_dir.join("runtime");
         }
+        create_private_dir(&cfg.data_dir)?;
         let path = cfg.data_dir.join(CONFIG_FILE_NAME);
         if path.exists() {
             let text = fs::read_to_string(&path).map_err(|e| {
@@ -83,6 +83,8 @@ impl Config {
             cfg.apply_file(file);
         }
         cfg.validate()?;
+        cfg.ensure_layout()?;
+        cfg.write_default_config()?;
         Ok(cfg)
     }
 
@@ -233,11 +235,25 @@ struct ConfigFile {
 }
 
 pub fn default_data_dir() -> PathBuf {
-    if let Some(dirs) = ProjectDirs::from("dev", "bb", "bb") {
-        dirs.data_dir().to_path_buf()
-    } else {
-        PathBuf::from(".bb")
-    }
+    data_dir_from(
+        std::env::var_os("HUNTPROXY_DATA_DIR"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn data_dir_from(
+    override_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    override_dir
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|directory| !directory.is_empty())
+                .map(PathBuf::from)
+                .map(|directory| directory.join(".huntproxy"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".huntproxy"))
 }
 
 pub fn create_private_dir(path: &Path) -> DomainResult<()> {
@@ -284,4 +300,34 @@ fn which_path(name: &str) -> Option<PathBuf> {
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_directory_is_dot_huntproxy_under_home() {
+        assert_eq!(
+            data_dir_from(None, Some("/users/alice".into())),
+            PathBuf::from("/users/alice/.huntproxy")
+        );
+        assert_eq!(
+            data_dir_from(Some("/custom".into()), Some("/users/alice".into())),
+            PathBuf::from("/custom")
+        );
+    }
+
+    #[test]
+    fn load_creates_a_complete_explicit_data_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let data_dir = parent.path().join("custom-data");
+        let config = Config::load(Some(data_dir.clone())).unwrap();
+
+        assert_eq!(config.data_dir, data_dir);
+        for relative in ["ca", "spool", "exports", "runtime"] {
+            assert!(config.data_dir.join(relative).is_dir());
+        }
+        assert!(config.data_dir.join(CONFIG_FILE_NAME).is_file());
+    }
 }

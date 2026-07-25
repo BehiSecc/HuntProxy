@@ -12,7 +12,7 @@ Targets planned for CI: Linux glibc amd64/arm64, macOS amd64/arm64.
 ## Homebrew (draft)
 
 ```ruby
-class Bb < Formula
+class Huntproxy < Formula
   desc "Local-first agent-safe HTTP workbench"
   homepage "https://github.com/example/HuntProxy"
   url "…"
