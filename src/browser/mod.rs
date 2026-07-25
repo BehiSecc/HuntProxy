@@ -33,6 +33,15 @@ pub struct BrowserInstallStatus {
     pub install_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserJavascriptFile {
+    pub url: String,
+    pub path: String,
+    pub host: String,
+    pub mime: Option<String>,
+    pub status_code: Option<u16>,
+}
+
 /// Secret-bearing values live only in daemon memory. SQLite stores version/hash/status metadata.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -811,6 +820,30 @@ impl BrowserService {
             data: result.get("data").cloned().filter(|value| !value.is_null()),
             error_code: None,
         })
+    }
+
+    pub async fn javascript_files(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+    ) -> DomainResult<Vec<BrowserJavascriptFile>> {
+        let belongs_to_project = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .is_some_and(|runtime| runtime.project_id == project_id);
+        if !belongs_to_project {
+            return Err(DomainError::not_found("active browser session"));
+        }
+        let result = self
+            .call_worker(
+                "session.javascript_files",
+                json!({ "session_id": session_id.get() }),
+            )
+            .await?;
+        serde_json::from_value(result.get("files").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))
     }
 
     pub async fn stop(

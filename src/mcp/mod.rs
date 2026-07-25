@@ -11,6 +11,7 @@ use crate::policy::{is_sensitive_header, PresentationOptions};
 use crate::storage::CreateCaptureSession;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
@@ -37,13 +38,62 @@ struct DaemonToolBackend {
 #[async_trait::async_trait]
 impl ToolBackend for DaemonToolBackend {
     async fn call(&self, name: &str, args: Value) -> DomainResult<Value> {
-        call_daemon_tool(&self.config, name, args).await
+        let armed_stop_guard = name == "huntproxy_stop";
+        if armed_stop_guard {
+            arm_stop_guard(&self.config)?;
+        }
+        let result = call_daemon_tool(&self.config, name, args).await;
+        if armed_stop_guard && result.is_err() {
+            clear_stop_guard(&self.config);
+        }
+        result
     }
 }
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "HuntProxy";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const EXPLICIT_STOP_GUARD: &str = ".mcp-stop-guard";
+
+fn stop_guard_path(config: &Config) -> std::path::PathBuf {
+    config.data_dir.join(EXPLICIT_STOP_GUARD)
+}
+
+#[cfg(unix)]
+fn parent_process_id() -> u32 {
+    unsafe { libc::getppid() as u32 }
+}
+
+#[cfg(not(unix))]
+fn parent_process_id() -> u32 {
+    0
+}
+
+fn arm_stop_guard(config: &Config) -> DomainResult<()> {
+    crate::config::write_private_file(
+        &stop_guard_path(config),
+        parent_process_id().to_string().as_bytes(),
+    )
+}
+
+pub fn stop_guard_blocks_start(config: &Config) -> bool {
+    let path = stop_guard_path(config);
+    let guarded_parent = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    if guarded_parent == Some(parent_process_id()) {
+        return true;
+    }
+    clear_stop_guard(config);
+    false
+}
+
+pub fn clear_stop_guard(config: &Config) {
+    let path = stop_guard_path(config);
+    if path.is_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -210,6 +260,8 @@ fn tool_defs() -> Value {
         {"name":"browser_start","description":"Start a browser session. Auto prefers Lightpanda and falls back to Chromium when startup/navigation fails.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank"},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
         {"name":"browser_manage","description":"Get status, stop one browser, stop all browsers in a project, or migrate Lightpanda state to Chromium. session_id is not needed for stop_all.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium"]}},"required":["project_id","op"]}},
+        {"name":"js_files","description":"Return JavaScript file URLs and paths. Without url, search saved project history; with url, load that page Lightpanda-first and return files observed in that fresh browser session. Optional domain accepts a hostname or URL and includes subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
+        {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply codec transforms","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_annotate","description":"Set an exchange title, note, and labels","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
@@ -290,13 +342,19 @@ async fn run_stdio_backend(
             }
         };
         let id = req.id.clone();
+        let stop_after_response = is_stop_request(&req);
         match handle_rpc(backend.clone(), &req).await {
-            Ok(Some(value)) => write_response(JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(value),
-                error: None,
-            }),
+            Ok(Some(value)) => {
+                write_response(JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(value),
+                    error: None,
+                });
+                if stop_after_response {
+                    break;
+                }
+            }
             Ok(None) => {}
             Err(e) => write_response(JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -315,6 +373,11 @@ async fn run_stdio_backend(
         }
     }
     Ok(())
+}
+
+fn is_stop_request(request: &JsonRpcRequest) -> bool {
+    request.method == "tools/call"
+        && request.params.get("name").and_then(Value::as_str) == Some("huntproxy_stop")
 }
 
 fn write_response(resp: JsonRpcResponse) {
@@ -440,6 +503,69 @@ fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
         .and_then(|v| v.as_i64())
         .ok_or_else(|| DomainError::invalid("project_id required"))?;
     Ok(ProjectId(id))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JavascriptFileOutput {
+    exchange_id: Option<ExchangeId>,
+    url: String,
+    path: String,
+    host: String,
+    mime: Option<String>,
+    status_code: Option<u16>,
+}
+
+fn normalize_domain_filter(value: Option<&str>) -> DomainResult<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let value = value.trim_start_matches("*.");
+    let parsed = if value.contains("://") {
+        url::Url::parse(value)
+    } else {
+        url::Url::parse(&format!("http://{value}"))
+    }
+    .map_err(|error| DomainError::invalid(format!("invalid domain filter: {error}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| DomainError::invalid("domain filter requires a host"))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    Ok(Some(host))
+}
+
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn javascript_files_response(
+    source: &str,
+    files: Vec<JavascriptFileOutput>,
+    truncated: bool,
+    domain: Option<&str>,
+    browser: Option<Value>,
+) -> Value {
+    let urls = files
+        .iter()
+        .map(|file| file.url.clone())
+        .collect::<Vec<_>>();
+    let paths = files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    json!({
+        "source": source,
+        "domain": domain,
+        "count": files.len(),
+        "truncated": truncated,
+        "files": files,
+        "urls": urls,
+        "paths": paths,
+        "browser": browser,
+    })
 }
 
 fn emit_event(state: &AppState, project_id: ProjectId, kind: &str, payload: Value) {
@@ -1045,6 +1171,110 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 )),
             }
         }
+        "js_files" => {
+            let project_id = require_project_id(&args)?;
+            let domain = normalize_domain_filter(args.get("domain").and_then(Value::as_str))?;
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(2_000)
+                .clamp(1, 10_000) as usize;
+            if let Some(url) = args.get("url").and_then(Value::as_str) {
+                let parsed = url::Url::parse(url)
+                    .map_err(|error| DomainError::invalid(format!("invalid load URL: {error}")))?;
+                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                    return Err(DomainError::invalid(
+                        "load URL must be an absolute http or https URL",
+                    ));
+                }
+                let session = state
+                    .browser
+                    .start(project_id, url.to_string(), EnginePolicy::Auto)
+                    .await?;
+                let settle_ms = args
+                    .get("settle_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(2_000)
+                    .min(30_000);
+                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                let files_result = state.browser.javascript_files(project_id, session.id).await;
+                let stop_result = state.browser.stop(project_id, session.id).await;
+                let mut files = files_result?
+                    .into_iter()
+                    .filter(|file| {
+                        domain
+                            .as_deref()
+                            .is_none_or(|domain| host_matches_domain(&file.host, domain))
+                    })
+                    .map(|file| JavascriptFileOutput {
+                        exchange_id: None,
+                        url: file.url,
+                        path: file.path,
+                        host: file.host,
+                        mime: file.mime,
+                        status_code: file.status_code,
+                    })
+                    .collect::<Vec<_>>();
+                stop_result?;
+                let truncated = files.len() > limit;
+                if truncated {
+                    files.truncate(limit);
+                }
+                Ok(javascript_files_response(
+                    "load",
+                    files,
+                    truncated,
+                    domain.as_deref(),
+                    Some(json!({
+                        "session_id": session.id,
+                        "engine": session.engine,
+                        "engine_policy": session.engine_policy,
+                        "fallback_used": session.fallback_used,
+                        "stopped": true,
+                    })),
+                ))
+            } else {
+                let (files, truncated) = state
+                    .db
+                    .list_javascript_files(project_id, None, domain.clone(), limit as u32)
+                    .await?;
+                let files = files
+                    .into_iter()
+                    .map(|file| JavascriptFileOutput {
+                        exchange_id: Some(file.exchange_id),
+                        url: file.url,
+                        path: file.path,
+                        host: file.host,
+                        mime: file.mime,
+                        status_code: file.status_code,
+                    })
+                    .collect();
+                Ok(javascript_files_response(
+                    "history",
+                    files,
+                    truncated,
+                    domain.as_deref(),
+                    None,
+                ))
+            }
+        }
+        "huntproxy_stop" => {
+            let (stopped_browsers, cleanup_warning) = match state.browser.stop_all().await {
+                Ok(stopped) => (Some(stopped), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let shutdown = state.shutdown.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                shutdown.cancel();
+            });
+            Ok(json!({
+                "ok": true,
+                "stopped_browsers": stopped_browsers,
+                "cleanup_warning": cleanup_warning,
+                "message": "HuntProxy is shutting down"
+            }))
+        }
         "codec_transform" => {
             let input = args
                 .get("input")
@@ -1187,6 +1417,47 @@ mod tests {
     }
 
     #[test]
+    fn javascript_domain_filters_accept_hosts_wildcards_and_urls() {
+        assert_eq!(
+            normalize_domain_filter(Some("target.com")).unwrap(),
+            Some("target.com".into())
+        );
+        assert_eq!(
+            normalize_domain_filter(Some("*.Target.COM")).unwrap(),
+            Some("target.com".into())
+        );
+        assert_eq!(
+            normalize_domain_filter(Some("https://cdn.target.com/path")).unwrap(),
+            Some("cdn.target.com".into())
+        );
+        assert!(host_matches_domain("cdn.target.com", "target.com"));
+        assert!(!host_matches_domain("eviltarget.com", "target.com"));
+    }
+
+    #[test]
+    fn successful_stop_calls_close_the_stdio_bridge_after_reply() {
+        let request = JsonRpcRequest {
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({"name": "huntproxy_stop", "arguments": {}}),
+        };
+        assert!(is_stop_request(&request));
+    }
+
+    #[test]
+    fn explicit_stop_guard_blocks_only_the_same_parent_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: directory.path().to_path_buf(),
+            ..Config::default()
+        };
+        arm_stop_guard(&config).unwrap();
+        assert!(stop_guard_blocks_start(&config));
+        clear_stop_guard(&config);
+        assert!(!stop_guard_path(&config).exists());
+    }
+
+    #[test]
     fn tool_schemas_describe_nested_reply_and_browser_inputs() {
         let tools = tool_defs();
         let tools = tools.as_array().unwrap();
@@ -1234,5 +1505,14 @@ mod tests {
                 ["pattern"],
             "^(url|body|header:.+)$"
         );
+        let js_files = tools
+            .iter()
+            .find(|tool| tool["name"] == "js_files")
+            .unwrap();
+        assert_eq!(
+            js_files["inputSchema"]["properties"]["settle_ms"]["default"],
+            2000
+        );
+        assert!(tools.iter().any(|tool| tool["name"] == "huntproxy_stop"));
     }
 }

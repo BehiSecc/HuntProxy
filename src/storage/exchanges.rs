@@ -52,7 +52,95 @@ pub struct NewExchange {
     pub error_message: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JavascriptFileRecord {
+    pub exchange_id: ExchangeId,
+    pub url: String,
+    pub path: String,
+    pub host: String,
+    pub mime: Option<String>,
+    pub status_code: Option<u16>,
+}
+
 impl Db {
+    pub async fn list_javascript_files(
+        &self,
+        project_id: ProjectId,
+        browser_session_id: Option<BrowserSessionId>,
+        domain: Option<String>,
+        limit: u32,
+    ) -> DomainResult<(Vec<JavascriptFileRecord>, bool)> {
+        let limit = limit.clamp(1, 10_000) as usize;
+        self.with_conn(move |conn| {
+            let sql = "WITH ranked AS (
+                SELECT exchange_id, scheme, authority, host, path, query, mime, status_code,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY scheme, authority, path, COALESCE(query, '')
+                           ORDER BY exchange_id DESC
+                       ) AS row_number
+                  FROM exchanges
+                 WHERE project_id=?1
+                   AND (?2 IS NULL OR browser_session_id=?2)
+                   AND (
+                       ?3 IS NULL
+                       OR lower(host)=?3
+                       OR substr(lower(host), -(length(?3) + 1))='.' || ?3
+                   )
+                   AND (
+                       lower(path) LIKE '%.js'
+                       OR lower(path) LIKE '%.mjs'
+                       OR lower(path) LIKE '%.cjs'
+                       OR lower(COALESCE(mime, '')) LIKE '%javascript%'
+                       OR lower(COALESCE(mime, '')) LIKE '%ecmascript%'
+                   )
+            )
+            SELECT exchange_id, scheme, authority, host, path, query, mime, status_code
+              FROM ranked
+             WHERE row_number=1
+             ORDER BY exchange_id ASC
+             LIMIT ?4";
+            let mut stmt = conn.prepare(sql).map_err(storage_error)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        project_id.get(),
+                        browser_session_id.map(BrowserSessionId::get),
+                        domain,
+                        (limit + 1) as i64
+                    ],
+                    |row| {
+                        let exchange_id = ExchangeId(row.get(0)?);
+                        let scheme: String = row.get(1)?;
+                        let authority: String = row.get(2)?;
+                        let host: String = row.get(3)?;
+                        let path: String = row.get(4)?;
+                        let query: Option<String> = row.get(5)?;
+                        let mut url = format!("{scheme}://{authority}{path}");
+                        if let Some(query) = query.filter(|query| !query.is_empty()) {
+                            url.push('?');
+                            url.push_str(&query);
+                        }
+                        Ok(JavascriptFileRecord {
+                            exchange_id,
+                            url,
+                            path,
+                            host,
+                            mime: row.get(6)?,
+                            status_code: row.get::<_, Option<i64>>(7)?.map(|value| value as u16),
+                        })
+                    },
+                )
+                .map_err(storage_error)?;
+            let mut files = collect_rows(rows)?;
+            let truncated = files.len() > limit;
+            if truncated {
+                files.truncate(limit);
+            }
+            Ok((files, truncated))
+        })
+        .await
+    }
+
     pub async fn insert_exchange(&self, ex: NewExchange) -> DomainResult<ExchangeId> {
         self.with_conn(move |conn| {
             let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
@@ -854,6 +942,80 @@ mod tests {
             page_title: None,
             error_message: None,
         }
+    }
+
+    #[tokio::test]
+    async fn javascript_files_are_deduplicated_and_safely_filtered() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "javascript files".into(),
+                target_url: "https://target.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+
+        for (host, path, query, mime, browser_session_id) in [
+            ("target.test", "/app.js", Some("v=1"), None, Some(7)),
+            ("target.test", "/app.js", Some("v=1"), None, Some(7)),
+            (
+                "cdn.target.test",
+                "/loader",
+                None,
+                Some("application/javascript; charset=utf-8"),
+                Some(7),
+            ),
+            ("target.test", "/module.mjs", None, None, None),
+            ("target.test", "/bundle.cjs", None, None, None),
+            (
+                "target.test",
+                "/app.js.map",
+                None,
+                Some("application/json"),
+                None,
+            ),
+            ("eviltarget.test", "/evil.js", None, None, Some(7)),
+        ] {
+            let mut exchange = spool_exchange(project.id);
+            exchange.method = "GET".into();
+            exchange.host = host.into();
+            exchange.authority = host.into();
+            exchange.path = path.into();
+            exchange.query = query.map(str::to_string);
+            exchange.mime = mime.map(str::to_string);
+            exchange.lineage.browser_session_id = browser_session_id.map(BrowserSessionId);
+            db.insert_exchange(exchange).await.unwrap();
+        }
+
+        let (history, truncated) = db
+            .list_javascript_files(project.id, None, Some("target.test".into()), 20)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(history.len(), 4);
+        assert!(history.iter().any(|file| file.url.ends_with("/app.js?v=1")));
+        assert!(history.iter().any(|file| file.path == "/loader"));
+        assert!(history.iter().all(|file| file.host != "eviltarget.test"));
+        assert!(history.iter().all(|file| file.path != "/app.js.map"));
+
+        let (session, _) = db
+            .list_javascript_files(
+                project.id,
+                Some(BrowserSessionId(7)),
+                Some("target.test".into()),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.len(), 2);
+
+        let (limited, truncated) = db
+            .list_javascript_files(project.id, None, Some("target.test".into()), 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert!(truncated);
     }
 
     #[tokio::test]

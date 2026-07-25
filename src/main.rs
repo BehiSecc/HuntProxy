@@ -108,6 +108,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
         }
         Commands::Serve { foreground: _ } => {
             let cfg = Config::load(cli.data_dir)?;
+            bb::mcp::clear_stop_guard(&cfg);
             init_logging(&cfg.log_level);
             // Ensure CA exists
             if !cfg.ca_cert_path().exists() {
@@ -125,6 +126,12 @@ async fn run(cli: Cli) -> DomainResult<()> {
             // MCP: logs to stderr only
             init_logging_stderr("warn");
             let cfg = Config::load(cli.data_dir.clone())?;
+            if bb::mcp::stop_guard_blocks_start(&cfg) {
+                return Err(DomainError::new(
+                    ErrorCode::DaemonNotRunning,
+                    "HuntProxy was explicitly stopped for this MCP client; restart the client to use it again",
+                ));
+            }
             ensure_daemon(&cfg).await?;
             bb::mcp::run_stdio_mcp_client(cfg).await
         }

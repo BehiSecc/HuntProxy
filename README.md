@@ -73,6 +73,11 @@ activity, the MCP bridge and daemon exit and all browser processes are closed.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
 
+Use `js_files` with only `project_id` to list JavaScript from saved history,
+add `domain` to filter it, or add `url` to perform a fresh Lightpanda-first
+load. Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;
+restart the MCP client (or run `HuntProxy serve`) when you want to use it again.
+
 If your MCP client cannot find `HuntProxy`, use the absolute path printed by
 the installer (normally `/home/you/.local/bin/HuntProxy`); MCP clients do not
 always inherit your shell's `PATH`.
@@ -93,7 +98,10 @@ Example agent tasks:
 - “Create a project for `https://example.com` and inspect its login flow.”
 - “Set project 1 cookies for `https://example.com` from `/tmp/cookies.txt`, then browse `/account`.”
 - “Show POST requests in project 1 and compare their responses.”
+- “List JavaScript files for `example.com` from project 1 history.”
+- “Load `https://example.com` and return every JavaScript URL and path.”
 - “Send this exact raw HTTP/1.1 request with CRLF using `reply_send_raw`.”
+- “Stop HuntProxy.”
 
 Capture scope is optional. Empty scope saves everything; configured scope only
 controls what is stored in History. It never restricts destinations. Sensitive

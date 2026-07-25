@@ -17,6 +17,37 @@ import { fileURLToPath } from "node:url";
 const PROTOCOL = 1;
 const sessions = new Map();
 
+function javascriptFile(response) {
+  let parsed;
+  try {
+    parsed = new URL(response.url());
+  } catch {
+    return null;
+  }
+  if (!new Set(["http:", "https:"]).has(parsed.protocol)) return null;
+  const headers = response.headers();
+  const mime = String(headers["content-type"] || "");
+  const pathname = parsed.pathname.toLowerCase();
+  const isJavascriptPath = /\.(?:js|mjs|cjs)$/.test(pathname);
+  const isJavascriptMime = /(?:java|ecma)script/i.test(mime);
+  if (!isJavascriptPath && !isJavascriptMime) return null;
+  return {
+    url: parsed.toString(),
+    path: parsed.pathname,
+    host: parsed.hostname,
+    mime: mime || null,
+    status_code: response.status(),
+  };
+}
+
+function trackJavascriptFiles(session, existing = new Map()) {
+  session.javascriptFiles = existing;
+  session.page.on("response", (response) => {
+    const file = javascriptFile(response);
+    if (file) session.javascriptFiles.set(file.url, file);
+  });
+}
+
 function loadPlaywright() {
   const candidates = [];
   if (process.env.BB_PLAYWRIGHT_CORE_PATH) {
@@ -468,12 +499,14 @@ async function migrateToChromium(sessionId, session) {
       sessionVerification.verified;
 
     await closeRuntime(session);
-    sessions.set(sessionId, {
+    const migrated = {
       ...replacement,
       engine: "chromium",
       proxy: session.proxy,
       caCertPath: session.caCertPath,
-    });
+    };
+    trackJavascriptFiles(migrated, new Map(session.javascriptFiles || []));
+    sessions.set(sessionId, migrated);
     return {
       ok: true,
       status: verified ? "migrated" : "migrated_partial",
@@ -514,6 +547,7 @@ async function handle(req) {
         const caCertPath = params.ca_cert_path || null;
         const runtime = await launchEngine(engine, params.proxy || null, caCertPath);
         const session = { ...runtime, engine, proxy: params.proxy || null, caCertPath };
+        trackJavascriptFiles(session);
         sessions.set(sessionId, session);
         try {
           if (Array.isArray(params.cookies) && params.cookies.length) {
@@ -591,6 +625,12 @@ async function handle(req) {
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
         return respond(id, { checkpoint: await extractCheckpoint(session) });
+      }
+      case "session.javascript_files": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        return respond(id, { files: [...(session.javascriptFiles?.values() || [])] });
       }
       case "session.migrate_to_chromium": {
         const sessionId = Number(params.session_id);
