@@ -306,7 +306,8 @@ fn value_as_string(v: &serde_json::Value) -> DomainResult<String> {
     }
 }
 
-/// Small text syntax: `host:example.com method:GET status>=400`
+/// Small text syntax: `host:example.com method:GET status>=400`.
+/// Bare words search common summary fields; `field:~value` means contains.
 pub fn parse_text_query(input: &str) -> DomainResult<FilterNode> {
     if input.len() > MAX_INPUT_LEN {
         return Err(DomainError::invalid("filter text too long"));
@@ -341,6 +342,9 @@ fn parse_one_term(part: &str) -> Result<FilterNode, String> {
         return Ok(term(field, "lt", rest));
     }
     if let Some((field, rest)) = part.split_once(':') {
+        if let Some(value) = rest.strip_prefix('~') {
+            return Ok(term(field, "contains", value));
+        }
         if let Some(v) = rest.strip_prefix('*') {
             if let Some(v) = v.strip_suffix('*') {
                 return Ok(term(field, "contains", v));
@@ -352,7 +356,12 @@ fn parse_one_term(part: &str) -> Result<FilterNode, String> {
         }
         return Ok(term(field, "eq", rest));
     }
-    Err("expected field:value or field>=value".into())
+    Ok(FilterNode::Or {
+        or: ["host", "authority", "path", "mime", "title", "error"]
+            .into_iter()
+            .map(|field| term(field, "contains", part))
+            .collect(),
+    })
 }
 
 fn term(field: &str, op: &str, value: &str) -> FilterNode {
@@ -477,6 +486,18 @@ mod tests {
         assert!(sql.contains("host"));
         assert!(sql.contains("method"));
         assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
+    fn bare_text_and_tilde_are_contains_searches() {
+        let bare = parse_text_query("javascript").unwrap();
+        let (sql, binds) = filter_to_sql(&bare).unwrap();
+        assert!(sql.contains(" OR "));
+        assert!(binds.iter().all(|value| value == "%javascript%"));
+
+        let path = parse_text_query("path:~.js").unwrap();
+        let (_, binds) = filter_to_sql(&path).unwrap();
+        assert_eq!(binds, vec!["%.js%"]);
     }
 
     #[test]

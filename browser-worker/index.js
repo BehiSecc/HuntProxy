@@ -203,7 +203,8 @@ async function extractCheckpoint(session) {
   const url = session.page.url();
   const origin = (() => {
     try {
-      return new URL(url).origin;
+      const parsed = new URL(url);
+      return new Set(["http:", "https:"]).has(parsed.protocol) ? parsed.origin : null;
     } catch {
       return null;
     }

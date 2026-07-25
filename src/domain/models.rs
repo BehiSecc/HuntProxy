@@ -164,6 +164,7 @@ pub struct ReplyTab {
 
 /// Canonical draft: base inheritance + overrides/tombstones. Never sanitized text.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReplyDraft {
     pub method: Option<String>,
     pub url: Option<String>,

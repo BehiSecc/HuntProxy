@@ -91,6 +91,47 @@ impl ErrorCode {
             Self::ProtocolIncompatible => "protocol_incompatible",
         }
     }
+
+    pub fn from_code(value: &str) -> Option<Self> {
+        Some(match value {
+            "internal" => Self::Internal,
+            "invalid_argument" => Self::InvalidArgument,
+            "not_found" => Self::NotFound,
+            "conflict" => Self::Conflict,
+            "unauthorized" => Self::Unauthorized,
+            "forbidden" => Self::Forbidden,
+            "unavailable" => Self::Unavailable,
+            "cancelled" => Self::Cancelled,
+            "timeout" => Self::Timeout,
+            "scope_denied" => Self::ScopeDenied,
+            "dns_blocked" => Self::DnsBlocked,
+            "rate_limited" => Self::RateLimited,
+            "concurrency_limited" => Self::ConcurrencyLimited,
+            "body_too_large" => Self::BodyTooLarge,
+            "disk_quota_exceeded" => Self::DiskQuotaExceeded,
+            "proxy_auth_required" => Self::ProxyAuthRequired,
+            "capture_incomplete" => Self::CaptureIncomplete,
+            "protocol_error" => Self::ProtocolError,
+            "storage_error" => Self::StorageError,
+            "migration_error" => Self::MigrationError,
+            "revision_conflict" => Self::RevisionConflict,
+            "placeholder_invalid" => Self::PlaceholderInvalid,
+            "job_interrupted" => Self::JobInterrupted,
+            "combination_limit" => Self::CombinationLimit,
+            "browser_disabled" => Self::BrowserDisabled,
+            "browser_not_installed" => Self::BrowserNotInstalled,
+            "chromium_not_installed" => Self::ChromiumNotInstalled,
+            "lightpanda_not_installed" => Self::LightpandaNotInstalled,
+            "engine_fallback" => Self::EngineFallback,
+            "migration_partial" => Self::MigrationPartial,
+            "login_required" => Self::LoginRequired,
+            "config_invalid" => Self::ConfigInvalid,
+            "daemon_not_running" => Self::DaemonNotRunning,
+            "daemon_already_running" => Self::DaemonAlreadyRunning,
+            "protocol_incompatible" => Self::ProtocolIncompatible,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -183,5 +224,24 @@ impl From<&DomainError> for ErrorEnvelope {
                 request_id: None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_error_codes_round_trip_from_daemon_envelopes() {
+        for code in [
+            ErrorCode::InvalidArgument,
+            ErrorCode::NotFound,
+            ErrorCode::Timeout,
+            ErrorCode::BrowserDisabled,
+            ErrorCode::ProtocolError,
+        ] {
+            assert_eq!(ErrorCode::from_code(code.as_str()), Some(code));
+        }
+        assert_eq!(ErrorCode::from_code("future_code"), None);
     }
 }

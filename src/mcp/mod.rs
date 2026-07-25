@@ -84,23 +84,94 @@ struct DaemonToolResponse {
     error: Option<ErrorEnvelope>,
 }
 
+fn reply_draft_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "All fields are optional. Omitted fields inherit from base_exchange_id when supplied.",
+        "properties": {
+            "method": {"type": ["string", "null"]},
+            "url": {"type": ["string", "null"]},
+            "header_overrides": {
+                "type": "array",
+                "default": [],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "value": {"oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}}
+                        ]}
+                    },
+                    "required": ["name", "value"],
+                    "additionalProperties": false
+                }
+            },
+            "header_tombstones": {"type": "array", "items": {"type": "string"}, "default": []},
+            "body_override": {
+                "oneOf": [
+                    {"type": "null"},
+                    {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}}
+                ]
+            },
+            "body_cleared": {"type": "boolean", "default": false}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn locator_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Use one locator strategy: role/name, text, test_id, or css.",
+        "properties": {
+            "role": {"type": ["string", "null"]},
+            "name": {"type": ["string", "null"]},
+            "text": {"type": ["string", "null"]},
+            "test_id": {"type": ["string", "null"]},
+            "css": {"type": ["string", "null"]},
+            "exact": {"type": ["boolean", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn browser_action_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Action object. navigate requires url; click requires locator; fill/select require locator and value; press requires key and optional locator; wait requires for_what and value; snapshot accepts format and max_bytes.",
+        "properties": {
+            "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "press", "wait", "back", "forward", "close"]},
+            "url": {"type": "string"},
+            "locator": locator_schema(),
+            "value": {"type": "string"},
+            "key": {"type": "string"},
+            "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"]},
+            "format": {"type": "string", "enum": ["accessibility", "dom"]},
+            "max_bytes": {"type": "integer", "minimum": 1}
+        },
+        "required": ["type"],
+        "additionalProperties": false
+    })
+}
+
 fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List, create, or set optional capture scope","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"type":"string"},"file_path":{"type":"string"}},"required":["project_id","action"]}},
-        {"name":"history_search","description":"Search exchange history","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string"},"limit":{"type":"integer"}},"required":["project_id"]}},
+        {"name":"history_search","description":"Search history. q accepts bare text or filters such as host:example.com path:~.js method:GET status>=400; separate terms with spaces.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"Bare text searches common fields. field:value is exact, field:~value contains, field:*suffix ends with, and comparisons use >= <= > < !=."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
-        {"name":"exchange_body","description":"Get exchange body preview","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["project_id","exchange_id"]}},
+        {"name":"exchange_body","description":"Read a request or response body in pages. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
-        {"name":"reply_tabs","description":"List/create reply tabs","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":{"type":"object"}},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a reply draft","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":{"type":"object"}},"required":["project_id"]}},
+        {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
+        {"name":"reply_send","description":"Send a semantic HTTP request. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]}},"required":["project_id"]}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a fuzz job","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":{"type":"object"},"confirm_large":{"type":"boolean"}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, or cancel fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"job_id":{"type":"integer"},"limit":{"type":"integer"},"before_case_index":{"type":"integer"}},"required":["project_id","action"]}},
-        {"name":"browser_start","description":"Start browser session","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string"}},"required":["project_id"]}},
-        {"name":"browser_action","description":"Run browser action","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":{"type":"object"}},"required":["project_id","session_id","action"]}},
-        {"name":"browser_manage","description":"Stop browser session","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string"}},"required":["project_id","session_id","op"]}},
+        {"name":"browser_start","description":"Start a browser session. Auto prefers Lightpanda and falls back to Chromium when startup/navigation fails.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank"},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"}},"required":["project_id"]}},
+        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
+        {"name":"browser_manage","description":"Get status, stop a browser session, or migrate Lightpanda state to Chromium.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","switch_chromium"]}},"required":["project_id","session_id","op"]}},
         {"name":"codec_transform","description":"Apply codec transforms","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_annotate","description":"Set an exchange title, note, and labels","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
@@ -168,7 +239,11 @@ async fn run_stdio_backend(backend: Arc<dyn ToolBackend>) -> DomainResult<()> {
                 id,
                 result: None,
                 error: Some(JsonRpcError {
-                    code: -32000,
+                    code: match e.code() {
+                        ErrorCode::InvalidArgument => -32602,
+                        ErrorCode::NotFound => -32001,
+                        _ => -32000,
+                    },
                     message: e.to_string(),
                     data: Some(json!({ "code": e.code().as_str() })),
                 }),
@@ -246,7 +321,7 @@ async fn call_daemon_tool(config: &Config, name: &str, args: Value) -> DomainRes
         request_id: None,
     });
     Err(DomainError::with_details(
-        ErrorCode::Unavailable,
+        ErrorCode::from_code(&error.code).unwrap_or(ErrorCode::Unavailable),
         error.message,
         json!({ "daemon_code": error.code, "details": error.details }),
     ))
@@ -494,7 +569,11 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             if let Some(filter) = &filter {
                 crate::history::validate_filter(filter)?;
             }
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .clamp(1, 500) as u32;
             let (items, next) = state
                 .db
                 .list_history_filtered(project_id, filter, limit, None, None)
@@ -533,10 +612,16 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 "request" => MessageSide::Request,
                 _ => MessageSide::Response,
             };
+            let offset = args
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                .unwrap_or(0);
             let max = args
                 .get("max_bytes")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(4096) as usize;
+                .unwrap_or(4096)
+                .clamp(1, 1024 * 1024) as usize;
             let mut body = state
                 .db
                 .load_raw_body(project_id, ExchangeId(eid), side)
@@ -555,11 +640,19 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     body = crate::reply::redact_raw_request_headers(&body);
                 }
             }
-            let slice = &body[..body.len().min(max)];
+            let end = offset.saturating_add(max).min(body.len());
+            let slice = if offset >= body.len() {
+                &body[..0]
+            } else {
+                &body[offset..end]
+            };
             Ok(json!({
                 "total": body.len(),
+                "offset": offset,
+                "length": slice.len(),
                 "preview": String::from_utf8_lossy(slice),
-                "truncated": body.len() > max
+                "truncated": end < body.len(),
+                "next_offset": (end < body.len()).then_some(end)
             }))
         }
         "secret_reveal" => {
@@ -660,6 +753,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .transpose()
                 .map_err(|e| DomainError::invalid(e.to_string()))?
                 .unwrap_or_default();
+            let protocol = match args.get("protocol").and_then(Value::as_str) {
+                Some("h1") => ProtocolPreference::H1,
+                Some("h2") => ProtocolPreference::H2,
+                Some("auto") | None => ProtocolPreference::Auto,
+                Some(_) => return Err(DomainError::invalid("protocol must be auto|h1|h2")),
+            };
             let result = state
                 .reply
                 .send(
@@ -669,7 +768,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .and_then(|v| v.as_i64())
                         .map(ExchangeId),
                     &draft,
-                    ProtocolPreference::Auto,
+                    protocol,
                     0,
                 )
                 .await?;
@@ -819,12 +918,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(|v| v.as_str())
                 .unwrap_or("about:blank")
                 .to_string();
-            Ok(json!(
-                state
-                    .browser
-                    .start(project_id, url, EnginePolicy::Auto)
-                    .await?
-            ))
+            let policy = match args.get("engine_policy").and_then(Value::as_str) {
+                Some("chromium") => EnginePolicy::Chromium,
+                Some("auto") | None => EnginePolicy::Auto,
+                Some(_) => return Err(DomainError::invalid("engine_policy must be auto|chromium")),
+            };
+            Ok(json!(state.browser.start(project_id, url, policy).await?))
         }
         "browser_action" => {
             let project_id = require_project_id(&args)?;
@@ -1000,5 +1099,47 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             Ok(json!(annotation))
         }
         other => Err(DomainError::invalid(format!("unknown tool {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_drafts_accept_the_minimal_shape_advertised_by_mcp() {
+        let draft: ReplyDraft = serde_json::from_value(json!({
+            "method": "GET",
+            "url": "https://example.com"
+        }))
+        .unwrap();
+        assert!(draft.header_overrides.is_empty());
+        assert!(draft.header_tombstones.is_empty());
+        assert!(!draft.body_cleared);
+    }
+
+    #[test]
+    fn tool_schemas_describe_nested_reply_and_browser_inputs() {
+        let tools = tool_defs();
+        let tools = tools.as_array().unwrap();
+        let reply = tools
+            .iter()
+            .find(|tool| tool["name"] == "reply_send")
+            .unwrap();
+        assert_eq!(
+            reply["inputSchema"]["properties"]["draft"]["properties"]["header_overrides"]["type"],
+            "array"
+        );
+        let browser = tools
+            .iter()
+            .find(|tool| tool["name"] == "browser_action")
+            .unwrap();
+        assert!(
+            browser["inputSchema"]["properties"]["action"]["properties"]["type"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "navigate")
+        );
     }
 }

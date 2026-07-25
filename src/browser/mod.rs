@@ -51,7 +51,9 @@ pub enum BrowserAction {
         url: String,
     },
     Snapshot {
+        #[serde(default = "default_snapshot_format")]
         format: String,
+        #[serde(default = "default_snapshot_max_bytes")]
         max_bytes: u64,
     },
     Click {
@@ -76,6 +78,14 @@ pub enum BrowserAction {
     Back,
     Forward,
     Close,
+}
+
+fn default_snapshot_format() -> String {
+    "accessibility".into()
+}
+
+fn default_snapshot_max_bytes() -> u64 {
+    200_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -557,24 +567,37 @@ impl BrowserService {
         })?;
         let managed_cookies =
             browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
-        let worker_result = self
-            .call_worker(
-                "session.start",
-                json!({
-                    "session_id": session.id.get(),
-                    "engine": engine_name(engine),
-                    "url": url,
-                    "proxy": {
-                        "server": self.proxy_server.clone(),
-                        "bearer_token": token.clone(),
-                        "username": PROXY_BASIC_USER,
-                        "password": token,
-                    },
-                    "ca_cert_path": self.ca_cert_path.as_ref().map(|path| path.display().to_string()),
-                    "cookies": managed_cookies,
-                }),
-            )
+        let mut start_params = json!({
+            "session_id": session.id.get(),
+            "engine": engine_name(engine),
+            "url": url,
+            "proxy": {
+                "server": self.proxy_server.clone(),
+                "bearer_token": token.clone(),
+                "username": PROXY_BASIC_USER,
+                "password": token,
+            },
+            "ca_cert_path": self.ca_cert_path.as_ref().map(|path| path.display().to_string()),
+            "cookies": managed_cookies,
+        });
+        let mut effective_engine = engine;
+        let mut checkpoint_status = "ok";
+        let mut worker_result = self
+            .call_worker("session.start", start_params.clone())
             .await;
+        if worker_result.is_err()
+            && policy == EnginePolicy::Auto
+            && engine == BrowserEngine::Lightpanda
+            && status.chromium_available
+        {
+            start_params["engine"] = json!(engine_name(BrowserEngine::Chromium));
+            worker_result = self.call_worker("session.start", start_params).await;
+            if worker_result.is_ok() {
+                effective_engine = BrowserEngine::Chromium;
+                checkpoint_status = "fallback_chromium";
+                session.fallback_used = true;
+            }
+        }
         let result = match worker_result {
             Ok(result) => result,
             Err(error) => {
@@ -589,11 +612,12 @@ impl BrowserService {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
         let saved = self
-            .save_checkpoint(project_id, session.id, checkpoint, "ok")
+            .save_checkpoint(project_id, session.id, checkpoint, checkpoint_status)
             .await?;
+        session.engine = effective_engine;
         session.current_url = saved.url;
         session.state = BrowserSessionState::Ready;
-        session.checkpoint_status = Some("ok".into());
+        session.checkpoint_status = Some(checkpoint_status.into());
         session.checkpoint_hash = Some(saved.hash);
         self.db.update_browser_session(&session).await?;
         self.runtime_sessions.lock().await.insert(
@@ -1286,6 +1310,18 @@ fn which(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_action_has_agent_friendly_defaults() {
+        let action: BrowserAction = serde_json::from_value(json!({ "type": "snapshot" })).unwrap();
+        match action {
+            BrowserAction::Snapshot { format, max_bytes } => {
+                assert_eq!(format, "accessibility");
+                assert_eq!(max_bytes, 200_000);
+            }
+            _ => panic!("wrong browser action"),
+        }
+    }
 
     #[test]
     fn decodes_checkpoint_without_exposing_private_shape() {
