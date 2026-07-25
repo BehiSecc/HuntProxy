@@ -257,9 +257,9 @@ fn tool_defs() -> Value {
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases"]},"job_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
-        {"name":"browser_start","description":"Start a browser session. Auto prefers Lightpanda and falls back to Chromium when startup/navigation fails.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank"},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"}},"required":["project_id"]}},
+        {"name":"browser_start","description":"Start a browser session. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank"},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
-        {"name":"browser_manage","description":"Get status, stop one browser, stop all browsers in a project, or migrate Lightpanda state to Chromium. session_id is not needed for stop_all.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium"]}},"required":["project_id","op"]}},
+        {"name":"browser_manage","description":"Get status, stop one browser, stop all browsers in a project, or migrate Lightpanda state to Chromium. Switching requires chromium_reason=user_requested or lightpanda_incompatible. session_id is not needed for stop_all.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."}},"required":["project_id","op"]}},
         {"name":"js_files","description":"Return JavaScript file URLs and paths. Without url, search saved project history; with url, load that page Lightpanda-first and return files observed in that fresh browser session. Optional domain accepts a hostname or URL and includes subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply codec transforms","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
@@ -503,6 +503,24 @@ fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
         .and_then(|v| v.as_i64())
         .ok_or_else(|| DomainError::invalid("project_id required"))?;
     Ok(ProjectId(id))
+}
+
+fn require_chromium_start_reason(args: &Value) -> DomainResult<()> {
+    match args.get("chromium_reason").and_then(Value::as_str) {
+        Some("user_requested") => Ok(()),
+        _ => Err(DomainError::invalid(
+            "forcing Chromium requires chromium_reason=user_requested; otherwise use engine_policy=auto so Lightpanda is tried first",
+        )),
+    }
+}
+
+fn require_chromium_switch_reason(args: &Value) -> DomainResult<()> {
+    match args.get("chromium_reason").and_then(Value::as_str) {
+        Some("user_requested" | "lightpanda_incompatible") => Ok(()),
+        _ => Err(DomainError::invalid(
+            "switch_chromium requires chromium_reason=user_requested or lightpanda_incompatible",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1109,7 +1127,10 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .unwrap_or("about:blank")
                 .to_string();
             let policy = match args.get("engine_policy").and_then(Value::as_str) {
-                Some("chromium") => EnginePolicy::Chromium,
+                Some("chromium") => {
+                    require_chromium_start_reason(&args)?;
+                    EnginePolicy::Chromium
+                }
                 Some("auto") | None => EnginePolicy::Auto,
                 Some(_) => return Err(DomainError::invalid("engine_policy must be auto|chromium")),
             };
@@ -1160,12 +1181,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .await?;
                     Ok(json!(s))
                 }
-                "switch_chromium" => Ok(json!(
-                    state
-                        .browser
-                        .switch_to_chromium(project_id, BrowserSessionId(sid))
-                        .await?
-                )),
+                "switch_chromium" => {
+                    require_chromium_switch_reason(&args)?;
+                    Ok(json!(
+                        state
+                            .browser
+                            .switch_to_chromium(project_id, BrowserSessionId(sid))
+                            .await?
+                    ))
+                }
                 _ => Err(DomainError::invalid(
                     "op must be stop|stop_all|status|switch_chromium",
                 )),
@@ -1445,6 +1469,28 @@ mod tests {
     }
 
     #[test]
+    fn forcing_chromium_requires_an_explicit_reason() {
+        assert!(require_chromium_start_reason(&json!({})).is_err());
+        assert!(require_chromium_start_reason(&json!({ "chromium_reason": "  " })).is_err());
+        assert!(require_chromium_start_reason(
+            &json!({ "chromium_reason": "lightpanda_incompatible" })
+        )
+        .is_err());
+        assert!(
+            require_chromium_start_reason(&json!({ "chromium_reason": "user_requested" })).is_ok()
+        );
+
+        assert!(require_chromium_switch_reason(&json!({})).is_err());
+        assert!(
+            require_chromium_switch_reason(&json!({ "chromium_reason": "user_requested" })).is_ok()
+        );
+        assert!(require_chromium_switch_reason(
+            &json!({ "chromium_reason": "lightpanda_incompatible" })
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn explicit_stop_guard_blocks_only_the_same_parent_client() {
         let directory = tempfile::tempdir().unwrap();
         let config = Config {
@@ -1494,6 +1540,32 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "session_id"));
+        assert!(!browser_manage["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "chromium_reason"));
+        assert_eq!(
+            browser_manage["inputSchema"]["properties"]["chromium_reason"]["enum"],
+            json!(["user_requested", "lightpanda_incompatible"])
+        );
+        let browser_start = tools
+            .iter()
+            .find(|tool| tool["name"] == "browser_start")
+            .unwrap();
+        assert_eq!(
+            browser_start["inputSchema"]["properties"]["engine_policy"]["default"],
+            "auto"
+        );
+        assert!(!browser_start["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "chromium_reason"));
+        assert_eq!(
+            browser_start["inputSchema"]["properties"]["chromium_reason"]["enum"],
+            json!(["user_requested"])
+        );
         let fuzz_start = tools
             .iter()
             .find(|tool| tool["name"] == "fuzz_start")
