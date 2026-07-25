@@ -391,7 +391,7 @@ impl ReplyService {
         context: ReplySendContext,
     ) -> DomainResult<ReplySendResult> {
         let project = self.db.get_project(project_id).await?;
-        let mat = materialize_request(
+        let mut mat = materialize_request(
             &self.db,
             project_id,
             base_exchange_id,
@@ -399,6 +399,26 @@ impl ReplyService {
             &self.placeholder_key,
         )
         .await?;
+        let cookie_overridden = draft
+            .header_overrides
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("cookie"));
+        let cookie_suppressed = draft
+            .header_tombstones
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("cookie"));
+        if !cookie_overridden && !cookie_suppressed {
+            if let Some(profile) = self
+                .db
+                .get_cookie_profile_for_url(project_id, &mat.url)
+                .await?
+            {
+                mat.headers
+                    .retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+                mat.headers
+                    .push(("Cookie".into(), profile.cookie_header.into_bytes()));
+            }
+        }
 
         // Scope controls persistence only; it never blocks egress.
         let should_capture = url_is_in_scope(&mat.url, &project.scope)?;
@@ -682,6 +702,112 @@ mod tests {
         fn provenance(&self) -> TransportProvenance {
             TransportProvenance::GenericUnprofiled
         }
+    }
+
+    type RecordedHeaders = Vec<(String, Vec<u8>)>;
+
+    struct RecordingTransport {
+        headers: Arc<std::sync::Mutex<Vec<RecordedHeaders>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for RecordingTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            self.headers.lock().unwrap().push(request.headers);
+            Ok(OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![],
+                body: bytes::Bytes::new(),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test".into(),
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_cookie_replaces_inherited_but_not_explicit_cookie() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "cookies".into(),
+                target_url: "http://127.0.0.1".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        db.upsert_cookie_profile(
+            project.id,
+            crate::cookies::validate_cookie_profile("http://127.0.0.1", "sid=managed".into())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = ReplyService {
+            db,
+            transport: Arc::new(RecordingTransport {
+                headers: recorded.clone(),
+            }),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+        };
+
+        service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("http://127.0.0.1/".into()),
+                    ..Default::default()
+                },
+                ProtocolPreference::H1,
+                0,
+            )
+            .await
+            .unwrap();
+        service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("http://127.0.0.1/".into()),
+                    header_overrides: vec![HeaderPatch {
+                        name: "Cookie".into(),
+                        value: b"sid=explicit".to_vec(),
+                    }],
+                    ..Default::default()
+                },
+                ProtocolPreference::H1,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let requests = recorded.lock().unwrap();
+        assert!(requests[0]
+            .iter()
+            .any(|(name, value)| name == "Cookie" && value == b"sid=managed"));
+        assert!(requests[1]
+            .iter()
+            .any(|(name, value)| name == "Cookie" && value == b"sid=explicit"));
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ pub mod app;
 pub mod browser;
 pub mod codec;
 pub mod config;
+pub mod cookies;
 pub mod domain;
 pub mod fuzzer;
 pub mod history;

@@ -88,13 +88,14 @@ fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List, create, or set optional capture scope","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
+        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"type":"string"},"file_path":{"type":"string"}},"required":["project_id","action"]}},
         {"name":"history_search","description":"Search exchange history","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string"},"limit":{"type":"integer"}},"required":["project_id"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_body","description":"Get exchange body preview","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List/create reply tabs","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":{"type":"object"}},"required":["project_id","action"]}},
         {"name":"reply_send","description":"Send a reply draft","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":{"type":"object"}},"required":["project_id"]}},
-        {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"}},"required":["project_id","target_url","request"]}},
+        {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a fuzz job","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":{"type":"object"},"confirm_large":{"type":"boolean"}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, or cancel fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"job_id":{"type":"integer"},"limit":{"type":"integer"},"before_case_index":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"browser_start","description":"Start browser session","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string"}},"required":["project_id"]}},
@@ -435,6 +436,53 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 )),
             }
         }
+        "cookies" => {
+            let project_id = require_project_id(&args)?;
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+            match action {
+                "list" => Ok(json!({
+                    "profiles": state.db.list_cookie_profiles(project_id).await?
+                })),
+                "set" => {
+                    let target_url = args
+                        .get("target_url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("target_url required"))?;
+                    let inline = args.get("cookie").and_then(Value::as_str);
+                    let file_path = args.get("file_path").and_then(Value::as_str);
+                    let cookie = match (inline, file_path) {
+                        (Some(value), None) => value.to_string(),
+                        (None, Some(path)) => {
+                            crate::cookies::read_cookie_file(std::path::Path::new(path))?
+                        }
+                        _ => {
+                            return Err(DomainError::invalid(
+                                "provide exactly one of cookie or file_path",
+                            ))
+                        }
+                    };
+                    Ok(json!(
+                        crate::cookies::set_project_cookie(&state, project_id, target_url, cookie,)
+                            .await?
+                    ))
+                }
+                "clear" => {
+                    let target_url = args
+                        .get("target_url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("target_url required"))?;
+                    Ok(json!({
+                        "cleared": crate::cookies::clear_project_cookie(
+                            &state,
+                            project_id,
+                            target_url,
+                        )
+                        .await?
+                    }))
+                }
+                _ => Err(DomainError::invalid("action must be set|list|clear")),
+            }
+        }
         "history_search" => {
             let project_id = require_project_id(&args)?;
             let filter = args
@@ -489,11 +537,24 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("max_bytes")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(4096) as usize;
-            let body = state
+            let mut body = state
                 .db
                 .load_raw_body(project_id, ExchangeId(eid), side)
                 .await?
                 .unwrap_or_default();
+            if side == MessageSide::Request {
+                let detail = state
+                    .db
+                    .get_exchange_detail(
+                        project_id,
+                        ExchangeId(eid),
+                        PresentationOptions::default(),
+                    )
+                    .await?;
+                if detail.protocol == "HTTP/1.1 raw" {
+                    body = crate::reply::redact_raw_request_headers(&body);
+                }
+            }
             let slice = &body[..body.len().min(max)];
             Ok(json!({
                 "total": body.len(),
@@ -657,6 +718,9 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .map(ReplyTabId),
                     target_url,
                     request_bytes,
+                    args.get("use_project_cookies")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 )
                 .await?;
             if let Some(exchange_id) = result.exchange_id {

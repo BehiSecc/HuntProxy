@@ -123,6 +123,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/projects/{id}", get(get_project))
         .route("/api/v1/projects/{id}/scope", post(update_project_scope))
         .route(
+            "/api/v1/projects/{id}/cookies",
+            get(list_project_cookies)
+                .put(set_project_cookie)
+                .delete(clear_project_cookie),
+        )
+        .route(
             "/api/v1/projects/{id}/capture-sessions",
             get(list_capture_sessions).post(create_capture_session),
         )
@@ -268,6 +274,49 @@ async fn get_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>) ->
     match state.db.get_project(ProjectId(id)).await {
         Ok(p) => Json(p).into_response(),
         Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetCookieBody {
+    target_url: String,
+    cookie: String,
+}
+
+async fn list_project_cookies(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match state.db.list_cookie_profiles(ProjectId(id)).await {
+        Ok(profiles) => Json(serde_json::json!({ "profiles": profiles })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn set_project_cookie(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<SetCookieBody>,
+) -> Response {
+    match crate::cookies::set_project_cookie(&state, ProjectId(id), &body.target_url, body.cookie)
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ClearCookieBody {
+    target_url: String,
+}
+
+async fn clear_project_cookie(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<ClearCookieBody>,
+) -> Response {
+    match crate::cookies::clear_project_cookie(&state, ProjectId(id), &body.target_url).await {
+        Ok(Some(result)) => Json(result).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error_response(error),
     }
 }
 
@@ -511,7 +560,22 @@ async fn get_body(
         .load_raw_body(ProjectId(id), ExchangeId(eid), side)
         .await
     {
-        Ok(Some(body)) => {
+        Ok(Some(mut body)) => {
+            if side == MessageSide::Request {
+                if let Ok(detail) = state
+                    .db
+                    .get_exchange_detail(
+                        ProjectId(id),
+                        ExchangeId(eid),
+                        PresentationOptions::default(),
+                    )
+                    .await
+                {
+                    if detail.protocol == "HTTP/1.1 raw" {
+                        body = crate::reply::redact_raw_request_headers(&body);
+                    }
+                }
+            }
             let total = body.len();
             let end = (offset + max_bytes).min(total);
             let slice = if offset >= total {
@@ -658,6 +722,8 @@ struct RawReplySendBody {
     #[serde(default)]
     encoding: Option<String>,
     tab_id: Option<i64>,
+    #[serde(default)]
+    use_project_cookies: bool,
 }
 
 async fn reply_send_raw(
@@ -687,6 +753,7 @@ async fn reply_send_raw(
             body.tab_id.map(ReplyTabId),
             &body.target_url,
             request_bytes,
+            body.use_project_cookies,
         )
         .await
     {

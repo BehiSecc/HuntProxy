@@ -506,6 +506,9 @@ async function handle(req) {
         const session = { ...runtime, engine, proxy: params.proxy || null, caCertPath };
         sessions.set(sessionId, session);
         try {
+          if (Array.isArray(params.cookies) && params.cookies.length) {
+            await session.context.addCookies(params.cookies);
+          }
           if (params.url && params.url !== "about:blank") {
             await session.page.goto(params.url, {
               waitUntil: "domcontentloaded",
@@ -535,6 +538,43 @@ async function handle(req) {
           data: result.data,
           checkpoint,
         });
+      }
+      case "session.set_cookies": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        if (!Array.isArray(params.cookies) || !params.cookies.length) {
+          throw rpcError(-32602, "cookies must be a non-empty array");
+        }
+        if (Array.isArray(params.clear_names) && params.clear_names.length) {
+          if (typeof params.target_url !== "string") {
+            throw rpcError(-32602, "target_url is required when replacing cookies");
+          }
+          await session.context.addCookies(params.clear_names.map((name) => ({
+            name,
+            value: "",
+            url: params.target_url,
+            expires: 1,
+          })));
+        }
+        await session.context.addCookies(params.cookies);
+        return respond(id, { checkpoint: await extractCheckpoint(session) });
+      }
+      case "session.clear_cookies": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        if (typeof params.target_url !== "string" || !Array.isArray(params.names)) {
+          throw rpcError(-32602, "target_url and names are required");
+        }
+        const expired = params.names.map((name) => ({
+          name,
+          value: "",
+          url: params.target_url,
+          expires: 1,
+        }));
+        if (expired.length) await session.context.addCookies(expired);
+        return respond(id, { checkpoint: await extractCheckpoint(session) });
       }
       case "session.checkpoint": {
         const sessionId = Number(params.session_id);

@@ -4,6 +4,7 @@ mod annotations;
 mod audit;
 mod bodies;
 mod browser_store;
+mod cookies;
 mod db;
 mod exchanges;
 mod fuzz_store;
@@ -25,6 +26,8 @@ pub use annotations::*;
 pub use audit::*;
 #[allow(unused_imports)]
 pub use browser_store::*;
+#[allow(unused_imports)]
+pub use cookies::*;
 #[allow(unused_imports)]
 pub use fuzz_store::*;
 #[allow(unused_imports)]

@@ -60,6 +60,13 @@ args = ["mcp"]
 `HuntProxy mcp` starts the local daemon automatically. Project-scoped tools
 require an explicit `project_id`.
 
+To reuse an authenticated session, call the `cookies` tool with `action: "set"`,
+the project's ID, a target URL, and either the exact Cookie header value in
+`cookie` or a local `file_path`. Values remain hidden from normal tool output.
+Matching cookies are then used automatically by Reply, Fuzzer, and new or
+active browser sessions. Raw Reply remains byte-exact unless
+`use_project_cookies: true` is explicitly set.
+
 If your MCP client cannot find `HuntProxy`, use the absolute path printed by
 the installer (normally `/home/you/.local/bin/HuntProxy`); MCP clients do not
 always inherit your shell's `PATH`.
@@ -78,6 +85,7 @@ Proxy credential before sending traffic through `127.0.0.1:17891`.
 Example agent tasks:
 
 - “Create a project for `https://example.com` and inspect its login flow.”
+- “Set project 1 cookies for `https://example.com` from `/tmp/cookies.txt`, then browse `/account`.”
 - “Show POST requests in project 1 and compare their responses.”
 - “Send this exact raw HTTP/1.1 request with CRLF using `reply_send_raw`.”
 

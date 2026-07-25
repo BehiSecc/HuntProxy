@@ -1,5 +1,6 @@
 //! Browser worker supervision, real actions, and memory-only session checkpoints.
 
+use crate::cookies::{CookiePair, StoredCookieProfile};
 use crate::domain::*;
 use crate::storage::{CreateCaptureSession, Db};
 use serde::{Deserialize, Serialize};
@@ -554,6 +555,8 @@ impl BrowserService {
                 "browser capture credential missing one-time token",
             )
         })?;
+        let managed_cookies =
+            browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
         let worker_result = self
             .call_worker(
                 "session.start",
@@ -568,6 +571,7 @@ impl BrowserService {
                         "password": token,
                     },
                     "ca_cert_path": self.ca_cert_path.as_ref().map(|path| path.display().to_string()),
+                    "cookies": managed_cookies,
                 }),
             )
             .await;
@@ -600,6 +604,96 @@ impl BrowserService {
             },
         );
         Ok(session)
+    }
+
+    /// Apply a managed cookie profile to every active browser session in the
+    /// project. The worker checkpoints each session so Lightpanda→Chromium
+    /// migration carries the imported cookies forward.
+    pub async fn apply_cookie_profile(
+        &self,
+        project_id: ProjectId,
+        previous: Option<&StoredCookieProfile>,
+        profile: &StoredCookieProfile,
+    ) -> DomainResult<usize> {
+        let cookies = browser_cookies(std::slice::from_ref(profile))?;
+        let previous_names = previous
+            .map(StoredCookieProfile::pairs)
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pair| pair.name)
+            .collect::<Vec<_>>();
+        let session_ids = self.active_session_ids(project_id).await;
+        for session_id in &session_ids {
+            let result = self
+                .call_worker(
+                    "session.set_cookies",
+                    json!({
+                        "session_id": session_id.get(),
+                        "cookies": cookies.clone(),
+                        "target_url": profile.target_url,
+                        "clear_names": previous_names,
+                    }),
+                )
+                .await?;
+            self.save_cookie_checkpoint(project_id, *session_id, &result)
+                .await?;
+        }
+        Ok(session_ids.len())
+    }
+
+    pub async fn clear_cookie_profile(
+        &self,
+        project_id: ProjectId,
+        profile: &StoredCookieProfile,
+    ) -> DomainResult<usize> {
+        let session_ids = self.active_session_ids(project_id).await;
+        let pairs = profile.pairs()?;
+        for session_id in &session_ids {
+            let result = self
+                .call_worker(
+                    "session.clear_cookies",
+                    json!({
+                        "session_id": session_id.get(),
+                        "target_url": profile.target_url,
+                        "names": pairs.iter().map(|pair| &pair.name).collect::<Vec<_>>(),
+                    }),
+                )
+                .await?;
+            self.save_cookie_checkpoint(project_id, *session_id, &result)
+                .await?;
+        }
+        Ok(session_ids.len())
+    }
+
+    async fn active_session_ids(&self, project_id: ProjectId) -> Vec<BrowserSessionId> {
+        self.runtime_sessions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, runtime)| {
+                (runtime.project_id == project_id).then_some(BrowserSessionId(*id))
+            })
+            .collect()
+    }
+
+    async fn save_cookie_checkpoint(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        result: &Value,
+    ) -> DomainResult<()> {
+        let checkpoint = result.get("checkpoint").ok_or_else(|| {
+            DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
+        })?;
+        let saved = self
+            .save_checkpoint(project_id, session_id, checkpoint, "ok")
+            .await?;
+        let mut session = self.db.get_browser_session(project_id, session_id).await?;
+        session.current_url = saved.url;
+        session.checkpoint_status = Some("ok".into());
+        session.checkpoint_hash = Some(saved.hash);
+        self.db.update_browser_session(&session).await
     }
 
     pub async fn action(
@@ -960,6 +1054,27 @@ fn engine_name(engine: BrowserEngine) -> &'static str {
     }
 }
 
+fn browser_cookies(profiles: &[StoredCookieProfile]) -> DomainResult<Vec<Value>> {
+    let mut output = Vec::new();
+    for profile in profiles {
+        // A Cookie header can contain duplicate names from different paths,
+        // but it carries no path metadata. For browser import, the last value
+        // wins and becomes a host-only, root-path session cookie.
+        let mut pairs = BTreeMap::<String, CookiePair>::new();
+        for pair in profile.pairs()? {
+            pairs.insert(pair.name.clone(), pair);
+        }
+        output.extend(pairs.into_values().map(|pair| {
+            json!({
+                "name": pair.name,
+                "value": pair.value,
+                "url": profile.target_url,
+            })
+        }));
+    }
+    Ok(output)
+}
+
 fn existing_path(configured: Option<PathBuf>, executable_name: &str) -> Option<PathBuf> {
     configured
         .filter(|path| path.exists())
@@ -1204,6 +1319,26 @@ mod tests {
         checkpoint.version = 99;
         checkpoint.hash = "old".into();
         assert_eq!(first, checkpoint_hash(&checkpoint).unwrap());
+    }
+
+    #[test]
+    fn browser_cookie_import_is_host_only_and_last_duplicate_wins() {
+        let profile = StoredCookieProfile {
+            project_id: ProjectId(1),
+            host: "example.com".into(),
+            target_url: "https://example.com/".into(),
+            cookie_header: "sid=old; theme=dark; sid=new".into(),
+            names: vec!["sid".into(), "theme".into()],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let cookies = browser_cookies(&[profile]).unwrap();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().any(|cookie| {
+            cookie["name"] == "sid"
+                && cookie["value"] == "new"
+                && cookie["url"] == "https://example.com/"
+        }));
     }
 
     #[test]

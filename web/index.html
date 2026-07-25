@@ -159,6 +159,20 @@
       <button class="btn primary" id="createProject" style="width:100%;margin-top:.55rem">Create</button>
       <button class="btn" id="saveScope" style="width:100%;margin-top:.4rem">Save capture scope</button>
 
+      <h3>Session cookies</h3>
+      <label for="cookieTarget">Target URL</label>
+      <input id="cookieTarget" placeholder="https://app.example.com" />
+      <label for="cookieValue">Cookie header value</label>
+      <textarea id="cookieValue" class="mono" style="min-height:70px" placeholder="session=...; csrf=..."></textarea>
+      <label for="cookieFile">Or load a cookie file</label>
+      <input id="cookieFile" type="file" />
+      <div class="row" style="margin-top:.4rem">
+        <button class="btn primary" id="setCookies">Set</button>
+        <button class="btn" id="clearCookies">Clear</button>
+      </div>
+      <p class="small muted">Values stay hidden. Applies to Reply, Fuzzer, Raw opt-in, and Browser.</p>
+      <div class="status" id="cookieStatus"></div>
+
       <h3>Proxy credential</h3>
       <p class="small muted">Copy once. The raw token is never stored.</p>
       <div class="row">
@@ -246,6 +260,7 @@
             <label for="rawReplyRequest">Exact HTTP/1.1 request</label>
             <textarea id="rawReplyRequest" class="mono" style="min-height:180px" placeholder="GET / HTTP/1.1&#10;Host: example.com&#10;Connection: close&#10;&#10;"></textarea>
             <label><input type="checkbox" id="rawReplyCrlf" checked style="width:auto" /> Convert editor line breaks to CRLF</label>
+            <label><input type="checkbox" id="rawReplyCookies" style="width:auto" /> Use managed cookies for this target</label>
             <button class="btn primary" id="sendRawReply">Send raw HTTP/1.1</button>
           </details>
           <pre class="mono hidden" id="replyResult"></pre>
@@ -403,7 +418,9 @@ test
         const project = await api(`/api/v1/projects/${state.projectId}`);
         $('scopeHosts').value = (project.scope?.host_patterns || []).join(', ');
       } catch (_) {}
-      await Promise.allSettled([loadHistory(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus()]);
+      $('cookieValue').value = '';
+      $('cookieFile').value = '';
+      await Promise.allSettled([loadHistory(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus(), loadCookies()]);
     }
 
     $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
@@ -427,6 +444,49 @@ test
         });
         status('sideStatus', hosts.length ? 'Capture scope saved' : 'Capture scope cleared; saving all traffic', 'ok');
       } catch (e) { status('sideStatus', e.message, 'err'); }
+    };
+
+    async function loadCookies() {
+      if (!state.projectId) return;
+      const result = await api(`/api/v1/projects/${state.projectId}/cookies`);
+      const profiles = result.profiles || [];
+      $('cookieStatus').textContent = profiles.length
+        ? profiles.map(profile => `${profile.host}: ${profile.names.join(', ')}`).join(' · ')
+        : 'No managed cookies.';
+    }
+
+    $('cookieFile').onchange = async event => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      let value = await file.text();
+      value = value.replace(/\r?\n$/, '');
+      $('cookieValue').value = value;
+    };
+
+    $('setCookies').onclick = async () => {
+      if (!state.projectId) return status('cookieStatus', 'Select a project', 'err');
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/cookies`, {
+          method: 'PUT',
+          body: JSON.stringify({ target_url: $('cookieTarget').value.trim(), cookie: $('cookieValue').value }),
+        });
+        $('cookieValue').value = '';
+        $('cookieFile').value = '';
+        status('cookieStatus', `Cookies set for ${result.profile.host}; ${result.active_browser_sessions_updated} active browser session(s) updated`, 'ok');
+      } catch (error) { status('cookieStatus', error.message, 'err'); }
+    };
+
+    $('clearCookies').onclick = async () => {
+      if (!state.projectId) return status('cookieStatus', 'Select a project', 'err');
+      try {
+        await api(`/api/v1/projects/${state.projectId}/cookies`, {
+          method: 'DELETE',
+          body: JSON.stringify({ target_url: $('cookieTarget').value.trim() }),
+        });
+        $('cookieValue').value = '';
+        $('cookieFile').value = '';
+        await loadCookies();
+      } catch (error) { status('cookieStatus', error.message, 'err'); }
     };
     $('newCredential').onclick = async () => {
       if (!state.projectId) return status('sideStatus', 'Select a project', 'err');
@@ -618,7 +678,13 @@ test
       try {
         const result = await api(`/api/v1/projects/${state.projectId}/reply-send-raw`, {
           method: 'POST',
-          body: JSON.stringify({ target_url: targetUrl, request, encoding: 'utf8', tab_id: state.activeReplyTab?.id || null }),
+          body: JSON.stringify({
+            target_url: targetUrl,
+            request,
+            encoding: 'utf8',
+            tab_id: state.activeReplyTab?.id || null,
+            use_project_cookies: $('rawReplyCookies').checked,
+          }),
         });
         $('replyResult').classList.remove('hidden'); $('replyResult').textContent = JSON.stringify(result, null, 2);
         status('replyStatus', result.exchange_id ? `Raw request saved as exchange ${result.exchange_id}` : 'Raw request sent (outside capture scope)', 'ok');

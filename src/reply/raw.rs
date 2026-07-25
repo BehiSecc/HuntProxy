@@ -35,12 +35,23 @@ impl ReplyService {
         project_id: ProjectId,
         tab_id: Option<ReplyTabId>,
         target_url: &str,
-        request_bytes: Vec<u8>,
+        mut request_bytes: Vec<u8>,
+        use_project_cookies: bool,
     ) -> DomainResult<RawReplyResult> {
         let project = self.db.get_project(project_id).await?;
         let target = TargetRef::from_url(target_url)?;
         if request_bytes.is_empty() {
             return Err(DomainError::invalid("raw HTTP/1.1 request cannot be empty"));
+        }
+        if use_project_cookies {
+            let profile = self
+                .db
+                .get_cookie_profile_for_url(project_id, target_url)
+                .await?
+                .ok_or_else(|| {
+                    DomainError::not_found("no managed cookies configured for target host")
+                })?;
+            request_bytes = inject_cookie_header(&request_bytes, &profile.cookie_header)?;
         }
         let request_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
         if request_bytes.len() as u64 > request_cap {
@@ -358,6 +369,103 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// Replace or add a Cookie header in a conventional CRLF-framed raw request.
+/// This is used only when the caller explicitly opts into managed cookies.
+pub fn inject_cookie_header(request: &[u8], cookie_value: &str) -> DomainResult<Vec<u8>> {
+    let header_end = find_header_end(request).ok_or_else(|| {
+        DomainError::invalid("managed cookie injection requires a CRLF-framed header block")
+    })?;
+    let head = &request[..header_end - 4];
+    let body = &request[header_end..];
+    let lines = head.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    if lines.is_empty() || lines[0].strip_suffix(b"\r").is_none() {
+        return Err(DomainError::invalid("invalid raw HTTP/1.1 request line"));
+    }
+    let line_count = lines.len();
+    let mut output = Vec::with_capacity(request.len() + cookie_value.len() + 12);
+    output.extend_from_slice(lines[0]);
+    output.push(b'\n');
+    let mut replaced = false;
+    for (index, line) in lines.into_iter().enumerate().skip(1) {
+        let line_without_cr = if index + 1 < line_count {
+            line.strip_suffix(b"\r").ok_or_else(|| {
+                DomainError::invalid("managed cookie injection requires CRLF header lines")
+            })?
+        } else {
+            line
+        };
+        if line_without_cr.starts_with(b" ") || line_without_cr.starts_with(b"\t") {
+            return Err(DomainError::invalid(
+                "managed cookie injection requires ordinary HTTP header lines",
+            ));
+        }
+        let colon = line_without_cr
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| DomainError::invalid("raw header line is missing ':'"))?;
+        let name = &line_without_cr[..colon];
+        if name.eq_ignore_ascii_case(b"cookie") {
+            if !replaced {
+                output.extend_from_slice(name);
+                output.extend_from_slice(b": ");
+                output.extend_from_slice(cookie_value.as_bytes());
+                output.extend_from_slice(b"\r\n");
+                replaced = true;
+            }
+        } else {
+            output.extend_from_slice(line_without_cr);
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+    if !replaced {
+        output.extend_from_slice(b"Cookie: ");
+        output.extend_from_slice(cookie_value.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(body);
+    Ok(output)
+}
+
+/// Best-effort presentation redaction for raw HTTP requests stored as bodies.
+pub fn redact_raw_request_headers(request: &[u8]) -> Vec<u8> {
+    let (head_end, body_start) = if let Some(index) = find_bytes(request, b"\r\n\r\n") {
+        (index, index + 4)
+    } else if let Some(index) = find_bytes(request, b"\n\n") {
+        (index, index + 2)
+    } else {
+        (request.len(), request.len())
+    };
+    let mut output = Vec::with_capacity(request.len());
+    let head = &request[..head_end];
+    for (index, line) in head.split(|byte| *byte == b'\n').enumerate() {
+        if index > 0 {
+            output.push(b'\n');
+        }
+        let line_without_cr = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line_without_cr.iter().position(|byte| *byte == b':') else {
+            output.extend_from_slice(line);
+            continue;
+        };
+        let name = &line_without_cr[..colon];
+        let sensitive = std::str::from_utf8(name)
+            .ok()
+            .is_some_and(crate::policy::is_sensitive_header);
+        if sensitive {
+            output.extend_from_slice(name);
+            output.extend_from_slice(b": <redacted>");
+            if line.ends_with(b"\r") {
+                output.push(b'\r');
+            }
+        } else {
+            output.extend_from_slice(line);
+        }
+    }
+    output.extend_from_slice(&request[head_end..body_start]);
+    output.extend_from_slice(&request[body_start..]);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +491,39 @@ mod tests {
         assert_eq!(parsed.status_code, Some(201));
         assert_eq!(parsed.headers.len(), 2);
         assert_eq!(parsed.body, b"body");
+    }
+
+    #[test]
+    fn managed_cookie_injection_replaces_cookie_and_preserves_body() {
+        let request =
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nCookie: old=1\r\nX-Test: yes\r\n\r\nbody";
+        let injected = inject_cookie_header(request, "sid=a==; theme=dark").unwrap();
+        assert_eq!(
+            injected,
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nCookie: sid=a==; theme=dark\r\nX-Test: yes\r\n\r\nbody"
+        );
+        let presented = redact_raw_request_headers(&injected);
+        assert!(!String::from_utf8_lossy(&presented).contains("a=="));
+        assert!(String::from_utf8_lossy(&presented).contains("Cookie: <redacted>"));
+        assert_eq!(
+            redact_raw_request_headers(b"GET / HTTP/1.1\nCookie: secret"),
+            b"GET / HTTP/1.1\nCookie: <redacted>"
+        );
+
+        let added = inject_cookie_header(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "sid=managed",
+        )
+        .unwrap();
+        assert_eq!(
+            added,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nCookie: sid=managed\r\n\r\n"
+        );
+        assert!(inject_cookie_header(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n folded\r\n\r\n",
+            "sid=managed"
+        )
+        .is_err());
     }
 
     #[tokio::test]

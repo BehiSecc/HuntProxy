@@ -213,3 +213,64 @@ async fn optional_capture_scope_can_be_updated_through_http_api() {
     let project = json_response(response).await;
     assert_eq!(project["scope"]["host_patterns"][0], "*.example.com");
 }
+
+#[tokio::test]
+async fn managed_cookies_are_configured_without_exposing_values() {
+    let (_directory, state, project_id) = test_state().await;
+    let app = bb::api::router(state);
+    let set = app
+        .clone()
+        .oneshot(
+            Request::put(format!("/api/v1/projects/{}/cookies", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "target_url": "https://example.com/login",
+                        "cookie": "sid=super-secret; csrf=also-secret"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+    let set_text =
+        String::from_utf8(set.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(!set_text.contains("super-secret"));
+    assert!(set_text.contains("sid"));
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}/cookies", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_text = String::from_utf8(
+        list.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!list_text.contains("super-secret"));
+    assert!(list_text.contains("example.com"));
+
+    let clear = app
+        .oneshot(
+            Request::delete(format!("/api/v1/projects/{}/cookies", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "target_url": "https://example.com" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(clear.status(), StatusCode::OK);
+}
