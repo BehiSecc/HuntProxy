@@ -155,6 +155,44 @@ fn browser_action_schema() -> Value {
     })
 }
 
+fn fuzz_template_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Use marker §name§ in the selected draft field. Example: draft.url='https://example.test/?q=§q§' with insertion point {name:'q', location:'url'}.",
+        "properties": {
+            "base_exchange_id": {"type": ["integer", "null"]},
+            "draft": reply_draft_schema(),
+            "insertion_points": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1, "description": "Marker name without section signs; name q maps to §q§."},
+                        "location": {"type": "string", "pattern": "^(url|body|header:.+)$", "description": "Use url, body, or header:<header-name>."}
+                    },
+                    "required": ["name", "location"],
+                    "additionalProperties": false
+                }
+            },
+            "wordlists": {
+                "type": "array",
+                "minItems": 1,
+                "description": "One array of payload strings per insertion point; sniper may use one shared array.",
+                "items": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+            },
+            "transforms": {
+                "type": "array",
+                "default": [],
+                "items": {"type": "string", "enum": ["raw", "hex_encode", "hex_decode", "base64_encode", "base64_decode", "base64_url_encode", "base64_url_decode", "url_encode", "url_decode", "html_encode", "html_decode"]}
+            },
+            "strategy": {"type": "string", "enum": ["sniper", "battering_ram", "pitchfork", "cluster_bomb"], "default": "sniper"}
+        },
+        "required": ["insertion_points", "wordlists"],
+        "additionalProperties": false
+    })
+}
+
 fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List, create, or set optional capture scope","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
@@ -167,8 +205,8 @@ fn tool_defs() -> Value {
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
         {"name":"reply_send","description":"Send a semantic HTTP request. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]}},"required":["project_id"]}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
-        {"name":"fuzz_start","description":"Start a fuzz job","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":{"type":"object"},"confirm_large":{"type":"boolean"}},"required":["project_id","template"]}},
-        {"name":"fuzz_manage","description":"List, inspect, or cancel fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"job_id":{"type":"integer"},"limit":{"type":"integer"},"before_case_index":{"type":"integer"}},"required":["project_id","action"]}},
+        {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
+        {"name":"fuzz_manage","description":"List, inspect, cancel, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases"]},"job_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
         {"name":"browser_start","description":"Start a browser session. Auto prefers Lightpanda and falls back to Chromium when startup/navigation fails.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank"},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
         {"name":"browser_manage","description":"Get status, stop one browser, stop all browsers in a project, or migrate Lightpanda state to Chromium. session_id is not needed for stop_all.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium"]}},"required":["project_id","op"]}},
@@ -1185,5 +1223,16 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "session_id"));
+        let fuzz_start = tools
+            .iter()
+            .find(|tool| tool["name"] == "fuzz_start")
+            .unwrap();
+        let template = &fuzz_start["inputSchema"]["properties"]["template"];
+        assert_eq!(template["properties"]["strategy"]["default"], "sniper");
+        assert_eq!(
+            template["properties"]["insertion_points"]["items"]["properties"]["location"]
+                ["pattern"],
+            "^(url|body|header:.+)$"
+        );
     }
 }

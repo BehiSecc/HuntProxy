@@ -348,8 +348,12 @@ async fn ensure_daemon(cfg: &Config) -> DomainResult<()> {
             });
         }
     }
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| DomainError::new(ErrorCode::Unavailable, format!("auto-start failed: {e}")))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;

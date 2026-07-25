@@ -23,12 +23,20 @@ pub struct InsertionPoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuzzTemplate {
+    #[serde(default)]
     pub base_exchange_id: Option<ExchangeId>,
+    #[serde(default)]
     pub draft: ReplyDraft,
     pub insertion_points: Vec<InsertionPoint>,
     pub wordlists: Vec<Vec<String>>,
+    #[serde(default)]
     pub transforms: Vec<crate::codec::Transform>,
+    #[serde(default = "default_fuzz_strategy")]
     pub strategy: FuzzStrategy,
+}
+
+fn default_fuzz_strategy() -> FuzzStrategy {
+    FuzzStrategy::Sniper
 }
 
 pub fn estimate_cases(strategy: FuzzStrategy, points: usize, list_lens: &[usize]) -> u64 {
@@ -729,7 +737,17 @@ fn apply_insertion(
                 .map_err(|_| DomainError::invalid("URL payload must be UTF-8 after transforms"))?;
             draft.url = Some(match draft.url.take() {
                 Some(url) if url.contains(&marker) => url.replace(&marker, payload),
-                _ => payload.to_string(),
+                _ if url::Url::parse(payload)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https")) =>
+                {
+                    payload.to_string()
+                }
+                _ => {
+                    return Err(DomainError::invalid(format!(
+                        "URL insertion point '{}' requires marker '{}' in draft.url; without a marker each payload must be an absolute URL",
+                        point.name, marker
+                    )))
+                }
             });
         }
         location if location.starts_with("header:") => {
@@ -1013,6 +1031,48 @@ mod tests {
             prepared.draft.body_override.as_deref(),
             Some(b"before=78".as_slice())
         );
+    }
+
+    #[test]
+    fn minimal_template_defaults_to_sniper_without_transforms() {
+        let template: FuzzTemplate = serde_json::from_value(serde_json::json!({
+            "draft": {"url": "https://example.test/?q=§q§"},
+            "insertion_points": [{"name": "q", "location": "url"}],
+            "wordlists": [["alpha"]]
+        }))
+        .unwrap();
+
+        assert_eq!(template.strategy, FuzzStrategy::Sniper);
+        assert!(template.transforms.is_empty());
+        assert_eq!(template.base_exchange_id, None);
+    }
+
+    #[test]
+    fn url_payload_without_matching_marker_has_actionable_error() {
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("https://example.test/?q=§other§".into()),
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "q".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![vec!["alpha".into()]],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+        };
+        let case = CaseIterator::new(
+            template.strategy,
+            template.insertion_points.len(),
+            template.wordlists.clone(),
+        )
+        .next()
+        .unwrap();
+        let error = prepare_case(&template, &case).unwrap_err();
+
+        assert!(error.message.contains("requires marker '§q§'"));
     }
 
     #[tokio::test]
