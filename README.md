@@ -67,6 +67,12 @@ Matching cookies are then used automatically by Reply, Fuzzer, and new or
 active browser sessions. Raw Reply remains byte-exact unless
 `use_project_cookies: true` is explicitly set.
 
+Use `browser_manage` with `op: "stop"` for one session or `op: "stop_all"`
+to close every browser in a project. After 30 minutes without MCP/UI control
+activity, the MCP bridge and daemon exit and all browser processes are closed.
+Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
+use `0` to disable it.
+
 If your MCP client cannot find `HuntProxy`, use the absolute path printed by
 the installer (normally `/home/you/.local/bin/HuntProxy`); MCP clients do not
 always inherit your shell's `PATH`.

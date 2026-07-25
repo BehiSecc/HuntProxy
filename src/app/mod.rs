@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +31,34 @@ pub struct AppState {
     pub browser: Arc<BrowserService>,
     pub events: broadcast::Sender<AppEvent>,
     pub shutdown: CancellationToken,
+    pub activity: ActivityTracker,
+}
+
+#[derive(Clone)]
+pub struct ActivityTracker {
+    last_control_activity: Arc<parking_lot::Mutex<Instant>>,
+}
+
+impl ActivityTracker {
+    pub fn new() -> Self {
+        Self {
+            last_control_activity: Arc::new(parking_lot::Mutex::new(Instant::now())),
+        }
+    }
+
+    pub fn touch(&self) {
+        *self.last_control_activity.lock() = Instant::now();
+    }
+
+    pub fn idle_for(&self) -> Duration {
+        self.last_control_activity.lock().elapsed()
+    }
+}
+
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub async fn run_daemon(config: Config) -> DomainResult<()> {
@@ -48,6 +77,36 @@ pub async fn run_daemon(config: Config) -> DomainResult<()> {
     let uds_listener = crate::api::bind_uds(&config.socket_path())?;
 
     let mut servers = tokio::task::JoinSet::new();
+
+    let idle_monitor = if config.idle_timeout_seconds == 0 {
+        None
+    } else {
+        let state = state.clone();
+        let timeout = Duration::from_secs(config.idle_timeout_seconds);
+        Some(tokio::spawn(async move {
+            loop {
+                let idle_for = state.activity.idle_for();
+                if idle_for >= timeout {
+                    if state.fuzzer.has_active_jobs() {
+                        tokio::select! {
+                            _ = state.shutdown.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
+                        }
+                    }
+                    tracing::info!(
+                        idle_seconds = idle_for.as_secs(),
+                        "control-plane inactivity timeout reached; shutting down"
+                    );
+                    state.shutdown.cancel();
+                    break;
+                }
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(timeout - idle_for) => {}
+                }
+            }
+        }))
+    };
 
     // API
     {
@@ -96,6 +155,11 @@ pub async fn run_daemon(config: Config) -> DomainResult<()> {
             state.shutdown.cancel();
             None
         }
+        _ = termination_signal() => {
+            tracing::info!("termination signal received, shutting down");
+            state.shutdown.cancel();
+            None
+        }
         result = servers.join_next() => {
             state.shutdown.cancel();
             match result {
@@ -116,12 +180,31 @@ pub async fn run_daemon(config: Config) -> DomainResult<()> {
         }
     };
     state.shutdown.cancel();
+    if let Err(error) = state.browser.stop_all().await {
+        tracing::warn!(%error, "failed to stop every browser during shutdown");
+    }
     while servers.join_next().await.is_some() {}
+    if let Some(idle_monitor) = idle_monitor {
+        let _ = idle_monitor.await;
+    }
     cleanup_daemon_files(&config);
     match server_error {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            let _ = signal.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
@@ -182,6 +265,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         browser,
         events,
         shutdown: CancellationToken::new(),
+        activity: ActivityTracker::new(),
     }))
 }
 

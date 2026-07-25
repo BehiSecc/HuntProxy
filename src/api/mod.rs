@@ -116,6 +116,7 @@ pub async fn serve_uds_listener(
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    let activity_state = state.clone();
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/version", get(version))
@@ -185,7 +186,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/codec", post(codec_transform))
         .route("/", get(ui_index))
+        .layer(axum::middleware::from_fn_with_state(
+            activity_state,
+            track_control_activity,
+        ))
         .with_state(state)
+}
+
+async fn track_control_activity(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !matches!(
+        request.uri().path(),
+        "/api/v1/health" | "/api/v1/version" | "/api/v1/doctor"
+    ) {
+        state.activity.touch();
+    }
+    next.run(request).await
 }
 
 fn private_router(state: Arc<AppState>) -> Router {
@@ -207,6 +226,7 @@ async fn internal_mcp_call(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InternalMcpCall>,
 ) -> Response {
+    state.activity.touch();
     match crate::mcp::call_tool(state, &body.name, body.arguments).await {
         Ok(result) => Json(serde_json::json!({
             "result": result,
@@ -1021,6 +1041,7 @@ async fn doctor(State(state): State<Arc<AppState>>) -> Response {
         "schema_version": schema,
         "api_listen": state.config.api_listen.to_string(),
         "proxy_listen": state.config.proxy_listen.to_string(),
+        "idle_timeout_seconds": state.config.idle_timeout_seconds,
         "ca_cert": state.config.ca_cert_path().exists(),
         "browser": browser,
     }))

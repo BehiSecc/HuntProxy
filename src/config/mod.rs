@@ -36,6 +36,8 @@ pub struct Config {
     pub node_path: Option<PathBuf>,
     pub browser_worker_path: Option<PathBuf>,
     pub auto_start_daemon: bool,
+    /// Stop an inactive MCP bridge/daemon and its browsers. Zero disables it.
+    pub idle_timeout_seconds: u64,
 }
 
 impl Default for Config {
@@ -58,6 +60,7 @@ impl Default for Config {
             node_path: which_path("node"),
             browser_worker_path: None,
             auto_start_daemon: true,
+            idle_timeout_seconds: 30 * 60,
         }
     }
 }
@@ -119,6 +122,9 @@ impl Config {
         }
         if let Some(v) = f.auto_start_daemon {
             self.auto_start_daemon = v;
+        }
+        if let Some(v) = f.idle_timeout_seconds {
+            self.idle_timeout_seconds = v;
         }
         if let Some(v) = f.lightpanda_path {
             self.lightpanda_path = Some(PathBuf::from(v));
@@ -205,6 +211,7 @@ impl Config {
             busy_timeout_ms: Some(self.busy_timeout_ms),
             max_body_bytes: Some(self.max_body_bytes),
             auto_start_daemon: Some(self.auto_start_daemon),
+            idle_timeout_seconds: Some(self.idle_timeout_seconds),
             lightpanda_path: self
                 .lightpanda_path
                 .as_ref()
@@ -230,6 +237,7 @@ struct ConfigFile {
     busy_timeout_ms: Option<u64>,
     max_body_bytes: Option<u64>,
     auto_start_daemon: Option<bool>,
+    idle_timeout_seconds: Option<u64>,
     lightpanda_path: Option<String>,
     node_path: Option<String>,
 }
@@ -329,5 +337,6 @@ mod tests {
             assert!(config.data_dir.join(relative).is_dir());
         }
         assert!(config.data_dir.join(CONFIG_FILE_NAME).is_file());
+        assert_eq!(config.idle_timeout_seconds, 30 * 60);
     }
 }

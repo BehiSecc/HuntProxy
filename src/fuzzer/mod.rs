@@ -242,6 +242,10 @@ impl FuzzerService {
         }
     }
 
+    pub fn has_active_jobs(&self) -> bool {
+        !self.cancel_flags.is_empty()
+    }
+
     fn project_limiter(&self, project: &Project) -> DomainResult<Arc<ProjectFuzzLimiter>> {
         if let Some(existing) = self.project_limiters.get(&project.id.get()) {
             return Ok(existing.clone());

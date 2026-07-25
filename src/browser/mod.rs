@@ -842,6 +842,55 @@ impl BrowserService {
         Ok(())
     }
 
+    /// Stop every active browser in one project and release the worker when
+    /// the final session closes.
+    pub async fn stop_project(&self, project_id: ProjectId) -> DomainResult<usize> {
+        let sessions = self
+            .runtime_sessions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, runtime)| {
+                (runtime.project_id == project_id).then_some((project_id, BrowserSessionId(*id)))
+            })
+            .collect::<Vec<_>>();
+        self.stop_sessions(sessions).await
+    }
+
+    /// Stop all active browsers across projects during daemon shutdown.
+    pub async fn stop_all(&self) -> DomainResult<usize> {
+        let sessions = self
+            .runtime_sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(id, runtime)| (runtime.project_id, BrowserSessionId(*id)))
+            .collect::<Vec<_>>();
+        self.stop_sessions(sessions).await
+    }
+
+    async fn stop_sessions(
+        &self,
+        sessions: Vec<(ProjectId, BrowserSessionId)>,
+    ) -> DomainResult<usize> {
+        let total = sessions.len();
+        let mut first_error = None;
+        for (project_id, session_id) in sessions {
+            if let Err(error) = self.stop(project_id, session_id).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        if self.runtime_sessions.lock().await.is_empty() {
+            if let Some(mut idle_worker) = self.worker.lock().await.take() {
+                idle_worker.terminate().await;
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(total),
+        }
+    }
+
     pub async fn switch_to_chromium(
         &self,
         project_id: ProjectId,

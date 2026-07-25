@@ -150,6 +150,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
             );
             println!("  api:      {}", cfg.api_listen);
             println!("  proxy:    {}", cfg.proxy_listen);
+            println!("  idle:     {} seconds", cfg.idle_timeout_seconds);
             if let Some(p) = &cfg.lightpanda_path {
                 println!("  lightpanda: {} exists={}", p.display(), p.exists());
             } else {

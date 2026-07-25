@@ -891,6 +891,7 @@ mod tests {
             browser,
             events,
             shutdown: CancellationToken::new(),
+            activity: crate::app::ActivityTracker::new(),
         });
         let project = db
             .create_project(CreateProjectRequest {

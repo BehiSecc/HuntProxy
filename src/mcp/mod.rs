@@ -171,7 +171,7 @@ fn tool_defs() -> Value {
         {"name":"fuzz_manage","description":"List, inspect, or cancel fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"job_id":{"type":"integer"},"limit":{"type":"integer"},"before_case_index":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"browser_start","description":"Start a browser session. Auto prefers Lightpanda and falls back to Chromium when startup/navigation fails.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank"},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
-        {"name":"browser_manage","description":"Get status, stop a browser session, or migrate Lightpanda state to Chromium.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","switch_chromium"]}},"required":["project_id","session_id","op"]}},
+        {"name":"browser_manage","description":"Get status, stop one browser, stop all browsers in a project, or migrate Lightpanda state to Chromium. session_id is not needed for stop_all.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium"]}},"required":["project_id","op"]}},
         {"name":"codec_transform","description":"Apply codec transforms","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_annotate","description":"Set an exchange title, note, and labels","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
@@ -179,32 +179,58 @@ fn tool_defs() -> Value {
 }
 
 pub async fn run_stdio_mcp(state: Arc<AppState>) -> DomainResult<()> {
-    run_stdio_backend(Arc::new(LocalToolBackend { state })).await
+    let idle_timeout = std::time::Duration::from_secs(state.config.idle_timeout_seconds);
+    run_stdio_backend(Arc::new(LocalToolBackend { state }), idle_timeout).await
 }
 
 /// Run the stdio MCP adapter as a thin client of the single daemon owner.
 pub async fn run_stdio_mcp_client(config: Config) -> DomainResult<()> {
-    run_stdio_backend(Arc::new(DaemonToolBackend { config })).await
+    let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_seconds);
+    run_stdio_backend(Arc::new(DaemonToolBackend { config }), idle_timeout).await
 }
 
 pub async fn run_stdio(state: Arc<AppState>) -> DomainResult<()> {
     run_stdio_mcp(state).await
 }
 
-async fn run_stdio_backend(backend: Arc<dyn ToolBackend>) -> DomainResult<()> {
+async fn run_stdio_backend(
+    backend: Arc<dyn ToolBackend>,
+    idle_timeout: std::time::Duration,
+) -> DomainResult<()> {
     eprintln!("HuntProxy mcp: starting stdio JSON-RPC server");
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut line = String::new();
+    // Tokio's stdin reader uses a blocking runtime thread which cannot be
+    // cancelled while the MCP client keeps its pipe open. A detached reader
+    // lets the process actually exit when the inactivity timeout fires.
+    let (line_tx, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in BufReader::new(stdin.lock()).lines() {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| DomainError::new(ErrorCode::ProtocolError, format!("stdin: {e}")))?;
-        if n == 0 {
+        let next_line = if idle_timeout.is_zero() {
+            lines.recv().await
+        } else {
+            match tokio::time::timeout(idle_timeout, lines.recv()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    eprintln!(
+                        "HuntProxy mcp: idle for {} seconds; exiting",
+                        idle_timeout.as_secs()
+                    );
+                    break;
+                }
+            }
+        };
+        let Some(line) = next_line else {
             break;
-        }
+        };
+        let line =
+            line.map_err(|e| DomainError::new(ErrorCode::ProtocolError, format!("stdin: {e}")))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -946,11 +972,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_manage" => {
             let project_id = require_project_id(&args)?;
+            let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("stop");
+            if op == "stop_all" {
+                let stopped = state.browser.stop_project(project_id).await?;
+                return Ok(json!({ "ok": true, "stopped": stopped }));
+            }
             let sid = args
                 .get("session_id")
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| DomainError::invalid("session_id required"))?;
-            let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("stop");
             match op {
                 "stop" | "close" => {
                     state
@@ -973,7 +1003,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .await?
                 )),
                 _ => Err(DomainError::invalid(
-                    "op must be stop|status|switch_chromium",
+                    "op must be stop|stop_all|status|switch_chromium",
                 )),
             }
         }
@@ -1141,5 +1171,19 @@ mod tests {
                 .iter()
                 .any(|value| value == "navigate")
         );
+        let browser_manage = tools
+            .iter()
+            .find(|tool| tool["name"] == "browser_manage")
+            .unwrap();
+        assert!(browser_manage["inputSchema"]["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "stop_all"));
+        assert!(!browser_manage["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "session_id"));
     }
 }

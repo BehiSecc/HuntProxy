@@ -99,6 +99,14 @@ function chromiumProxy(proxy) {
   };
 }
 
+function lightpandaProxyUrl(proxy) {
+  if (!proxy?.server) return null;
+  const url = new URL(proxy.server);
+  if (proxy.username) url.username = proxy.username;
+  if (proxy.password) url.password = proxy.password;
+  return url.toString();
+}
+
 async function launchChromium(proxy, caCertPath) {
   const executablePath = existingChromiumExecutable();
   if (!executablePath) {
@@ -166,8 +174,9 @@ async function launchLightpanda(proxy, caCertPath) {
   const lightpanda = process.env.LIGHTPANDA_PATH || "lightpanda";
   const port = await availableLoopbackPort();
   const args = ["serve", "--host", "127.0.0.1", "--port", String(port)];
-  if (proxy?.server) args.push("--http-proxy", proxy.server);
-  if (proxy?.bearer_token) {
+  const proxyUrl = lightpandaProxyUrl(proxy);
+  if (proxyUrl) args.push("--http-proxy", proxyUrl);
+  if (proxy?.bearer_token && !proxy?.username) {
     args.push("--proxy-bearer-token", proxy.bearer_token);
   }
   if (caCertPath) args.push("--ca-cert", caCertPath);
