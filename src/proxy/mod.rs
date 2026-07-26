@@ -880,6 +880,7 @@ mod tests {
             Some(worker),
             "http://127.0.0.1:17891".into(),
             None,
+            config.browser_profiles_dir(),
         ));
         let (events, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(AppState {

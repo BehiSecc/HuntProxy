@@ -254,6 +254,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         managed_worker,
         format!("http://{}", config.proxy_listen),
         Some(config.ca_cert_path()),
+        config.browser_profiles_dir(),
     ));
     let (events, _) = broadcast::channel(256);
     Ok(Arc::new(AppState {

@@ -138,7 +138,25 @@ function lightpandaProxyUrl(proxy) {
   return url.toString();
 }
 
-async function launchChromium(proxy, caCertPath) {
+function chromiumLaunchOptions(proxy, caCertPath) {
+  return {
+    executablePath: existingChromiumExecutable(),
+    headless: true,
+    proxy: chromiumProxy(proxy),
+    ignoreHTTPSErrors: Boolean(caCertPath),
+    serviceWorkers: "allow",
+    args: [
+      "--disable-quic",
+      "--disk-cache-size=52428800",
+      "--media-cache-size=10485760",
+      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+      "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+      "--proxy-bypass-list=<-loopback>",
+    ],
+  };
+}
+
+async function launchChromium(proxy, caCertPath, profileDir = null) {
   const executablePath = existingChromiumExecutable();
   if (!executablePath) {
     throw rpcError(
@@ -146,23 +164,30 @@ async function launchChromium(proxy, caCertPath) {
       "Chromium executable not found; install Chromium or set BB_CHROME_EXECUTABLE",
     );
   }
-  const browser = await chromium.launch({
-    executablePath,
-    headless: true,
-    proxy: chromiumProxy(proxy),
-    args: [
-      "--disable-quic",
-      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-      "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-      "--proxy-bypass-list=<-loopback>",
-    ],
-  });
+  const options = chromiumLaunchOptions(proxy, caCertPath);
+  options.serviceWorkers = profileDir ? "allow" : "block";
+  if (profileDir) {
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(profileDir, 0o700); } catch {}
+    const context = await chromium.launchPersistentContext(profileDir, options);
+    const page = context.pages()[0] || await context.newPage();
+    return {
+      browser: null,
+      context,
+      page,
+      lightpandaProc: null,
+      persistent: true,
+      profileDir,
+    };
+  }
+  const { ignoreHTTPSErrors, serviceWorkers, ...launchOptions } = options;
+  const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
-    serviceWorkers: "block",
-    ignoreHTTPSErrors: Boolean(caCertPath),
+    serviceWorkers,
+    ignoreHTTPSErrors,
   });
   const page = await context.newPage();
-  return { browser, context, page, lightpandaProc: null };
+  return { browser, context, page, lightpandaProc: null, persistent: false, profileDir: null };
 }
 
 async function waitForCdp(endpoint, child, timeoutMs = 15_000) {
@@ -233,10 +258,82 @@ async function launchLightpanda(proxy, caCertPath) {
   }
 }
 
-async function launchEngine(engine, proxy, caCertPath) {
+async function launchEngine(engine, proxy, caCertPath, profileDir = null) {
   return engine === "lightpanda"
     ? launchLightpanda(proxy, caCertPath)
-    : launchChromium(proxy, caCertPath);
+    : launchChromium(proxy, caCertPath, profileDir);
+}
+
+async function restoreProjectState(session, state) {
+  if (!state || typeof state !== "object") return;
+  session.restoreState = state;
+  session.restoredOrigins = new Set();
+  if (session.engine === "chromium" && session.persistent) {
+    await session.context.clearCookies();
+  }
+  if (Array.isArray(state.cookies) && state.cookies.length) {
+    const cookies = state.cookies
+      .filter((cookie) => cookie && cookie.name && cookie.domain)
+      .map((cookie) => {
+        const restored = {
+          name: String(cookie.name),
+          value: String(cookie.value || ""),
+          domain: String(cookie.domain),
+          path: String(cookie.path || "/"),
+          httpOnly: Boolean(cookie.httpOnly),
+          secure: Boolean(cookie.secure),
+          sameSite: ["Strict", "Lax", "None"].includes(cookie.sameSite)
+            ? cookie.sameSite
+            : "Lax",
+        };
+        if (typeof cookie.expires === "number" && cookie.expires > 0) {
+          restored.expires = cookie.expires;
+        }
+        if (session.engine === "chromium" && cookie.partitionKey) {
+          restored.partitionKey = cookie.partitionKey;
+        }
+        return restored;
+      });
+    if (cookies.length) await session.context.addCookies(cookies);
+  }
+}
+
+async function reconcileCurrentOriginStorage(session) {
+  if (!session.restoreState) return;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let origin;
+    try {
+      const parsed = new URL(session.page.url());
+      if (!new Set(["http:", "https:"]).has(parsed.protocol)) return;
+      origin = parsed.origin;
+    } catch {
+      return;
+    }
+    if (session.restoredOrigins?.has(origin)) return;
+    const localByOrigin = session.restoreState.local_storage || {};
+    const sessionByOrigin = session.restoreState.session_storage || {};
+    const hasStoredOrigin = Object.hasOwn(localByOrigin, origin)
+      || Object.hasOwn(sessionByOrigin, origin);
+    if (!hasStoredOrigin) {
+      session.restoredOrigins?.add(origin);
+      return;
+    }
+    const localValues = localByOrigin[origin] || {};
+    const sessionValues = sessionByOrigin[origin] || {};
+    await session.page.evaluate(
+      ({ local, currentSession }) => {
+        localStorage.clear();
+        sessionStorage.clear();
+        for (const [key, value] of Object.entries(local)) localStorage.setItem(key, value);
+        for (const [key, value] of Object.entries(currentSession)) {
+          sessionStorage.setItem(key, value);
+        }
+      },
+      { local: localValues, currentSession: sessionValues },
+    );
+    session.restoredOrigins?.add(origin);
+    await session.page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
+  }
 }
 
 async function extractCheckpoint(session) {
@@ -249,7 +346,7 @@ async function extractCheckpoint(session) {
       return null;
     }
   })();
-  const cookies = await session.context.cookies(origin ? [origin] : undefined);
+  const cookies = await session.context.cookies();
   const storage = await session.page
     .evaluate(() => {
       const collect = (source) => {
@@ -284,41 +381,6 @@ async function extractCheckpoint(session) {
     state_hash: stateHash,
     _private: privateState,
   };
-}
-
-function normalizeCookiesForChromium(cookies, currentUrl) {
-  return cookies.map((cookie) => {
-    const normalized = {
-      name: cookie.name,
-      value: cookie.value,
-      httpOnly: Boolean(cookie.httpOnly),
-      secure: Boolean(cookie.secure),
-      sameSite: ["Strict", "Lax", "None"].includes(cookie.sameSite)
-        ? cookie.sameSite
-        : "Lax",
-    };
-    const domain = String(cookie.domain || "").replace(/^\./, "");
-    const cookiePath = cookie.path || "/";
-    if (domain && domain !== "localhost" && domain !== "127.0.0.1") {
-      normalized.domain = cookie.domain;
-      normalized.path = cookiePath;
-    } else {
-      let base;
-      try {
-        base = new URL(currentUrl);
-      } catch {
-        base = new URL("http://127.0.0.1/");
-      }
-      base.pathname = cookiePath;
-      base.search = "";
-      base.hash = "";
-      normalized.url = base.toString();
-    }
-    if (typeof cookie.expires === "number" && cookie.expires > 0) {
-      normalized.expires = cookie.expires;
-    }
-    return normalized;
-  });
 }
 
 function cookieKey(cookie) {
@@ -401,6 +463,7 @@ async function executeAction(session, action = {}) {
         waitUntil: "domcontentloaded",
         timeout: action.timeout_ms || 30_000,
       });
+      await reconcileCurrentOriginStorage(session);
       return { message: "navigation completed", data: { url: session.page.url() } };
     }
     case "snapshot": {
@@ -447,48 +510,52 @@ async function executeAction(session, action = {}) {
       };
     case "back":
       await session.page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      await reconcileCurrentOriginStorage(session);
       return { message: "went back", data: { url: session.page.url() } };
     case "forward":
       await session.page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      await reconcileCurrentOriginStorage(session);
       return { message: "went forward", data: { url: session.page.url() } };
     default:
       throw rpcError(-32602, `unsupported browser action: ${action.type || "missing"}`);
   }
 }
 
-async function migrateToChromium(sessionId, session) {
+async function migrateToChromium(sessionId, session, profileDir = null) {
   if (session.engine !== "lightpanda") {
     throw rpcError(-32602, "only Lightpanda sessions can migrate to Chromium");
   }
   const sourceCheckpoint = await extractCheckpoint(session);
   const source = sourceCheckpoint._private;
-  const replacement = await launchChromium(session.proxy, session.caCertPath);
+  const replacement = await launchChromium(session.proxy, session.caCertPath, profileDir);
   try {
-    const cookies = normalizeCookiesForChromium(source.cookies, sourceCheckpoint.url);
-    if (cookies.length) await replacement.context.addCookies(cookies);
-    await replacement.context.addInitScript(
-      ({ expectedOrigin, localValues, sessionValues }) => {
-        if (expectedOrigin && location.origin !== expectedOrigin) return;
-        for (const [key, value] of Object.entries(localValues || {})) {
-          try { localStorage.setItem(key, value); } catch {}
-        }
-        for (const [key, value] of Object.entries(sessionValues || {})) {
-          try { sessionStorage.setItem(key, value); } catch {}
-        }
-      },
-      {
-        expectedOrigin: source.origin,
-        localValues: source.local_storage,
-        sessionValues: source.session_storage,
-      },
-    );
+    const migrated = {
+      ...replacement,
+      engine: "chromium",
+      proxy: session.proxy,
+      caCertPath: session.caCertPath,
+      persistent: Boolean(profileDir),
+      profileDir,
+    };
+    const localByOrigin = source.origin
+      ? { [source.origin]: source.local_storage || {} }
+      : {};
+    const sessionByOrigin = source.origin
+      ? { [source.origin]: source.session_storage || {} }
+      : {};
+    await restoreProjectState(migrated, {
+      cookies: source.cookies,
+      local_storage: localByOrigin,
+      session_storage: sessionByOrigin,
+    });
     if (sourceCheckpoint.url && sourceCheckpoint.url !== "about:blank") {
-      await replacement.page.goto(sourceCheckpoint.url, {
+      await migrated.page.goto(sourceCheckpoint.url, {
         waitUntil: "domcontentloaded",
         timeout: 30_000,
       });
+      await reconcileCurrentOriginStorage(migrated);
     }
-    const restoredCheckpoint = await extractCheckpoint(replacement);
+    const restoredCheckpoint = await extractCheckpoint(migrated);
     const restored = restoredCheckpoint._private;
     const cookieVerification = compareCookies(source.cookies, restored.cookies);
     const localVerification = compareStorage(source.local_storage, restored.local_storage);
@@ -499,12 +566,6 @@ async function migrateToChromium(sessionId, session) {
       sessionVerification.verified;
 
     await closeRuntime(session);
-    const migrated = {
-      ...replacement,
-      engine: "chromium",
-      proxy: session.proxy,
-      caCertPath: session.caCertPath,
-    };
     trackJavascriptFiles(migrated, new Map(session.javascriptFiles || []));
     sessions.set(sessionId, migrated);
     return {
@@ -545,11 +606,27 @@ async function handle(req) {
           throw rpcError(-32602, "engine must be lightpanda or chromium");
         }
         const caCertPath = params.ca_cert_path || null;
-        const runtime = await launchEngine(engine, params.proxy || null, caCertPath);
-        const session = { ...runtime, engine, proxy: params.proxy || null, caCertPath };
+        const profileDir = params.persistent && engine === "chromium"
+          ? params.profile_dir || null
+          : null;
+        const runtime = await launchEngine(
+          engine,
+          params.proxy || null,
+          caCertPath,
+          profileDir,
+        );
+        const session = {
+          ...runtime,
+          engine,
+          proxy: params.proxy || null,
+          caCertPath,
+          persistent: Boolean(params.persistent),
+          profileDir,
+        };
         trackJavascriptFiles(session);
         sessions.set(sessionId, session);
         try {
+          await restoreProjectState(session, params.restore_state);
           if (Array.isArray(params.cookies) && params.cookies.length) {
             await session.context.addCookies(params.cookies);
           }
@@ -558,6 +635,7 @@ async function handle(req) {
               waitUntil: "domcontentloaded",
               timeout: params.timeout_ms || 30_000,
             });
+            await reconcileCurrentOriginStorage(session);
           }
           const checkpoint = await extractCheckpoint(session);
           logMeta("session.start", { session_id: sessionId, engine });
@@ -636,7 +714,7 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        const result = await migrateToChromium(sessionId, session);
+        const result = await migrateToChromium(sessionId, session, params.profile_dir || null);
         logMeta("session.migrate", {
           session_id: sessionId,
           status: result.status,
@@ -646,8 +724,13 @@ async function handle(req) {
       }
       case "session.stop": {
         const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        let checkpoint = null;
+        if (session) {
+          try { checkpoint = await extractCheckpoint(session); } catch {}
+        }
         await closeSession(sessionId);
-        return respond(id, { stopped: true });
+        return respond(id, { stopped: true, checkpoint });
       }
       default:
         throw rpcError(-32601, `method not found: ${method}`);

@@ -187,12 +187,17 @@ impl Config {
         self.data_dir.join(PLACEHOLDER_KEY_NAME)
     }
 
+    pub fn browser_profiles_dir(&self) -> PathBuf {
+        self.data_dir.join("browser-profiles")
+    }
+
     pub fn ensure_layout(&self) -> DomainResult<()> {
         create_private_dir(&self.data_dir)?;
         create_private_dir(&self.data_dir.join("ca"))?;
         create_private_dir(&self.spool_dir)?;
         create_private_dir(&self.export_dir)?;
         create_private_dir(&self.runtime_dir)?;
+        create_private_dir(&self.browser_profiles_dir())?;
         Ok(())
     }
 
@@ -333,7 +338,7 @@ mod tests {
         let config = Config::load(Some(data_dir.clone())).unwrap();
 
         assert_eq!(config.data_dir, data_dir);
-        for relative in ["ca", "spool", "exports", "runtime"] {
+        for relative in ["ca", "spool", "exports", "runtime", "browser-profiles"] {
             assert!(config.data_dir.join(relative).is_dir());
         }
         assert!(config.data_dir.join(CONFIG_FILE_NAME).is_file());

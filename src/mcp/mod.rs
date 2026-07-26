@@ -257,9 +257,9 @@ fn tool_defs() -> Value {
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases"]},"job_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
-        {"name":"browser_start","description":"Start a browser session. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank"},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
+        {"name":"browser_start","description":"Start or resume the project's persistent browser workspace. Omit url to resume the last page. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
-        {"name":"browser_manage","description":"Get status, stop one browser, stop all browsers in a project, or migrate Lightpanda state to Chromium. Switching requires chromium_reason=user_requested or lightpanda_incompatible. session_id is not needed for stop_all.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."}},"required":["project_id","op"]}},
+        {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, migrate Lightpanda state to Chromium, or reset the persistent browser workspace. Stop operations preserve browser state. Switching requires chromium_reason=user_requested or lightpanda_incompatible. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool. session_id is not needed for stop_all or reset_profile.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium","reset_profile"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
         {"name":"js_files","description":"Return JavaScript file URLs and paths. Without url, search saved project history; with url, load that page Lightpanda-first and return files observed in that fresh browser session. Optional domain accepts a hostname or URL and includes subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply codec transforms","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
@@ -1162,6 +1162,19 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 let stopped = state.browser.stop_project(project_id).await?;
                 return Ok(json!({ "ok": true, "stopped": stopped }));
             }
+            if op == "reset_profile" {
+                if args.get("confirm").and_then(Value::as_bool) != Some(true) {
+                    return Err(DomainError::invalid(
+                        "reset_profile permanently deletes browser state and requires confirm=true",
+                    ));
+                }
+                let removed = state.browser.reset_project_profile(project_id).await?;
+                return Ok(json!({
+                    "ok": true,
+                    "removed": removed,
+                    "managed_cookies_preserved": true,
+                }));
+            }
             let sid = args
                 .get("session_id")
                 .and_then(|v| v.as_i64())
@@ -1191,7 +1204,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     ))
                 }
                 _ => Err(DomainError::invalid(
-                    "op must be stop|stop_all|status|switch_chromium",
+                    "op must be stop|stop_all|status|switch_chromium|reset_profile",
                 )),
             }
         }
@@ -1213,7 +1226,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 }
                 let session = state
                     .browser
-                    .start(project_id, url.to_string(), EnginePolicy::Auto)
+                    .start_ephemeral(project_id, url.to_string(), EnginePolicy::Auto)
                     .await?;
                 let settle_ms = args
                     .get("settle_ms")
@@ -1535,6 +1548,15 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "stop_all"));
+        assert!(browser_manage["inputSchema"]["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "reset_profile"));
+        assert_eq!(
+            browser_manage["inputSchema"]["properties"]["confirm"]["default"],
+            false
+        );
         assert!(!browser_manage["inputSchema"]["required"]
             .as_array()
             .unwrap()

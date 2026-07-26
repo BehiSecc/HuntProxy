@@ -67,15 +67,21 @@ Matching cookies are then used automatically by Reply, Fuzzer, and new or
 active browser sessions. Raw Reply remains byte-exact unless
 `use_project_cookies: true` is explicitly set.
 
-Use `browser_manage` with `op: "stop"` for one session or `op: "stop_all"`
-to close every browser in a project. After 30 minutes without MCP/UI control
-activity, the MCP bridge and daemon exit and all browser processes are closed.
+Browser state is private and persistent per project. Cookies and site storage
+survive `stop`, daemon restarts, and idle shutdown; omit `url` from the next
+`browser_start` call to resume the last page. Use `browser_manage` with
+`op: "stop"` for one session or `op: "stop_all"` to suspend every browser in a
+project without clearing its state. Use `op: "reset_profile"` with
+`confirm: true` to clear browser-derived state; cookies configured with the
+`cookies` tool remain separately managed and should also be cleared for a
+complete logout. After 30 minutes without MCP/UI
+control activity, the MCP bridge and daemon exit and browser processes close.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
 
 Use `js_files` with only `project_id` to list JavaScript from saved history,
-add `domain` to filter it, or add `url` to perform a fresh Lightpanda-first
-load. Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;
+add `domain` to filter it, or add `url` to perform a fresh, ephemeral,
+Lightpanda-first load. Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;
 restart the MCP client (or run `HuntProxy serve`) when you want to use it again.
 
 If your MCP client cannot find `HuntProxy`, use the absolute path printed by

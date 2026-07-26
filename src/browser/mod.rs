@@ -1,12 +1,13 @@
-//! Browser worker supervision, real actions, and memory-only session checkpoints.
+//! Browser worker supervision, real actions, and private per-project browser state.
 
+use crate::config::{create_private_dir, write_private_file};
 use crate::cookies::{CookiePair, StoredCookieProfile};
 use crate::domain::*;
 use crate::storage::{CreateCaptureSession, Db};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use tokio::sync::Mutex;
 const WORKER_PROTOCOL_VERSION: u64 = 1;
 const WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
+const MAX_PERSISTENT_PROFILE_BYTES: usize = 25 * 1024 * 1024;
 const EMBEDDED_WORKER: &str = include_str!("../../browser-worker/index.js");
 const EMBEDDED_WORKER_PACKAGE: &str = include_str!("../../browser-worker/package.json");
 const EMBEDDED_WORKER_LOCK: &str = include_str!("../../browser-worker/package-lock.json");
@@ -51,6 +53,22 @@ pub struct Checkpoint {
     pub session_storage: BTreeMap<String, String>,
     pub version: u64,
     pub hash: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistentBrowserProfile {
+    #[serde(default)]
+    version: u64,
+    #[serde(default)]
+    checkpoint_hash: String,
+    #[serde(default)]
+    last_url: Option<String>,
+    #[serde(default)]
+    cookies: Vec<Value>,
+    #[serde(default)]
+    local_storage: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    session_storage: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +139,8 @@ pub struct ActionResult {
 struct RuntimeSession {
     project_id: ProjectId,
     capture_session_id: CaptureSessionId,
+    engine: BrowserEngine,
+    persistent: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,10 +393,14 @@ pub struct BrowserService {
     pub worker_path: Option<PathBuf>,
     proxy_server: String,
     ca_cert_path: Option<PathBuf>,
+    profiles_root: PathBuf,
     playwright_core_path: Option<PathBuf>,
     chromium_path: Option<PathBuf>,
     checkpoints: Mutex<HashMap<i64, Checkpoint>>,
     runtime_sessions: Mutex<HashMap<i64, RuntimeSession>>,
+    profile_leases: Mutex<HashSet<i64>>,
+    profile_io: Mutex<()>,
+    session_ops: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     worker: Mutex<Option<WorkerProcess>>,
 }
 
@@ -387,6 +411,7 @@ impl BrowserService {
         node_path: Option<PathBuf>,
         worker_path: Option<PathBuf>,
     ) -> Self {
+        let profiles_root = default_profiles_root(&db);
         let proxy_server = std::env::var("BB_BROWSER_PROXY_SERVER")
             .unwrap_or_else(|_| DEFAULT_BROWSER_PROXY.to_string());
         let ca_cert_path = std::env::var_os("BB_BROWSER_CA_CERT").map(PathBuf::from);
@@ -397,6 +422,7 @@ impl BrowserService {
             worker_path,
             proxy_server,
             ca_cert_path,
+            profiles_root,
         )
     }
 
@@ -408,6 +434,7 @@ impl BrowserService {
         worker_path: Option<PathBuf>,
         proxy_server: String,
     ) -> Self {
+        let profiles_root = default_profiles_root(&db);
         let ca_cert_path = std::env::var_os("BB_BROWSER_CA_CERT").map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
@@ -416,6 +443,7 @@ impl BrowserService {
             worker_path,
             proxy_server,
             ca_cert_path,
+            profiles_root,
         )
     }
 
@@ -427,6 +455,7 @@ impl BrowserService {
         worker_path: Option<PathBuf>,
         proxy_server: String,
         ca_cert_path: Option<PathBuf>,
+        profiles_root: PathBuf,
     ) -> Self {
         let worker_path = resolve_worker_path(worker_path);
         let playwright_core_path = worker_path
@@ -441,10 +470,14 @@ impl BrowserService {
             worker_path,
             proxy_server,
             ca_cert_path: ca_cert_path.filter(|path| path.is_file()),
+            profiles_root,
             playwright_core_path,
             chromium_path,
             checkpoints: Mutex::new(HashMap::new()),
             runtime_sessions: Mutex::new(HashMap::new()),
+            profile_leases: Mutex::new(HashSet::new()),
+            profile_io: Mutex::new(()),
+            session_ops: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
         }
     }
@@ -506,6 +539,66 @@ impl BrowserService {
         url: String,
         policy: EnginePolicy,
     ) -> DomainResult<BrowserSession> {
+        self.start_with_persistence(project_id, url, policy, true)
+            .await
+    }
+
+    pub async fn start_ephemeral(
+        &self,
+        project_id: ProjectId,
+        url: String,
+        policy: EnginePolicy,
+    ) -> DomainResult<BrowserSession> {
+        self.start_with_persistence(project_id, url, policy, false)
+            .await
+    }
+
+    async fn start_with_persistence(
+        &self,
+        project_id: ProjectId,
+        url: String,
+        policy: EnginePolicy,
+        persistent: bool,
+    ) -> DomainResult<BrowserSession> {
+        if persistent {
+            let mut leases = self.profile_leases.lock().await;
+            if !leases.insert(project_id.get()) {
+                drop(leases);
+                let active_session_id =
+                    self.runtime_sessions
+                        .lock()
+                        .await
+                        .iter()
+                        .find_map(|(id, runtime)| {
+                            (runtime.project_id == project_id && runtime.persistent).then_some(*id)
+                        });
+                let detail = active_session_id
+                    .map(|id| format!(" as session {id}"))
+                    .unwrap_or_default();
+                return Err(DomainError::new(
+                    ErrorCode::ConcurrencyLimited,
+                    format!(
+                        "project persistent browser is already active{detail}; stop it before starting another"
+                    ),
+                ));
+            }
+        }
+        let result = self
+            .start_runtime(project_id, url, policy, persistent)
+            .await;
+        if result.is_err() && persistent {
+            self.profile_leases.lock().await.remove(&project_id.get());
+        }
+        result
+    }
+
+    async fn start_runtime(
+        &self,
+        project_id: ProjectId,
+        mut url: String,
+        policy: EnginePolicy,
+        persistent: bool,
+    ) -> DomainResult<BrowserSession> {
         let status = self.status();
         if !status.worker_available {
             return Err(DomainError::new(
@@ -516,10 +609,8 @@ impl BrowserService {
             ));
         }
         let project = self.db.get_project(project_id).await?;
-        let active_for_project = self
-            .runtime_sessions
-            .lock()
-            .await
+        let runtimes = self.runtime_sessions.lock().await;
+        let active_for_project = runtimes
             .values()
             .filter(|runtime| runtime.project_id == project_id)
             .count() as u32;
@@ -528,6 +619,33 @@ impl BrowserService {
                 ErrorCode::ConcurrencyLimited,
                 "project browser concurrency limit reached",
             ));
+        }
+        if persistent {
+            if let Some(active_session_id) = runtimes.iter().find_map(|(id, runtime)| {
+                (runtime.project_id == project_id && runtime.persistent).then_some(*id)
+            }) {
+                return Err(DomainError::new(
+                    ErrorCode::ConcurrencyLimited,
+                    format!(
+                        "project persistent browser is already active as session {active_session_id}; stop it before starting another"
+                    ),
+                ));
+            }
+        }
+        drop(runtimes);
+
+        let restored_profile = if persistent {
+            self.load_persistent_profile(project_id).await?
+        } else {
+            None
+        };
+        if url == "about:blank" {
+            if let Some(last_url) = restored_profile
+                .as_ref()
+                .and_then(|profile| profile.last_url.as_ref())
+            {
+                url = last_url.clone();
+            }
         }
 
         let engine = match policy {
@@ -576,6 +694,9 @@ impl BrowserService {
         })?;
         let managed_cookies =
             browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
+        let profile_dir = persistent
+            .then(|| self.chromium_profile_dir(project_id))
+            .transpose()?;
         let mut start_params = json!({
             "session_id": session.id.get(),
             "engine": engine_name(engine),
@@ -588,9 +709,20 @@ impl BrowserService {
             },
             "ca_cert_path": self.ca_cert_path.as_ref().map(|path| path.display().to_string()),
             "cookies": managed_cookies,
+            "restore_state": restored_profile,
+            "persistent": persistent,
+            "profile_dir": if engine == BrowserEngine::Chromium {
+                profile_dir.as_ref().map(|path| path.display().to_string())
+            } else {
+                None
+            },
         });
         let mut effective_engine = engine;
-        let mut checkpoint_status = "ok";
+        let mut checkpoint_status = if persistent && restored_profile.is_some() {
+            "restored"
+        } else {
+            "ok"
+        };
         let mut worker_result = self
             .call_worker("session.start", start_params.clone())
             .await;
@@ -600,6 +732,10 @@ impl BrowserService {
             && status.chromium_available
         {
             start_params["engine"] = json!(engine_name(BrowserEngine::Chromium));
+            if persistent {
+                start_params["profile_dir"] =
+                    json!(profile_dir.as_ref().map(|path| path.display().to_string()));
+            }
             worker_result = self.call_worker("session.start", start_params).await;
             if worker_result.is_ok() {
                 effective_engine = BrowserEngine::Chromium;
@@ -617,26 +753,73 @@ impl BrowserService {
                 return Err(error);
             }
         };
-        let checkpoint = result.get("checkpoint").ok_or_else(|| {
-            DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
-        })?;
-        let saved = self
-            .save_checkpoint(project_id, session.id, checkpoint, checkpoint_status)
-            .await?;
+        let checkpoint = match result.get("checkpoint") {
+            Some(checkpoint) => checkpoint,
+            None => {
+                self.cleanup_failed_start(project_id, &mut session, capture.id)
+                    .await;
+                return Err(DomainError::new(
+                    ErrorCode::ProtocolError,
+                    "worker omitted checkpoint",
+                ));
+            }
+        };
+        let saved = match self
+            .save_checkpoint(
+                project_id,
+                session.id,
+                checkpoint,
+                checkpoint_status,
+                persistent,
+            )
+            .await
+        {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.cleanup_failed_start(project_id, &mut session, capture.id)
+                    .await;
+                return Err(error);
+            }
+        };
         session.engine = effective_engine;
         session.current_url = saved.url;
         session.state = BrowserSessionState::Ready;
         session.checkpoint_status = Some(checkpoint_status.into());
         session.checkpoint_hash = Some(saved.hash);
-        self.db.update_browser_session(&session).await?;
+        if let Err(error) = self.db.update_browser_session(&session).await {
+            self.cleanup_failed_start(project_id, &mut session, capture.id)
+                .await;
+            return Err(error);
+        }
         self.runtime_sessions.lock().await.insert(
             session.id.get(),
             RuntimeSession {
                 project_id,
                 capture_session_id: capture.id,
+                engine: effective_engine,
+                persistent,
             },
         );
         Ok(session)
+    }
+
+    async fn cleanup_failed_start(
+        &self,
+        project_id: ProjectId,
+        session: &mut BrowserSession,
+        capture_session_id: CaptureSessionId,
+    ) {
+        let _ = self
+            .call_worker("session.stop", json!({ "session_id": session.id.get() }))
+            .await;
+        session.state = BrowserSessionState::Failed;
+        session.checkpoint_status = Some("start_failed".into());
+        let _ = self.db.update_browser_session(session).await;
+        self.checkpoints.lock().await.remove(&session.id.get());
+        let _ = self
+            .db
+            .revoke_capture_session(project_id, capture_session_id)
+            .await;
     }
 
     /// Apply a managed cookie profile to every active browser session in the
@@ -658,6 +841,8 @@ impl BrowserService {
             .collect::<Vec<_>>();
         let session_ids = self.active_session_ids(project_id).await;
         for session_id in &session_ids {
+            let operation_lock = self.session_operation_lock(*session_id).await;
+            let _operation_guard = operation_lock.lock().await;
             let result = self
                 .call_worker(
                     "session.set_cookies",
@@ -683,6 +868,8 @@ impl BrowserService {
         let session_ids = self.active_session_ids(project_id).await;
         let pairs = profile.pairs()?;
         for session_id in &session_ids {
+            let operation_lock = self.session_operation_lock(*session_id).await;
+            let _operation_guard = operation_lock.lock().await;
             let result = self
                 .call_worker(
                     "session.clear_cookies",
@@ -710,6 +897,23 @@ impl BrowserService {
             .collect()
     }
 
+    async fn session_is_persistent(&self, session_id: BrowserSessionId) -> bool {
+        self.runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .is_some_and(|runtime| runtime.persistent)
+    }
+
+    async fn session_operation_lock(&self, session_id: BrowserSessionId) -> Arc<Mutex<()>> {
+        self.session_ops
+            .lock()
+            .await
+            .entry(session_id.get())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     async fn save_cookie_checkpoint(
         &self,
         project_id: ProjectId,
@@ -719,8 +923,9 @@ impl BrowserService {
         let checkpoint = result.get("checkpoint").ok_or_else(|| {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
+        let persistent = self.session_is_persistent(session_id).await;
         let saved = self
-            .save_checkpoint(project_id, session_id, checkpoint, "ok")
+            .save_checkpoint(project_id, session_id, checkpoint, "ok", persistent)
             .await?;
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
         session.current_url = saved.url;
@@ -735,6 +940,18 @@ impl BrowserService {
         session_id: BrowserSessionId,
         action: BrowserAction,
     ) -> DomainResult<ActionResult> {
+        if matches!(&action, BrowserAction::Close) {
+            self.stop(project_id, session_id).await?;
+            return Ok(ActionResult {
+                ok: true,
+                untrusted: false,
+                message: "session closed".into(),
+                data: None,
+                error_code: None,
+            });
+        }
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
         if matches!(
             session.state,
@@ -747,27 +964,18 @@ impl BrowserService {
                 "browser session is not active",
             ));
         }
-        if matches!(&action, BrowserAction::Close) {
-            self.stop(project_id, session_id).await?;
-            return Ok(ActionResult {
-                ok: true,
-                untrusted: false,
-                message: "session closed".into(),
-                data: None,
-                error_code: None,
-            });
-        }
-        if !self
+        let runtime = self
             .runtime_sessions
             .lock()
             .await
-            .contains_key(&session_id.get())
-        {
+            .get(&session_id.get())
+            .cloned();
+        let Some(runtime) = runtime else {
             return Err(DomainError::new(
                 ErrorCode::Unavailable,
                 "browser runtime is not attached; start a new browser session",
             ));
-        }
+        };
 
         session.state = BrowserSessionState::Busy;
         self.db.update_browser_session(&session).await?;
@@ -798,7 +1006,7 @@ impl BrowserService {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
         let saved = self
-            .save_checkpoint(project_id, session_id, checkpoint, "ok")
+            .save_checkpoint(project_id, session_id, checkpoint, "ok", runtime.persistent)
             .await?;
         session.current_url = saved.url;
         session.state = BrowserSessionState::Ready;
@@ -836,6 +1044,8 @@ impl BrowserService {
         if !belongs_to_project {
             return Err(DomainError::not_found("active browser session"));
         }
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
         let result = self
             .call_worker(
                 "session.javascript_files",
@@ -851,12 +1061,40 @@ impl BrowserService {
         project_id: ProjectId,
         session_id: BrowserSessionId,
     ) -> DomainResult<()> {
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
-        let runtime = self.runtime_sessions.lock().await.remove(&session_id.get());
-        if runtime.is_some() {
-            let _ = self
+        let runtime = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .cloned();
+        let mut persistence_error = None;
+        if let Some(runtime) = &runtime {
+            if let Ok(result) = self
                 .call_worker("session.stop", json!({ "session_id": session_id.get() }))
-                .await;
+                .await
+            {
+                if let Some(checkpoint) = result.get("checkpoint") {
+                    if let Err(error) = self
+                        .save_checkpoint(
+                            project_id,
+                            session_id,
+                            checkpoint,
+                            "stopped",
+                            runtime.persistent,
+                        )
+                        .await
+                    {
+                        persistence_error = Some(error);
+                    }
+                }
+            }
+        }
+        self.runtime_sessions.lock().await.remove(&session_id.get());
+        if runtime.as_ref().is_some_and(|runtime| runtime.persistent) {
+            self.profile_leases.lock().await.remove(&project_id.get());
         }
         session.state = BrowserSessionState::Stopped;
         self.db.update_browser_session(&session).await?;
@@ -872,7 +1110,14 @@ impl BrowserService {
                 idle_worker.terminate().await;
             }
         }
-        Ok(())
+        self.session_ops.lock().await.remove(&session_id.get());
+        match persistence_error {
+            Some(error) => Err(DomainError::new(
+                ErrorCode::StorageError,
+                format!("browser stopped but final state save failed: {error}"),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Stop every active browser in one project and release the worker when
@@ -929,6 +1174,8 @@ impl BrowserService {
         project_id: ProjectId,
         session_id: BrowserSessionId,
     ) -> DomainResult<BrowserSession> {
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
         let status = self.status();
         if !status.chromium_available {
             return Err(DomainError::new(
@@ -937,7 +1184,25 @@ impl BrowserService {
             ));
         }
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
-        if session.engine != BrowserEngine::Lightpanda {
+        let runtime = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .cloned();
+        let Some(runtime) = runtime else {
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                "browser runtime is not attached; start a new browser session",
+            ));
+        };
+        if runtime.engine != BrowserEngine::Lightpanda {
+            if session.engine != runtime.engine {
+                session.engine = runtime.engine;
+                session.fallback_used = true;
+                session.state = BrowserSessionState::Ready;
+                let _ = self.db.update_browser_session(&session).await;
+            }
             return Err(DomainError::new(
                 ErrorCode::EngineFallback,
                 "only Lightpanda sessions can switch to Chromium",
@@ -949,24 +1214,20 @@ impl BrowserService {
                 "fallback already used for this session",
             ));
         }
-        if !self
-            .runtime_sessions
-            .lock()
-            .await
-            .contains_key(&session_id.get())
-        {
-            return Err(DomainError::new(
-                ErrorCode::Unavailable,
-                "browser runtime is not attached; start a new browser session",
-            ));
-        }
 
         session.state = BrowserSessionState::Migrating;
-        self.db.update_browser_session(&session).await?;
+        let _ = self.db.update_browser_session(&session).await;
         let result = match self
             .call_worker(
                 "session.migrate_to_chromium",
-                json!({ "session_id": session_id.get() }),
+                json!({
+                    "session_id": session_id.get(),
+                    "profile_dir": if runtime.persistent {
+                        Some(self.chromium_profile_dir(project_id)?.display().to_string())
+                    } else {
+                        None
+                    },
+                }),
             )
             .await
         {
@@ -987,15 +1248,48 @@ impl BrowserService {
             .and_then(Value::as_str)
             .unwrap_or("migrated_partial")
             .to_string();
-        let checkpoint = result.get("checkpoint").ok_or_else(|| {
-            DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
-        })?;
-        let saved = self
-            .save_checkpoint(project_id, session_id, checkpoint, &migration_status)
-            .await?;
         session.engine = BrowserEngine::Chromium;
         session.fallback_used = true;
         session.state = BrowserSessionState::Ready;
+        session.checkpoint_status = Some(migration_status.clone());
+        if let Some(runtime) = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get_mut(&session_id.get())
+        {
+            runtime.engine = BrowserEngine::Chromium;
+        }
+        self.db.update_browser_session(&session).await?;
+
+        let Some(checkpoint) = result.get("checkpoint") else {
+            session.checkpoint_status = Some("migrated_state_unavailable".into());
+            let _ = self.db.update_browser_session(&session).await;
+            return Err(DomainError::new(
+                ErrorCode::ProtocolError,
+                "browser migrated to Chromium but the worker omitted its checkpoint",
+            ));
+        };
+        let saved = match self
+            .save_checkpoint(
+                project_id,
+                session_id,
+                checkpoint,
+                &migration_status,
+                runtime.persistent,
+            )
+            .await
+        {
+            Ok(saved) => saved,
+            Err(error) => {
+                session.checkpoint_status = Some("migrated_state_save_failed".into());
+                let _ = self.db.update_browser_session(&session).await;
+                return Err(DomainError::new(
+                    ErrorCode::StorageError,
+                    format!("browser migrated to Chromium but state save failed: {error}"),
+                ));
+            }
+        };
         session.current_url = saved.url;
         session.checkpoint_status = Some(migration_status);
         session.checkpoint_hash = Some(saved.hash);
@@ -1052,7 +1346,14 @@ impl BrowserService {
             std::mem::take(&mut *active)
         };
         self.checkpoints.lock().await.clear();
+        self.session_ops.lock().await.clear();
         for (session_id, runtime) in runtimes {
+            if runtime.persistent {
+                self.profile_leases
+                    .lock()
+                    .await
+                    .remove(&runtime.project_id.get());
+            }
             if let Ok(mut session) = self
                 .db
                 .get_browser_session(runtime.project_id, BrowserSessionId(session_id))
@@ -1069,12 +1370,172 @@ impl BrowserService {
         }
     }
 
+    fn project_profile_dir(&self, project_id: ProjectId) -> PathBuf {
+        self.profiles_root
+            .join("projects")
+            .join(project_id.get().to_string())
+    }
+
+    fn profile_state_path(&self, project_id: ProjectId) -> PathBuf {
+        self.project_profile_dir(project_id).join("state.json")
+    }
+
+    fn chromium_profile_dir(&self, project_id: ProjectId) -> DomainResult<PathBuf> {
+        let directory = self
+            .project_profile_dir(project_id)
+            .join("chromium")
+            .join("default");
+        create_private_dir(&directory)?;
+        Ok(directory)
+    }
+
+    async fn load_persistent_profile(
+        &self,
+        project_id: ProjectId,
+    ) -> DomainResult<Option<PersistentBrowserProfile>> {
+        let _guard = self.profile_io.lock().await;
+        let path = self.profile_state_path(project_id);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(DomainError::new(
+                    ErrorCode::StorageError,
+                    format!("read browser profile metadata: {error}"),
+                ))
+            }
+        };
+        if metadata.len() > MAX_PERSISTENT_PROFILE_BYTES as u64 {
+            return Err(DomainError::new(
+                ErrorCode::StorageError,
+                "browser profile state exceeds the 25 MiB safety limit; reset the project browser profile",
+            ));
+        }
+        let encoded = std::fs::read(&path).map_err(|error| {
+            DomainError::new(
+                ErrorCode::StorageError,
+                format!("read browser profile state: {error}"),
+            )
+        })?;
+        serde_json::from_slice(&encoded).map(Some).map_err(|_| {
+            DomainError::new(
+                ErrorCode::StorageError,
+                "browser profile state is invalid; reset the project browser profile",
+            )
+        })
+    }
+
+    async fn persist_checkpoint(
+        &self,
+        project_id: ProjectId,
+        checkpoint: &Checkpoint,
+    ) -> DomainResult<()> {
+        let _guard = self.profile_io.lock().await;
+        let path = self.profile_state_path(project_id);
+        let mut profile = match std::fs::read(&path) {
+            Ok(encoded) if encoded.len() <= MAX_PERSISTENT_PROFILE_BYTES => {
+                serde_json::from_slice(&encoded).map_err(|_| {
+                    DomainError::new(
+                        ErrorCode::StorageError,
+                        "browser profile state is invalid; reset the project browser profile",
+                    )
+                })?
+            }
+            Ok(_) => {
+                return Err(DomainError::new(
+                    ErrorCode::StorageError,
+                    "browser profile state exceeds the 25 MiB safety limit; reset the project browser profile",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PersistentBrowserProfile::default()
+            }
+            Err(error) => {
+                return Err(DomainError::new(
+                    ErrorCode::StorageError,
+                    format!("read browser profile state: {error}"),
+                ))
+            }
+        };
+        if !checkpoint.hash.is_empty() && profile.checkpoint_hash == checkpoint.hash {
+            return Ok(());
+        }
+        merge_persistent_profile(&mut profile, checkpoint);
+        let encoded = serde_json::to_vec(&profile)
+            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+        if encoded.len() > MAX_PERSISTENT_PROFILE_BYTES {
+            return Err(DomainError::new(
+                ErrorCode::StorageError,
+                "browser profile state exceeds the 25 MiB safety limit",
+            ));
+        }
+        let directory = self.project_profile_dir(project_id);
+        create_private_dir(&directory)?;
+        let temporary = directory.join(format!(".state-{}.tmp", std::process::id()));
+        write_private_file(&temporary, &encoded)?;
+        if let Ok(file) = std::fs::File::open(&temporary) {
+            let _ = file.sync_all();
+        }
+        std::fs::rename(&temporary, &path).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            DomainError::new(
+                ErrorCode::StorageError,
+                format!("commit browser profile state: {error}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    pub async fn reset_project_profile(&self, project_id: ProjectId) -> DomainResult<bool> {
+        self.db.get_project(project_id).await?;
+        let _ = self.stop_project(project_id).await;
+        {
+            let mut leases = self.profile_leases.lock().await;
+            if !leases.insert(project_id.get()) {
+                return Err(DomainError::new(
+                    ErrorCode::ConcurrencyLimited,
+                    "project browser is starting or active; stop it before resetting the profile",
+                ));
+            }
+        }
+        let _guard = self.profile_io.lock().await;
+        let directory = self.project_profile_dir(project_id);
+        let result = (|| {
+            let metadata = match std::fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(DomainError::new(
+                        ErrorCode::StorageError,
+                        format!("inspect browser profile: {error}"),
+                    ))
+                }
+            };
+            let removed = if metadata.file_type().is_symlink() || metadata.is_file() {
+                std::fs::remove_file(&directory)
+            } else {
+                std::fs::remove_dir_all(&directory)
+            };
+            removed.map_err(|error| {
+                DomainError::new(
+                    ErrorCode::StorageError,
+                    format!("reset browser profile: {error}"),
+                )
+            })?;
+            Ok(true)
+        })();
+        drop(_guard);
+        self.profile_leases.lock().await.remove(&project_id.get());
+        result
+    }
+
     async fn save_checkpoint(
         &self,
         project_id: ProjectId,
         session_id: BrowserSessionId,
         value: &Value,
         status: &str,
+        persistent: bool,
     ) -> DomainResult<Checkpoint> {
         let mut checkpoint = decode_checkpoint(value)?;
         let mut checkpoints = self.checkpoints.lock().await;
@@ -1084,6 +1545,9 @@ impl BrowserService {
         checkpoint.hash = checkpoint_hash(&checkpoint)?;
         checkpoints.insert(session_id.get(), checkpoint.clone());
         drop(checkpoints);
+        if persistent {
+            self.persist_checkpoint(project_id, &checkpoint).await?;
+        }
         self.db
             .update_browser_checkpoint_metadata(
                 project_id,
@@ -1157,6 +1621,31 @@ fn engine_name(engine: BrowserEngine) -> &'static str {
     match engine {
         BrowserEngine::Lightpanda => "lightpanda",
         BrowserEngine::Chromium => "chromium",
+    }
+}
+
+fn default_profiles_root(db: &Db) -> PathBuf {
+    db.path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.join("browser-profiles"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("huntproxy-browser-profiles-{}", std::process::id()))
+        })
+}
+
+fn merge_persistent_profile(profile: &mut PersistentBrowserProfile, checkpoint: &Checkpoint) {
+    profile.version = profile.version.saturating_add(1);
+    profile.checkpoint_hash.clone_from(&checkpoint.hash);
+    profile.last_url.clone_from(&checkpoint.url);
+    profile.cookies.clone_from(&checkpoint.cookies);
+    for (origin, values) in &checkpoint.local_storage {
+        profile.local_storage.insert(origin.clone(), values.clone());
+    }
+    if let Some(origin) = checkpoint.local_storage.keys().next() {
+        profile
+            .session_storage
+            .insert(origin.clone(), checkpoint.session_storage.clone());
     }
 }
 
@@ -1437,6 +1926,132 @@ mod tests {
         checkpoint.version = 99;
         checkpoint.hash = "old".into();
         assert_eq!(first, checkpoint_hash(&checkpoint).unwrap());
+    }
+
+    #[test]
+    fn persistent_profile_merges_origins_and_replaces_the_cookie_jar() {
+        let mut profile = PersistentBrowserProfile::default();
+        let first = Checkpoint {
+            url: Some("https://one.test/app".into()),
+            cookies: vec![json!({"name":"one","value":"1","domain":"one.test","path":"/"})],
+            local_storage: BTreeMap::from([(
+                "https://one.test".into(),
+                BTreeMap::from([("theme".into(), "dark".into())]),
+            )]),
+            session_storage: BTreeMap::from([("nonce".into(), "first".into())]),
+            ..Default::default()
+        };
+        merge_persistent_profile(&mut profile, &first);
+
+        let second = Checkpoint {
+            url: Some("https://two.test/".into()),
+            cookies: vec![json!({"name":"two","value":"2","domain":"two.test","path":"/"})],
+            local_storage: BTreeMap::from([(
+                "https://two.test".into(),
+                BTreeMap::from([("visit".into(), "2".into())]),
+            )]),
+            session_storage: BTreeMap::from([("nonce".into(), "second".into())]),
+            ..Default::default()
+        };
+        merge_persistent_profile(&mut profile, &second);
+
+        assert_eq!(profile.version, 2);
+        assert_eq!(profile.last_url.as_deref(), Some("https://two.test/"));
+        assert_eq!(profile.cookies.len(), 1);
+        assert_eq!(profile.cookies[0]["name"], "two");
+        assert_eq!(profile.local_storage["https://one.test"]["theme"], "dark");
+        assert_eq!(profile.local_storage["https://two.test"]["visit"], "2");
+        assert_eq!(
+            profile.session_storage["https://one.test"]["nonce"],
+            "first"
+        );
+        assert_eq!(
+            profile.session_storage["https://two.test"]["nonce"],
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_profile_file_round_trips_privately() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let project_id = ProjectId(42);
+        let checkpoint = Checkpoint {
+            url: Some("https://example.test/".into()),
+            cookies: vec![
+                json!({"name":"sid","value":"secret","domain":"example.test","path":"/"}),
+            ],
+            local_storage: BTreeMap::from([(
+                "https://example.test".into(),
+                BTreeMap::from([("key".into(), "value".into())]),
+            )]),
+            ..Default::default()
+        };
+
+        service
+            .persist_checkpoint(project_id, &checkpoint)
+            .await
+            .unwrap();
+        let loaded = service
+            .load_persistent_profile(project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.last_url, checkpoint.url);
+        assert_eq!(loaded.cookies, checkpoint.cookies);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(service.profile_state_path(project_id))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_profile_recovers_from_corrupt_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "reset profile".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let state_path = service.profile_state_path(project.id);
+        write_private_file(&state_path, b"not json").unwrap();
+
+        assert!(service.reset_project_profile(project.id).await.unwrap());
+        assert!(!service.project_profile_dir(project.id).exists());
+        assert!(service
+            .load_persistent_profile(project.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]
