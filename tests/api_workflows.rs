@@ -274,3 +274,67 @@ async fn managed_cookies_are_configured_without_exposing_values() {
         .unwrap();
     assert_eq!(clear.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn response_body_api_decodes_gzip_and_preserves_raw_access() {
+    use base64::Engine;
+    use std::io::Write;
+
+    let (_directory, state, project_id) = test_state().await;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(b"readable response").unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut captured = exchange(project_id, "GET", "/compressed");
+    captured.response_headers = vec![HeaderEntry {
+        name: "Content-Encoding".into(),
+        value: b"gzip".to_vec(),
+        ordinal: 0,
+    }];
+    captured.response_body = Some(compressed.clone());
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+    let app = bb::api::router(state);
+
+    let decoded = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/body?side=response",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let decoded = json_response(decoded).await;
+    assert_eq!(decoded["decoded"], true);
+    assert_eq!(decoded["content_encoding"], "gzip");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(decoded["data"].as_str().unwrap())
+            .unwrap(),
+        b"readable response"
+    );
+
+    let raw = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/body?side=response&raw=true",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let raw = json_response(raw).await;
+    assert_eq!(raw["decoded"], false);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(raw["data"].as_str().unwrap())
+            .unwrap(),
+        compressed
+    );
+}

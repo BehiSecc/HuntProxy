@@ -4,6 +4,7 @@ mod raw;
 
 pub use raw::*;
 
+use crate::codec::{decode_content_encodings, MAX_DECODED_BODY_OUTPUT};
 use crate::domain::*;
 use crate::history::{diff_exchanges, ResponseDiff};
 use crate::policy::{
@@ -175,6 +176,8 @@ pub async fn materialize_request(
     draft: &ReplyDraft,
     key: &PlaceholderKey,
 ) -> DomainResult<MaterializedRequest> {
+    let normalized = normalize_reply_draft(draft.clone())?;
+    let draft = &normalized;
     let mut method = draft.method.clone().unwrap_or_else(|| "GET".into());
     let mut url = draft
         .url
@@ -182,13 +185,39 @@ pub async fn materialize_request(
         .unwrap_or_else(|| "http://localhost/".into());
     let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
     let mut body = draft.body_override.clone();
+    let mut inherited_url = None;
 
     if let Some(base_id) = base_exchange_id {
+        let detail = db
+            .get_exchange_detail(project_id, base_id, PresentationOptions::default())
+            .await?;
+        let query = detail
+            .summary
+            .query
+            .as_ref()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default();
+        let base_url = format!(
+            "{}://{}{}{}",
+            detail.summary.scheme, detail.summary.authority, detail.summary.path, query
+        );
+        inherited_url = Some(base_url.clone());
+        if draft.method.is_none() {
+            method = detail.summary.method;
+        }
+        if draft.url.is_none() {
+            url = base_url;
+        }
+
         let base_headers = db
             .load_raw_headers(project_id, base_id, MessageSide::Request)
             .await?;
-        // Start from base headers
         for h in &base_headers {
+            if draft.inheritance == ReplyInheritance::CookiesAuthOnly
+                && !is_auth_context_header(&h.name)
+            {
+                continue;
+            }
             if draft
                 .header_tombstones
                 .iter()
@@ -205,27 +234,10 @@ pub async fn materialize_request(
             }
             headers.push((h.name.clone(), h.value.clone()));
         }
-        if draft.method.is_none() || draft.url.is_none() {
-            let detail = db
-                .get_exchange_detail(project_id, base_id, PresentationOptions::default())
-                .await?;
-            if draft.method.is_none() {
-                method = detail.summary.method;
-            }
-            if draft.url.is_none() {
-                let q = detail
-                    .summary
-                    .query
-                    .as_ref()
-                    .map(|q| format!("?{q}"))
-                    .unwrap_or_default();
-                url = format!(
-                    "{}://{}{}{}",
-                    detail.summary.scheme, detail.summary.authority, detail.summary.path, q
-                );
-            }
-        }
-        if body.is_none() && !draft.body_cleared {
+        if body.is_none()
+            && !draft.body_cleared
+            && draft.inheritance == ReplyInheritance::FullRequest
+        {
             body = db
                 .load_raw_body(project_id, base_id, MessageSide::Request)
                 .await?;
@@ -274,12 +286,85 @@ pub async fn materialize_request(
         headers.push((o.name.clone(), val));
     }
 
+    // Semantic transports own message framing. Keeping inherited framing is
+    // misleading in history and can make a changed body appear malformed.
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case("transfer-encoding")
+    });
+
+    let host_was_overridden = draft
+        .header_overrides
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("host"));
+    if !host_was_overridden
+        && inherited_url
+            .as_deref()
+            .is_some_and(|base| origins_differ(base, &url))
+    {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
+    }
+
     Ok(MaterializedRequest {
         method,
         url,
         headers,
         body,
     })
+}
+
+pub fn normalize_reply_draft(mut draft: ReplyDraft) -> DomainResult<ReplyDraft> {
+    let body_sources = usize::from(draft.body_override.is_some())
+        + usize::from(draft.body_text.is_some())
+        + usize::from(draft.body_json.is_some());
+    if body_sources > 1 {
+        return Err(DomainError::invalid(
+            "provide only one of body_override, body_text, or body_json",
+        ));
+    }
+    if draft.body_cleared && body_sources > 0 {
+        return Err(DomainError::invalid(
+            "body_cleared cannot be combined with a body value",
+        ));
+    }
+    if let Some(text) = draft.body_text.take() {
+        draft.body_override = Some(text.into_bytes());
+    }
+    if let Some(value) = draft.body_json.take() {
+        draft.body_override = Some(
+            serde_json::to_vec(&value)
+                .map_err(|error| DomainError::invalid(format!("body_json: {error}")))?,
+        );
+        if !draft
+            .header_overrides
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-type"))
+        {
+            draft.header_overrides.push(HeaderPatch {
+                name: "Content-Type".into(),
+                value: b"application/json".to_vec(),
+            });
+        }
+    }
+    Ok(draft)
+}
+
+fn is_auth_context_header(name: &str) -> bool {
+    ["cookie", "authorization", "origin"]
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+fn origins_differ(left: &str, right: &str) -> bool {
+    let Ok(left) = url::Url::parse(left) else {
+        return true;
+    };
+    let Ok(right) = url::Url::parse(right) else {
+        return true;
+    };
+    left.scheme() != right.scheme()
+        || left.host_str() != right.host_str()
+        || left.port_or_known_default() != right.port_or_known_default()
 }
 
 #[derive(Debug, Clone)]
@@ -307,19 +392,27 @@ pub struct EphemeralReplyResponse {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplyBodyPreview {
+    pub text: String,
+    pub truncated: bool,
+    pub decoded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ReplySendResult {
     pub exchange_id: Option<ExchangeId>,
     pub diff: Option<ResponseDiff>,
     /// Present only when capture scope excludes the exchange.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<EphemeralReplyResponse>,
-    #[serde(skip)]
+    pub response_preview: ReplyBodyPreview,
     pub response_length: i64,
-    #[serde(skip)]
     pub response_body_hash: String,
-    #[serde(skip)]
     pub duration_ms: i64,
-    #[serde(skip)]
     pub status_code: u16,
 }
 
@@ -533,6 +626,26 @@ impl ReplyService {
             .find(|h| h.name.eq_ignore_ascii_case("content-type"))
             .map(|h| String::from_utf8_lossy(&h.value).into_owned());
 
+        let content_encoding = response_content_encoding(&resp_headers);
+        let (preview_body, decoded, decode_error) = match content_encoding.as_deref() {
+            Some(encoding) => {
+                match decode_content_encodings(&out.body, encoding, MAX_DECODED_BODY_OUTPUT) {
+                    Ok(decoded) => (decoded, true, None),
+                    Err(error) => (out.body.to_vec(), false, Some(error.to_string())),
+                }
+            }
+            None => (out.body.to_vec(), false, None),
+        };
+        const REPLY_PREVIEW_BYTES: usize = 4096;
+        let preview_end = preview_body.len().min(REPLY_PREVIEW_BYTES);
+        let response_preview = ReplyBodyPreview {
+            text: String::from_utf8_lossy(&preview_body[..preview_end]).into_owned(),
+            truncated: preview_end < preview_body.len() || out.body_truncated,
+            decoded,
+            content_encoding,
+            decode_error,
+        };
+
         let response_length = out.body.len() as i64;
         let response_body_hash = crate::storage::sha256_hex(&out.body);
         let duration_ms = out.duration.as_millis() as i64;
@@ -660,6 +773,7 @@ impl ReplyService {
             exchange_id,
             diff,
             response: ephemeral_response,
+            response_preview,
             response_length,
             response_body_hash,
             duration_ms,
@@ -668,10 +782,21 @@ impl ReplyService {
     }
 }
 
+fn response_content_encoding(headers: &[HeaderEntry]) -> Option<String> {
+    let values = headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+        .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"))
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::storage::NewExchange;
     use crate::transport::OutboundResponse;
 
     struct CannedTransport;
@@ -689,6 +814,43 @@ mod tests {
                 body: bytes::Bytes::from_static(b"ephemeral"),
                 body_truncated: false,
                 protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test".into(),
+                duration: Duration::from_millis(2),
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    struct GzipTransport;
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for GzipTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            _request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(b"decoded preview").unwrap();
+            Ok(OutboundResponse {
+                status: http::StatusCode::CREATED,
+                headers: vec![
+                    ("content-type".into(), b"text/plain".to_vec()),
+                    ("content-encoding".into(), b"gzip".to_vec()),
+                ],
+                body: bytes::Bytes::from(encoder.finish().unwrap()),
+                body_truncated: false,
+                protocol: "HTTP/2".into(),
                 transport_provenance: TransportProvenance::GenericUnprofiled,
                 transport_profile: "test".into(),
                 duration: Duration::from_millis(2),
@@ -865,5 +1027,176 @@ mod tests {
             .unwrap()
             .0
             .is_empty());
+    }
+
+    #[test]
+    fn reply_body_conveniences_normalize_to_canonical_bytes() {
+        let text = normalize_reply_draft(ReplyDraft {
+            body_text: Some("hello".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(text.body_override.as_deref(), Some(b"hello".as_slice()));
+        assert!(text.body_text.is_none());
+
+        let json = normalize_reply_draft(ReplyDraft {
+            body_json: Some(serde_json::json!({"ok": true})),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            json.body_override.as_deref(),
+            Some(br#"{"ok":true}"#.as_slice())
+        );
+        assert!(json.header_overrides.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("content-type") && header.value == b"application/json"
+        }));
+
+        assert!(normalize_reply_draft(ReplyDraft {
+            body_override: Some(vec![1]),
+            body_text: Some("conflict".into()),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn auth_only_inheritance_drops_stale_request_shape() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "inheritance".into(),
+                target_url: "https://base.test/rpc".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let base = db
+            .insert_exchange(NewExchange {
+                project_id: project.id,
+                source: ExchangeSource::Proxy,
+                protocol: "HTTP/2".into(),
+                method: "POST".into(),
+                scheme: "https".into(),
+                authority: "base.test".into(),
+                host: "base.test".into(),
+                port: 443,
+                path: "/rpc".into(),
+                query: None,
+                status_code: Some(200),
+                mime: Some("application/json+protobuf".into()),
+                completion: CompletionState::Complete,
+                capture_quality: CaptureQuality::Semantic,
+                header_representation: HeaderRepresentation::Semantic,
+                body_representation: BodyRepresentation::SemanticEncoded,
+                cache_provenance: CacheProvenance::None,
+                transport_provenance: Some(TransportProvenance::ProtocolProfileOnly),
+                transport_profile: Some("test".into()),
+                request_headers: [
+                    ("Host", "base.test"),
+                    ("Cookie", "sid=secret"),
+                    ("Authorization", "Bearer secret"),
+                    ("Origin", "https://base.test"),
+                    ("Content-Type", "application/json+protobuf"),
+                    ("Content-Length", "44"),
+                    ("X-Goog-Api-Key", "wrong-key"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, (name, value))| HeaderEntry {
+                    name: name.into(),
+                    value: value.as_bytes().to_vec(),
+                    ordinal: ordinal as u32,
+                })
+                .collect(),
+                response_headers: vec![],
+                request_body: Some(b"old protobuf body".to_vec()),
+                response_body: None,
+                duration_ms: Some(1),
+                lineage: ExchangeLineage::default(),
+                page_title: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+
+        let request = materialize_request(
+            &db,
+            project.id,
+            Some(base),
+            &ReplyDraft {
+                method: Some("POST".into()),
+                url: Some("https://other.test/rest".into()),
+                inheritance: ReplyInheritance::CookiesAuthOnly,
+                body_json: Some(serde_json::json!({"partner": 7})),
+                ..Default::default()
+            },
+            &PlaceholderKey::from_bytes(vec![1; 32]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            request.body.as_deref(),
+            Some(br#"{"partner":7}"#.as_slice())
+        );
+        for expected in ["cookie", "authorization", "origin", "content-type"] {
+            assert!(request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(expected)));
+        }
+        for removed in [
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "x-goog-api-key",
+        ] {
+            assert!(!request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(removed)));
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_result_includes_decoded_body_preview() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "preview".into(),
+                target_url: "http://127.0.0.1/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let service = ReplyService {
+            db,
+            transport: Arc::new(GzipTransport),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+        };
+        let result = service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("http://127.0.0.1/".into()),
+                    ..Default::default()
+                },
+                ProtocolPreference::H2,
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status_code, 201);
+        assert_eq!(result.response_preview.text, "decoded preview");
+        assert!(result.response_preview.decoded);
+        assert_eq!(
+            result.response_preview.content_encoding.as_deref(),
+            Some("gzip")
+        );
     }
 }

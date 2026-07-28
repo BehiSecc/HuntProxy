@@ -71,13 +71,22 @@ Browser state is private and persistent per project. Cookies and site storage
 survive `stop`, daemon restarts, and idle shutdown; omit `url` from the next
 `browser_start` call to resume the last page. Use `browser_manage` with
 `op: "stop"` for one session or `op: "stop_all"` to suspend every browser in a
-project without clearing its state. Use `op: "reset_profile"` with
+project without clearing its state. `browser_manage` status can omit
+`session_id` to list active project browsers. Use `op: "reset_profile"` with
 `confirm: true` to clear browser-derived state; cookies configured with the
 `cookies` tool remain separately managed and should also be cleared for a
-complete logout. After 30 minutes without MCP/UI
+complete logout. After one hour without MCP/UI
 control activity, the MCP bridge and daemon exit and browser processes close.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
+
+Reply drafts accept `body_text` or `body_json` as convenient alternatives to
+byte-array `body_override`. When adapting a captured request to a different
+endpoint, set `inheritance: "cookies_auth_only"` to retain only Cookie,
+Authorization, and Origin; `full_request` remains the compatibility default.
+Semantic Reply always recalculates message framing, and `reply_send` includes a
+decoded 4 KiB response preview. `exchange_body` decodes gzip, Brotli, and
+deflate responses by default; pass `raw: true` for the captured bytes.
 
 Use `js_files` with only `project_id` to list JavaScript from saved history,
 add `domain` to filter it, or add `url` to perform a fresh, ephemeral,

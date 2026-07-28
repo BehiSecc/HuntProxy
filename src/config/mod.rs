@@ -60,7 +60,7 @@ impl Default for Config {
             node_path: which_path("node"),
             browser_worker_path: None,
             auto_start_daemon: true,
-            idle_timeout_seconds: 30 * 60,
+            idle_timeout_seconds: 60 * 60,
         }
     }
 }
@@ -342,6 +342,6 @@ mod tests {
             assert!(config.data_dir.join(relative).is_dir());
         }
         assert!(config.data_dir.join(CONFIG_FILE_NAME).is_file());
-        assert_eq!(config.idle_timeout_seconds, 30 * 60);
+        assert_eq!(config.idle_timeout_seconds, 60 * 60);
     }
 }

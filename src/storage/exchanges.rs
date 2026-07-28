@@ -201,7 +201,7 @@ impl Db {
         before_started: Option<String>,
         before_id: Option<i64>,
     ) -> DomainResult<(Vec<ExchangeSummary>, Option<(String, i64)>)> {
-        let limit = limit.clamp(1, 200) as usize;
+        let limit = limit.clamp(1, 500) as usize;
         let (filter_sql, filter_binds) = match filter {
             Some(filter) => filter_to_sql(&filter)?,
             None => ("1=1".into(), Vec::new()),

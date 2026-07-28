@@ -137,7 +137,7 @@ struct DaemonToolResponse {
 fn reply_draft_schema() -> Value {
     json!({
         "type": "object",
-        "description": "All fields are optional. Omitted fields inherit from base_exchange_id when supplied.",
+        "description": "All fields are optional. Omitted fields inherit from base_exchange_id when supplied. Use inheritance=cookies_auth_only when adapting a captured request to a different endpoint.",
         "properties": {
             "method": {"type": ["string", "null"]},
             "url": {"type": ["string", "null"]},
@@ -158,12 +158,15 @@ fn reply_draft_schema() -> Value {
                 }
             },
             "header_tombstones": {"type": "array", "items": {"type": "string"}, "default": []},
+            "inheritance": {"type": "string", "enum": ["full_request", "cookies_auth_only"], "default": "full_request", "description": "full_request preserves all base headers/body. cookies_auth_only keeps only Cookie, Authorization, and Origin; explicit overrides still apply."},
             "body_override": {
                 "oneOf": [
                     {"type": "null"},
                     {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}}
                 ]
             },
+            "body_text": {"type": ["string", "null"], "description": "UTF-8 request body convenience field. Mutually exclusive with body_override and body_json."},
+            "body_json": {"description": "JSON request body convenience field. Mutually exclusive with body_override and body_text; adds application/json unless Content-Type is explicit.", "oneOf": [{"type":"object"},{"type":"array"},{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"}]},
             "body_cleared": {"type": "boolean", "default": false}
         },
         "additionalProperties": false
@@ -248,21 +251,21 @@ fn tool_defs() -> Value {
         {"name":"projects","description":"List, create, or set optional capture scope","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"type":"string"},"file_path":{"type":"string"}},"required":["project_id","action"]}},
-        {"name":"history_search","description":"Search history. q accepts bare text or filters such as host:example.com path:~.js method:GET status>=400; separate terms with spaces.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"Bare text searches common fields. field:value is exact, field:~value contains, field:*suffix ends with, and comparisons use >= <= > < !=."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
+        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. q accepts bare text or filters such as host:example.com path:~.js method:GET status>=400; separate terms with spaces.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"Bare text searches common fields. field:value is exact, field:~value contains, field:*suffix ends with, and comparisons use >= <= > < !=."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
-        {"name":"exchange_body","description":"Read a request or response body in pages. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576}},"required":["project_id","exchange_id"]}},
+        {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a semantic HTTP request. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]}},"required":["project_id"]}},
+        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]}},"required":["project_id"]}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases"]},"job_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
         {"name":"browser_start","description":"Start or resume the project's persistent browser workspace. Omit url to resume the last page. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
-        {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, migrate Lightpanda state to Chromium, or reset the persistent browser workspace. Stop operations preserve browser state. Switching requires chromium_reason=user_requested or lightpanda_incompatible. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool. session_id is not needed for stop_all or reset_profile.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium","reset_profile"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
+        {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, migrate Lightpanda state to Chromium, or reset the persistent browser workspace. Status without session_id lists active browser sessions. Stop operations preserve browser state. Switching requires chromium_reason=user_requested or lightpanda_incompatible. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop and switch_chromium; optional for status."},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium","reset_profile"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
         {"name":"js_files","description":"Return JavaScript file URLs and paths. Without url, search saved project history; with url, load that page Lightpanda-first and return files observed in that fresh browser session. Optional domain accepts a hostname or URL and includes subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"codec_transform","description":"Apply codec transforms","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
+        {"name":"codec_transform","description":"Apply byte transforms, including gzip_decode/gunzip and brotli_decode","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string","enum":["utf8","base64","hex"]},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_annotate","description":"Set an exchange title, note, and labels","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
     ])
@@ -786,7 +789,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .db
                 .list_history_filtered(project_id, filter, limit, None, None)
                 .await?;
-            Ok(json!({ "items": items, "next": next }))
+            Ok(json!({
+                "items": items,
+                "next": next,
+                "saved_only": true,
+                "noise_filtered": false
+            }))
         }
         "exchange_get" => {
             let project_id = require_project_id(&args)?;
@@ -835,6 +843,9 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .load_raw_body(project_id, ExchangeId(eid), side)
                 .await?
                 .unwrap_or_default();
+            let raw_total = body.len();
+            let mut content_encoding = None;
+            let mut decoded = false;
             if side == MessageSide::Request {
                 let detail = state
                     .db
@@ -846,6 +857,29 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     .await?;
                 if detail.protocol == "HTTP/1.1 raw" {
                     body = crate::reply::redact_raw_request_headers(&body);
+                }
+            } else if !args.get("raw").and_then(Value::as_bool).unwrap_or(false) {
+                let headers = state
+                    .db
+                    .load_raw_headers(project_id, ExchangeId(eid), MessageSide::Response)
+                    .await?;
+                let encodings = headers
+                    .iter()
+                    .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+                    .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
+                    .filter(|encoding| {
+                        !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
+                    })
+                    .collect::<Vec<_>>();
+                if !encodings.is_empty() {
+                    let encoding = encodings.join(", ");
+                    body = crate::codec::decode_content_encodings(
+                        &body,
+                        &encoding,
+                        crate::codec::MAX_DECODED_BODY_OUTPUT,
+                    )?;
+                    content_encoding = Some(encoding);
+                    decoded = true;
                 }
             }
             let end = offset.saturating_add(max).min(body.len());
@@ -860,7 +894,10 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 "length": slice.len(),
                 "preview": String::from_utf8_lossy(slice),
                 "truncated": end < body.len(),
-                "next_offset": (end < body.len()).then_some(end)
+                "next_offset": (end < body.len()).then_some(end),
+                "decoded": decoded,
+                "content_encoding": content_encoding,
+                "raw_total": raw_total,
             }))
         }
         "secret_reveal" => {
@@ -934,6 +971,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .transpose()
                         .map_err(|e| DomainError::invalid(e.to_string()))?
                         .unwrap_or_default();
+                    let draft = crate::reply::normalize_reply_draft(draft)?;
                     Ok(json!(
                         state
                             .db
@@ -1173,6 +1211,11 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "ok": true,
                     "removed": removed,
                     "managed_cookies_preserved": true,
+                }));
+            }
+            if op == "status" && args.get("session_id").and_then(Value::as_i64).is_none() {
+                return Ok(json!({
+                    "sessions": state.browser.active_sessions(project_id).await?
                 }));
             }
             let sid = args
@@ -1445,11 +1488,16 @@ mod tests {
     fn reply_drafts_accept_the_minimal_shape_advertised_by_mcp() {
         let draft: ReplyDraft = serde_json::from_value(json!({
             "method": "GET",
-            "url": "https://example.com"
+            "url": "https://example.com",
+            "header_overrides": [{"name":"X-Binary","value":[0,255]}],
+            "body_text": "hello",
+            "inheritance": "cookies_auth_only"
         }))
         .unwrap();
-        assert!(draft.header_overrides.is_empty());
+        assert_eq!(draft.header_overrides[0].value, vec![0, 255]);
         assert!(draft.header_tombstones.is_empty());
+        assert_eq!(draft.body_text.as_deref(), Some("hello"));
+        assert_eq!(draft.inheritance, ReplyInheritance::CookiesAuthOnly);
         assert!(!draft.body_cleared);
     }
 
@@ -1528,6 +1576,13 @@ mod tests {
             reply["inputSchema"]["properties"]["draft"]["properties"]["header_overrides"]["type"],
             "array"
         );
+        assert_eq!(
+            reply["inputSchema"]["properties"]["draft"]["properties"]["inheritance"]["default"],
+            "full_request"
+        );
+        assert!(reply["inputSchema"]["properties"]["draft"]["properties"]
+            .get("body_text")
+            .is_some());
         let browser = tools
             .iter()
             .find(|tool| tool["name"] == "browser_action")

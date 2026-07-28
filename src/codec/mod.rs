@@ -3,8 +3,10 @@
 use crate::domain::{DomainError, DomainResult, ErrorCode};
 use base64::Engine;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
+use std::io::Read;
 
 const MAX_TRANSFORM_OUTPUT: usize = 10 * 1024 * 1024;
+pub const MAX_DECODED_BODY_OUTPUT: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +22,10 @@ pub enum Transform {
     UrlDecode,
     HtmlEncode,
     HtmlDecode,
+    #[serde(alias = "gunzip")]
+    GzipDecode,
+    #[serde(alias = "br_decode")]
+    BrotliDecode,
 }
 
 pub fn apply_transform(t: Transform, input: &[u8]) -> DomainResult<Vec<u8>> {
@@ -82,6 +88,16 @@ pub fn apply_transform(t: Transform, input: &[u8]) -> DomainResult<Vec<u8>> {
                 .into_owned()
                 .into_bytes()
         }
+        Transform::GzipDecode => decode_reader(
+            flate2::read::GzDecoder::new(input),
+            MAX_TRANSFORM_OUTPUT,
+            "gzip",
+        )?,
+        Transform::BrotliDecode => decode_reader(
+            brotli::Decompressor::new(input, 4096),
+            MAX_TRANSFORM_OUTPUT,
+            "brotli",
+        )?,
     };
     if out.len() > MAX_TRANSFORM_OUTPUT {
         return Err(DomainError::new(
@@ -94,6 +110,66 @@ pub fn apply_transform(t: Transform, input: &[u8]) -> DomainResult<Vec<u8>> {
         ));
     }
     Ok(out)
+}
+
+/// Decode an HTTP Content-Encoding chain. Encodings are applied by servers in
+/// header order and therefore decoded in reverse order.
+pub fn decode_content_encodings(
+    input: &[u8],
+    content_encoding: &str,
+    max_output: usize,
+) -> DomainResult<Vec<u8>> {
+    let encodings = content_encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .collect::<Vec<_>>();
+    let mut output = input.to_vec();
+    for encoding in encodings.into_iter().rev() {
+        output = if encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("x-gzip")
+        {
+            decode_reader(
+                flate2::read::GzDecoder::new(output.as_slice()),
+                max_output,
+                "gzip",
+            )?
+        } else if encoding.eq_ignore_ascii_case("br") {
+            decode_reader(
+                brotli::Decompressor::new(output.as_slice(), 4096),
+                max_output,
+                "brotli",
+            )?
+        } else if encoding.eq_ignore_ascii_case("deflate") {
+            decode_reader(
+                flate2::read::ZlibDecoder::new(output.as_slice()),
+                max_output,
+                "deflate",
+            )?
+        } else {
+            return Err(DomainError::invalid(format!(
+                "unsupported content encoding `{encoding}`; request the raw body instead"
+            )));
+        };
+    }
+    Ok(output)
+}
+
+fn decode_reader(reader: impl Read, max_output: usize, encoding: &str) -> DomainResult<Vec<u8>> {
+    let limit = u64::try_from(max_output)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut output = Vec::new();
+    reader
+        .take(limit)
+        .read_to_end(&mut output)
+        .map_err(|error| DomainError::invalid(format!("{encoding} decode: {error}")))?;
+    if output.len() > max_output {
+        return Err(DomainError::new(
+            ErrorCode::BodyTooLarge,
+            format!("decoded {encoding} body exceeds {max_output} bytes"),
+        ));
+    }
+    Ok(output)
 }
 
 pub fn apply_pipeline(steps: &[Transform], input: &[u8]) -> DomainResult<Vec<u8>> {
@@ -145,5 +221,40 @@ mod tests {
     #[test]
     fn invalid_hex() {
         assert!(apply_transform(Transform::HexDecode, b"zz").is_err());
+    }
+
+    #[test]
+    fn gzip_and_brotli_decode() {
+        use std::io::Write;
+
+        let expected = b"compressed response body";
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(expected).unwrap();
+        let gzip = gzip.finish().unwrap();
+        assert_eq!(
+            apply_transform(Transform::GzipDecode, &gzip).unwrap(),
+            expected
+        );
+
+        let mut brotli = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut brotli, 4096, 3, 22);
+            writer.write_all(expected).unwrap();
+        }
+        assert_eq!(
+            apply_transform(Transform::BrotliDecode, &brotli).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_or_oversized_content_encoding() {
+        assert!(decode_content_encodings(b"body", "compress", 1024).is_err());
+
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        use std::io::Write;
+        gzip.write_all(&[b'a'; 64]).unwrap();
+        let gzip = gzip.finish().unwrap();
+        assert!(decode_content_encodings(&gzip, "gzip", 8).is_err());
     }
 }

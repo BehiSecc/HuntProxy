@@ -897,6 +897,20 @@ impl BrowserService {
             .collect()
     }
 
+    pub async fn active_sessions(
+        &self,
+        project_id: ProjectId,
+    ) -> DomainResult<Vec<BrowserSession>> {
+        self.db.get_project(project_id).await?;
+        let ids = self.active_session_ids(project_id).await;
+        let mut sessions = Vec::with_capacity(ids.len());
+        for session_id in ids {
+            sessions.push(self.db.get_browser_session(project_id, session_id).await?);
+        }
+        sessions.sort_by_key(|session| session.id.get());
+        Ok(sessions)
+    }
+
     async fn session_is_persistent(&self, session_id: BrowserSessionId) -> bool {
         self.runtime_sessions
             .lock()

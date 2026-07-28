@@ -562,6 +562,7 @@ struct BodyQuery {
     side: Option<String>,
     offset: Option<usize>,
     max_bytes: Option<usize>,
+    raw: Option<bool>,
 }
 
 async fn get_body(
@@ -581,6 +582,9 @@ async fn get_body(
         .await
     {
         Ok(Some(mut body)) => {
+            let raw_total = body.len();
+            let mut content_encoding = None;
+            let mut decoded = false;
             if side == MessageSide::Request {
                 if let Ok(detail) = state
                     .db
@@ -594,6 +598,36 @@ async fn get_body(
                     if detail.protocol == "HTTP/1.1 raw" {
                         body = crate::reply::redact_raw_request_headers(&body);
                     }
+                }
+            } else if !q.raw.unwrap_or(false) {
+                let headers = match state
+                    .db
+                    .load_raw_headers(ProjectId(id), ExchangeId(eid), MessageSide::Response)
+                    .await
+                {
+                    Ok(headers) => headers,
+                    Err(error) => return error_response(error),
+                };
+                let encodings = headers
+                    .iter()
+                    .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+                    .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
+                    .filter(|encoding| {
+                        !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
+                    })
+                    .collect::<Vec<_>>();
+                if !encodings.is_empty() {
+                    let encoding = encodings.join(", ");
+                    body = match crate::codec::decode_content_encodings(
+                        &body,
+                        &encoding,
+                        crate::codec::MAX_DECODED_BODY_OUTPUT,
+                    ) {
+                        Ok(body) => body,
+                        Err(error) => return error_response(error),
+                    };
+                    content_encoding = Some(encoding);
+                    decoded = true;
                 }
             }
             let total = body.len();
@@ -613,6 +647,9 @@ async fn get_body(
                 "encoding": "base64",
                 "data": b64,
                 "untrusted": true,
+                "decoded": decoded,
+                "content_encoding": content_encoding,
+                "raw_total_length": raw_total,
             }))
             .into_response()
         }
@@ -651,6 +688,10 @@ async fn upsert_reply_tab(
         Some("h2") => ProtocolPreference::H2,
         _ => ProtocolPreference::Auto,
     };
+    let draft = match crate::reply::normalize_reply_draft(body.draft) {
+        Ok(draft) => draft,
+        Err(error) => return error_response(error),
+    };
     match state
         .db
         .upsert_reply_tab(
@@ -659,7 +700,7 @@ async fn upsert_reply_tab(
             body.name,
             body.base_exchange_id.map(ExchangeId),
             protocol,
-            body.draft,
+            draft,
             body.revision,
         )
         .await

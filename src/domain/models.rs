@@ -172,8 +172,24 @@ pub struct ReplyDraft {
     pub header_overrides: Vec<HeaderPatch>,
     /// Header names tombstoned (removed from base).
     pub header_tombstones: Vec<String>,
+    /// How much of the base request is inherited. Full request preserves the
+    /// original behavior; cookies/auth-only is safer for a new endpoint.
+    pub inheritance: ReplyInheritance,
     pub body_override: Option<Vec<u8>>,
+    /// UTF-8 convenience input. Mutually exclusive with body_override/body_json.
+    pub body_text: Option<String>,
+    /// JSON convenience input. Serialized compactly and defaults Content-Type
+    /// to application/json when no explicit Content-Type override exists.
+    pub body_json: Option<serde_json::Value>,
     pub body_cleared: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyInheritance {
+    #[default]
+    FullRequest,
+    CookiesAuthOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,13 +222,24 @@ mod serde_bytes_or_string {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        if let Some(rest) = s.strip_prefix("base64:") {
-            base64::engine::general_purpose::STANDARD
-                .decode(rest)
-                .map_err(serde::de::Error::custom)
-        } else {
-            Ok(s.into_bytes())
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrBytes {
+            String(String),
+            Bytes(Vec<u8>),
+        }
+
+        match StringOrBytes::deserialize(deserializer)? {
+            StringOrBytes::String(s) => {
+                if let Some(rest) = s.strip_prefix("base64:") {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(rest)
+                        .map_err(serde::de::Error::custom)
+                } else {
+                    Ok(s.into_bytes())
+                }
+            }
+            StringOrBytes::Bytes(bytes) => Ok(bytes),
         }
     }
 }
