@@ -10,7 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use futures::StreamExt;
@@ -142,6 +142,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(renew_capture_session),
         )
         .route("/api/v1/projects/{id}/history", get(history))
+        .route("/api/v1/projects/{id}/sitemap", get(sitemap))
+        .route(
+            "/api/v1/projects/{id}/findings",
+            get(list_findings).post(create_finding),
+        )
+        .route(
+            "/api/v1/projects/{id}/findings/{fid}",
+            delete(delete_finding),
+        )
         .route("/api/v1/projects/{id}/exchanges/{eid}", get(get_exchange))
         .route(
             "/api/v1/projects/{id}/exchanges/{eid}/annotation",
@@ -480,6 +489,84 @@ async fn history(
     }
 }
 
+#[derive(Deserialize)]
+struct SitemapQuery {
+    host: Option<String>,
+}
+
+async fn sitemap(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<SitemapQuery>,
+) -> Response {
+    match state.db.list_sitemap(ProjectId(id), query.host).await {
+        Ok(hosts) => Json(serde_json::json!({ "hosts": hosts })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateFindingBody {
+    exchange_id: i64,
+    title: String,
+    description: String,
+}
+
+async fn list_findings(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match state.db.list_findings(ProjectId(id)).await {
+        Ok(findings) => Json(serde_json::json!({ "findings": findings })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn create_finding(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateFindingBody>,
+) -> Response {
+    match state
+        .db
+        .create_finding(
+            ProjectId(id),
+            ExchangeId(body.exchange_id),
+            body.title,
+            body.description,
+        )
+        .await
+    {
+        Ok(finding) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "finding".into(),
+                payload: serde_json::json!({ "finding_id": finding.id.get(), "action": "added" }),
+            });
+            Json(finding).into_response()
+        }
+        Err(error) => error_response(error),
+    }
+}
+
+async fn delete_finding(
+    State(state): State<Arc<AppState>>,
+    Path((id, finding_id)): Path<(i64, i64)>,
+) -> Response {
+    match state
+        .db
+        .delete_finding(ProjectId(id), FindingId(finding_id))
+        .await
+    {
+        Ok(()) => {
+            let _ = state.events.send(AppEvent {
+                project_id: id,
+                kind: "finding".into(),
+                payload: serde_json::json!({ "finding_id": finding_id, "action": "removed" }),
+            });
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => error_response(error),
+    }
+}
+
 async fn get_exchange(
     State(state): State<Arc<AppState>>,
     Path((id, eid)): Path<(i64, i64)>,
@@ -688,10 +775,6 @@ async fn upsert_reply_tab(
         Some("h2") => ProtocolPreference::H2,
         _ => ProtocolPreference::Auto,
     };
-    let draft = match crate::reply::normalize_reply_draft(body.draft) {
-        Ok(draft) => draft,
-        Err(error) => return error_response(error),
-    };
     match state
         .db
         .upsert_reply_tab(
@@ -700,7 +783,7 @@ async fn upsert_reply_tab(
             body.name,
             body.base_exchange_id.map(ExchangeId),
             protocol,
-            draft,
+            body.draft,
             body.revision,
         )
         .await

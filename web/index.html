@@ -132,6 +132,8 @@
     <div class="health" id="health">connecting…</div>
     <nav aria-label="Workbench">
       <button type="button" data-view="history" class="active">History</button>
+      <button type="button" data-view="sitemap">Sitemap</button>
+      <button type="button" data-view="findings">Findings</button>
       <button type="button" data-view="reply">Reply</button>
       <button type="button" data-view="fuzzer">Fuzzer</button>
       <button type="button" data-view="browser">Browser</button>
@@ -226,9 +228,38 @@
               <div class="row">
                 <button class="btn primary" id="saveAnnotation" disabled>Save annotation</button>
                 <button class="btn" id="sendToReply" disabled>Send to Reply</button>
+                <button class="btn" id="markFinding" disabled>Mark finding</button>
               </div>
               <div class="status" id="annotationStatus"></div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-sitemap" class="panel hidden">
+        <div class="toolbar">
+          <div class="grow"><label for="sitemapHost">Host <span class="muted">(optional)</span></label><input id="sitemapHost" placeholder="example.com" /></div>
+          <button class="btn primary fit" id="loadSitemap">Load</button>
+        </div>
+        <div class="status" id="sitemapStatus"></div>
+        <div class="stack" id="sitemapHosts"></div>
+        <div class="empty hidden" id="sitemapEmpty">No saved routes.</div>
+      </section>
+
+      <section id="view-findings" class="panel hidden">
+        <div class="split">
+          <div class="card">
+            <h2>Mark a finding</h2>
+            <label for="findingExchange">Exchange ID</label><input id="findingExchange" type="number" min="1" />
+            <label for="findingTitle">Title</label><input id="findingTitle" placeholder="Broken access control" />
+            <label for="findingDescription">Description</label><textarea id="findingDescription" placeholder="What happened, impact, and evidence"></textarea>
+            <button class="btn primary" id="addFinding">Add finding</button>
+            <div class="status" id="findingStatus"></div>
+          </div>
+          <div>
+            <div class="row" style="margin-bottom:.55rem"><h2 style="margin:0">Findings</h2><button class="btn fit" id="refreshFindings">Refresh</button></div>
+            <div class="stack" id="findingList"></div>
+            <div class="empty hidden" id="findingsEmpty">No findings yet.</div>
           </div>
         </div>
       </section>
@@ -243,6 +274,9 @@
             <div><label for="replyProtocol">Protocol</label><select id="replyProtocol"><option value="auto">Auto</option><option value="h1">HTTP/1.1</option><option value="h2">HTTP/2</option></select></div>
           </div>
           <label for="replyUrl">URL</label><input id="replyUrl" placeholder="https://example.com/path" />
+          <label for="replyBodyFormat">Body format</label>
+          <select id="replyBodyFormat"><option value="raw">Raw</option><option value="json">JSON</option><option value="xml">XML</option><option value="form_urlencoded">x-www-form-urlencoded</option><option value="multipart">multipart/form-data</option></select>
+          <p class="small muted">For form formats, enter one <code>name=value</code> field per line. Content-Type is updated automatically.</p>
           <div class="detail-grid">
             <div><label for="replyHeaders">Header overrides</label><textarea id="replyHeaders" placeholder="X-Test: value"></textarea></div>
             <div><label for="replyBody">Body override</label><textarea id="replyBody"></textarea></div>
@@ -385,6 +419,8 @@ test
     function activateView(name) {
       document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
       document.querySelectorAll('.workspace > section').forEach(s => s.classList.toggle('hidden', s.id !== `view-${name}`));
+      if (name === 'sitemap') loadSitemap();
+      if (name === 'findings') loadFindings();
       if (name === 'fuzzer') loadFuzzJobs();
       if (name === 'browser') loadBrowserStatus();
     }
@@ -412,6 +448,7 @@ test
       state.selectedDetail = null;
       $('saveAnnotation').disabled = true;
       $('sendToReply').disabled = true;
+      $('markFinding').disabled = true;
       connectEvents();
       if (!state.projectId) return;
       try {
@@ -420,7 +457,7 @@ test
       } catch (_) {}
       $('cookieValue').value = '';
       $('cookieFile').value = '';
-      await Promise.allSettled([loadHistory(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus(), loadCookies()]);
+      await Promise.allSettled([loadHistory(), loadSitemap(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus(), loadCookies()]);
     }
 
     $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
@@ -516,9 +553,10 @@ test
       const source = new EventSource(`/api/v1/projects/${state.projectId}/events`);
       state.events = source;
       source.addEventListener('ready', () => { $('liveDot').classList.add('on'); $('liveText').textContent = 'live'; });
-      for (const event of ['exchange', 'annotation', 'fuzz', 'browser', 'capture']) {
+      for (const event of ['exchange', 'annotation', 'finding', 'fuzz', 'browser', 'capture']) {
         source.addEventListener(event, () => {
           if (event === 'exchange' || event === 'annotation') loadHistory();
+          if (event === 'finding') loadFindings();
           if (event === 'fuzz') loadFuzzJobs();
           if (event === 'browser') loadBrowserStatus();
         });
@@ -572,7 +610,7 @@ test
         $('annotationTitle').value = detail.annotation?.display_title || detail.summary.display_title || '';
         $('annotationLabels').value = (detail.annotation?.labels || detail.summary.labels || []).join(', ');
         $('annotationNote').value = detail.annotation?.note || '';
-        $('saveAnnotation').disabled = false; $('sendToReply').disabled = false;
+        $('saveAnnotation').disabled = false; $('sendToReply').disabled = false; $('markFinding').disabled = false;
         status('inspectorStatus', `${detail.summary.method} ${detail.summary.scheme}://${detail.summary.authority}${detail.summary.path} · ${detail.protocol}`);
         document.querySelectorAll('#historyRows tr').forEach(r => r.classList.toggle('selected', Number(r.dataset.id) === exchangeId));
       } catch (e) { status('inspectorStatus', e.message, 'err'); }
@@ -595,6 +633,66 @@ test
       } catch (e) { status('annotationStatus', e.message, 'err'); }
     };
 
+    async function loadSitemap() {
+      if (!state.projectId) return;
+      try {
+        const query = new URLSearchParams();
+        if ($('sitemapHost').value.trim()) query.set('host', $('sitemapHost').value.trim());
+        const result = await api(`/api/v1/projects/${state.projectId}/sitemap?${query}`);
+        const hosts = result.hosts || [];
+        $('sitemapHosts').innerHTML = hosts.map(host => `<div class="card"><div class="row"><strong>${escapeHtml(host.host)}</strong><span class="pill fit">${host.paths.length} route${host.paths.length === 1 ? '' : 's'}</span></div><pre class="mono">${host.paths.map(escapeHtml).join('\n')}</pre></div>`).join('');
+        $('sitemapEmpty').classList.toggle('hidden', hosts.length > 0);
+        status('sitemapStatus', `${hosts.length} host${hosts.length === 1 ? '' : 's'}`);
+      } catch (error) { status('sitemapStatus', error.message, 'err'); }
+    }
+    $('loadSitemap').onclick = loadSitemap;
+    $('sitemapHost').onkeydown = event => { if (event.key === 'Enter') loadSitemap(); };
+
+    async function loadFindings() {
+      if (!state.projectId) return;
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/findings`);
+        const findings = result.findings || [];
+        $('findingList').innerHTML = findings.map(finding => `<div class="card"><div class="row"><strong>${escapeHtml(finding.title)}</strong><span class="pill fit">Exchange ${finding.exchange_id}</span></div><p class="mono">${escapeHtml(finding.description)}</p><div class="row"><button class="btn" data-finding-exchange="${finding.exchange_id}">View request</button><button class="btn danger" data-remove-finding="${finding.id}">Remove</button></div></div>`).join('');
+        $('findingsEmpty').classList.toggle('hidden', findings.length > 0);
+      } catch (error) { status('findingStatus', error.message, 'err'); }
+    }
+    $('refreshFindings').onclick = loadFindings;
+    $('addFinding').onclick = async () => {
+      if (!state.projectId) return status('findingStatus', 'Select a project', 'err');
+      try {
+        const finding = await api(`/api/v1/projects/${state.projectId}/findings`, {
+          method: 'POST',
+          body: JSON.stringify({
+            exchange_id: Number($('findingExchange').value),
+            title: $('findingTitle').value.trim(),
+            description: $('findingDescription').value.trim(),
+          }),
+        });
+        $('findingTitle').value = ''; $('findingDescription').value = '';
+        status('findingStatus', `Finding ${finding.id} added`, 'ok');
+        await loadFindings();
+      } catch (error) { status('findingStatus', error.message, 'err'); }
+    };
+    $('findingList').onclick = async event => {
+      const remove = event.target.closest('[data-remove-finding]');
+      const exchange = event.target.closest('[data-finding-exchange]');
+      if (remove) {
+        try {
+          await api(`/api/v1/projects/${state.projectId}/findings/${remove.dataset.removeFinding}`, { method: 'DELETE' });
+          status('findingStatus', 'Finding removed', 'ok'); await loadFindings();
+        } catch (error) { status('findingStatus', error.message, 'err'); }
+      }
+      if (exchange) { activateView('history'); await selectExchange(Number(exchange.dataset.findingExchange)); }
+    };
+    $('markFinding').onclick = () => {
+      if (!state.selectedExchange) return;
+      $('findingExchange').value = state.selectedExchange;
+      $('findingTitle').value = $('annotationTitle').value.trim();
+      $('findingDescription').value = $('annotationNote').value;
+      activateView('findings');
+    };
+
     async function loadReplyTabs(selectId) {
       if (!state.projectId) return;
       const result = await api(`/api/v1/projects/${state.projectId}/reply-tabs`);
@@ -614,7 +712,11 @@ test
       $('replyUrl').value = tab?.draft?.url || '';
       $('replyProtocol').value = tab?.protocol || 'auto';
       $('replyHeaders').value = (tab?.draft?.header_overrides || []).map(h => `${h.name}: ${text(h.value)}`).join('\n');
-      $('replyBody').value = text(tab?.draft?.body_override);
+      const format = tab?.draft?.body_format || 'raw';
+      $('replyBodyFormat').value = format;
+      if (tab?.draft?.body_params?.length) $('replyBody').value = tab.draft.body_params.map(parameter => `${parameter.name}=${parameter.value}`).join('\n');
+      else if (tab?.draft?.body_json != null) $('replyBody').value = JSON.stringify(tab.draft.body_json, null, 2);
+      else $('replyBody').value = tab?.draft?.body_text ?? text(tab?.draft?.body_override);
       $('replyClearBody').checked = !!tab?.draft?.body_cleared;
     }
     $('replyTabs').onclick = e => {
@@ -633,14 +735,33 @@ test
         if (match) overrides.push({ name: match[1].trim(), value: bytes(match[2]) });
       }
       const bodyValue = $('replyBody').value;
-      return {
+      const clearBody = $('replyClearBody').checked;
+      const format = $('replyBodyFormat').value;
+      const draft = {
         method: $('replyMethod').value.trim() || null,
         url: $('replyUrl').value.trim() || null,
         header_overrides: overrides,
         header_tombstones: [],
-        body_override: bodyValue ? bytes(bodyValue) : null,
-        body_cleared: $('replyClearBody').checked,
+        body_override: null,
+        body_text: null,
+        body_json: null,
+        body_format: null,
+        body_params: [],
+        body_cleared: clearBody,
       };
+      if (clearBody || !bodyValue) return draft;
+      if (format === 'raw') draft.body_override = bytes(bodyValue);
+      else if (format === 'json') { draft.body_format = 'json'; draft.body_json = JSON.parse(bodyValue); }
+      else if (format === 'xml') { draft.body_format = 'xml'; draft.body_text = bodyValue; }
+      else {
+        draft.body_format = format;
+        draft.body_params = bodyValue.split('\n').filter(line => line.length).map(line => {
+          const separator = line.indexOf('=');
+          if (separator < 1) throw new Error('Form fields must use name=value, one per line');
+          return { name: line.slice(0, separator), value: line.slice(separator + 1) };
+        });
+      }
+      return draft;
     }
     async function saveReplyTab() {
       const payload = {

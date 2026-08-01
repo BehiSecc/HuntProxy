@@ -43,3 +43,4 @@ id_newtype!(BrowserSessionId);
 id_newtype!(BrowserActionId);
 id_newtype!(AnnotationId);
 id_newtype!(BodyId);
+id_newtype!(FindingId);

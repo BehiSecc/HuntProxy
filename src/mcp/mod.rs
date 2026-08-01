@@ -167,6 +167,8 @@ fn reply_draft_schema() -> Value {
             },
             "body_text": {"type": ["string", "null"], "description": "UTF-8 request body convenience field. Mutually exclusive with body_override and body_json."},
             "body_json": {"description": "JSON request body convenience field. Mutually exclusive with body_override and body_text; adds application/json unless Content-Type is explicit.", "oneOf": [{"type":"object"},{"type":"array"},{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"}]},
+            "body_format": {"type":["string","null"],"enum":["raw","json","xml","form_urlencoded","multipart",null],"description":"Validates/serializes the body and replaces Content-Type. JSON accepts body_json/body_text; XML accepts body_text; form formats accept body_params."},
+            "body_params": {"type":"array","default":[],"description":"Ordered name/value fields for form_urlencoded or multipart.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false}},
             "body_cleared": {"type": "boolean", "default": false}
         },
         "additionalProperties": false
@@ -259,6 +261,8 @@ fn tool_defs() -> Value {
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"type":"string"},"file_path":{"type":"string"}},"required":["project_id","action"]}},
         {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; (request:~this OR request:~that OR request:~\":smtg\") method:PUT.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. request:~text searches the request target, headers, and body. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
+        {"name":"sitemap","description":"Return an alphanumerically sorted sitemap derived from saved project history. Omit host for every host or provide one exact host.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive."}},"required":["project_id"]}},
+        {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
@@ -812,6 +816,91 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 "noise_filtered": false
             }))
         }
+        "sitemap" => {
+            let project_id = require_project_id(&args)?;
+            let host = args.get("host").and_then(Value::as_str).map(str::to_string);
+            Ok(json!({
+                "hosts": state.db.list_sitemap(project_id, host).await?
+            }))
+        }
+        "findings" => {
+            let project_id = require_project_id(&args)?;
+            match args.get("action").and_then(Value::as_str).unwrap_or("list") {
+                "list" => Ok(json!({
+                    "findings": state.db.list_findings(project_id).await?
+                })),
+                "add" => {
+                    let exchange_id = args
+                        .get("exchange_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+                    let title = args
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("title required"))?;
+                    let description = args
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("description required"))?;
+                    let finding = state
+                        .db
+                        .create_finding(
+                            project_id,
+                            ExchangeId(exchange_id),
+                            title.to_string(),
+                            description.to_string(),
+                        )
+                        .await?;
+                    emit_event(
+                        &state,
+                        project_id,
+                        "finding",
+                        json!({ "finding_id": finding.id.get(), "action": "added" }),
+                    );
+                    let _ = state
+                        .db
+                        .audit(
+                            Some(project_id),
+                            "finding_add",
+                            Some("mcp"),
+                            Some("finding"),
+                            Some(&finding.id.to_string()),
+                            json!({ "exchange_id": exchange_id }),
+                        )
+                        .await;
+                    Ok(json!(finding))
+                }
+                "remove" => {
+                    let finding_id = args
+                        .get("finding_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("finding_id required"))?;
+                    state
+                        .db
+                        .delete_finding(project_id, FindingId(finding_id))
+                        .await?;
+                    emit_event(
+                        &state,
+                        project_id,
+                        "finding",
+                        json!({ "finding_id": finding_id, "action": "removed" }),
+                    );
+                    let _ = state
+                        .db
+                        .audit(
+                            Some(project_id),
+                            "finding_remove",
+                            Some("mcp"),
+                            Some("finding"),
+                            Some(&finding_id.to_string()),
+                            json!({}),
+                        )
+                        .await;
+                    Ok(json!({ "ok": true, "removed": finding_id }))
+                }
+                _ => Err(DomainError::invalid("action must be list|add|remove")),
+            }
+        }
         "exchange_get" => {
             let project_id = require_project_id(&args)?;
             let eid = args
@@ -987,7 +1076,6 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .transpose()
                         .map_err(|e| DomainError::invalid(e.to_string()))?
                         .unwrap_or_default();
-                    let draft = crate::reply::normalize_reply_draft(draft)?;
                     Ok(json!(
                         state
                             .db
@@ -1613,6 +1701,10 @@ mod tests {
         assert!(reply["inputSchema"]["properties"]["draft"]["properties"]
             .get("body_text")
             .is_some());
+        assert_eq!(
+            reply["inputSchema"]["properties"]["draft"]["properties"]["body_format"]["enum"],
+            json!(["raw", "json", "xml", "form_urlencoded", "multipart", null])
+        );
         let browser = tools
             .iter()
             .find(|tool| tool["name"] == "browser_action")
@@ -1693,5 +1785,7 @@ mod tests {
             2000
         );
         assert!(tools.iter().any(|tool| tool["name"] == "huntproxy_stop"));
+        assert!(tools.iter().any(|tool| tool["name"] == "sitemap"));
+        assert!(tools.iter().any(|tool| tool["name"] == "findings"));
     }
 }

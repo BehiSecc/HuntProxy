@@ -87,11 +87,18 @@ Authorization, and Origin; `full_request` remains the compatibility default.
 Semantic Reply always recalculates message framing, and `reply_send` includes a
 decoded 4 KiB response preview. `exchange_body` decodes gzip, Brotli, and
 deflate responses by default; pass `raw: true` for the captured bytes.
+Set `body_format` to `json`, `xml`, `form_urlencoded`, or `multipart` to
+validate/serialize the body and update Content-Type. Form formats use ordered
+`body_params` name/value entries. Explicit method changes do not accidentally
+inherit the old request body or entity headers.
 
 History filters support Boolean expressions, for example
 `(request:~this OR request:~that) method:PUT`; `request:~text` searches the
 request target, headers, and body. Fuzzer templates accept inline `wordlists`
 or local UTF-8 `wordlist_files`, with one payload per line.
+The `sitemap` tool returns sorted routes for every saved host or one requested
+host. The `findings` tool links a title and description to an exchange and can
+list or remove those findings.
 
 Use `js_files` with only `project_id` to list JavaScript from saved history,
 add `domain` to filter it, or add `url` to perform a fresh, ephemeral,
@@ -118,6 +125,8 @@ Example agent tasks:
 - “Create a project for `https://example.com` and inspect its login flow.”
 - “Set project 1 cookies for `https://example.com` from `/tmp/cookies.txt`, then browse `/account`.”
 - “Show POST requests in project 1 and compare their responses.”
+- “Dump the sitemap for `example.com` and mark exchange 42 as a finding.”
+- “Replay exchange 42 as POST with a JSON body.”
 - “List JavaScript files for `example.com` from project 1 history.”
 - “Load `https://example.com` and return every JavaScript URL and path.”
 - “Send this exact raw HTTP/1.1 request with CRLF using `reply_send_raw`.”

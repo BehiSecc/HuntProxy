@@ -7,11 +7,13 @@ mod browser_store;
 mod cookies;
 mod db;
 mod exchanges;
+mod findings;
 mod fuzz_store;
 mod migrations;
 mod projects;
 mod reply_store;
 mod sessions;
+mod sitemap;
 
 pub use bodies::*;
 pub use db::*;
@@ -29,6 +31,10 @@ pub use browser_store::*;
 #[allow(unused_imports)]
 pub use cookies::*;
 #[allow(unused_imports)]
+pub use findings::*;
+#[allow(unused_imports)]
 pub use fuzz_store::*;
 #[allow(unused_imports)]
 pub use reply_store::*;
+#[allow(unused_imports)]
+pub use sitemap::*;

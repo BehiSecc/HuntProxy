@@ -138,6 +138,25 @@ pub struct AnnotationUpdate {
     pub expected_revision: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Finding {
+    pub id: FindingId,
+    pub project_id: ProjectId,
+    pub exchange_id: ExchangeId,
+    pub title: String,
+    pub description: String,
+    #[serde(with = "rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SitemapHost {
+    pub host: String,
+    pub paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolPreference {
@@ -181,7 +200,28 @@ pub struct ReplyDraft {
     /// JSON convenience input. Serialized compactly and defaults Content-Type
     /// to application/json when no explicit Content-Type override exists.
     pub body_json: Option<serde_json::Value>,
+    /// Optional semantic body format. When set, normalization updates
+    /// Content-Type and validates/serializes the corresponding body input.
+    pub body_format: Option<ReplyBodyFormat>,
+    /// Ordered text fields for form-urlencoded and multipart bodies.
+    pub body_params: Vec<ReplyBodyParam>,
     pub body_cleared: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyBodyFormat {
+    Raw,
+    Json,
+    Xml,
+    FormUrlencoded,
+    Multipart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyBodyParam {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

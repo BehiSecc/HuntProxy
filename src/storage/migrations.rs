@@ -13,6 +13,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "003_project_cookies",
         include_str!("../../migrations/003_project_cookies.sql"),
     ),
+    (
+        "004_findings",
+        include_str!("../../migrations/004_findings.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {

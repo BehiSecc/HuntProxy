@@ -176,6 +176,10 @@ pub async fn materialize_request(
     draft: &ReplyDraft,
     key: &PlaceholderKey,
 ) -> DomainResult<MaterializedRequest> {
+    let has_explicit_body = draft.body_override.is_some()
+        || draft.body_text.is_some()
+        || draft.body_json.is_some()
+        || !draft.body_params.is_empty();
     let normalized = normalize_reply_draft(draft.clone())?;
     let draft = &normalized;
     let mut method = draft.method.clone().unwrap_or_else(|| "GET".into());
@@ -186,6 +190,7 @@ pub async fn materialize_request(
     let mut headers: Vec<(String, Vec<u8>)> = Vec::new();
     let mut body = draft.body_override.clone();
     let mut inherited_url = None;
+    let mut method_changed = false;
 
     if let Some(base_id) = base_exchange_id {
         let detail = db
@@ -202,6 +207,10 @@ pub async fn materialize_request(
             detail.summary.scheme, detail.summary.authority, detail.summary.path, query
         );
         inherited_url = Some(base_url.clone());
+        method_changed = draft
+            .method
+            .as_deref()
+            .is_some_and(|requested| !requested.eq_ignore_ascii_case(&detail.summary.method));
         if draft.method.is_none() {
             method = detail.summary.method;
         }
@@ -237,6 +246,7 @@ pub async fn materialize_request(
         if body.is_none()
             && !draft.body_cleared
             && draft.inheritance == ReplyInheritance::FullRequest
+            && !method_changed
         {
             body = db
                 .load_raw_body(project_id, base_id, MessageSide::Request)
@@ -286,6 +296,17 @@ pub async fn materialize_request(
         headers.push((o.name.clone(), val));
     }
 
+    if method_changed && !has_explicit_body {
+        body = None;
+        headers.retain(|(name, _)| {
+            !is_entity_header(name)
+                || draft
+                    .header_overrides
+                    .iter()
+                    .any(|override_| override_.name.eq_ignore_ascii_case(name))
+        });
+    }
+
     // Semantic transports own message framing. Keeping inherited framing is
     // misleading in history and can make a changed body appear malformed.
     headers.retain(|(name, _)| {
@@ -316,37 +337,175 @@ pub async fn materialize_request(
 pub fn normalize_reply_draft(mut draft: ReplyDraft) -> DomainResult<ReplyDraft> {
     let body_sources = usize::from(draft.body_override.is_some())
         + usize::from(draft.body_text.is_some())
-        + usize::from(draft.body_json.is_some());
+        + usize::from(draft.body_json.is_some())
+        + usize::from(!draft.body_params.is_empty());
     if body_sources > 1 {
         return Err(DomainError::invalid(
-            "provide only one of body_override, body_text, or body_json",
+            "provide only one of body_override, body_text, body_json, or body_params",
         ));
     }
-    if draft.body_cleared && body_sources > 0 {
+    if draft.body_cleared && (body_sources > 0 || draft.body_format.is_some()) {
         return Err(DomainError::invalid(
-            "body_cleared cannot be combined with a body value",
+            "body_cleared cannot be combined with a body value or body_format",
         ));
     }
-    if let Some(text) = draft.body_text.take() {
-        draft.body_override = Some(text.into_bytes());
-    }
-    if let Some(value) = draft.body_json.take() {
-        draft.body_override = Some(
-            serde_json::to_vec(&value)
-                .map_err(|error| DomainError::invalid(format!("body_json: {error}")))?,
-        );
-        if !draft
-            .header_overrides
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("content-type"))
-        {
-            draft.header_overrides.push(HeaderPatch {
-                name: "Content-Type".into(),
-                value: b"application/json".to_vec(),
-            });
+    let format = draft.body_format;
+    match format {
+        None => {
+            if let Some(text) = draft.body_text.take() {
+                draft.body_override = Some(text.into_bytes());
+            }
+            if let Some(value) = draft.body_json.take() {
+                draft.body_override = Some(json_body(&value)?);
+                set_content_type(&mut draft, "application/json", false);
+            }
+        }
+        Some(ReplyBodyFormat::Raw) => {
+            if draft.body_json.is_some() || !draft.body_params.is_empty() {
+                return Err(DomainError::invalid(
+                    "raw body format accepts body_override or body_text",
+                ));
+            }
+            if let Some(text) = draft.body_text.take() {
+                draft.body_override = Some(text.into_bytes());
+            }
+            require_body(&draft)?;
+        }
+        Some(ReplyBodyFormat::Json) => {
+            if !draft.body_params.is_empty() {
+                return Err(DomainError::invalid(
+                    "json body format accepts body_json, body_text, or body_override",
+                ));
+            }
+            if let Some(value) = draft.body_json.take() {
+                draft.body_override = Some(json_body(&value)?);
+            } else if let Some(text) = draft.body_text.take() {
+                draft.body_override = Some(text.into_bytes());
+            }
+            require_body(&draft)?;
+            serde_json::from_slice::<serde_json::Value>(
+                draft.body_override.as_deref().unwrap_or_default(),
+            )
+            .map_err(|error| DomainError::invalid(format!("invalid JSON body: {error}")))?;
+            set_content_type(&mut draft, "application/json", true);
+        }
+        Some(ReplyBodyFormat::Xml) => {
+            if draft.body_json.is_some() || !draft.body_params.is_empty() {
+                return Err(DomainError::invalid(
+                    "xml body format accepts body_text or body_override",
+                ));
+            }
+            if let Some(text) = draft.body_text.take() {
+                draft.body_override = Some(text.into_bytes());
+            }
+            require_body(&draft)?;
+            set_content_type(&mut draft, "application/xml", true);
+        }
+        Some(ReplyBodyFormat::FormUrlencoded) => {
+            if draft.body_json.is_some() {
+                return Err(DomainError::invalid(
+                    "form_urlencoded accepts body_params, body_text, or body_override",
+                ));
+            }
+            if !draft.body_params.is_empty() {
+                let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                for parameter in &draft.body_params {
+                    serializer.append_pair(&parameter.name, &parameter.value);
+                }
+                draft.body_override = Some(serializer.finish().into_bytes());
+                draft.body_params.clear();
+            } else if let Some(text) = draft.body_text.take() {
+                draft.body_override = Some(text.into_bytes());
+            }
+            require_body(&draft)?;
+            set_content_type(&mut draft, "application/x-www-form-urlencoded", true);
+        }
+        Some(ReplyBodyFormat::Multipart) => {
+            if draft.body_override.is_some()
+                || draft.body_text.is_some()
+                || draft.body_json.is_some()
+                || draft.body_params.is_empty()
+            {
+                return Err(DomainError::invalid(
+                    "multipart body format requires non-empty body_params only",
+                ));
+            }
+            let boundary = format!("huntproxy-{}", uuid::Uuid::new_v4().simple());
+            draft.body_override = Some(multipart_body(&draft.body_params, &boundary)?);
+            draft.body_params.clear();
+            set_content_type(
+                &mut draft,
+                &format!("multipart/form-data; boundary={boundary}"),
+                true,
+            );
         }
     }
     Ok(draft)
+}
+
+fn json_body(value: &serde_json::Value) -> DomainResult<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|error| DomainError::invalid(format!("body_json: {error}")))
+}
+
+fn require_body(draft: &ReplyDraft) -> DomainResult<()> {
+    if draft.body_override.is_none() {
+        Err(DomainError::invalid(
+            "the selected body_format requires an explicit body",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn set_content_type(draft: &mut ReplyDraft, value: &str, replace: bool) {
+    if !replace
+        && draft
+            .header_overrides
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-type"))
+    {
+        return;
+    }
+    draft
+        .header_overrides
+        .retain(|header| !header.name.eq_ignore_ascii_case("content-type"));
+    draft.header_overrides.push(HeaderPatch {
+        name: "Content-Type".into(),
+        value: value.as_bytes().to_vec(),
+    });
+}
+
+fn multipart_body(parameters: &[ReplyBodyParam], boundary: &str) -> DomainResult<Vec<u8>> {
+    let mut body = Vec::new();
+    for parameter in parameters {
+        if parameter.name.is_empty()
+            || parameter.name.contains('\r')
+            || parameter.name.contains('\n')
+            || parameter.name.len() > 1024
+        {
+            return Err(DomainError::invalid("invalid multipart field name"));
+        }
+        let name = parameter.name.replace('\\', "\\\\").replace('"', "\\\"");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(parameter.value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    Ok(body)
+}
+
+fn is_entity_header(name: &str) -> bool {
+    [
+        "content-type",
+        "content-encoding",
+        "content-language",
+        "content-location",
+    ]
+    .iter()
+    .any(|header| name.eq_ignore_ascii_case(header))
 }
 
 fn is_auth_context_header(name: &str) -> bool {
@@ -1060,6 +1219,71 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn semantic_body_formats_update_content_type_and_structure() {
+        let json = normalize_reply_draft(ReplyDraft {
+            body_format: Some(ReplyBodyFormat::Json),
+            body_text: Some("{\"ok\":true}".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            json.body_override.as_deref(),
+            Some(b"{\"ok\":true}".as_slice())
+        );
+        assert!(json.header_overrides.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("content-type") && header.value == b"application/json"
+        }));
+
+        let form = normalize_reply_draft(ReplyDraft {
+            body_format: Some(ReplyBodyFormat::FormUrlencoded),
+            body_params: vec![
+                ReplyBodyParam {
+                    name: "a".into(),
+                    value: "hello world".into(),
+                },
+                ReplyBodyParam {
+                    name: "a".into(),
+                    value: "two".into(),
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            form.body_override.as_deref(),
+            Some(b"a=hello+world&a=two".as_slice())
+        );
+
+        let multipart = normalize_reply_draft(ReplyDraft {
+            body_format: Some(ReplyBodyFormat::Multipart),
+            body_params: vec![ReplyBodyParam {
+                name: "name".into(),
+                value: "value".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let content_type = multipart
+            .header_overrides
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&content_type.value)
+            .starts_with("multipart/form-data; boundary=huntproxy-"));
+        assert!(
+            String::from_utf8_lossy(multipart.body_override.as_deref().unwrap())
+                .contains("name=\"name\"\r\n\r\nvalue")
+        );
+
+        assert!(normalize_reply_draft(ReplyDraft {
+            body_format: Some(ReplyBodyFormat::Json),
+            body_text: Some("not-json".into()),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
     #[tokio::test]
     async fn auth_only_inheritance_drops_stale_request_shape() {
         let db = Db::open_in_memory().await.unwrap();
@@ -1157,6 +1381,24 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case(removed)));
         }
+
+        let changed_to_get = materialize_request(
+            &db,
+            project.id,
+            Some(base),
+            &ReplyDraft {
+                method: Some("GET".into()),
+                url: Some("https://base.test/rpc".into()),
+                ..Default::default()
+            },
+            &PlaceholderKey::from_bytes(vec![1; 32]),
+        )
+        .await
+        .unwrap();
+        assert!(changed_to_get.body.is_none());
+        assert!(!changed_to_get.headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("content-length")
+        }));
     }
 
     #[tokio::test]

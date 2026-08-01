@@ -178,11 +178,14 @@ async fn embedded_ui_exposes_the_complete_workbench() {
     for expected in [
         "HuntProxy",
         "History",
+        "Sitemap",
+        "Findings",
         "Reply",
         "Fuzzer",
         "Browser",
         "Codec",
         "Save annotation",
+        "Body format",
     ] {
         assert!(html.contains(expected), "missing UI workflow: {expected}");
     }
@@ -337,4 +340,115 @@ async fn response_body_api_decodes_gzip_and_preserves_raw_access() {
             .unwrap(),
         compressed
     );
+}
+
+#[tokio::test]
+async fn sitemap_and_findings_work_through_http_api() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut first = exchange(project_id, "GET", "/z-route");
+    first.host = "Example.COM".into();
+    first.authority = "Example.COM".into();
+    let exchange_id = state.db.insert_exchange(first).await.unwrap();
+
+    let mut second = exchange(project_id, "POST", "/a-route");
+    second.host = "example.com".into();
+    second.authority = "example.com".into();
+    state.db.insert_exchange(second.clone()).await.unwrap();
+    state.db.insert_exchange(second).await.unwrap();
+
+    let mut third = exchange(project_id, "GET", "/cdn");
+    third.host = "cdn.example.com".into();
+    third.authority = "cdn.example.com".into();
+    state.db.insert_exchange(third).await.unwrap();
+    let app = bb::api::router(state);
+
+    let sitemap = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}/sitemap", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sitemap = json_response(sitemap).await;
+    assert_eq!(sitemap["hosts"][0]["host"], "cdn.example.com");
+    assert_eq!(sitemap["hosts"][1]["host"], "example.com");
+    assert_eq!(
+        sitemap["hosts"][1]["paths"],
+        serde_json::json!(["/a-route", "/z-route"])
+    );
+
+    let filtered = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/sitemap?host=EXAMPLE.COM",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        json_response(filtered).await["hosts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/projects/{}/findings", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "exchange_id": exchange_id.get(),
+                        "title": "Access control issue",
+                        "description": "A lower-privileged account can access the record."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let finding = json_response(created).await;
+    assert_eq!(finding["exchange_id"], exchange_id.get());
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}/findings", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        json_response(listed).await["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let removed = app
+        .clone()
+        .oneshot(
+            Request::delete(format!(
+                "/api/v1/projects/{}/findings/{}",
+                project_id.get(),
+                finding["id"].as_i64().unwrap()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
 }
