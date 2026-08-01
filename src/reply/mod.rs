@@ -1150,6 +1150,7 @@ mod tests {
                 advanced: Some(ScopePolicy {
                     schemes: vec!["https".into()],
                     host_patterns: vec!["example.com".into()],
+                    excluded_host_patterns: vec![],
                     ports: vec![],
                     path_prefixes: vec![],
                 }),

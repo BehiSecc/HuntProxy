@@ -157,6 +157,8 @@
       <input id="projectUrl" placeholder="https://app.example.com" />
       <label for="scopeHosts">Capture hosts <span class="muted">(optional)</span></label>
       <input id="scopeHosts" placeholder="example.com, *.example.com" />
+      <label for="scopeExcludedHosts">Exclude hosts <span class="muted">(optional)</span></label>
+      <input id="scopeExcludedHosts" placeholder="admin.example.com, *.internal.example.com" />
       <p class="small muted">Empty saves all traffic. Scope never blocks requests.</p>
       <button class="btn primary" id="createProject" style="width:100%;margin-top:.55rem">Create</button>
       <button class="btn" id="saveScope" style="width:100%;margin-top:.4rem">Save capture scope</button>
@@ -229,6 +231,18 @@
                 <button class="btn primary" id="saveAnnotation" disabled>Save annotation</button>
                 <button class="btn" id="sendToReply" disabled>Send to Reply</button>
                 <button class="btn" id="markFinding" disabled>Mark finding</button>
+              </div>
+              <div class="row">
+                <button class="btn" id="copyCurl" disabled>Copy as cURL</button>
+                <button class="btn" id="copyPython" disabled>Copy as Python</button>
+                <button class="btn" id="analyzePage" disabled>Analyze page</button>
+                <label class="fit" style="margin:0"><input type="checkbox" id="copySecrets" style="width:auto" /> include secrets</label>
+              </div>
+              <div class="card hidden" id="pageAnalysis">
+                <div class="status" id="pageAnalysisStats"></div>
+                <h3>Endpoints</h3><pre class="mono" id="pageAnalysisEndpoints">—</pre>
+                <h3>URLs</h3><pre class="mono" id="pageAnalysisUrls">—</pre>
+                <h3>Emails</h3><pre class="mono" id="pageAnalysisEmails">—</pre>
               </div>
               <div class="status" id="annotationStatus"></div>
             </div>
@@ -449,11 +463,16 @@ test
       $('saveAnnotation').disabled = true;
       $('sendToReply').disabled = true;
       $('markFinding').disabled = true;
+      $('copyCurl').disabled = true;
+      $('copyPython').disabled = true;
+      $('analyzePage').disabled = true;
+      $('pageAnalysis').classList.add('hidden');
       connectEvents();
       if (!state.projectId) return;
       try {
         const project = await api(`/api/v1/projects/${state.projectId}`);
         $('scopeHosts').value = (project.scope?.host_patterns || []).join(', ');
+        $('scopeExcludedHosts').value = (project.scope?.excluded_host_patterns || []).join(', ');
       } catch (_) {}
       $('cookieValue').value = '';
       $('cookieFile').value = '';
@@ -465,7 +484,8 @@ test
     $('createProject').onclick = async () => {
       try {
         const hosts = $('scopeHosts').value.split(',').map(v => v.trim()).filter(Boolean);
-        const advanced = hosts.length ? { schemes: ['http', 'https'], host_patterns: hosts, ports: [], path_prefixes: [] } : null;
+        const excludedHosts = $('scopeExcludedHosts').value.split(',').map(v => v.trim()).filter(Boolean);
+        const advanced = (hosts.length || excludedHosts.length) ? { schemes: ['http', 'https'], host_patterns: hosts, excluded_host_patterns: excludedHosts, ports: [], path_prefixes: [] } : null;
         const project = await api('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name: $('projectName').value.trim(), target_url: $('projectUrl').value.trim(), advanced }) });
         status('sideStatus', `Created project ${project.id}`, 'ok');
         await loadProjects(project.id);
@@ -474,12 +494,13 @@ test
     $('saveScope').onclick = async () => {
       if (!state.projectId) return status('sideStatus', 'Select a project', 'err');
       const hosts = $('scopeHosts').value.split(',').map(v => v.trim()).filter(Boolean);
+      const excludedHosts = $('scopeExcludedHosts').value.split(',').map(v => v.trim()).filter(Boolean);
       try {
         await api(`/api/v1/projects/${state.projectId}/scope`, {
           method: 'POST',
-          body: JSON.stringify({ schemes: ['http', 'https'], host_patterns: hosts, ports: [], path_prefixes: [] }),
+          body: JSON.stringify({ schemes: ['http', 'https'], host_patterns: hosts, excluded_host_patterns: excludedHosts, ports: [], path_prefixes: [] }),
         });
-        status('sideStatus', hosts.length ? 'Capture scope saved' : 'Capture scope cleared; saving all traffic', 'ok');
+        status('sideStatus', (hosts.length || excludedHosts.length) ? 'Capture scope saved' : 'Capture scope cleared; saving all traffic', 'ok');
       } catch (e) { status('sideStatus', e.message, 'err'); }
     };
 
@@ -598,6 +619,7 @@ test
     }
     async function selectExchange(exchangeId) {
       try {
+        $('pageAnalysis').classList.add('hidden');
         const noisy = $('showNoisy').checked;
         const [detail, requestBody, responseBody] = await Promise.all([
           api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}?include_noisy_headers=${noisy}`),
@@ -611,6 +633,8 @@ test
         $('annotationLabels').value = (detail.annotation?.labels || detail.summary.labels || []).join(', ');
         $('annotationNote').value = detail.annotation?.note || '';
         $('saveAnnotation').disabled = false; $('sendToReply').disabled = false; $('markFinding').disabled = false;
+        $('copyCurl').disabled = false; $('copyPython').disabled = false; $('analyzePage').disabled = false;
+        $('pageAnalysis').classList.add('hidden');
         status('inspectorStatus', `${detail.summary.method} ${detail.summary.scheme}://${detail.summary.authority}${detail.summary.path} · ${detail.protocol}`);
         document.querySelectorAll('#historyRows tr').forEach(r => r.classList.toggle('selected', Number(r.dataset.id) === exchangeId));
       } catch (e) { status('inspectorStatus', e.message, 'err'); }
@@ -631,6 +655,50 @@ test
         status('annotationStatus', 'Annotation saved', 'ok');
         loadHistory();
       } catch (e) { status('annotationStatus', e.message, 'err'); }
+    };
+
+    async function writeClipboard(value) {
+      if (navigator.clipboard?.writeText) {
+        try { await navigator.clipboard.writeText(value); return; } catch (_) { /* fallback below */ }
+      }
+      const input = document.createElement('textarea');
+      input.value = value; input.style.position = 'fixed'; input.style.opacity = '0';
+      document.body.appendChild(input); input.select();
+      const copied = document.execCommand('copy');
+      input.remove();
+      if (!copied) throw new Error('Clipboard access was denied');
+    }
+
+    async function copySelectedRequest(format, label) {
+      if (!state.selectedExchange) return;
+      try {
+        const query = new URLSearchParams({ format });
+        if ($('copySecrets').checked) query.set('include_secrets', 'true');
+        const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${state.selectedExchange}/copy-as?${query}`);
+        await writeClipboard(result.content);
+        const redaction = result.redacted_headers ? ` (${result.redacted_headers} secret header${result.redacted_headers === 1 ? '' : 's'} redacted)` : '';
+        status('annotationStatus', `${label} copied${redaction}`, 'ok');
+      } catch (error) { status('annotationStatus', error.message, 'err'); }
+    }
+    $('copyCurl').onclick = () => copySelectedRequest('curl', 'cURL');
+    $('copyPython').onclick = () => copySelectedRequest('python_requests', 'Python request');
+    $('analyzePage').onclick = async () => {
+      if (!state.selectedExchange) return;
+      $('analyzePage').disabled = true;
+      status('annotationStatus', 'Analyzing response…');
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${state.selectedExchange}/analyze`);
+        $('pageAnalysisEndpoints').textContent = (result.endpoints || []).join('\n') || '—';
+        $('pageAnalysisUrls').textContent = (result.urls || []).join('\n') || '—';
+        $('pageAnalysisEmails').textContent = (result.emails || []).join('\n') || '—';
+        status('pageAnalysisStats', `${result.stats.endpoints} endpoint${result.stats.endpoints === 1 ? '' : 's'} · ${result.stats.urls} URL${result.stats.urls === 1 ? '' : 's'} · ${result.stats.emails} email${result.stats.emails === 1 ? '' : 's'}`);
+        $('pageAnalysis').classList.remove('hidden');
+        status('annotationStatus', 'Page analysis complete', 'ok');
+      } catch (error) {
+        status('annotationStatus', error.message, 'err');
+      } finally {
+        $('analyzePage').disabled = false;
+      }
     };
 
     async function loadSitemap() {

@@ -20,9 +20,19 @@ pub struct Project {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScopePolicy {
     pub schemes: Vec<String>,
     pub host_patterns: Vec<String>,
+    /// Host patterns that must not be captured. Exclusions take precedence
+    /// over `host_patterns`; an empty include list still means capture all
+    /// otherwise-matching hosts.
+    #[serde(
+        default,
+        alias = "out_of_scope_host_patterns",
+        alias = "exclude_host_patterns"
+    )]
+    pub excluded_host_patterns: Vec<String>,
     pub ports: Vec<u16>,
     /// Empty means any path.
     pub path_prefixes: Vec<String>,
@@ -33,6 +43,7 @@ impl Default for ScopePolicy {
         Self {
             schemes: vec!["http".into(), "https".into()],
             host_patterns: vec![],
+            excluded_host_patterns: vec![],
             ports: vec![],
             path_prefixes: vec![],
         }

@@ -257,13 +257,15 @@ fn fuzz_template_schema() -> Value {
 
 fn tool_defs() -> Value {
     json!([
-        {"name":"projects","description":"List, create, or set optional capture scope","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
+        {"name":"projects","description":"List, create, or set optional capture scope. Host patterns may be exact or wildcard suffixes such as *.example.com; excluded_host_patterns always take precedence. Empty host_patterns captures every host except exclusions. Scope only controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"type":"string"},"file_path":{"type":"string"}},"required":["project_id","action"]}},
         {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; (request:~this OR request:~that OR request:~\":smtg\") method:PUT.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. request:~text searches the request target, headers, and body. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
         {"name":"sitemap","description":"Return an alphanumerically sorted sitemap derived from saved project history. Omit host for every host or provide one exact host.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive."}},"required":["project_id"]}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
+        {"name":"page_analyzer","description":"Extract sorted, unique endpoints, absolute URLs, and emails from JavaScript or HTML without executing it. Provide exactly one saved exchange_id or absolute URL. URL mode sends a semantic GET with project cookies and analyzes the complete response; secrets are never scanned or returned.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer","description":"Saved exchange whose decoded response body should be analyzed."},"url":{"type":"string","description":"Absolute http/https URL to fetch and analyze."}},"required":["project_id"],"oneOf":[{"required":["exchange_id"]},{"required":["url"]}],"additionalProperties":false}},
+        {"name":"copy_as","description":"Convert a saved request to cURL or Python requests. Sensitive header values are redacted by default; set include_secrets=true only when the user explicitly asks for a usable copy containing secrets.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"format":{"type":"string","enum":["curl","python_requests"]},"include_secrets":{"type":"boolean","default":false}},"required":["project_id","exchange_id","format"],"additionalProperties":false}},
         {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
@@ -918,6 +920,145 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 object.insert("annotation".into(), json!(annotation));
             }
             Ok(value)
+        }
+        "page_analyzer" => {
+            let project_id = require_project_id(&args)?;
+            let exchange_id = args
+                .get("exchange_id")
+                .and_then(Value::as_i64)
+                .map(ExchangeId);
+            let url = args.get("url").and_then(Value::as_str);
+            match (exchange_id, url) {
+                (Some(exchange_id), None) => Ok(json!(
+                    crate::page_analyzer::analyze_exchange(&state.db, project_id, exchange_id,)
+                        .await?
+                )),
+                (None, Some(url)) => {
+                    let parsed = url::Url::parse(url).map_err(|error| {
+                        DomainError::invalid(format!("invalid analysis URL: {error}"))
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                        return Err(DomainError::invalid(
+                            "analysis URL must be an absolute http or https URL",
+                        ));
+                    }
+                    let draft = ReplyDraft {
+                        method: Some("GET".into()),
+                        url: Some(parsed.to_string()),
+                        ..Default::default()
+                    };
+                    let result = state
+                        .reply
+                        .send(project_id, None, None, &draft, ProtocolPreference::Auto, 0)
+                        .await?;
+                    if let Some(exchange_id) = result.exchange_id {
+                        emit_event(
+                            &state,
+                            project_id,
+                            "exchange",
+                            json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
+                        );
+                        return Ok(json!(
+                            crate::page_analyzer::analyze_exchange(
+                                &state.db,
+                                project_id,
+                                exchange_id,
+                            )
+                            .await?
+                        ));
+                    }
+
+                    let response = result.response.ok_or_else(|| {
+                        DomainError::new(
+                            ErrorCode::Internal,
+                            "URL analysis response body was unavailable",
+                        )
+                    })?;
+                    let mut body = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        response.body_base64.as_bytes(),
+                    )
+                    .map_err(|error| {
+                        DomainError::new(
+                            ErrorCode::Internal,
+                            format!("invalid internal response body: {error}"),
+                        )
+                    })?;
+                    let encodings = response
+                        .headers
+                        .iter()
+                        .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+                        .map(|header| header.value.trim().to_string())
+                        .filter(|encoding| {
+                            !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
+                        })
+                        .collect::<Vec<_>>();
+                    let content_encoding = (!encodings.is_empty()).then(|| encodings.join(", "));
+                    if let Some(encoding) = &content_encoding {
+                        body = crate::codec::decode_content_encodings(
+                            &body,
+                            encoding,
+                            crate::codec::MAX_DECODED_BODY_OUTPUT,
+                        )?;
+                    }
+                    let analysis = crate::page_analyzer::analyze_page(&body);
+                    Ok(json!({
+                        "project_id": project_id,
+                        "exchange_id": null,
+                        "source_url": parsed.to_string(),
+                        "decoded": content_encoding.is_some(),
+                        "content_encoding": content_encoding,
+                        "body_truncated": response.body_truncated,
+                        "endpoints": analysis.endpoints,
+                        "urls": analysis.urls,
+                        "emails": analysis.emails,
+                        "stats": analysis.stats,
+                    }))
+                }
+                _ => Err(DomainError::invalid(
+                    "provide exactly one of exchange_id or url",
+                )),
+            }
+        }
+        "copy_as" => {
+            let project_id = require_project_id(&args)?;
+            let exchange_id = args
+                .get("exchange_id")
+                .and_then(Value::as_i64)
+                .map(ExchangeId)
+                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let format: crate::copy_as::CopyAsFormat = serde_json::from_value(
+                args.get("format")
+                    .cloned()
+                    .ok_or_else(|| DomainError::invalid("format required"))?,
+            )
+            .map_err(|_| DomainError::invalid("format must be curl|python_requests"))?;
+            let include_secrets = args
+                .get("include_secrets")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let result = crate::copy_as::copy_exchange_as(
+                &state.db,
+                project_id,
+                exchange_id,
+                format,
+                include_secrets,
+            )
+            .await?;
+            if include_secrets {
+                let _ = state
+                    .db
+                    .audit(
+                        Some(project_id),
+                        "copy_as_secret_reveal",
+                        Some("mcp"),
+                        Some("exchange"),
+                        Some(&exchange_id.get().to_string()),
+                        json!({ "format": format }),
+                    )
+                    .await;
+            }
+            Ok(json!(result))
         }
         "exchange_body" => {
             let project_id = require_project_id(&args)?;

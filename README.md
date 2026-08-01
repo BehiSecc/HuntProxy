@@ -98,7 +98,12 @@ request target, headers, and body. Fuzzer templates accept inline `wordlists`
 or local UTF-8 `wordlist_files`, with one payload per line.
 The `sitemap` tool returns sorted routes for every saved host or one requested
 host. The `findings` tool links a title and description to an exchange and can
-list or remove those findings.
+list or remove those findings. `copy_as` converts any saved request to cURL or
+Python requests. Sensitive headers stay redacted unless `include_secrets: true`
+is explicitly requested.
+`page_analyzer` accepts either a saved `exchange_id` or an absolute `url` and
+returns sorted, unique endpoints, URLs, and emails from decoded JavaScript or
+HTML. It performs static text analysis only and does not scan or return secrets.
 
 Use `js_files` with only `project_id` to list JavaScript from saved history,
 add `domain` to filter it, or add `url` to perform a fresh, ephemeral,
@@ -129,6 +134,7 @@ Example agent tasks:
 - “Replay exchange 42 as POST with a JSON body.”
 - “List JavaScript files for `example.com` from project 1 history.”
 - “Load `https://example.com` and return every JavaScript URL and path.”
+- “Analyze exchange 42 for endpoints, URLs, and emails.”
 - “Send this exact raw HTTP/1.1 request with CRLF using `reply_send_raw`.”
 - “Stop HuntProxy.”
 
@@ -136,6 +142,10 @@ Capture scope is optional. Empty scope saves everything; configured scope only
 controls what is stored in History. It never restricts destinations. Sensitive
 header values are redacted from normal agent output while remaining usable for
 replay and fuzzing.
+
+Capture hosts accept exact names and wildcard suffixes such as `*.example.com`.
+Multiple include and exclude patterns are supported; exclusions always win. An
+empty include list with exclusions captures every host except those exclusions.
 
 ## Development
 

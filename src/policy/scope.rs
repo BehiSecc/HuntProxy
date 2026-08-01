@@ -76,6 +76,7 @@ pub fn derive_scope_from_target(target_url: &str) -> DomainResult<ScopePolicy> {
     Ok(ScopePolicy {
         schemes: vec![t.scheme],
         host_patterns: vec![t.host],
+        excluded_host_patterns: vec![],
         ports: vec![t.port],
         path_prefixes: vec![],
     })
@@ -111,6 +112,16 @@ pub fn path_allowed(path: &str, prefixes: &[String]) -> bool {
 /// capture everything; scope never controls whether a request may be sent.
 pub fn check_url_in_scope(url: &str, policy: &ScopePolicy) -> DomainResult<TargetRef> {
     let t = TargetRef::from_url(url)?;
+    if policy
+        .excluded_host_patterns
+        .iter()
+        .any(|p| host_matches_pattern(&t.host, p))
+    {
+        return Err(DomainError::scope_denied(format!(
+            "host {} is excluded from scope",
+            t.host
+        )));
+    }
     if policy.host_patterns.is_empty() {
         return Ok(t);
     }
@@ -259,6 +270,7 @@ mod tests {
         ScopePolicy {
             schemes: vec!["http".into(), "https".into()],
             host_patterns: vec![host.into()],
+            excluded_host_patterns: vec![],
             ports: vec![80, 443, 8080],
             path_prefixes: vec![],
         }
@@ -287,6 +299,76 @@ mod tests {
         assert!(check_url_in_scope("https://a.example.com/api", &p).is_ok());
         assert!(check_url_in_scope("https://a.example.com/api2", &p).is_err());
         assert!(check_url_in_scope("https://a.example.com/other", &p).is_err());
+    }
+
+    #[test]
+    fn multiple_included_hosts_are_supported() {
+        let mut p = policy("example.com");
+        p.host_patterns
+            .extend(["test.org".into(), "*.apps.example.net".into()]);
+
+        assert!(url_is_in_scope("https://example.com/", &p).unwrap());
+        assert!(url_is_in_scope("https://test.org/", &p).unwrap());
+        assert!(url_is_in_scope("https://api.apps.example.net/", &p).unwrap());
+        assert!(!url_is_in_scope("https://example.net/", &p).unwrap());
+    }
+
+    #[test]
+    fn exclusions_override_exact_and_wildcard_inclusions() {
+        let mut p = policy("*.test.com");
+        p.host_patterns.push("other.example".into());
+        p.excluded_host_patterns = vec!["admin.test.com".into(), "other.example".into()];
+
+        assert!(url_is_in_scope("https://api.test.com/", &p).unwrap());
+        assert!(!url_is_in_scope("https://admin.test.com/", &p).unwrap());
+        assert!(!url_is_in_scope("https://other.example/", &p).unwrap());
+    }
+
+    #[test]
+    fn wildcard_exclusion_covers_nested_subdomains() {
+        let mut p = policy("*.test.com");
+        p.excluded_host_patterns = vec!["*.internal.test.com".into()];
+
+        assert!(url_is_in_scope("https://public.test.com/", &p).unwrap());
+        assert!(!url_is_in_scope("https://internal.test.com/", &p).unwrap());
+        assert!(!url_is_in_scope("https://deep.internal.test.com/", &p).unwrap());
+    }
+
+    #[test]
+    fn exclusion_only_scope_captures_everything_else() {
+        let p = ScopePolicy {
+            excluded_host_patterns: vec!["excluded.example".into(), "*.private.test".into()],
+            ..Default::default()
+        };
+
+        assert!(url_is_in_scope("https://public.example/", &p).unwrap());
+        assert!(!url_is_in_scope("https://excluded.example/", &p).unwrap());
+        assert!(!url_is_in_scope("https://api.private.test/", &p).unwrap());
+    }
+
+    #[test]
+    fn legacy_scope_json_defaults_exclusions_to_empty() {
+        let scope: ScopePolicy = serde_json::from_str(
+            r#"{"schemes":["https"],"host_patterns":["example.com"],"ports":[],"path_prefixes":[]}"#,
+        )
+        .unwrap();
+
+        assert!(scope.excluded_host_patterns.is_empty());
+        assert!(url_is_in_scope("https://example.com/", &scope).unwrap());
+    }
+
+    #[test]
+    fn partial_scope_json_uses_safe_defaults() {
+        let scope: ScopePolicy = serde_json::from_str(
+            r#"{"host_patterns":["*.example.com"],"excluded_host_patterns":["admin.example.com"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(scope.schemes, ["http", "https"]);
+        assert!(scope.ports.is_empty());
+        assert!(scope.path_prefixes.is_empty());
+        assert!(url_is_in_scope("https://api.example.com/", &scope).unwrap());
+        assert!(!url_is_in_scope("https://admin.example.com/", &scope).unwrap());
     }
 
     #[test]

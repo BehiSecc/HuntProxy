@@ -185,10 +185,54 @@ async fn embedded_ui_exposes_the_complete_workbench() {
         "Browser",
         "Codec",
         "Save annotation",
+        "Analyze page",
+        "Copy as cURL",
+        "Exclude hosts",
         "Body format",
     ] {
         assert!(html.contains(expected), "missing UI workflow: {expected}");
     }
+}
+
+#[tokio::test]
+async fn page_analyzer_extracts_saved_response_findings_through_http_api() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut captured = exchange(project_id, "GET", "/app.js");
+    captured.mime = Some("application/javascript".into());
+    captured.response_body = Some(
+        br#"const route = '/api/v1/profile';
+            const docs = 'https://docs.example.test/Program Terms.pdf';
+            const email = 'security@example.test';"#
+            .to_vec(),
+    );
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+
+    let response = bb::api::router(state)
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/analyze",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let analysis = json_response(response).await;
+    assert_eq!(
+        analysis["endpoints"],
+        serde_json::json!(["/api/v1/profile"])
+    );
+    assert_eq!(
+        analysis["urls"],
+        serde_json::json!(["https://docs.example.test/Program Terms.pdf"])
+    );
+    assert_eq!(
+        analysis["emails"],
+        serde_json::json!(["security@example.test"])
+    );
 }
 
 #[tokio::test]
@@ -202,7 +246,8 @@ async fn optional_capture_scope_can_be_updated_through_http_api() {
                 .body(Body::from(
                     serde_json::json!({
                         "schemes": ["http", "https"],
-                        "host_patterns": ["*.example.com"],
+                        "host_patterns": ["*.example.com", "test.org"],
+                        "excluded_host_patterns": ["admin.example.com", "*.private.example.com"],
                         "ports": [],
                         "path_prefixes": []
                     })
@@ -215,6 +260,15 @@ async fn optional_capture_scope_can_be_updated_through_http_api() {
     assert_eq!(response.status(), StatusCode::OK);
     let project = json_response(response).await;
     assert_eq!(project["scope"]["host_patterns"][0], "*.example.com");
+    assert_eq!(project["scope"]["host_patterns"][1], "test.org");
+    assert_eq!(
+        project["scope"]["excluded_host_patterns"][0],
+        "admin.example.com"
+    );
+    assert_eq!(
+        project["scope"]["excluded_host_patterns"][1],
+        "*.private.example.com"
+    );
 }
 
 #[tokio::test]
@@ -451,4 +505,79 @@ async fn sitemap_and_findings_work_through_http_api() {
         .await
         .unwrap();
     assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn copy_as_redacts_secrets_by_default_and_can_explicitly_include_them() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut captured = exchange(project_id, "POST", "/submit");
+    captured.query = Some("from=history".into());
+    captured.request_headers = vec![
+        HeaderEntry {
+            name: "Authorization".into(),
+            value: b"Bearer top-secret".to_vec(),
+            ordinal: 0,
+        },
+        HeaderEntry {
+            name: "X-Repeat".into(),
+            value: b"one".to_vec(),
+            ordinal: 1,
+        },
+        HeaderEntry {
+            name: "X-Repeat".into(),
+            value: b"two".to_vec(),
+            ordinal: 2,
+        },
+    ];
+    captured.request_body = Some(br#"{"ok":true}"#.to_vec());
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+    let app = bb::api::router(state);
+
+    let redacted = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/copy-as?format=curl",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(redacted.status(), StatusCode::OK);
+    let redacted = json_response(redacted).await;
+    assert_eq!(redacted["redacted_headers"], 1);
+    assert!(redacted["content"]
+        .as_str()
+        .unwrap()
+        .contains("Authorization: <redacted>"));
+    assert_eq!(
+        redacted["content"]
+            .as_str()
+            .unwrap()
+            .matches("--header 'X-Repeat:")
+            .count(),
+        2
+    );
+
+    let revealed = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/copy-as?format=python_requests&include_secrets=true",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revealed.status(), StatusCode::OK);
+    let revealed = json_response(revealed).await;
+    let content = revealed["content"].as_str().unwrap();
+    assert!(content.contains("Bearer top-secret"));
+    assert!(content.contains("\"X-Repeat\": \"one, two\""));
+    assert!(content.contains("https://example.com/submit?from=history"));
 }

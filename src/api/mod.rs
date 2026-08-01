@@ -158,6 +158,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/projects/{id}/exchanges/{eid}/body", get(get_body))
         .route(
+            "/api/v1/projects/{id}/exchanges/{eid}/analyze",
+            get(analyze_exchange),
+        )
+        .route(
+            "/api/v1/projects/{id}/exchanges/{eid}/copy-as",
+            get(copy_as),
+        )
+        .route(
             "/api/v1/projects/{id}/reply-tabs",
             get(list_reply_tabs).post(upsert_reply_tab),
         )
@@ -605,6 +613,59 @@ async fn get_exchange(
             Json(value).into_response()
         }
         Err(e) => error_response(e),
+    }
+}
+
+async fn analyze_exchange(
+    State(state): State<Arc<AppState>>,
+    Path((id, eid)): Path<(i64, i64)>,
+) -> Response {
+    match crate::page_analyzer::analyze_exchange(&state.db, ProjectId(id), ExchangeId(eid)).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct CopyAsQuery {
+    format: crate::copy_as::CopyAsFormat,
+    #[serde(default)]
+    include_secrets: bool,
+}
+
+async fn copy_as(
+    State(state): State<Arc<AppState>>,
+    Path((id, eid)): Path<(i64, i64)>,
+    Query(query): Query<CopyAsQuery>,
+) -> Response {
+    let project_id = ProjectId(id);
+    let exchange_id = ExchangeId(eid);
+    match crate::copy_as::copy_exchange_as(
+        &state.db,
+        project_id,
+        exchange_id,
+        query.format,
+        query.include_secrets,
+    )
+    .await
+    {
+        Ok(result) => {
+            if query.include_secrets {
+                let _ = state
+                    .db
+                    .audit(
+                        Some(project_id),
+                        "copy_as_secret_reveal",
+                        Some("api"),
+                        Some("exchange"),
+                        Some(&eid.to_string()),
+                        serde_json::json!({ "format": query.format }),
+                    )
+                    .await;
+            }
+            Json(result).into_response()
+        }
+        Err(error) => error_response(error),
     }
 }
 
