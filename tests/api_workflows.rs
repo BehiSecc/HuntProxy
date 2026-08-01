@@ -196,6 +196,72 @@ async fn embedded_ui_exposes_the_complete_workbench() {
 }
 
 #[tokio::test]
+async fn fuzzer_number_generator_runs_through_http_api() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/item"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let (_directory, state, project_id) = test_state().await;
+    let app = bb::api::router(state.clone());
+    let response = app
+        .oneshot(
+            Request::post(format!("/api/v1/projects/{}/fuzz-jobs", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "template": {
+                            "draft": {"url": format!("{}/item?id=§id§", server.uri())},
+                            "insertion_points": [{"name": "id", "location": "url"}],
+                            "payload_generators": [{
+                                "type": "numbers", "from": 1, "to": 10, "step": 3
+                            }]
+                        },
+                        "confirm": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let job = json_response(response).await;
+    assert_eq!(job["estimated_cases"], 4);
+
+    for _ in 0..40 {
+        if state
+            .db
+            .get_fuzz_job(project_id, FuzzJobId(job["id"].as_i64().unwrap()))
+            .await
+            .unwrap()
+            .state
+            == FuzzJobState::Completed
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let requests = server.received_requests().await.unwrap();
+    let mut ids = requests
+        .iter()
+        .filter_map(|request| {
+            request
+                .url
+                .query_pairs()
+                .find(|(name, _)| name == "id")
+                .map(|(_, value)| value.into_owned())
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, ["1", "10", "4", "7"]);
+}
+
+#[tokio::test]
 async fn page_analyzer_extracts_saved_response_findings_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let mut captured = exchange(project_id, "GET", "/app.js");

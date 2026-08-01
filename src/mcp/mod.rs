@@ -242,6 +242,41 @@ fn fuzz_template_schema() -> Value {
                 "description": "Local UTF-8 wordlist paths. Each file is one wordlist with one payload per line; files are appended after inline wordlists.",
                 "items": {"type": "string", "minLength": 1}
             },
+            "payload_generators": {
+                "type": "array",
+                "default": [],
+                "description": "Native generators. Each generator is appended as one wordlist. Number ranges always include from and to. Regex bypass implements Recollapse-style byte mutations at the start, around separators, at the end, and in place of regex metacharacters.",
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": {"const": "numbers"},
+                                "from": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64},
+                                "to": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64},
+                                "step": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64, "description": "Non-zero; its sign must move from from toward to."}
+                            },
+                            "required": ["type", "from", "to", "step"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": {"const": "regex_bypass"},
+                                "input": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Known value that the target's validation accepts or rejects (maximum 4096 UTF-8 bytes)."},
+                                "encoding": {"type": "string", "enum": ["url", "unicode", "raw", "double_url"], "default": "url"},
+                                "modes": {"type": "array", "minItems": 1, "uniqueItems": true, "default": ["start", "separator", "end", "regex_metachar"], "items": {"type": "string", "enum": ["start", "separator", "end", "regex_metachar"]}},
+                                "byte_from": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
+                                "byte_to": {"type": "integer", "minimum": 0, "maximum": 255, "default": 255},
+                                "include_alphanumeric": {"type": "boolean", "default": false},
+                                "max_payloads": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615_u64, "default": 2000}
+                            },
+                            "required": ["type", "input"],
+                            "additionalProperties": false
+                        }
+                    ]
+                }
+            },
             "transforms": {
                 "type": "array",
                 "default": [],
@@ -250,7 +285,7 @@ fn fuzz_template_schema() -> Value {
             "strategy": {"type": "string", "enum": ["sniper", "battering_ram", "pitchfork", "cluster_bomb"], "default": "sniper"}
         },
         "required": ["insertion_points"],
-        "anyOf": [{"required":["wordlists"]},{"required":["wordlist_files"]}],
+        "anyOf": [{"required":["wordlists"]},{"required":["wordlist_files"]},{"required":["payload_generators"]}],
         "additionalProperties": false
     })
 }
@@ -271,7 +306,7 @@ fn tool_defs() -> Value {
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
         {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]}},"required":["project_id"]}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
-        {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists or local UTF-8 wordlist_files with one payload per line.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
+        {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases"]},"job_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
         {"name":"browser_start","description":"Start or resume the project's persistent browser workspace. Omit url to resume the last page. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
@@ -1958,6 +1993,18 @@ mod tests {
             .unwrap();
         let template = &fuzz_start["inputSchema"]["properties"]["template"];
         assert_eq!(template["properties"]["strategy"]["default"], "sniper");
+        let generators = &template["properties"]["payload_generators"];
+        assert_eq!(generators["default"], json!([]));
+        let regex_generator = &generators["items"]["oneOf"][1];
+        assert_eq!(regex_generator["properties"]["encoding"]["default"], "url");
+        assert_eq!(
+            regex_generator["properties"]["modes"]["default"],
+            json!(["start", "separator", "end", "regex_metachar"])
+        );
+        assert_eq!(
+            regex_generator["properties"]["max_payloads"]["default"],
+            2000
+        );
         assert_eq!(
             template["properties"]["insertion_points"]["items"]["properties"]["location"]
                 ["pattern"],

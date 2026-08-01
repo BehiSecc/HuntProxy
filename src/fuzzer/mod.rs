@@ -14,6 +14,10 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+mod generators;
+
+pub use generators::PayloadGenerator;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsertionPoint {
     pub name: String,
@@ -34,6 +38,10 @@ pub struct FuzzTemplate {
     /// wordlist and is appended after inline wordlists.
     #[serde(default)]
     pub wordlist_files: Vec<String>,
+    /// Native payload generators. Each generator becomes one wordlist and is
+    /// appended after inline and file-backed wordlists.
+    #[serde(default)]
+    pub payload_generators: Vec<PayloadGenerator>,
     #[serde(default)]
     pub transforms: Vec<crate::codec::Transform>,
     #[serde(default = "default_fuzz_strategy")]
@@ -277,9 +285,10 @@ impl FuzzerService {
         mut template: FuzzTemplate,
         confirm_large: bool,
     ) -> DomainResult<FuzzJob> {
-        load_wordlist_files(&mut template).await?;
-        validate_template(&template)?;
         let project = self.db.get_project(project_id).await?;
+        load_wordlist_files(&mut template).await?;
+        generators::expand_generators(&mut template, project.limits.max_fuzz_cases)?;
+        validate_template(&template)?;
         if let Some(base_exchange_id) = template.base_exchange_id {
             self.db
                 .get_exchange_detail(
@@ -1054,6 +1063,7 @@ mod tests {
             ],
             wordlists: vec![vec!["admin".into()], vec!["x".into()]],
             wordlist_files: vec![],
+            payload_generators: vec![],
             transforms: vec![Transform::HexEncode],
             strategy: FuzzStrategy::Pitchfork,
         };
@@ -1088,6 +1098,7 @@ mod tests {
         assert!(template.transforms.is_empty());
         assert_eq!(template.base_exchange_id, None);
         assert!(template.wordlist_files.is_empty());
+        assert!(template.payload_generators.is_empty());
     }
 
     #[tokio::test]
@@ -1105,6 +1116,7 @@ mod tests {
             }],
             wordlists: vec![],
             wordlist_files: vec![file.path().display().to_string()],
+            payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
         };
@@ -1129,6 +1141,7 @@ mod tests {
             }],
             wordlists: vec![vec!["alpha".into()]],
             wordlist_files: vec![],
+            payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
         };
@@ -1250,6 +1263,7 @@ mod tests {
             }],
             wordlists: vec![vec!["payload".into()]],
             wordlist_files: vec![],
+            payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
         };
@@ -1334,6 +1348,7 @@ mod tests {
             }],
             wordlists: vec![vec!["first".into(), "second".into()]],
             wordlist_files: vec![],
+            payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
         };

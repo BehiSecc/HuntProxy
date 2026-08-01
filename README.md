@@ -95,7 +95,12 @@ inherit the old request body or entity headers.
 History filters support Boolean expressions, for example
 `(request:~this OR request:~that) method:PUT`; `request:~text` searches the
 request target, headers, and body. Fuzzer templates accept inline `wordlists`
-or local UTF-8 `wordlist_files`, with one payload per line.
+or local UTF-8 `wordlist_files`, with one payload per line. Native
+`payload_generators` provide inclusive signed number ranges and bounded,
+[REcollapse](https://github.com/0xacb/recollapse)-inspired regex bypass
+mutations without requiring Python. Regex bypass defaults to URL-encoded byte
+mutations at the start, around separators, at the end, and in place of regex
+metacharacters (REcollapse by André Baptista, MIT).
 The `sitemap` tool returns sorted routes for every saved host or one requested
 host. The `findings` tool links a title and description to an exchange and can
 list or remove those findings. `copy_as` converts any saved request to cURL or
@@ -146,6 +151,8 @@ Example agent tasks:
 - “Load `https://example.com` and return every JavaScript URL and path.”
 - “Build a target-specific wordlist for `example.com`, including related JavaScript.”
 - “Analyze exchange 42 for endpoints, URLs, and emails.”
+- “Fuzz `§id§` with every number from 1 through 100, stepping by 1.”
+- “Generate regex-bypass payloads for `admin@example.com` and fuzz `§email§`.”
 - “Send this exact raw HTTP/1.1 request with CRLF using `reply_send_raw`.”
 - “Stop HuntProxy.”
 

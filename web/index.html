@@ -334,10 +334,38 @@
             <label for="fuzzStrategy">Strategy</label><select id="fuzzStrategy"><option value="sniper">Sniper</option><option value="battering_ram">Battering ram</option><option value="pitchfork">Pitchfork</option><option value="cluster_bomb">Cluster bomb</option></select>
             <label for="fuzzPoints">Insertion points — one <code>name|location</code> per line</label>
             <textarea id="fuzzPoints" style="min-height:65px">p0|url</textarea>
-            <label for="fuzzWords">Wordlists — separate lists with a line containing <code>---</code></label>
-            <textarea id="fuzzWords">admin
+            <label for="fuzzPayloadSource">Payload source</label>
+            <select id="fuzzPayloadSource"><option value="wordlists">Wordlists</option><option value="numbers">Numbers</option><option value="regex_bypass">Regex bypass</option></select>
+            <div id="fuzzWordlistFields">
+              <label for="fuzzWords">Wordlists — separate lists with a line containing <code>---</code></label>
+              <textarea id="fuzzWords">admin
 test
 ../</textarea>
+            </div>
+            <div id="fuzzNumberFields" class="hidden">
+              <div class="row"><div><label for="fuzzNumberFrom">From</label><input id="fuzzNumberFrom" type="number" step="1" required value="1" /></div><div><label for="fuzzNumberTo">To</label><input id="fuzzNumberTo" type="number" step="1" required value="100" /></div><div><label for="fuzzNumberStep">Step</label><input id="fuzzNumberStep" type="number" step="1" required value="1" /></div></div>
+              <p class="small muted">Both endpoints are included.</p>
+            </div>
+            <div id="fuzzRegexFields" class="hidden">
+              <label for="fuzzRegexInput">Original value</label><input id="fuzzRegexInput" required placeholder="admin@example.com" />
+              <label for="fuzzRegexEncoding">Encoding</label><select id="fuzzRegexEncoding"><option value="url">URL encoded</option><option value="unicode">Unicode escape</option><option value="raw">Raw</option><option value="double_url">Double URL encoded</option></select>
+              <p class="small muted">Generates bounded byte mutations at the start, around separators, at the end, and in place of regex metacharacters.</p>
+              <details>
+                <summary>Advanced</summary>
+                <div class="row">
+                  <div><label for="fuzzRegexByteFrom">Byte from</label><input id="fuzzRegexByteFrom" type="number" min="0" max="255" step="1" value="0" /></div>
+                  <div><label for="fuzzRegexByteTo">Byte to</label><input id="fuzzRegexByteTo" type="number" min="0" max="255" step="1" value="255" /></div>
+                  <div><label for="fuzzRegexMax">Max payloads</label><input id="fuzzRegexMax" type="number" min="1" step="1" value="2000" /></div>
+                </div>
+                <div class="row small">
+                  <label><input id="fuzzRegexModeStart" type="checkbox" style="width:auto" checked /> start</label>
+                  <label><input id="fuzzRegexModeSeparator" type="checkbox" style="width:auto" checked /> separator</label>
+                  <label><input id="fuzzRegexModeEnd" type="checkbox" style="width:auto" checked /> end</label>
+                  <label><input id="fuzzRegexModeMeta" type="checkbox" style="width:auto" checked /> regex metacharacter</label>
+                  <label><input id="fuzzRegexAlphanumeric" type="checkbox" style="width:auto" /> include alphanumeric bytes</label>
+                </div>
+              </details>
+            </div>
             <label for="fuzzTransforms">Transforms applied to payloads</label>
             <input id="fuzzTransforms" placeholder="url_encode,base64_encode" />
             <button class="btn primary" id="startFuzz" style="width:100%;margin-top:.65rem">Start</button>
@@ -925,6 +953,49 @@ test
     function parseWordlists() {
       return $('fuzzWords').value.split(/^---\s*$/m).map(block => block.split('\n').map(s => s.trim()).filter(Boolean)).filter(list => list.length);
     }
+    function fuzzPayloadInput() {
+      const source = $('fuzzPayloadSource').value;
+      const integer = (id, label) => {
+        const raw = $(id).value.trim();
+        const value = Number(raw);
+        if (!raw || !Number.isSafeInteger(value)) throw new Error(`${label} must be a whole number`);
+        return value;
+      };
+      if (source === 'numbers') {
+        const from = integer('fuzzNumberFrom', 'From');
+        const to = integer('fuzzNumberTo', 'To');
+        const step = integer('fuzzNumberStep', 'Step');
+        if (!step) throw new Error('Step must not be zero');
+        if ((from < to && step < 0) || (from > to && step > 0)) throw new Error('Step must move from the starting number toward the ending number');
+        return { wordlists: [], payload_generators: [{ type: 'numbers', from, to, step }] };
+      }
+      if (source === 'regex_bypass') {
+        const input = $('fuzzRegexInput').value;
+        if (!input) throw new Error('Original value is required');
+        const byteFrom = integer('fuzzRegexByteFrom', 'Byte from');
+        const byteTo = integer('fuzzRegexByteTo', 'Byte to');
+        const maxPayloads = integer('fuzzRegexMax', 'Max payloads');
+        if (byteFrom < 0 || byteTo > 255 || byteFrom > byteTo) throw new Error('Byte range must be between 0 and 255, from lowest to highest');
+        if (maxPayloads < 1) throw new Error('Max payloads must be at least 1');
+        const modes = [
+          ['fuzzRegexModeStart', 'start'], ['fuzzRegexModeSeparator', 'separator'],
+          ['fuzzRegexModeEnd', 'end'], ['fuzzRegexModeMeta', 'regex_metachar'],
+        ].filter(([id]) => $(id).checked).map(([, mode]) => mode);
+        if (!modes.length) throw new Error('Select at least one regex bypass mode');
+        return { wordlists: [], payload_generators: [{
+          type: 'regex_bypass', input, encoding: $('fuzzRegexEncoding').value, modes,
+          byte_from: byteFrom, byte_to: byteTo, include_alphanumeric: $('fuzzRegexAlphanumeric').checked,
+          max_payloads: maxPayloads,
+        }] };
+      }
+      return { wordlists: parseWordlists(), payload_generators: [] };
+    }
+    $('fuzzPayloadSource').onchange = () => {
+      const source = $('fuzzPayloadSource').value;
+      $('fuzzWordlistFields').classList.toggle('hidden', source !== 'wordlists');
+      $('fuzzNumberFields').classList.toggle('hidden', source !== 'numbers');
+      $('fuzzRegexFields').classList.toggle('hidden', source !== 'regex_bypass');
+    };
     function parsePoints() {
       return $('fuzzPoints').value.split('\n').map(line => {
         const [name, location] = line.split('|').map(s => s.trim());
@@ -937,7 +1008,7 @@ test
         await saveReplyTab();
         const template = {
           base_exchange_id: state.activeReplyTab.base_exchange_id,
-          draft: replyDraftFromForm(), insertion_points: parsePoints(), wordlists: parseWordlists(),
+          draft: replyDraftFromForm(), insertion_points: parsePoints(), ...fuzzPayloadInput(),
           transforms: $('fuzzTransforms').value.split(',').map(s => s.trim()).filter(Boolean), strategy: $('fuzzStrategy').value,
         };
         const job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, { method: 'POST', body: JSON.stringify({ template, confirm: true }) });
