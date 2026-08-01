@@ -1019,6 +1019,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_request_contains_searches_headers_and_compressed_bodies() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "request search".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+
+        let mut body_match = spool_exchange(project.id);
+        body_match.method = "PUT".into();
+        body_match.path = "/body".into();
+        body_match.request_body = Some(format!("this{}", "x".repeat(2048)).into_bytes());
+        let body_id = db.insert_exchange(body_match).await.unwrap();
+
+        let mut header_match = spool_exchange(project.id);
+        header_match.method = "PUT".into();
+        header_match.path = "/header".into();
+        header_match.request_headers = vec![HeaderEntry {
+            name: "X-Test".into(),
+            value: b"that".to_vec(),
+            ordinal: 0,
+        }];
+        let header_id = db.insert_exchange(header_match).await.unwrap();
+
+        let mut wrong_method = spool_exchange(project.id);
+        wrong_method.method = "GET".into();
+        wrong_method.path = "/:smtg".into();
+        db.insert_exchange(wrong_method).await.unwrap();
+
+        let filter = crate::history::parse_text_query(
+            r#"(request:~this OR request:~that OR request:~":smtg") method:PUT"#,
+        )
+        .unwrap();
+        let (items, next) = db
+            .list_history_filtered(project.id, Some(filter), 20, None, None)
+            .await
+            .unwrap();
+        assert!(next.is_none());
+        let ids = items
+            .into_iter()
+            .map(|item| item.exchange_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&body_id));
+        assert!(ids.contains(&header_id));
+    }
+
+    #[tokio::test]
     async fn inserts_file_backed_bodies_without_loading_them_into_exchange() {
         let db = Db::open_in_memory().await.unwrap();
         let project = db

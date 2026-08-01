@@ -88,6 +88,11 @@ Semantic Reply always recalculates message framing, and `reply_send` includes a
 decoded 4 KiB response preview. `exchange_body` decodes gzip, Brotli, and
 deflate responses by default; pass `raw: true` for the captured bytes.
 
+History filters support Boolean expressions, for example
+`(request:~this OR request:~that) method:PUT`; `request:~text` searches the
+request target, headers, and body. Fuzzer templates accept inline `wordlists`
+or local UTF-8 `wordlist_files`, with one payload per line.
+
 Use `js_files` with only `project_id` to list JavaScript from saved history,
 add `domain` to filter it, or add `url` to perform a fresh, ephemeral,
 Lightpanda-first load. Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;

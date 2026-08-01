@@ -28,7 +28,12 @@ pub struct FuzzTemplate {
     #[serde(default)]
     pub draft: ReplyDraft,
     pub insertion_points: Vec<InsertionPoint>,
+    #[serde(default)]
     pub wordlists: Vec<Vec<String>>,
+    /// Local UTF-8 files, one payload per line. Each file becomes one
+    /// wordlist and is appended after inline wordlists.
+    #[serde(default)]
+    pub wordlist_files: Vec<String>,
     #[serde(default)]
     pub transforms: Vec<crate::codec::Transform>,
     #[serde(default = "default_fuzz_strategy")]
@@ -269,9 +274,10 @@ impl FuzzerService {
     pub async fn start(
         &self,
         project_id: ProjectId,
-        template: FuzzTemplate,
+        mut template: FuzzTemplate,
         confirm_large: bool,
     ) -> DomainResult<FuzzJob> {
+        load_wordlist_files(&mut template).await?;
         validate_template(&template)?;
         let project = self.db.get_project(project_id).await?;
         if let Some(base_exchange_id) = template.base_exchange_id {
@@ -418,6 +424,41 @@ impl FuzzerService {
             .list_fuzz_cases(project_id, job_id, limit, before_case_index)
             .await
     }
+}
+
+const MAX_WORDLIST_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+async fn load_wordlist_files(template: &mut FuzzTemplate) -> DomainResult<()> {
+    for file_path in std::mem::take(&mut template.wordlist_files) {
+        let path = std::path::PathBuf::from(&file_path);
+        let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+            DomainError::invalid(format!("read wordlist file {file_path}: {error}"))
+        })?;
+        if !metadata.is_file() {
+            return Err(DomainError::invalid(format!(
+                "wordlist path is not a file: {file_path}"
+            )));
+        }
+        if metadata.len() > MAX_WORDLIST_FILE_BYTES {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                format!("wordlist file exceeds 10 MiB: {file_path}"),
+            ));
+        }
+        let contents = tokio::fs::read_to_string(&path).await.map_err(|error| {
+            DomainError::invalid(format!(
+                "wordlist file must be UTF-8 ({file_path}): {error}"
+            ))
+        })?;
+        let payloads = contents.lines().map(str::to_string).collect::<Vec<_>>();
+        if payloads.is_empty() {
+            return Err(DomainError::invalid(format!(
+                "wordlist file is empty: {file_path}"
+            )));
+        }
+        template.wordlists.push(payloads);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,6 +1053,7 @@ mod tests {
                 },
             ],
             wordlists: vec![vec!["admin".into()], vec!["x".into()]],
+            wordlist_files: vec![],
             transforms: vec![Transform::HexEncode],
             strategy: FuzzStrategy::Pitchfork,
         };
@@ -1045,6 +1087,32 @@ mod tests {
         assert_eq!(template.strategy, FuzzStrategy::Sniper);
         assert!(template.transforms.is_empty());
         assert_eq!(template.base_exchange_id, None);
+        assert!(template.wordlist_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wordlist_files_load_one_payload_per_line() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "alpha\r\n\r\n:smtg\r\n").unwrap();
+        let mut template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft::default(),
+            insertion_points: vec![InsertionPoint {
+                name: "value".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![],
+            wordlist_files: vec![file.path().display().to_string()],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+        };
+
+        load_wordlist_files(&mut template).await.unwrap();
+        assert_eq!(template.wordlists, vec![vec!["alpha", "", ":smtg"]]);
+        assert!(template.wordlist_files.is_empty());
+        validate_template(&template).unwrap();
     }
 
     #[test]
@@ -1060,6 +1128,7 @@ mod tests {
                 location: "url".into(),
             }],
             wordlists: vec![vec!["alpha".into()]],
+            wordlist_files: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
         };
@@ -1180,6 +1249,7 @@ mod tests {
                 location: "url".into(),
             }],
             wordlists: vec![vec!["payload".into()]],
+            wordlist_files: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
         };
@@ -1263,6 +1333,7 @@ mod tests {
                 location: "url".into(),
             }],
             wordlists: vec![vec!["first".into(), "second".into()]],
+            wordlist_files: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
         };

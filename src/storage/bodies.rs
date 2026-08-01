@@ -216,7 +216,7 @@ pub fn store_body_file_conn(
     })
 }
 
-fn decode_body(codec: &str, content: &[u8]) -> DomainResult<Vec<u8>> {
+pub(crate) fn decode_body(codec: &str, content: &[u8]) -> DomainResult<Vec<u8>> {
     match codec {
         "raw" => Ok(content.to_vec()),
         "zstd" => zstd::decode_all(content)

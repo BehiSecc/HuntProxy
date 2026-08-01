@@ -43,6 +43,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "fuzz_job",
     "time",
     "error",
+    "request",
 ];
 
 const ALLOWED_OPS: &[&str] = &[
@@ -165,6 +166,9 @@ fn compile_term(
     if field == "label" {
         return compile_label_term(op, value, binds);
     }
+    if field == "request" {
+        return compile_request_term(op, value, binds);
+    }
     let c = col(field)?;
     match op {
         "eq" => {
@@ -227,6 +231,39 @@ fn compile_term(
         }
         other => Err(DomainError::invalid(format!("unsupported op {other}"))),
     }
+}
+
+fn compile_request_term(
+    op: &str,
+    value: &serde_json::Value,
+    binds: &mut Vec<String>,
+) -> DomainResult<String> {
+    if op != "contains" {
+        return Err(DomainError::invalid(
+            "request supports only the contains operator; use request:~text",
+        ));
+    }
+    let value = value_as_string(value)?;
+    binds.push(format!("%{}%", escape_like(&value)));
+    let like_index = binds.len();
+    binds.push(value);
+    let body_index = binds.len();
+    Ok(format!(
+        "(method LIKE ?{like_index} ESCAPE '\\' \
+          OR scheme LIKE ?{like_index} ESCAPE '\\' \
+          OR authority LIKE ?{like_index} ESCAPE '\\' \
+          OR path LIKE ?{like_index} ESCAPE '\\' \
+          OR COALESCE(query, '') LIKE ?{like_index} ESCAPE '\\' \
+          OR EXISTS (SELECT 1 FROM message_headers mh \
+                     WHERE mh.project_id=exchanges.project_id \
+                       AND mh.exchange_id=exchanges.exchange_id \
+                       AND mh.side='request' \
+                       AND (mh.name LIKE ?{like_index} ESCAPE '\\' \
+                            OR CAST(mh.value AS TEXT) LIKE ?{like_index} ESCAPE '\\')) \
+          OR EXISTS (SELECT 1 FROM bodies b \
+                     WHERE b.id=exchanges.request_body_id \
+                       AND huntproxy_body_contains(b.codec, b.content, ?{body_index})))"
+    ))
 }
 
 fn compile_label_term(
@@ -308,6 +345,7 @@ fn value_as_string(v: &serde_json::Value) -> DomainResult<String> {
 
 /// Small text syntax: `host:example.com method:GET status>=400`.
 /// Bare words search common summary fields; `field:~value` means contains.
+/// `AND`, `OR`, `NOT`, parentheses, and quoted values are supported.
 pub fn parse_text_query(input: &str) -> DomainResult<FilterNode> {
     if input.len() > MAX_INPUT_LEN {
         return Err(DomainError::invalid("filter text too long"));
@@ -316,13 +354,173 @@ pub fn parse_text_query(input: &str) -> DomainResult<FilterNode> {
     if input.is_empty() {
         return Ok(FilterNode::And { and: vec![] });
     }
-    let mut terms = Vec::new();
-    for part in input.split_whitespace() {
-        let term = parse_one_term(part)
-            .map_err(|e| DomainError::invalid(format!("filter parse error at `{part}`: {e}")))?;
-        terms.push(term);
+    QueryParser::new(tokenize_query(input)?).parse()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryToken {
+    Text(String),
+    LeftParen,
+    RightParen,
+}
+
+fn tokenize_query(input: &str) -> DomainResult<Vec<QueryToken>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let flush = |current: &mut String, tokens: &mut Vec<QueryToken>| {
+        if !current.is_empty() {
+            tokens.push(QueryToken::Text(std::mem::take(current)));
+        }
+    };
+    for character in input.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if quoted && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted {
+            match character {
+                '(' => {
+                    flush(&mut current, &mut tokens);
+                    tokens.push(QueryToken::LeftParen);
+                    continue;
+                }
+                ')' => {
+                    flush(&mut current, &mut tokens);
+                    tokens.push(QueryToken::RightParen);
+                    continue;
+                }
+                character if character.is_whitespace() => {
+                    flush(&mut current, &mut tokens);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        current.push(character);
     }
-    Ok(FilterNode::And { and: terms })
+    if quoted {
+        return Err(DomainError::invalid("unterminated quote in history filter"));
+    }
+    if escaped {
+        current.push('\\');
+    }
+    flush(&mut current, &mut tokens);
+    Ok(tokens)
+}
+
+struct QueryParser {
+    tokens: Vec<QueryToken>,
+    position: usize,
+}
+
+impl QueryParser {
+    fn new(tokens: Vec<QueryToken>) -> Self {
+        Self {
+            tokens,
+            position: 0,
+        }
+    }
+
+    fn parse(mut self) -> DomainResult<FilterNode> {
+        let node = self.parse_or()?;
+        if self.position != self.tokens.len() {
+            return Err(DomainError::invalid("unexpected token in history filter"));
+        }
+        Ok(node)
+    }
+
+    fn parse_or(&mut self) -> DomainResult<FilterNode> {
+        let mut nodes = vec![self.parse_and()?];
+        while self.consume_keyword("OR") {
+            nodes.push(self.parse_and()?);
+        }
+        Ok(if nodes.len() == 1 {
+            nodes.remove(0)
+        } else {
+            FilterNode::Or { or: nodes }
+        })
+    }
+
+    fn parse_and(&mut self) -> DomainResult<FilterNode> {
+        let mut nodes = vec![self.parse_not()?];
+        loop {
+            if self.peek_keyword("OR") || matches!(self.peek(), None | Some(QueryToken::RightParen))
+            {
+                break;
+            }
+            let _ = self.consume_keyword("AND");
+            nodes.push(self.parse_not()?);
+        }
+        Ok(if nodes.len() == 1 {
+            nodes.remove(0)
+        } else {
+            FilterNode::And { and: nodes }
+        })
+    }
+
+    fn parse_not(&mut self) -> DomainResult<FilterNode> {
+        if self.consume_keyword("NOT") {
+            return Ok(FilterNode::Not {
+                not: Box::new(self.parse_not()?),
+            });
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> DomainResult<FilterNode> {
+        match self.next() {
+            Some(QueryToken::Text(text)) => parse_one_term(&text).map_err(|error| {
+                DomainError::invalid(format!("filter parse error at `{text}`: {error}"))
+            }),
+            Some(QueryToken::LeftParen) => {
+                let node = self.parse_or()?;
+                match self.next() {
+                    Some(QueryToken::RightParen) => Ok(node),
+                    _ => Err(DomainError::invalid(
+                        "missing closing parenthesis in history filter",
+                    )),
+                }
+            }
+            Some(QueryToken::RightParen) => {
+                Err(DomainError::invalid("unexpected closing parenthesis"))
+            }
+            None => Err(DomainError::invalid("missing term in history filter")),
+        }
+    }
+
+    fn peek(&self) -> Option<&QueryToken> {
+        self.tokens.get(self.position)
+    }
+
+    fn next(&mut self) -> Option<QueryToken> {
+        let token = self.tokens.get(self.position).cloned();
+        self.position += usize::from(token.is_some());
+        token
+    }
+
+    fn peek_keyword(&self, expected: &str) -> bool {
+        matches!(self.peek(), Some(QueryToken::Text(text)) if text.eq_ignore_ascii_case(expected))
+    }
+
+    fn consume_keyword(&mut self, expected: &str) -> bool {
+        if self.peek_keyword(expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn parse_one_term(part: &str) -> Result<FilterNode, String> {
@@ -498,6 +696,28 @@ mod tests {
         let path = parse_text_query("path:~.js").unwrap();
         let (_, binds) = filter_to_sql(&path).unwrap();
         assert_eq!(binds, vec!["%.js%"]);
+    }
+
+    #[test]
+    fn request_contains_supports_boolean_or_quotes_and_method() {
+        let filter = parse_text_query(
+            r#"(request:~"this" OR request:~"that" OR request:~":smtg") method:PUT"#,
+        )
+        .unwrap();
+        let (sql, binds) = filter_to_sql(&filter).unwrap();
+        assert!(sql.contains("huntproxy_body_contains"));
+        assert!(sql.contains(" OR "));
+        assert!(sql.contains(" AND "));
+        assert!(sql.contains("method="));
+        assert!(binds.iter().any(|value| value == ":smtg"));
+        assert!(binds.iter().any(|value| value == "PUT"));
+    }
+
+    #[test]
+    fn malformed_boolean_queries_are_rejected() {
+        assert!(parse_text_query("method:PUT OR").is_err());
+        assert!(parse_text_query("(method:PUT").is_err());
+        assert!(parse_text_query(r#"request:~"unfinished"#).is_err());
     }
 
     #[test]

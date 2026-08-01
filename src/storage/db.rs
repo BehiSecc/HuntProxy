@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::domain::{DomainError, DomainResult, ErrorCode};
 use crate::storage::migrations;
 use deadpool_sqlite::{Config as PoolConfig, Pool, Runtime};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Arc;
@@ -120,6 +121,26 @@ pub fn configure_connection(
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
     conn.pragma_update(None, "trusted_schema", false)
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+    conn.create_scalar_function(
+        "huntproxy_body_contains",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let codec = context.get::<String>(0)?;
+            let content = context.get::<Vec<u8>>(1)?;
+            let needle = context.get::<String>(2)?.to_lowercase();
+            let decoded =
+                crate::storage::bodies::decode_body(&codec, &content).map_err(|error| {
+                    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(
+                        error.to_string(),
+                    )))
+                })?;
+            Ok(String::from_utf8_lossy(&decoded)
+                .to_lowercase()
+                .contains(&needle))
+        },
+    )
+    .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
     // DEFENSIVE mode
     unsafe {
         rusqlite::ffi::sqlite3_db_config(
