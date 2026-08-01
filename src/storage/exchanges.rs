@@ -10,6 +10,7 @@ use crate::storage::Db;
 use rusqlite::params;
 use rusqlite::types::Value;
 use rusqlite::{Transaction, TransactionBehavior};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const EXCHANGE_ACCOUNTING_OVERHEAD: u64 = 512;
@@ -54,15 +55,76 @@ pub struct NewExchange {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct JavascriptFileRecord {
-    pub exchange_id: ExchangeId,
+    pub exchange_id: Option<ExchangeId>,
     pub url: String,
     pub path: String,
     pub host: String,
     pub mime: Option<String>,
     pub status_code: Option<u16>,
+    pub related_page_urls: Vec<String>,
+    pub related_page_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JavascriptProvenanceInput {
+    pub url: String,
+    pub source_page_url: Option<String>,
 }
 
 impl Db {
+    /// Remove URLs already present in project history while preserving the
+    /// caller's order. Used by the background crawler to avoid duplicating
+    /// resources the browser loaded itself.
+    pub async fn filter_uncaptured_urls(
+        &self,
+        project_id: ProjectId,
+        urls: Vec<String>,
+    ) -> DomainResult<Vec<String>> {
+        let mut unique = Vec::new();
+        let mut seen = HashSet::new();
+        for url in urls.into_iter().take(256) {
+            if seen.insert(url.clone()) {
+                unique.push(url);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(unique);
+        }
+        let query_urls = unique.clone();
+        self.with_conn(move |conn| {
+            let placeholders = (0..query_urls.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT scheme || '://' || authority || path ||
+                        CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END
+                   FROM exchanges
+                  WHERE project_id=?1 AND
+                        (scheme || '://' || authority || path ||
+                         CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END)
+                        IN ({placeholders})"
+            );
+            let mut values = Vec::with_capacity(query_urls.len() + 1);
+            values.push(Value::Integer(project_id.get()));
+            values.extend(query_urls.iter().cloned().map(Value::Text));
+            let mut statement = conn.prepare(&sql).map_err(storage_error)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(values), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(storage_error)?;
+            let captured = rows
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(storage_error)?;
+            Ok(unique
+                .into_iter()
+                .filter(|url| !captured.contains(url))
+                .collect())
+        })
+        .await
+    }
+
     pub async fn list_javascript_files(
         &self,
         project_id: ProjectId,
@@ -72,7 +134,18 @@ impl Db {
     ) -> DomainResult<(Vec<JavascriptFileRecord>, bool)> {
         let limit = limit.clamp(1, 10_000) as usize;
         self.with_conn(move |conn| {
-            let sql = "WITH ranked AS (
+            let sql = "WITH matching_urls AS (
+                SELECT javascript_url
+                  FROM javascript_provenance
+                 WHERE project_id=?1
+                   AND (
+                       ?3 IS NULL
+                       OR lower(source_page_host)=?3
+                       OR substr(lower(source_page_host), -(length(?3) + 1))='.' || ?3
+                       OR lower(javascript_host)=?3
+                       OR substr(lower(javascript_host), -(length(?3) + 1))='.' || ?3
+                   )
+            ), ranked AS (
                 SELECT exchange_id, scheme, authority, host, path, query, mime, status_code,
                        ROW_NUMBER() OVER (
                            PARTITION BY scheme, authority, path, COALESCE(query, '')
@@ -85,6 +158,7 @@ impl Db {
                        ?3 IS NULL
                        OR lower(host)=?3
                        OR substr(lower(host), -(length(?3) + 1))='.' || ?3
+                       OR (scheme || '://' || authority || path || CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END) IN (SELECT javascript_url FROM matching_urls)
                    )
                    AND (
                        lower(path) LIKE '%.js'
@@ -109,7 +183,7 @@ impl Db {
                         (limit + 1) as i64
                     ],
                     |row| {
-                        let exchange_id = ExchangeId(row.get(0)?);
+                        let exchange_id = Some(ExchangeId(row.get(0)?));
                         let scheme: String = row.get(1)?;
                         let authority: String = row.get(2)?;
                         let host: String = row.get(3)?;
@@ -127,16 +201,178 @@ impl Db {
                             host,
                             mime: row.get(6)?,
                             status_code: row.get::<_, Option<i64>>(7)?.map(|value| value as u16),
+                            related_page_urls: Vec::new(),
+                            related_page_hosts: Vec::new(),
                         })
                     },
                 )
                 .map_err(storage_error)?;
             let mut files = collect_rows(rows)?;
+            let mut discovered = conn
+                .prepare(
+                    "SELECT javascript_url, javascript_path, javascript_host
+                       FROM javascript_provenance
+                      WHERE project_id=?1
+                        AND (?2 IS NULL OR browser_session_id=?2)
+                        AND (
+                            ?3 IS NULL
+                            OR lower(source_page_host)=?3
+                            OR substr(lower(source_page_host), -(length(?3) + 1))='.' || ?3
+                            OR lower(javascript_host)=?3
+                            OR substr(lower(javascript_host), -(length(?3) + 1))='.' || ?3
+                        )
+                      ORDER BY lower(javascript_url), javascript_url
+                      LIMIT ?4",
+                )
+                .map_err(storage_error)?;
+            let discovered_rows = discovered
+                .query_map(
+                    params![
+                        project_id.get(),
+                        browser_session_id.map(BrowserSessionId::get),
+                        domain,
+                        (limit + 1) as i64,
+                    ],
+                    |row| {
+                        Ok(JavascriptFileRecord {
+                            exchange_id: None,
+                            url: row.get(0)?,
+                            path: row.get(1)?,
+                            host: row.get(2)?,
+                            mime: None,
+                            status_code: None,
+                            related_page_urls: Vec::new(),
+                            related_page_hosts: Vec::new(),
+                        })
+                    },
+                )
+                .map_err(storage_error)?;
+            let mut known_urls = files
+                .iter()
+                .map(|file| file.url.clone())
+                .collect::<HashSet<_>>();
+            for discovered_file in discovered_rows {
+                let discovered_file = discovered_file.map_err(storage_error)?;
+                if known_urls.insert(discovered_file.url.clone()) {
+                    files.push(discovered_file);
+                }
+            }
+            let mut related_by_url: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            if !known_urls.is_empty() {
+                let placeholders = (0..known_urls.len())
+                    .map(|index| format!("?{}", index + 2))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let query = format!(
+                    "SELECT javascript_url, source_page_url, source_page_host
+                       FROM javascript_provenance
+                      WHERE project_id=?1 AND javascript_url IN ({placeholders})
+                      ORDER BY lower(source_page_host), source_page_url"
+                );
+                let mut values = Vec::with_capacity(known_urls.len() + 1);
+                values.push(Value::Integer(project_id.get()));
+                values.extend(known_urls.iter().cloned().map(Value::Text));
+                let mut provenance = conn.prepare(&query).map_err(storage_error)?;
+                let rows = provenance
+                    .query_map(rusqlite::params_from_iter(values), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(storage_error)?;
+                for row in rows {
+                    let (javascript_url, page_url, page_host) = row.map_err(storage_error)?;
+                    related_by_url
+                        .entry(javascript_url)
+                        .or_default()
+                        .push((page_url, page_host));
+                }
+            }
+            for file in &mut files {
+                for (url, host) in related_by_url.remove(&file.url).unwrap_or_default() {
+                    file.related_page_urls.push(url);
+                    if !file.related_page_hosts.contains(&host) {
+                        file.related_page_hosts.push(host);
+                    }
+                }
+            }
+            files.sort_by(|left, right| {
+                left.url
+                    .to_ascii_lowercase()
+                    .cmp(&right.url.to_ascii_lowercase())
+                    .then_with(|| left.url.cmp(&right.url))
+            });
             let truncated = files.len() > limit;
             if truncated {
                 files.truncate(limit);
             }
             Ok((files, truncated))
+        })
+        .await
+    }
+
+    /// Record that pages included or loaded JavaScript resources. Invalid or
+    /// non-HTTP resource URLs are ignored so passive discovery cannot poison
+    /// later host-scoped queries.
+    pub async fn record_javascript_files(
+        &self,
+        project_id: ProjectId,
+        default_source_page_url: &str,
+        files: Vec<JavascriptProvenanceInput>,
+        browser_session_id: Option<BrowserSessionId>,
+        discovery_kind: &str,
+    ) -> DomainResult<usize> {
+        let default_source_page_url = default_source_page_url.to_string();
+        let discovery_kind = discovery_kind.to_string();
+        self.with_conn(move |conn| {
+            let default_source = normalized_http_url(&default_source_page_url)?;
+            if !matches!(discovery_kind.as_str(), "browser" | "source") {
+                return Err(DomainError::invalid(
+                    "JavaScript discovery_kind must be browser or source",
+                ));
+            }
+            let now = now_rfc3339();
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+            let mut changed = 0;
+            for file in files {
+                let source = match file.source_page_url.as_deref() {
+                    Some(value) => normalized_http_url(value).unwrap_or_else(|_| default_source.clone()),
+                    None => default_source.clone(),
+                };
+                let resource = normalized_http_url(&file.url)
+                    .or_else(|_| normalized_join_http_url(&source, &file.url));
+                let Ok(resource) = resource else {
+                    continue;
+                };
+                changed += tx
+                    .execute(
+                        "INSERT INTO javascript_provenance (
+                            project_id, javascript_url, javascript_host, javascript_path,
+                            source_page_url, source_page_host, browser_session_id,
+                            discovery_kind, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         ON CONFLICT(project_id, javascript_url, source_page_url) DO UPDATE SET
+                            browser_session_id=COALESCE(excluded.browser_session_id, browser_session_id),
+                            discovery_kind=excluded.discovery_kind",
+                        params![
+                            project_id.get(),
+                            resource.as_str(),
+                            resource.host_str().unwrap_or_default().to_ascii_lowercase(),
+                            resource.path(),
+                            source.as_str(),
+                            source.host_str().unwrap_or_default().to_ascii_lowercase(),
+                            browser_session_id.map(BrowserSessionId::get),
+                            discovery_kind,
+                            now,
+                        ],
+                    )
+                    .map_err(storage_error)?;
+            }
+            tx.commit().map_err(storage_error)?;
+            Ok(changed)
         })
         .await
     }
@@ -872,6 +1108,31 @@ fn parse_transport_prov(s: &str) -> TransportProvenance {
     }
 }
 
+fn normalized_http_url(value: &str) -> DomainResult<url::Url> {
+    let mut parsed = url::Url::parse(value.trim())
+        .map_err(|error| DomainError::invalid(format!("invalid URL: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(DomainError::invalid(
+            "URL must use http or https and have a host",
+        ));
+    }
+    parsed.set_fragment(None);
+    Ok(parsed)
+}
+
+fn normalized_join_http_url(base: &url::Url, value: &str) -> DomainResult<url::Url> {
+    let mut parsed = base
+        .join(value.trim())
+        .map_err(|error| DomainError::invalid(format!("invalid relative URL: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(DomainError::invalid(
+            "URL must use http or https and have a host",
+        ));
+    }
+    parsed.set_fragment(None);
+    Ok(parsed)
+}
+
 fn storage_error(error: rusqlite::Error) -> DomainError {
     DomainError::new(ErrorCode::StorageError, error.to_string())
 }
@@ -1016,6 +1277,92 @@ mod tests {
             .unwrap();
         assert_eq!(limited.len(), 1);
         assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn javascript_provenance_ties_cross_origin_and_relative_files_to_page_host() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "javascript provenance".into(),
+                target_url: "https://target.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+
+        db.record_javascript_files(
+            project.id,
+            "https://target.test/products/one#section",
+            vec![
+                JavascriptProvenanceInput {
+                    url: "https://assets.cdn.test/app.js?v=1#ignored".into(),
+                    source_page_url: Some("https://shop.target.test/cart#total".into()),
+                },
+                JavascriptProvenanceInput {
+                    url: "/static/local.js#ignored".into(),
+                    source_page_url: None,
+                },
+                JavascriptProvenanceInput {
+                    url: "data:text/javascript,ignored".into(),
+                    source_page_url: None,
+                },
+            ],
+            Some(BrowserSessionId(11)),
+            "source",
+        )
+        .await
+        .unwrap();
+
+        let (target_files, truncated) = db
+            .list_javascript_files(project.id, None, Some("target.test".into()), 20)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(target_files.len(), 2);
+        assert!(target_files.iter().all(|file| file.exchange_id.is_none()));
+        assert!(target_files
+            .iter()
+            .any(|file| file.url == "https://assets.cdn.test/app.js?v=1"));
+        assert!(target_files
+            .iter()
+            .any(|file| file.url == "https://target.test/static/local.js"));
+
+        let cdn = target_files
+            .iter()
+            .find(|file| file.host == "assets.cdn.test")
+            .unwrap();
+        assert_eq!(cdn.related_page_hosts, vec!["shop.target.test"]);
+        assert_eq!(cdn.related_page_urls, vec!["https://shop.target.test/cart"]);
+
+        let (session_files, _) = db
+            .list_javascript_files(
+                project.id,
+                Some(BrowserSessionId(11)),
+                Some("target.test".into()),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_files.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn javascript_provenance_rejects_unknown_discovery_kind() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "javascript provenance validation".into(),
+                target_url: "https://target.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let error = db
+            .record_javascript_files(project.id, "https://target.test/", vec![], None, "unknown")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
     }
 
     #[tokio::test]

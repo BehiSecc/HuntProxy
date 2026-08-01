@@ -179,6 +179,7 @@ async fn embedded_ui_exposes_the_complete_workbench() {
         "HuntProxy",
         "History",
         "Sitemap",
+        "Get Words",
         "Findings",
         "Reply",
         "Fuzzer",
@@ -233,6 +234,189 @@ async fn page_analyzer_extracts_saved_response_findings_through_http_api() {
         analysis["emails"],
         serde_json::json!(["security@example.test"])
     );
+}
+
+#[tokio::test]
+async fn get_words_includes_javascript_related_to_the_requested_site_by_default() {
+    let (_directory, state, project_id) = test_state().await;
+
+    let mut page = exchange(project_id, "GET", "/partner-dashboard");
+    page.query = Some("account_name=one".into());
+    page.mime = Some("text/html".into());
+    page.response_body = Some(b"<h1>Partner Workspace</h1>".to_vec());
+    state.db.insert_exchange(page).await.unwrap();
+
+    let mut javascript = exchange(project_id, "GET", "/static/app.js");
+    javascript.scheme = "https".into();
+    javascript.authority = "assets.cdn.test".into();
+    javascript.host = "assets.cdn.test".into();
+    javascript.mime = Some("application/javascript".into());
+    javascript.response_body = Some(b"const workspaceManager = true;".to_vec());
+    state.db.insert_exchange(javascript).await.unwrap();
+    state
+        .db
+        .record_javascript_files(
+            project_id,
+            "https://example.com/partner-dashboard",
+            vec![bb::storage::JavascriptProvenanceInput {
+                url: "https://assets.cdn.test/static/app.js".into(),
+                source_page_url: None,
+            }],
+            None,
+            "source",
+        )
+        .await
+        .unwrap();
+
+    let app = bb::api::router(state);
+    let included = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/words?domain=example.com",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(included.status(), StatusCode::OK);
+    let included = json_response(included).await;
+    let words = included["words"].as_array().unwrap();
+    assert!(words.iter().any(|word| word == "Partner"));
+    assert!(words.iter().any(|word| word == "workspaceManager"));
+    assert!(
+        included["stats"]["javascript_exchanges_examined"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+
+    let excluded = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/words?domain=example.com&include_js=false",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let excluded = json_response(excluded).await;
+    assert!(!excluded["words"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|word| word == "workspaceManager"));
+}
+
+#[tokio::test]
+async fn background_crawler_fetches_one_level_and_obeys_scope_exclusions() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/about"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("About page"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/app.js"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/javascript")
+                .set_body_string("const projectWord = true;"),
+        )
+        .mount(&server)
+        .await;
+
+    let (_directory, state, project_id) = test_state().await;
+    let base = url::Url::parse(&server.uri()).unwrap();
+    let host = base.host_str().unwrap().to_string();
+    let port = base.port().unwrap();
+    state
+        .db
+        .update_project_scope(
+            project_id,
+            ScopePolicy {
+                schemes: vec!["http".into()],
+                host_patterns: vec![host.clone()],
+                excluded_host_patterns: vec!["localhost".into()],
+                ports: vec![port],
+                path_prefixes: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut page = exchange(project_id, "GET", "/");
+    page.source = ExchangeSource::Browser;
+    page.scheme = "http".into();
+    page.authority = format!("{host}:{port}");
+    page.host = host.clone();
+    page.port = port;
+    page.mime = Some("text/html".into());
+    page.response_body = Some(
+        format!(
+            r#"<a href="{}/about">About</a>
+                <script src="{}/app.js"></script>
+                <a href="http://localhost:{port}/excluded">Excluded</a>"#,
+            server.uri(),
+            server.uri(),
+        )
+        .into_bytes(),
+    );
+    let page_id = state.db.insert_exchange(page).await.unwrap();
+
+    let mut browser_script = exchange(project_id, "GET", "/app.js");
+    browser_script.source = ExchangeSource::Proxy;
+    browser_script.scheme = "http".into();
+    browser_script.authority = format!("{host}:{port}");
+    browser_script.host = host.clone();
+    browser_script.port = port;
+    browser_script.mime = Some("application/javascript".into());
+    browser_script.response_body = Some(b"const alreadyLoaded = true;".to_vec());
+    state.db.insert_exchange(browser_script).await.unwrap();
+
+    state.crawler.crawl_exchange(project_id, page_id).await;
+
+    let sitemap = state
+        .db
+        .list_sitemap(project_id, Some(host.clone()))
+        .await
+        .unwrap();
+    assert_eq!(sitemap.len(), 1);
+    assert!(sitemap[0].paths.contains(&"/about".to_string()));
+    assert!(sitemap[0].paths.contains(&"/app.js".to_string()));
+    assert!(!sitemap[0].paths.contains(&"/excluded".to_string()));
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests
+        .iter()
+        .any(|request| request.url.path() == "/about"));
+    assert!(!requests
+        .iter()
+        .any(|request| request.url.path() == "/app.js"));
+    assert!(!requests
+        .iter()
+        .any(|request| request.url.path() == "/excluded"));
+
+    let (scripts, _) = state
+        .db
+        .list_javascript_files(project_id, None, Some(host), 20)
+        .await
+        .unwrap();
+    let script = scripts
+        .iter()
+        .find(|script| script.path == "/app.js")
+        .unwrap();
+    assert!(script
+        .related_page_urls
+        .iter()
+        .any(|url| url == &format!("{}/", server.uri())));
 }
 
 #[tokio::test]
@@ -508,7 +692,7 @@ async fn sitemap_and_findings_work_through_http_api() {
 }
 
 #[tokio::test]
-async fn copy_as_redacts_secrets_by_default_and_can_explicitly_include_them() {
+async fn copy_as_includes_secrets_by_default_and_can_explicitly_redact_them() {
     let (_directory, state, project_id) = test_state().await;
     let mut captured = exchange(project_id, "POST", "/submit");
     captured.query = Some("from=history".into());
@@ -533,7 +717,7 @@ async fn copy_as_redacts_secrets_by_default_and_can_explicitly_include_them() {
     let exchange_id = state.db.insert_exchange(captured).await.unwrap();
     let app = bb::api::router(state);
 
-    let redacted = app
+    let included = app
         .clone()
         .oneshot(
             Request::get(format!(
@@ -546,15 +730,15 @@ async fn copy_as_redacts_secrets_by_default_and_can_explicitly_include_them() {
         )
         .await
         .unwrap();
-    assert_eq!(redacted.status(), StatusCode::OK);
-    let redacted = json_response(redacted).await;
-    assert_eq!(redacted["redacted_headers"], 1);
-    assert!(redacted["content"]
+    assert_eq!(included.status(), StatusCode::OK);
+    let included = json_response(included).await;
+    assert_eq!(included["redacted_headers"], 0);
+    assert!(included["content"]
         .as_str()
         .unwrap()
-        .contains("Authorization: <redacted>"));
+        .contains("Authorization: Bearer top-secret"));
     assert_eq!(
-        redacted["content"]
+        included["content"]
             .as_str()
             .unwrap()
             .matches("--header 'X-Repeat:")
@@ -562,10 +746,10 @@ async fn copy_as_redacts_secrets_by_default_and_can_explicitly_include_them() {
         2
     );
 
-    let revealed = app
+    let redacted = app
         .oneshot(
             Request::get(format!(
-                "/api/v1/projects/{}/exchanges/{}/copy-as?format=python_requests&include_secrets=true",
+                "/api/v1/projects/{}/exchanges/{}/copy-as?format=python_requests&include_secrets=false",
                 project_id.get(),
                 exchange_id.get()
             ))
@@ -574,10 +758,12 @@ async fn copy_as_redacts_secrets_by_default_and_can_explicitly_include_them() {
         )
         .await
         .unwrap();
-    assert_eq!(revealed.status(), StatusCode::OK);
-    let revealed = json_response(revealed).await;
-    let content = revealed["content"].as_str().unwrap();
-    assert!(content.contains("Bearer top-secret"));
+    assert_eq!(redacted.status(), StatusCode::OK);
+    let redacted = json_response(redacted).await;
+    assert_eq!(redacted["redacted_headers"], 1);
+    let content = redacted["content"].as_str().unwrap();
+    assert!(content.contains("<redacted>"));
+    assert!(!content.contains("Bearer top-secret"));
     assert!(content.contains("\"X-Repeat\": \"one, two\""));
     assert!(content.contains("https://example.com/submit?from=history"));
 }

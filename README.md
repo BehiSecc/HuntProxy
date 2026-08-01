@@ -99,15 +99,25 @@ or local UTF-8 `wordlist_files`, with one payload per line.
 The `sitemap` tool returns sorted routes for every saved host or one requested
 host. The `findings` tool links a title and description to an exchange and can
 list or remove those findings. `copy_as` converts any saved request to cURL or
-Python requests. Sensitive headers stay redacted unless `include_secrets: true`
-is explicitly requested.
+Python requests, including sensitive headers so the result is immediately
+runnable. Set `include_secrets: false` when a redacted copy is preferred.
 `page_analyzer` accepts either a saved `exchange_id` or an absolute `url` and
 returns sorted, unique endpoints, URLs, and emails from decoded JavaScript or
 HTML. It performs static text analysis only and does not scan or return secrets.
 
 Use `js_files` with only `project_id` to list JavaScript from saved history,
 add `domain` to filter it, or add `url` to perform a fresh, ephemeral,
-Lightpanda-first load. Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;
+Lightpanda-first load. JavaScript results retain the page URLs and hosts that
+included or loaded them. `get_words` builds a target-specific wordlist from
+saved traffic and includes JavaScript related to the requested site by default;
+set `include_js: false` to omit it.
+
+Browser-loaded HTML is crawled one level in the background: HuntProxy follows
+at most 64 discovered links/assets with four concurrent GETs. These requests
+are saved into History and Sitemap only when their destinations match capture
+scope; excluded hosts are never crawled.
+
+Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;
 restart the MCP client (or run `HuntProxy serve`) when you want to use it again.
 
 If your MCP client cannot find `HuntProxy`, use the absolute path printed by
@@ -134,6 +144,7 @@ Example agent tasks:
 - “Replay exchange 42 as POST with a JSON body.”
 - “List JavaScript files for `example.com` from project 1 history.”
 - “Load `https://example.com` and return every JavaScript URL and path.”
+- “Build a target-specific wordlist for `example.com`, including related JavaScript.”
 - “Analyze exchange 42 for endpoints, URLs, and emails.”
 - “Send this exact raw HTTP/1.1 request with CRLF using `reply_send_raw`.”
 - “Stop HuntProxy.”

@@ -14,6 +14,7 @@ mod projects;
 mod reply_store;
 mod sessions;
 mod sitemap;
+mod word_sources;
 
 pub use bodies::*;
 pub use db::*;
@@ -38,3 +39,5 @@ pub use fuzz_store::*;
 pub use reply_store::*;
 #[allow(unused_imports)]
 pub use sitemap::*;
+#[allow(unused_imports)]
+pub use word_sources::*;

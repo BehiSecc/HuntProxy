@@ -363,6 +363,21 @@ async fn record_failed_exchange(
     }
 }
 
+fn is_html_content_type(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|content_type| {
+        matches!(
+            content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "text/html" | "application/xhtml+xml"
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn streaming_response(
     state: Arc<AppState>,
@@ -439,6 +454,7 @@ async fn pump_streaming_response(
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("content-type"))
         .map(|header| String::from_utf8_lossy(&header.value).into_owned());
+    let crawl_html = session.is_browser_bound && is_html_content_type(mime.as_deref());
     let mut captured = 0u64;
     let mut truncated = false;
     let mut completion = CompletionState::Complete;
@@ -570,6 +586,14 @@ async fn pump_streaming_response(
                     "completion": completion,
                 }),
             });
+            if crawl_html {
+                let crawler = state.crawler.clone();
+                tokio::spawn(async move {
+                    crawler
+                        .crawl_exchange(session.project_id, exchange_id)
+                        .await;
+                });
+            }
         }
         Err(error) => tracing::warn!(%error, "failed to persist streamed proxy exchange"),
     }
@@ -883,6 +907,11 @@ mod tests {
             config.browser_profiles_dir(),
         ));
         let (events, _) = tokio::sync::broadcast::channel(8);
+        let crawler = Arc::new(crate::crawler::CrawlerService::new(
+            db.clone(),
+            reply.clone(),
+            events.clone(),
+        ));
         let state = Arc::new(AppState {
             db: db.clone(),
             config,
@@ -890,6 +919,7 @@ mod tests {
             reply,
             fuzzer,
             browser,
+            crawler,
             events,
             shutdown: CancellationToken::new(),
             activity: crate::app::ActivityTracker::new(),

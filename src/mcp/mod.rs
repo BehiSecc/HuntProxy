@@ -265,7 +265,7 @@ fn tool_defs() -> Value {
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"page_analyzer","description":"Extract sorted, unique endpoints, absolute URLs, and emails from JavaScript or HTML without executing it. Provide exactly one saved exchange_id or absolute URL. URL mode sends a semantic GET with project cookies and analyzes the complete response; secrets are never scanned or returned.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer","description":"Saved exchange whose decoded response body should be analyzed."},"url":{"type":"string","description":"Absolute http/https URL to fetch and analyze."}},"required":["project_id"],"oneOf":[{"required":["exchange_id"]},{"required":["url"]}],"additionalProperties":false}},
-        {"name":"copy_as","description":"Convert a saved request to cURL or Python requests. Sensitive header values are redacted by default; set include_secrets=true only when the user explicitly asks for a usable copy containing secrets.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"format":{"type":"string","enum":["curl","python_requests"]},"include_secrets":{"type":"boolean","default":false}},"required":["project_id","exchange_id","format"],"additionalProperties":false}},
+        {"name":"copy_as","description":"Convert a saved request to cURL or Python requests. The output includes the original sensitive headers by default so it is immediately runnable; set include_secrets=false to produce a redacted copy.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"format":{"type":"string","enum":["curl","python_requests"]},"include_secrets":{"type":"boolean","default":true}},"required":["project_id","exchange_id","format"],"additionalProperties":false}},
         {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
@@ -276,7 +276,8 @@ fn tool_defs() -> Value {
         {"name":"browser_start","description":"Start or resume the project's persistent browser workspace. Omit url to resume the last page. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, migrate Lightpanda state to Chromium, or reset the persistent browser workspace. Status without session_id lists active browser sessions. Stop operations preserve browser state. Switching requires chromium_reason=user_requested or lightpanda_incompatible. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop and switch_chromium; optional for status."},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium","reset_profile"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
-        {"name":"js_files","description":"Return JavaScript file URLs and paths. Without url, search saved project history; with url, load that page Lightpanda-first and return files observed in that fresh browser session. Optional domain accepts a hostname or URL and includes subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
+        {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page Lightpanda-first. A domain filter matches either the JavaScript host or its related page host, including subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
+        {"name":"get_words","description":"Build a sorted target-specific wordlist from saved request paths, parameter names, and textual responses. Related JavaScript files are included by default. Optionally filter by a domain and its subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"domain":{"type":"string","description":"Optional hostname, wildcard hostname, or HTTP URL."},"include_js":{"type":"boolean","default":true},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":5000}},"required":["project_id"],"additionalProperties":false}},
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply byte transforms, including gzip_decode/gunzip and brotli_decode","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string","enum":["utf8","base64","hex"]},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
@@ -556,6 +557,8 @@ struct JavascriptFileOutput {
     host: String,
     mime: Option<String>,
     status_code: Option<u16>,
+    related_page_urls: Vec<String>,
+    related_page_hosts: Vec<String>,
 }
 
 fn normalize_domain_filter(value: Option<&str>) -> DomainResult<Option<String>> {
@@ -1036,7 +1039,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             let include_secrets = args
                 .get("include_secrets")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or(true);
             let result = crate::copy_as::copy_exchange_as(
                 &state.db,
                 project_id,
@@ -1527,9 +1530,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 let mut files = files_result?
                     .into_iter()
                     .filter(|file| {
-                        domain
-                            .as_deref()
-                            .is_none_or(|domain| host_matches_domain(&file.host, domain))
+                        domain.as_deref().is_none_or(|domain| {
+                            host_matches_domain(&file.host, domain)
+                                || file
+                                    .source_page_url
+                                    .as_deref()
+                                    .and_then(|url| url::Url::parse(url).ok())
+                                    .and_then(|url| url.host_str().map(str::to_string))
+                                    .is_some_and(|host| host_matches_domain(&host, domain))
+                        })
                     })
                     .map(|file| JavascriptFileOutput {
                         exchange_id: None,
@@ -1538,6 +1547,14 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         host: file.host,
                         mime: file.mime,
                         status_code: file.status_code,
+                        related_page_urls: file.source_page_url.clone().into_iter().collect(),
+                        related_page_hosts: file
+                            .source_page_url
+                            .as_deref()
+                            .and_then(|url| url::Url::parse(url).ok())
+                            .and_then(|url| url.host_str().map(str::to_string))
+                            .into_iter()
+                            .collect(),
                     })
                     .collect::<Vec<_>>();
                 stop_result?;
@@ -1566,12 +1583,14 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 let files = files
                     .into_iter()
                     .map(|file| JavascriptFileOutput {
-                        exchange_id: Some(file.exchange_id),
+                        exchange_id: file.exchange_id,
                         url: file.url,
                         path: file.path,
                         host: file.host,
                         mime: file.mime,
                         status_code: file.status_code,
+                        related_page_urls: file.related_page_urls,
+                        related_page_hosts: file.related_page_hosts,
                     })
                     .collect();
                 Ok(javascript_files_response(
@@ -1582,6 +1601,33 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     None,
                 ))
             }
+        }
+        "get_words" => {
+            let project_id = require_project_id(&args)?;
+            let include_js = args
+                .get("include_js")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::get_words::DEFAULT_WORD_LIMIT as u64)
+                .clamp(1, crate::get_words::MAX_WORD_LIMIT as u64) as usize;
+            Ok(json!(
+                crate::get_words::get_words(
+                    &state.db,
+                    project_id,
+                    crate::get_words::GetWordsOptions {
+                        domain: args
+                            .get("domain")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        include_js,
+                        limit,
+                    },
+                )
+                .await?
+            ))
         }
         "huntproxy_stop" => {
             let (stopped_browsers, cleanup_warning) = match state.browser.stop_all().await {
@@ -1924,6 +1970,19 @@ mod tests {
         assert_eq!(
             js_files["inputSchema"]["properties"]["settle_ms"]["default"],
             2000
+        );
+        let get_words = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_words")
+            .unwrap();
+        assert_eq!(
+            get_words["inputSchema"]["properties"]["include_js"]["default"],
+            true
+        );
+        let copy_as = tools.iter().find(|tool| tool["name"] == "copy_as").unwrap();
+        assert_eq!(
+            copy_as["inputSchema"]["properties"]["include_secrets"]["default"],
+            true
         );
         assert!(tools.iter().any(|tool| tool["name"] == "huntproxy_stop"));
         assert!(tools.iter().any(|tool| tool["name"] == "sitemap"));

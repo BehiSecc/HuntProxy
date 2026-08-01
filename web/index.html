@@ -133,6 +133,7 @@
     <nav aria-label="Workbench">
       <button type="button" data-view="history" class="active">History</button>
       <button type="button" data-view="sitemap">Sitemap</button>
+      <button type="button" data-view="words">Get Words</button>
       <button type="button" data-view="findings">Findings</button>
       <button type="button" data-view="reply">Reply</button>
       <button type="button" data-view="fuzzer">Fuzzer</button>
@@ -236,7 +237,7 @@
                 <button class="btn" id="copyCurl" disabled>Copy as cURL</button>
                 <button class="btn" id="copyPython" disabled>Copy as Python</button>
                 <button class="btn" id="analyzePage" disabled>Analyze page</button>
-                <label class="fit" style="margin:0"><input type="checkbox" id="copySecrets" style="width:auto" /> include secrets</label>
+                <label class="fit" style="margin:0"><input type="checkbox" id="copyRedactSecrets" style="width:auto" /> redact secrets</label>
               </div>
               <div class="card hidden" id="pageAnalysis">
                 <div class="status" id="pageAnalysisStats"></div>
@@ -258,6 +259,16 @@
         <div class="status" id="sitemapStatus"></div>
         <div class="stack" id="sitemapHosts"></div>
         <div class="empty hidden" id="sitemapEmpty">No saved routes.</div>
+      </section>
+
+      <section id="view-words" class="panel hidden">
+        <div class="toolbar">
+          <div class="grow"><label for="wordsDomain">Domain <span class="muted">(optional)</span></label><input id="wordsDomain" placeholder="example.com" /></div>
+          <label class="fit" style="margin:0"><input type="checkbox" id="wordsIncludeJs" style="width:auto" checked /> include related JavaScript</label>
+          <button class="btn primary fit" id="loadWords">Get words</button>
+        </div>
+        <div class="status" id="wordsStatus"></div>
+        <pre class="mono" id="wordsOutput">Select a project and get words.</pre>
       </section>
 
       <section id="view-findings" class="panel hidden">
@@ -434,6 +445,7 @@ test
       document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
       document.querySelectorAll('.workspace > section').forEach(s => s.classList.toggle('hidden', s.id !== `view-${name}`));
       if (name === 'sitemap') loadSitemap();
+      if (name === 'words') loadWords();
       if (name === 'findings') loadFindings();
       if (name === 'fuzzer') loadFuzzJobs();
       if (name === 'browser') loadBrowserStatus();
@@ -673,7 +685,7 @@ test
       if (!state.selectedExchange) return;
       try {
         const query = new URLSearchParams({ format });
-        if ($('copySecrets').checked) query.set('include_secrets', 'true');
+        if ($('copyRedactSecrets').checked) query.set('include_secrets', 'false');
         const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${state.selectedExchange}/copy-as?${query}`);
         await writeClipboard(result.content);
         const redaction = result.redacted_headers ? ` (${result.redacted_headers} secret header${result.redacted_headers === 1 ? '' : 's'} redacted)` : '';
@@ -715,6 +727,24 @@ test
     }
     $('loadSitemap').onclick = loadSitemap;
     $('sitemapHost').onkeydown = event => { if (event.key === 'Enter') loadSitemap(); };
+
+    async function loadWords() {
+      if (!state.projectId) return status('wordsStatus', 'Select a project', 'err');
+      try {
+        const query = new URLSearchParams({
+          include_js: String($('wordsIncludeJs').checked),
+          limit: '5000',
+        });
+        if ($('wordsDomain').value.trim()) query.set('domain', $('wordsDomain').value.trim());
+        status('wordsStatus', 'Building wordlist…');
+        const result = await api(`/api/v1/projects/${state.projectId}/words?${query}`);
+        $('wordsOutput').textContent = (result.words || []).join('\n') || 'No words found.';
+        const js = result.stats?.javascript_exchanges_examined || 0;
+        status('wordsStatus', `${result.words?.length || 0} words from ${result.stats?.exchanges_examined || 0} exchanges${result.include_js ? ` · ${js} JavaScript` : ''}${result.truncated ? ' · truncated' : ''}`, result.words?.length ? 'ok' : '');
+      } catch (error) { status('wordsStatus', error.message, 'err'); }
+    }
+    $('loadWords').onclick = loadWords;
+    $('wordsDomain').onkeydown = event => { if (event.key === 'Enter') loadWords(); };
 
     async function loadFindings() {
       if (!state.projectId) return;

@@ -42,6 +42,8 @@ pub struct BrowserJavascriptFile {
     pub host: String,
     pub mime: Option<String>,
     pub status_code: Option<u16>,
+    #[serde(default)]
+    pub source_page_url: Option<String>,
 }
 
 /// Secret-bearing values live only in daemon memory. SQLite stores version/hash/status metadata.
@@ -800,6 +802,12 @@ impl BrowserService {
                 persistent,
             },
         );
+        if let Err(error) = self
+            .persist_javascript_files(project_id, session.id, session.current_url.as_deref())
+            .await
+        {
+            tracing::warn!(%error, session_id = session.id.get(), "could not persist JavaScript provenance");
+        }
         Ok(session)
     }
 
@@ -1027,6 +1035,12 @@ impl BrowserService {
         session.checkpoint_status = Some("ok".into());
         session.checkpoint_hash = Some(saved.hash);
         self.db.update_browser_session(&session).await?;
+        if let Err(error) = self
+            .persist_javascript_files(project_id, session_id, session.current_url.as_deref())
+            .await
+        {
+            tracing::warn!(%error, session_id = session_id.get(), "could not persist JavaScript provenance");
+        }
 
         Ok(ActionResult {
             ok: result.get("ok").and_then(Value::as_bool).unwrap_or(true),
@@ -1060,14 +1074,50 @@ impl BrowserService {
         }
         let operation_lock = self.session_operation_lock(session_id).await;
         let _operation_guard = operation_lock.lock().await;
+        self.persist_javascript_files(project_id, session_id, None)
+            .await
+    }
+
+    async fn persist_javascript_files(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        default_source_page_url: Option<&str>,
+    ) -> DomainResult<Vec<BrowserJavascriptFile>> {
         let result = self
             .call_worker(
                 "session.javascript_files",
                 json!({ "session_id": session_id.get() }),
             )
             .await?;
-        serde_json::from_value(result.get("files").cloned().unwrap_or_else(|| json!([])))
-            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))
+        let files: Vec<BrowserJavascriptFile> =
+            serde_json::from_value(result.get("files").cloned().unwrap_or_else(|| json!([])))
+                .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+        let fallback = default_source_page_url
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .or_else(|| {
+                files
+                    .iter()
+                    .find_map(|file| file.source_page_url.as_deref())
+            });
+        if let Some(fallback) = fallback {
+            self.db
+                .record_javascript_files(
+                    project_id,
+                    fallback,
+                    files
+                        .iter()
+                        .map(|file| crate::storage::JavascriptProvenanceInput {
+                            url: file.url.clone(),
+                            source_page_url: file.source_page_url.clone(),
+                        })
+                        .collect(),
+                    Some(session_id),
+                    "browser",
+                )
+                .await?;
+        }
+        Ok(files)
     }
 
     pub async fn stop(

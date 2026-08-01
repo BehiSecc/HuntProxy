@@ -143,6 +143,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/projects/{id}/history", get(history))
         .route("/api/v1/projects/{id}/sitemap", get(sitemap))
+        .route("/api/v1/projects/{id}/words", get(get_words))
         .route(
             "/api/v1/projects/{id}/findings",
             get(list_findings).post(create_finding),
@@ -514,6 +515,37 @@ async fn sitemap(
 }
 
 #[derive(Deserialize)]
+struct GetWordsQuery {
+    domain: Option<String>,
+    include_js: Option<bool>,
+    limit: Option<usize>,
+}
+
+async fn get_words(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<GetWordsQuery>,
+) -> Response {
+    match crate::get_words::get_words(
+        &state.db,
+        ProjectId(id),
+        crate::get_words::GetWordsOptions {
+            domain: query.domain,
+            include_js: query.include_js.unwrap_or(true),
+            limit: query
+                .limit
+                .unwrap_or(crate::get_words::DEFAULT_WORD_LIMIT)
+                .clamp(1, crate::get_words::MAX_WORD_LIMIT),
+        },
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
 struct CreateFindingBody {
     exchange_id: i64,
     title: String,
@@ -629,8 +661,12 @@ async fn analyze_exchange(
 #[derive(Deserialize)]
 struct CopyAsQuery {
     format: crate::copy_as::CopyAsFormat,
-    #[serde(default)]
+    #[serde(default = "copy_as_includes_secrets_by_default")]
     include_secrets: bool,
+}
+
+fn copy_as_includes_secrets_by_default() -> bool {
+    true
 }
 
 async fn copy_as(

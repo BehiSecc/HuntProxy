@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 const PROTOCOL = 1;
 const sessions = new Map();
 
-function javascriptFile(response) {
+function javascriptFile(response, fallbackPageUrl) {
   let parsed;
   try {
     parsed = new URL(response.url());
@@ -31,19 +31,27 @@ function javascriptFile(response) {
   const isJavascriptPath = /\.(?:js|mjs|cjs)$/.test(pathname);
   const isJavascriptMime = /(?:java|ecma)script/i.test(mime);
   if (!isJavascriptPath && !isJavascriptMime) return null;
+  let sourcePageUrl = fallbackPageUrl || null;
+  try {
+    const frameUrl = response.request().frame()?.url();
+    if (frameUrl && frameUrl !== "about:blank") sourcePageUrl = frameUrl;
+  } catch {
+    // Some browser backends do not expose the initiating frame for every response.
+  }
   return {
     url: parsed.toString(),
     path: parsed.pathname,
     host: parsed.hostname,
     mime: mime || null,
     status_code: response.status(),
+    source_page_url: sourcePageUrl,
   };
 }
 
 function trackJavascriptFiles(session, existing = new Map()) {
   session.javascriptFiles = existing;
   session.page.on("response", (response) => {
-    const file = javascriptFile(response);
+    const file = javascriptFile(response, session.page.url());
     if (file) session.javascriptFiles.set(file.url, file);
   });
 }

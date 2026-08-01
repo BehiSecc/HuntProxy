@@ -2,6 +2,7 @@
 
 use crate::browser::BrowserService;
 use crate::config::Config;
+use crate::crawler::CrawlerService;
 use crate::domain::*;
 use crate::fuzzer::FuzzerService;
 use crate::reply::{PlaceholderKey, ReplyService};
@@ -29,6 +30,7 @@ pub struct AppState {
     pub reply: Arc<ReplyService>,
     pub fuzzer: Arc<FuzzerService>,
     pub browser: Arc<BrowserService>,
+    pub crawler: Arc<CrawlerService>,
     pub events: broadcast::Sender<AppEvent>,
     pub shutdown: CancellationToken,
     pub activity: ActivityTracker,
@@ -257,6 +259,11 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         config.browser_profiles_dir(),
     ));
     let (events, _) = broadcast::channel(256);
+    let crawler = Arc::new(CrawlerService::new(
+        db.clone(),
+        reply.clone(),
+        events.clone(),
+    ));
     Ok(Arc::new(AppState {
         db,
         config,
@@ -264,6 +271,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         reply,
         fuzzer,
         browser,
+        crawler,
         events,
         shutdown: CancellationToken::new(),
         activity: ActivityTracker::new(),
