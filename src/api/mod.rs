@@ -121,7 +121,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/version", get(version))
         .route("/api/v1/projects", get(list_projects).post(create_project))
-        .route("/api/v1/projects/{id}", get(get_project))
+        .route("/api/v1/projects/import", post(import_project))
+        .route(
+            "/api/v1/projects/{id}",
+            get(get_project)
+                .patch(rename_project)
+                .delete(delete_project),
+        )
+        .route("/api/v1/projects/{id}/usage", get(project_usage))
+        .route("/api/v1/projects/{id}/export", get(export_project))
         .route("/api/v1/projects/{id}/scope", post(update_project_scope))
         .route(
             "/api/v1/projects/{id}/cookies",
@@ -141,7 +149,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/projects/{id}/capture-sessions/{sid}/renew",
             post(renew_capture_session),
         )
-        .route("/api/v1/projects/{id}/history", get(history))
+        .route(
+            "/api/v1/projects/{id}/history",
+            get(history).delete(clear_history),
+        )
         .route("/api/v1/projects/{id}/sitemap", get(sitemap))
         .route("/api/v1/projects/{id}/words", get(get_words))
         .route(
@@ -229,8 +240,14 @@ fn private_router(state: Arc<AppState>) -> Router {
     router(state.clone()).merge(
         Router::new()
             .route("/internal/mcp/call", post(internal_mcp_call))
+            .route("/internal/shutdown", post(internal_shutdown))
             .with_state(state),
     )
+}
+
+async fn internal_shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.shutdown.cancel();
+    Json(serde_json::json!({ "ok": true }))
 }
 
 #[derive(Deserialize)]
@@ -312,6 +329,73 @@ async fn get_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>) ->
     match state.db.get_project(ProjectId(id)).await {
         Ok(p) => Json(p).into_response(),
         Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameProjectBody {
+    name: String,
+}
+
+async fn rename_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RenameProjectBody>,
+) -> Response {
+    match state.db.rename_project(ProjectId(id), body.name).await {
+        Ok(project) => Json(project).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn delete_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    let project_id = ProjectId(id);
+    match state.fuzzer.list(project_id).await {
+        Ok(jobs)
+            if jobs.iter().any(|job| {
+                !matches!(
+                    job.state,
+                    FuzzJobState::Completed | FuzzJobState::Failed | FuzzJobState::Interrupted
+                )
+            }) =>
+        {
+            return error_response(DomainError::conflict(
+                "cancel active fuzz jobs before deleting the project",
+            ));
+        }
+        Err(error) => return error_response(error),
+        _ => {}
+    }
+    if let Err(error) = state.browser.reset_project_profile(project_id).await {
+        return error_response(error);
+    }
+    match state.db.delete_project(project_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn project_usage(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match state.db.project_usage(ProjectId(id)).await {
+        Ok(usage) => Json(usage).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn export_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match state.db.export_project(ProjectId(id)).await {
+        Ok(archive) => Json(archive).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn import_project(
+    State(state): State<Arc<AppState>>,
+    Json(archive): Json<crate::storage::ProjectArchive>,
+) -> Response {
+    match state.db.import_project(archive).await {
+        Ok(project) => (StatusCode::CREATED, Json(project)).into_response(),
+        Err(error) => error_response(error),
     }
 }
 
@@ -460,6 +544,26 @@ struct HistoryQuery {
     include_noisy_headers: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct ClearHistoryQuery {
+    before: String,
+}
+
+async fn clear_history(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<ClearHistoryQuery>,
+) -> Response {
+    match state
+        .db
+        .clear_history_before(ProjectId(id), query.before)
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
 async fn history(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -485,14 +589,24 @@ async fn history(
         _ => None,
     };
 
+    let count_filter = filter.clone();
     match state
         .db
         .list_history_filtered(ProjectId(id), filter, limit, before_started, before_id)
         .await
     {
         Ok((items, next)) => {
+            let total = match state
+                .db
+                .count_history_filtered(ProjectId(id), count_filter)
+                .await
+            {
+                Ok(total) => total,
+                Err(error) => return error_response(error),
+            };
             let cursor = next.map(|(s, i)| format!("{s}:{i}"));
-            Json(serde_json::json!({"items": items, "next_cursor": cursor})).into_response()
+            Json(serde_json::json!({"items": items, "next_cursor": cursor, "total": total}))
+                .into_response()
         }
         Err(e) => error_response(e),
     }
@@ -1102,8 +1216,15 @@ async fn list_fuzz_cases(
     }
 }
 
-async fn browser_status(State(state): State<Arc<AppState>>) -> Response {
-    Json(state.browser.status()).into_response()
+async fn browser_status(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match state.browser.active_sessions(ProjectId(id)).await {
+        Ok(sessions) => Json(serde_json::json!({
+            "runtime": state.browser.status(),
+            "sessions": sessions,
+        }))
+        .into_response(),
+        Err(error) => error_response(error),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1256,6 +1377,8 @@ async fn events(
 async fn doctor(State(state): State<Arc<AppState>>) -> Response {
     let browser = state.browser.status();
     let schema = state.db.schema_version().await.ok();
+    let daemon_log = state.config.daemon_log_path();
+    let startup_log = state.config.daemon_startup_log_path();
     Json(serde_json::json!({
         "data_dir": state.config.data_dir,
         "db": state.config.db_path(),
@@ -1265,8 +1388,20 @@ async fn doctor(State(state): State<Arc<AppState>>) -> Response {
         "idle_timeout_seconds": state.config.idle_timeout_seconds,
         "ca_cert": state.config.ca_cert_path().exists(),
         "browser": browser,
+        "daemon_log": daemon_log,
+        "daemon_log_tail": read_file_tail(&daemon_log, 4096),
+        "last_startup_output": read_file_tail(&startup_log, 4096),
     }))
     .into_response()
+}
+
+fn read_file_tail(path: &std::path::Path, max_bytes: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let start = bytes.len().saturating_sub(max_bytes);
+    Some(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
 #[derive(Deserialize)]

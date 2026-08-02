@@ -102,7 +102,25 @@ async fn history_filter_and_annotation_work_through_http_api() {
     assert_eq!(filtered.status(), StatusCode::OK);
     let filtered = json_response(filtered).await;
     assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["total"], 1);
     assert_eq!(filtered["items"][0]["method"], "GET");
+
+    let first_page = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/history?limit=1",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_page = json_response(first_page).await;
+    assert_eq!(first_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first_page["total"], 2);
+    assert!(first_page["next_cursor"].is_string());
 
     let empty = app
         .clone()
@@ -657,7 +675,12 @@ async fn sitemap_and_findings_work_through_http_api() {
     let mut second = exchange(project_id, "POST", "/a-route");
     second.host = "example.com".into();
     second.authority = "example.com".into();
+    second.query = Some("page=1&tag=first".into());
+    second.mime = Some("application/json; charset=utf-8".into());
     state.db.insert_exchange(second.clone()).await.unwrap();
+    second.method = "GET".into();
+    second.status_code = Some(404);
+    second.query = Some("page=2&tag=second".into());
     state.db.insert_exchange(second).await.unwrap();
 
     let mut third = exchange(project_id, "GET", "/cdn");
@@ -682,6 +705,18 @@ async fn sitemap_and_findings_work_through_http_api() {
         sitemap["hosts"][1]["paths"],
         serde_json::json!(["/a-route", "/z-route"])
     );
+    assert_eq!(
+        sitemap["hosts"][1]["routes"][0],
+        serde_json::json!({
+            "path": "/a-route",
+            "methods": ["GET", "POST"],
+            "status_codes": [200, 404],
+            "parameters": ["page", "tag"],
+            "content_types": ["application/json"],
+            "exchange_count": 2
+        })
+    );
+    assert_eq!(sitemap["hosts"][1]["tree"][0]["path"], "/a-route");
 
     let filtered = app
         .clone()

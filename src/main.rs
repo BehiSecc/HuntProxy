@@ -4,10 +4,15 @@ use bb::app;
 use bb::config::Config;
 use bb::domain::{CreateProjectRequest, DomainError, DomainResult, ErrorCode};
 use clap::{Parser, Subcommand};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
+
+const MAX_DAEMON_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,6 +50,13 @@ enum Commands {
         #[command(subcommand)]
         cmd: ProjectCmd,
     },
+    /// History retention commands.
+    History {
+        #[command(subcommand)]
+        cmd: HistoryCmd,
+    },
+    /// Create a consistent SQLite database backup.
+    Backup { destination: PathBuf },
     /// Browser artifact install helper.
     Browser {
         #[command(subcommand)]
@@ -56,6 +68,21 @@ enum Commands {
 enum ProjectCmd {
     Create { name: String, target_url: String },
     List,
+    Rename { id: i64, name: String },
+    Delete { id: i64 },
+    Usage { id: i64 },
+    Export { id: i64, output: PathBuf },
+    Import { input: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum HistoryCmd {
+    /// Delete exchanges strictly older than an RFC 3339 timestamp.
+    Clear {
+        project_id: i64,
+        #[arg(long)]
+        before: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -109,7 +136,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Serve { foreground: _ } => {
             let cfg = Config::load(cli.data_dir)?;
             bb::mcp::clear_stop_guard(&cfg);
-            init_logging(&cfg.log_level);
+            let mirror_to_stderr = std::env::var_os("HUNTPROXY_DAEMONIZED").is_none();
+            init_daemon_logging(&cfg.log_level, cfg.daemon_log_path(), mirror_to_stderr);
             // Ensure CA exists
             if !cfg.ca_cert_path().exists() {
                 generate_ca(&cfg)?;
@@ -158,6 +186,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!("  api:      {}", cfg.api_listen);
             println!("  proxy:    {}", cfg.proxy_listen);
             println!("  idle:     {} seconds", cfg.idle_timeout_seconds);
+            println!("  log:      {}", cfg.daemon_log_path().display());
             if let Some(p) = &cfg.lightpanda_path {
                 println!("  lightpanda: {} exists={}", p.display(), p.exists());
             } else {
@@ -175,6 +204,9 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 }
             } else {
                 println!("  daemon:     not running");
+            }
+            if let Some(output) = read_log_tail(&cfg.daemon_startup_log_path(), 4 * 1024) {
+                println!("  last startup output:\n{output}");
             }
             Ok(())
         }
@@ -220,7 +252,76 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     let v = daemon_get(&cfg, "/api/v1/projects").await?;
                     println!("{v}");
                 }
+                ProjectCmd::Rename { id, name } => {
+                    let body = serde_json::json!({ "name": name }).to_string();
+                    let value = daemon_request(
+                        &cfg,
+                        "PATCH",
+                        &format!("/api/v1/projects/{id}"),
+                        Some(&body),
+                    )
+                    .await?;
+                    println!("{value}");
+                }
+                ProjectCmd::Delete { id } => {
+                    daemon_request(&cfg, "DELETE", &format!("/api/v1/projects/{id}"), None).await?;
+                    println!("Deleted project {id}");
+                }
+                ProjectCmd::Usage { id } => {
+                    let value = daemon_get(&cfg, &format!("/api/v1/projects/{id}/usage")).await?;
+                    println!("{value}");
+                }
+                ProjectCmd::Export { id, output } => {
+                    let db = bb::storage::Db::open(&cfg).await?;
+                    let archive = db.export_project(bb::domain::ProjectId(id)).await?;
+                    let encoded = serde_json::to_vec_pretty(&archive).map_err(|error| {
+                        DomainError::new(ErrorCode::StorageError, error.to_string())
+                    })?;
+                    bb::config::write_private_file(&output, &encoded)?;
+                    println!("Exported project {id} to {}", output.display());
+                }
+                ProjectCmd::Import { input } => {
+                    let encoded = std::fs::read(&input).map_err(|error| {
+                        DomainError::new(ErrorCode::StorageError, error.to_string())
+                    })?;
+                    let archive: bb::storage::ProjectArchive = serde_json::from_slice(&encoded)
+                        .map_err(|error| {
+                            DomainError::invalid(format!("invalid project archive: {error}"))
+                        })?;
+                    let db = bb::storage::Db::open(&cfg).await?;
+                    let project = db.import_project(archive).await?;
+                    println!("Imported project {} ({})", project.id.get(), project.name);
+                }
             }
+            Ok(())
+        }
+        Commands::History { cmd } => {
+            init_logging("error");
+            let cfg = Config::load(cli.data_dir)?;
+            ensure_daemon(&cfg).await?;
+            match cmd {
+                HistoryCmd::Clear { project_id, before } => {
+                    let query = url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair("before", &before)
+                        .finish();
+                    let value = daemon_request(
+                        &cfg,
+                        "DELETE",
+                        &format!("/api/v1/projects/{project_id}/history?{query}"),
+                        None,
+                    )
+                    .await?;
+                    println!("{value}");
+                }
+            }
+            Ok(())
+        }
+        Commands::Backup { destination } => {
+            init_logging("error");
+            let cfg = Config::load(cli.data_dir)?;
+            let db = bb::storage::Db::open(&cfg).await?;
+            let path = db.backup_to(destination).await?;
+            println!("Backup written to {}", path.display());
             Ok(())
         }
         Commands::Browser { cmd } => {
@@ -286,6 +387,100 @@ fn init_logging_stderr(level: &str) {
         .try_init();
 }
 
+#[derive(Clone)]
+struct DaemonLogMakeWriter {
+    path: PathBuf,
+    mirror_to_stderr: bool,
+    lock: Arc<Mutex<()>>,
+}
+
+struct DaemonLogWriter {
+    path: PathBuf,
+    mirror_to_stderr: bool,
+    lock: Arc<Mutex<()>>,
+}
+
+impl<'a> MakeWriter<'a> for DaemonLogMakeWriter {
+    type Writer = DaemonLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DaemonLogWriter {
+            path: self.path.clone(),
+            mirror_to_stderr: self.mirror_to_stderr,
+            lock: self.lock.clone(),
+        }
+    }
+}
+
+impl std::io::Write for DaemonLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.mirror_to_stderr {
+            let _ = std::io::stderr().write_all(bytes);
+        }
+        let Ok(_guard) = self.lock.lock() else {
+            return Ok(bytes.len());
+        };
+        if let Some(parent) = self.path.parent() {
+            let _ = bb::config::create_private_dir(parent);
+        }
+        let current = std::fs::metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if current.saturating_add(bytes.len() as u64) > MAX_DAEMON_LOG_BYTES {
+            let rotated = self.path.with_extension("log.1");
+            let _ = std::fs::remove_file(&rotated);
+            let _ = std::fs::rename(&self.path, rotated);
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(&self.path) {
+            let slice = if bytes.len() as u64 > MAX_DAEMON_LOG_BYTES {
+                &bytes[bytes.len() - MAX_DAEMON_LOG_BYTES as usize..]
+            } else {
+                bytes
+            };
+            let _ = file.write_all(slice);
+            let _ = file.flush();
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.mirror_to_stderr {
+            let _ = std::io::stderr().flush();
+        }
+        Ok(())
+    }
+}
+
+fn init_daemon_logging(level: &str, path: PathBuf, mirror_to_stderr: bool) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let writer = DaemonLogMakeWriter {
+        path,
+        mirror_to_stderr,
+        lock: Arc::new(Mutex::new(())),
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_target(false)
+        .try_init();
+}
+
+fn read_log_tail(path: &std::path::Path, max_bytes: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let start = bytes.len().saturating_sub(max_bytes);
+    Some(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
 fn generate_ca(cfg: &Config) -> DomainResult<()> {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     let mut params = CertificateParams::new(vec!["HuntProxy local CA".into()])
@@ -338,13 +533,31 @@ async fn ensure_daemon(cfg: &Config) -> DomainResult<()> {
 
     let bin = std::env::current_exe()
         .map_err(|e| DomainError::new(ErrorCode::Internal, e.to_string()))?;
+    let startup_log_path = cfg.daemon_startup_log_path();
+    let mut startup_options = OpenOptions::new();
+    startup_options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        startup_options.mode(0o600);
+    }
+    let startup_stdout = startup_options.open(&startup_log_path).map_err(|error| {
+        DomainError::new(
+            ErrorCode::StorageError,
+            format!("startup log {}: {error}", startup_log_path.display()),
+        )
+    })?;
+    let startup_stderr = startup_stdout.try_clone().map_err(|error| {
+        DomainError::new(ErrorCode::StorageError, format!("startup log: {error}"))
+    })?;
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("serve")
         .arg("--data-dir")
         .arg(&cfg.data_dir)
+        .env("HUNTPROXY_DAEMONIZED", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(startup_stdout))
+        .stderr(Stdio::from(startup_stderr));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -368,11 +581,15 @@ async fn ensure_daemon(cfg: &Config) -> DomainResult<()> {
             return Ok(());
         }
     }
+    let detail = read_log_tail(&startup_log_path, 4 * 1024)
+        .filter(|output| !output.trim().is_empty())
+        .map(|output| format!("\nlast startup output:\n{}", output.trim_end()))
+        .unwrap_or_default();
     Err(DomainError::new(
         ErrorCode::Unavailable,
         format!(
-            "daemon did not become ready; check logs under {}",
-            cfg.data_dir.display()
+            "daemon did not become ready; check {}{detail}",
+            startup_log_path.display()
         ),
     ))
 }
@@ -388,6 +605,16 @@ async fn daemon_post(cfg: &Config, path: &str, body: &str) -> DomainResult<Strin
     // Use hyper client manually to avoid requiring reqwest in bin always —
     // use tokio tcp + simple HTTP.
     simple_http("POST", &url, Some(body)).await
+}
+
+async fn daemon_request(
+    cfg: &Config,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> DomainResult<String> {
+    let url = format!("http://{}{path}", cfg.api_listen);
+    simple_http(method, &url, body).await
 }
 
 async fn reqwest_get(url: &str) -> DomainResult<String> {
@@ -408,13 +635,13 @@ async fn simple_http(method: &str, url: &str, body: Option<&str>) -> DomainResul
         .await
         .map_err(|e| DomainError::new(ErrorCode::DaemonNotRunning, e.to_string()))?;
     let payload = body.unwrap_or("");
-    let req = if method == "POST" {
+    let req = if body.is_some() {
         format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
         )
     } else {
-        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
     };
     stream
         .write_all(req.as_bytes())
@@ -437,5 +664,32 @@ async fn simple_http(method: &str, url: &str, body: Option<&str>) -> DomainResul
                 body.chars().take(200).collect::<String>()
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_log_rotates_at_the_size_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("daemon.log");
+        std::fs::write(&path, vec![b'a'; MAX_DAEMON_LOG_BYTES as usize]).unwrap();
+        let mut writer = DaemonLogWriter {
+            path: path.clone(),
+            mirror_to_stderr: false,
+            lock: Arc::new(Mutex::new(())),
+        };
+
+        std::io::Write::write_all(&mut writer, b"next\n").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"next\n");
+        assert_eq!(
+            std::fs::metadata(path.with_extension("log.1"))
+                .unwrap()
+                .len(),
+            MAX_DAEMON_LOG_BYTES
+        );
     }
 }

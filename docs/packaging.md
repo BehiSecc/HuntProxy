@@ -35,4 +35,6 @@ Browser engines (Lightpanda/Chromium) remain optional installable artifacts.
 
 ## Project license
 
-Owner must select a project license before public distribution. Default dependency path uses exact-pinned Apache-2.0 Wreq prereleases (see ADR 0001).
+HuntProxy is distributed under Apache-2.0. Release archives must include the
+repository `LICENSE` file. The default dependency path uses exact-pinned
+Apache-2.0 Wreq prereleases (see ADR 0001).

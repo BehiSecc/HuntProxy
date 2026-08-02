@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Local-first agent-safe HTTP workbench for authorized web application testing"
+license = "Apache-2.0"
+repository = "https://github.com/BehiSecc/HuntProxy"
+homepage = "https://github.com/BehiSecc/HuntProxy"
 publish = false
 default-run = "HuntProxy"
 

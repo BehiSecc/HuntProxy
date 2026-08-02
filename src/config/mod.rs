@@ -16,6 +16,8 @@ pub const DB_FILE_NAME: &str = "bb.db";
 pub const CA_CERT_NAME: &str = "ca.crt";
 pub const CA_KEY_NAME: &str = "ca.key";
 pub const PLACEHOLDER_KEY_NAME: &str = "placeholder.key";
+pub const DAEMON_LOG_NAME: &str = "daemon.log";
+pub const DAEMON_STARTUP_LOG_NAME: &str = "daemon-startup.log";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -185,6 +187,14 @@ impl Config {
 
     pub fn placeholder_key_path(&self) -> PathBuf {
         self.data_dir.join(PLACEHOLDER_KEY_NAME)
+    }
+
+    pub fn daemon_log_path(&self) -> PathBuf {
+        self.runtime_dir.join(DAEMON_LOG_NAME)
+    }
+
+    pub fn daemon_startup_log_path(&self) -> PathBuf {
+        self.runtime_dir.join(DAEMON_STARTUP_LOG_NAME)
     }
 
     pub fn browser_profiles_dir(&self) -> PathBuf {

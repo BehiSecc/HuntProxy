@@ -9,6 +9,9 @@ use time::OffsetDateTime;
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
+    /// Starting target used for project context and quick browser actions.
+    /// It is metadata, not an implicit capture scope.
+    pub target_url: String,
     #[serde(with = "rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "rfc3339")]
@@ -165,7 +168,32 @@ pub struct Finding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SitemapHost {
     pub host: String,
+    /// Backward-compatible, unique list of paths.
     pub paths: Vec<String>,
+    /// Aggregated request/response observations for each path.
+    #[serde(default)]
+    pub routes: Vec<SitemapRoute>,
+    /// Path segments arranged as a browsable tree.
+    #[serde(default)]
+    pub tree: Vec<SitemapNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SitemapRoute {
+    pub path: String,
+    pub methods: Vec<String>,
+    pub status_codes: Vec<u16>,
+    pub parameters: Vec<String>,
+    pub content_types: Vec<String>,
+    pub exchange_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SitemapNode {
+    pub segment: String,
+    pub path: String,
+    pub route: Option<SitemapRoute>,
+    pub children: Vec<SitemapNode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -406,6 +434,8 @@ pub struct BrowserSession {
     pub engine: BrowserEngine,
     pub engine_policy: EnginePolicy,
     pub current_url: Option<String>,
+    /// Last title reported by the active page, retained for client reattachment.
+    pub current_title: Option<String>,
     pub state: BrowserSessionState,
     pub fallback_used: bool,
     pub checkpoint_status: Option<String>,

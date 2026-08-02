@@ -22,7 +22,7 @@ const HISTORY_SELECT: &str =
             page_title, display_title, parent_exchange_id, transport_provenance
      FROM exchanges";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewExchange {
     pub project_id: ProjectId,
     pub source: ExchangeSource,
@@ -484,6 +484,35 @@ impl Db {
                 (started_at, last.exchange_id.get())
             });
             Ok((items, next))
+        })
+        .await
+    }
+
+    pub async fn count_history_filtered(
+        &self,
+        project_id: ProjectId,
+        filter: Option<FilterNode>,
+    ) -> DomainResult<u64> {
+        let (filter_sql, filter_binds) = match filter {
+            Some(filter) => filter_to_sql(&filter)?,
+            None => ("1=1".into(), Vec::new()),
+        };
+        self.with_conn(move |conn| {
+            let mut bind_values: Vec<Value> = filter_binds.into_iter().map(Value::Text).collect();
+            let project_idx = bind_values.len() + 1;
+            bind_values.push(Value::Integer(project_id.get()));
+            let sql = format!(
+                "SELECT COUNT(*) FROM exchanges WHERE ({filter_sql}) AND project_id=?{project_idx}"
+            );
+            let count = conn
+                .query_row(
+                    &sql,
+                    rusqlite::params_from_iter(bind_values.iter()),
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(storage_error)?;
+            u64::try_from(count)
+                .map_err(|_| DomainError::new(ErrorCode::StorageError, "negative history count"))
         })
         .await
     }
@@ -965,7 +994,7 @@ fn alloc_exchange_id(
     Ok(ExchangeId(next - 1))
 }
 
-fn load_headers(
+pub(crate) fn load_headers(
     conn: &rusqlite::Connection,
     project_id: ProjectId,
     exchange_id: ExchangeId,
@@ -997,7 +1026,7 @@ fn source_str(s: ExchangeSource) -> &'static str {
         ExchangeSource::Proxy => "proxy",
     }
 }
-fn parse_source(s: &str) -> ExchangeSource {
+pub(crate) fn parse_source(s: &str) -> ExchangeSource {
     match s {
         "browser" => ExchangeSource::Browser,
         "reply" => ExchangeSource::Reply,
@@ -1017,7 +1046,7 @@ fn completion_str(c: CompletionState) -> &'static str {
         CompletionState::Interrupted => "interrupted",
     }
 }
-fn parse_completion(s: &str) -> CompletionState {
+pub(crate) fn parse_completion(s: &str) -> CompletionState {
     match s {
         "in_progress" => CompletionState::InProgress,
         "timeout" => CompletionState::Timeout,
@@ -1036,7 +1065,7 @@ fn capture_quality_str(c: CaptureQuality) -> &'static str {
         CaptureQuality::BrowserObserved => "browser_observed",
     }
 }
-fn parse_capture_quality(s: &str) -> CaptureQuality {
+pub(crate) fn parse_capture_quality(s: &str) -> CaptureQuality {
     match s {
         "wire_preserved" => CaptureQuality::WirePreserved,
         "browser_observed" => CaptureQuality::BrowserObserved,
@@ -1050,7 +1079,7 @@ fn header_rep_str(h: HeaderRepresentation) -> &'static str {
         HeaderRepresentation::BrowserObserved => "browser_observed",
     }
 }
-fn parse_header_rep(s: &str) -> HeaderRepresentation {
+pub(crate) fn parse_header_rep(s: &str) -> HeaderRepresentation {
     match s {
         "wire_preserved" => HeaderRepresentation::WirePreserved,
         "browser_observed" => HeaderRepresentation::BrowserObserved,
@@ -1065,7 +1094,7 @@ fn body_rep_str(b: BodyRepresentation) -> &'static str {
         BodyRepresentation::Unavailable => "unavailable",
     }
 }
-fn parse_body_rep(s: &str) -> BodyRepresentation {
+pub(crate) fn parse_body_rep(s: &str) -> BodyRepresentation {
     match s {
         "wire_encoded" => BodyRepresentation::WireEncoded,
         "browser_decoded" => BodyRepresentation::BrowserDecoded,
@@ -1081,7 +1110,7 @@ fn cache_prov_str(c: CacheProvenance) -> &'static str {
         CacheProvenance::None => "none",
     }
 }
-fn parse_cache_prov(s: &str) -> CacheProvenance {
+pub(crate) fn parse_cache_prov(s: &str) -> CacheProvenance {
     match s {
         "route_cache_disabled" => CacheProvenance::RouteCacheDisabled,
         "browser_cache" => CacheProvenance::BrowserCache,
@@ -1098,7 +1127,7 @@ fn transport_prov_str(t: TransportProvenance) -> &'static str {
         TransportProvenance::SemanticProxy => "semantic_proxy",
     }
 }
-fn parse_transport_prov(s: &str) -> TransportProvenance {
+pub(crate) fn parse_transport_prov(s: &str) -> TransportProvenance {
     match s {
         "protocol_profile_only" => TransportProvenance::ProtocolProfileOnly,
         "identity_inconsistent" => TransportProvenance::IdentityInconsistent,

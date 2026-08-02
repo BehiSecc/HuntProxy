@@ -31,6 +31,7 @@ pub struct BrowserInstallStatus {
     pub lightpanda_available: bool,
     pub chromium_available: bool,
     pub lightpanda_path: Option<String>,
+    pub chromium_path: Option<String>,
     pub node_path: Option<String>,
     pub install_hint: Option<String>,
 }
@@ -50,6 +51,7 @@ pub struct BrowserJavascriptFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub url: Option<String>,
+    pub title: Option<String>,
     pub cookies: Vec<Value>,
     pub local_storage: BTreeMap<String, BTreeMap<String, String>>,
     pub session_storage: BTreeMap<String, String>,
@@ -336,6 +338,7 @@ impl WorkerProcess {
                 -32001 => ErrorCode::NotFound,
                 -32003 => ErrorCode::ChromiumNotInstalled,
                 -32004 => ErrorCode::LightpandaNotInstalled,
+                -32005 => ErrorCode::EngineFallback,
                 _ => ErrorCode::Unavailable,
             };
             return Err(WorkerCallFailure::Rpc(DomainError::new(
@@ -527,6 +530,10 @@ impl BrowserService {
                 .lightpanda_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            chromium_path: self
+                .chromium_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
             node_path: self
                 .node_path
                 .as_ref()
@@ -713,7 +720,13 @@ impl BrowserService {
             "cookies": managed_cookies,
             "restore_state": restored_profile,
             "persistent": persistent,
-            "profile_dir": if engine == BrowserEngine::Chromium {
+            // A directly started persistent Chromium profile is authoritative
+            // because it may contain a manual login. Lightpanda fallback
+            // disables this so its checkpoint can be transferred instead.
+            "prefer_profile_state": persistent && engine == BrowserEngine::Chromium,
+            // The worker also needs the Chromium profile path if an active
+            // Lightpanda session later performs its one automatic fallback.
+            "profile_dir": if persistent {
                 profile_dir.as_ref().map(|path| path.display().to_string())
             } else {
                 None
@@ -728,12 +741,15 @@ impl BrowserService {
         let mut worker_result = self
             .call_worker("session.start", start_params.clone())
             .await;
-        if worker_result.is_err()
+        if worker_result
+            .as_ref()
+            .is_err_and(|error| error.code() == ErrorCode::EngineFallback)
             && policy == EnginePolicy::Auto
             && engine == BrowserEngine::Lightpanda
             && status.chromium_available
         {
             start_params["engine"] = json!(engine_name(BrowserEngine::Chromium));
+            start_params["prefer_profile_state"] = json!(false);
             if persistent {
                 start_params["profile_dir"] =
                     json!(profile_dir.as_ref().map(|path| path.display().to_string()));
@@ -785,6 +801,7 @@ impl BrowserService {
         };
         session.engine = effective_engine;
         session.current_url = saved.url;
+        session.current_title = saved.title;
         session.state = BrowserSessionState::Ready;
         session.checkpoint_status = Some(checkpoint_status.into());
         session.checkpoint_hash = Some(saved.hash);
@@ -910,7 +927,16 @@ impl BrowserService {
         project_id: ProjectId,
     ) -> DomainResult<Vec<BrowserSession>> {
         self.db.get_project(project_id).await?;
-        let ids = self.active_session_ids(project_id).await;
+        let ids = self
+            .runtime_sessions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, runtime)| {
+                (runtime.project_id == project_id && runtime.persistent)
+                    .then_some(BrowserSessionId(*id))
+            })
+            .collect::<Vec<_>>();
         let mut sessions = Vec::with_capacity(ids.len());
         for session_id in ids {
             sessions.push(self.db.get_browser_session(project_id, session_id).await?);
@@ -951,6 +977,7 @@ impl BrowserService {
             .await?;
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
         session.current_url = saved.url;
+        session.current_title = saved.title;
         session.checkpoint_status = Some("ok".into());
         session.checkpoint_hash = Some(saved.hash);
         self.db.update_browser_session(&session).await
@@ -1027,12 +1054,37 @@ impl BrowserService {
         let checkpoint = result.get("checkpoint").ok_or_else(|| {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
+        let checkpoint_status =
+            if result.get("fallback_used").and_then(Value::as_bool) == Some(true) {
+                "fallback_chromium"
+            } else {
+                "ok"
+            };
         let saved = self
-            .save_checkpoint(project_id, session_id, checkpoint, "ok", runtime.persistent)
+            .save_checkpoint(
+                project_id,
+                session_id,
+                checkpoint,
+                checkpoint_status,
+                runtime.persistent,
+            )
             .await?;
         session.current_url = saved.url;
+        session.current_title = saved.title;
+        if result.get("fallback_used").and_then(Value::as_bool) == Some(true) {
+            session.engine = BrowserEngine::Chromium;
+            session.fallback_used = true;
+            if let Some(active) = self
+                .runtime_sessions
+                .lock()
+                .await
+                .get_mut(&session_id.get())
+            {
+                active.engine = BrowserEngine::Chromium;
+            }
+        }
         session.state = BrowserSessionState::Ready;
-        session.checkpoint_status = Some("ok".into());
+        session.checkpoint_status = Some(checkpoint_status.into());
         session.checkpoint_hash = Some(saved.hash);
         self.db.update_browser_session(&session).await?;
         if let Err(error) = self
@@ -1054,7 +1106,10 @@ impl BrowserService {
                 .unwrap_or("browser action completed")
                 .to_string(),
             data: result.get("data").cloned().filter(|value| !value.is_null()),
-            error_code: None,
+            error_code: result
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
     }
 
@@ -1211,6 +1266,15 @@ impl BrowserService {
         self.stop_sessions(sessions).await
     }
 
+    /// Terminate the shared worker and mark every attached session interrupted.
+    /// Used only when graceful shutdown exceeds its bound.
+    pub async fn force_stop_all(&self) {
+        if let Some(mut worker) = self.worker.lock().await.take() {
+            worker.terminate().await;
+        }
+        self.interrupt_runtime_sessions().await;
+    }
+
     async fn stop_sessions(
         &self,
         sessions: Vec<(ProjectId, BrowserSessionId)>,
@@ -1355,6 +1419,7 @@ impl BrowserService {
             }
         };
         session.current_url = saved.url;
+        session.current_title = saved.title;
         session.checkpoint_status = Some(migration_status);
         session.checkpoint_hash = Some(saved.hash);
         self.db.update_browser_session(&session).await?;
@@ -1617,6 +1682,7 @@ impl BrowserService {
                 project_id,
                 session_id,
                 checkpoint.url.clone(),
+                checkpoint.title.clone(),
                 status.to_string(),
                 checkpoint.hash.clone(),
                 checkpoint.version,
@@ -1659,6 +1725,11 @@ fn decode_checkpoint(value: &Value) -> DomainResult<Checkpoint> {
     }
     Ok(Checkpoint {
         url: value.get("url").and_then(Value::as_str).map(str::to_string),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string),
         cookies,
         local_storage: local_by_origin,
         session_storage,
@@ -1672,6 +1743,7 @@ fn checkpoint_hash(checkpoint: &Checkpoint) -> DomainResult<String> {
     cookies.sort_by_key(|cookie| serde_json::to_string(cookie).unwrap_or_default());
     let hashable = json!({
         "url": checkpoint.url.clone(),
+        "title": checkpoint.title.clone(),
         "cookies": cookies,
         "local_storage": checkpoint.local_storage.clone(),
         "session_storage": checkpoint.session_storage.clone(),
@@ -1962,6 +2034,7 @@ mod tests {
     fn decodes_checkpoint_without_exposing_private_shape() {
         let value = json!({
             "url": "https://example.com/app",
+            "title": "Example application",
             "_private": {
                 "origin": "https://example.com",
                 "cookies": [{"name":"sid","value":"secret"}],
@@ -1971,12 +2044,43 @@ mod tests {
         });
         let checkpoint = decode_checkpoint(&value).unwrap();
         assert_eq!(checkpoint.url.as_deref(), Some("https://example.com/app"));
+        assert_eq!(checkpoint.title.as_deref(), Some("Example application"));
         assert_eq!(checkpoint.cookies.len(), 1);
         assert_eq!(
             checkpoint.local_storage["https://example.com"]["theme"],
             "dark"
         );
         assert_eq!(checkpoint.session_storage["csrf"], "secret");
+    }
+
+    #[tokio::test]
+    async fn browser_session_title_round_trips_for_client_reattachment() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "reattach".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let mut session = db
+            .create_browser_session(project.id, BrowserEngine::Lightpanda, EnginePolicy::Auto)
+            .await
+            .unwrap();
+        session.current_url = Some("https://example.test/dashboard".into());
+        session.current_title = Some("Dashboard".into());
+        session.state = BrowserSessionState::Ready;
+        db.update_browser_session(&session).await.unwrap();
+
+        let restored = db
+            .get_browser_session(project.id, session.id)
+            .await
+            .unwrap();
+        assert_eq!(restored.current_url, session.current_url);
+        assert_eq!(restored.current_title.as_deref(), Some("Dashboard"));
+        assert_eq!(restored.engine, BrowserEngine::Lightpanda);
+        assert_eq!(restored.state, BrowserSessionState::Ready);
     }
 
     #[test]

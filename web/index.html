@@ -105,6 +105,12 @@
     .tab-button.active { border-color: var(--border); }
     .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
     .detail-grid h3 { margin-top: .35rem; }
+    .body-tools { display: flex; gap: .35rem; align-items: center; margin-bottom: .35rem; }
+    .body-tools select { width: auto; min-width: 92px; padding: .38rem .45rem; }
+    .body-tools .btn { padding: .38rem .55rem; }
+    .sitemap-tree { margin-top: .55rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .sitemap-node { margin-left: 1rem; border-left: 1px solid var(--border); padding-left: .55rem; }
+    .sitemap-route { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; padding: .2rem 0; }
     .annotation { border-top: 1px solid var(--border); margin-top: .75rem; padding-top: .55rem; }
     .muted { color: var(--muted); }
     .small { font-size: .78rem; }
@@ -161,8 +167,28 @@
       <label for="scopeExcludedHosts">Exclude hosts <span class="muted">(optional)</span></label>
       <input id="scopeExcludedHosts" placeholder="admin.example.com, *.internal.example.com" />
       <p class="small muted">Empty saves all traffic. Scope never blocks requests.</p>
-      <button class="btn primary" id="createProject" style="width:100%;margin-top:.55rem">Create</button>
+      <div class="row" style="margin-top:.55rem">
+        <button class="btn" id="createProject">Create</button>
+        <button class="btn primary" id="createAndBrowse">Create and browse</button>
+      </div>
       <button class="btn" id="saveScope" style="width:100%;margin-top:.4rem">Save capture scope</button>
+
+      <details style="margin-top:.75rem">
+        <summary>Project management</summary>
+        <label for="renameProjectName">Project name</label>
+        <input id="renameProjectName" />
+        <div class="row" style="margin-top:.4rem">
+          <button class="btn" id="renameProject">Rename</button>
+          <button class="btn danger" id="deleteProject">Delete</button>
+        </div>
+        <div class="row" style="margin-top:.4rem">
+          <button class="btn" id="exportProject">Export</button>
+          <button class="btn" id="importProject">Import</button>
+          <input class="hidden" id="importProjectFile" type="file" accept="application/json,.json" />
+        </div>
+        <div class="small muted" id="projectUsage" style="margin-top:.45rem"></div>
+        <p class="small muted">Exports include raw captured traffic and may contain credentials or cookies.</p>
+      </details>
 
       <h3>Session cookies</h3>
       <label for="cookieTarget">Target URL</label>
@@ -196,6 +222,8 @@
             <input id="historyFilter" placeholder="host:example.com method:GET status>=400 source:fuzzer" />
           </div>
           <button class="btn primary fit" id="loadHistory">Load</button>
+          <label class="fit" style="margin:0">Clear before <input id="historyClearBefore" type="datetime-local" /></label>
+          <button class="btn fit danger" id="clearHistory">Clear</button>
           <span class="small muted fit"><span class="live-dot" id="liveDot"></span><span id="liveText">offline</span></span>
         </div>
         <div class="status" id="historyStatus"></div>
@@ -208,6 +236,7 @@
               </table>
             </div>
             <div class="empty hidden" id="historyEmpty">No matching exchanges.</div>
+            <div class="row" style="margin-top:.55rem"><button class="btn fit hidden" id="historyMore">Load more</button></div>
           </div>
           <div class="card">
             <div class="row">
@@ -218,8 +247,8 @@
             <div class="detail-grid">
               <div><h3>Request headers</h3><pre class="mono" id="requestHeaders">—</pre></div>
               <div><h3>Response headers</h3><pre class="mono" id="responseHeaders">—</pre></div>
-              <div><h3>Request body</h3><pre class="mono" id="requestBody">—</pre></div>
-              <div><h3>Response body</h3><pre class="mono" id="responseBody">—</pre></div>
+              <div><h3>Request body</h3><div class="body-tools"><select id="requestBodyMode"><option value="decoded">Decoded</option><option value="raw">Raw</option><option value="hex">Hex</option></select><button class="btn" id="requestBodyMore" disabled>Load more</button><button class="btn" id="requestBodyDownload" disabled>Download</button></div><pre class="mono" id="requestBody">—</pre></div>
+              <div><h3>Response body</h3><div class="body-tools"><select id="responseBodyMode"><option value="decoded">Decoded</option><option value="raw">Raw</option><option value="hex">Hex</option></select><button class="btn" id="responseBodyMore" disabled>Load more</button><button class="btn" id="responseBodyDownload" disabled>Download</button></div><pre class="mono" id="responseBody">—</pre></div>
             </div>
             <div class="annotation">
               <div class="row">
@@ -385,6 +414,7 @@ test
           <div class="card">
             <h2>Browser session</h2>
             <pre class="mono" id="browserInstallStatus">Checking runtime…</pre>
+            <div class="card hidden" id="browserCurrent"></div>
             <label for="browserUrl">URL</label><input id="browserUrl" placeholder="https://app.example.com" />
             <div class="row">
               <button class="btn primary" id="startBrowser">Start Auto</button>
@@ -437,6 +467,10 @@ test
       browserSession: null,
       events: null,
       fuzzTimer: null,
+      historyItems: [],
+      historyCursor: null,
+      historyTotal: 0,
+      bodies: { request: null, response: null },
     };
 
     async function api(path, options = {}) {
@@ -463,15 +497,16 @@ test
 
     function bytes(value) { return Array.from(encoder.encode(value || '')); }
     function text(value) { return Array.isArray(value) ? decoder.decode(new Uint8Array(value)) : (value || ''); }
-    function decodeBase64(value) {
-      if (!value) return '';
+    function decodeBase64Bytes(value) {
+      if (!value) return new Uint8Array();
       const raw = atob(value);
-      return decoder.decode(Uint8Array.from(raw, c => c.charCodeAt(0)));
+      return Uint8Array.from(raw, c => c.charCodeAt(0));
     }
 
-    function activateView(name) {
+    function activateView(name, updateHash = true) {
       document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
       document.querySelectorAll('.workspace > section').forEach(s => s.classList.toggle('hidden', s.id !== `view-${name}`));
+      if (updateHash) history.replaceState(null, '', `#${name}`);
       if (name === 'sitemap') loadSitemap();
       if (name === 'words') loadWords();
       if (name === 'findings') loadFindings();
@@ -500,6 +535,10 @@ test
     async function projectChanged() {
       state.selectedExchange = null;
       state.selectedDetail = null;
+      state.historyItems = [];
+      state.historyCursor = null;
+      state.historyTotal = 0;
+      state.bodies = { request: null, response: null };
       $('saveAnnotation').disabled = true;
       $('sendToReply').disabled = true;
       $('markFinding').disabled = true;
@@ -513,15 +552,18 @@ test
         const project = await api(`/api/v1/projects/${state.projectId}`);
         $('scopeHosts').value = (project.scope?.host_patterns || []).join(', ');
         $('scopeExcludedHosts').value = (project.scope?.excluded_host_patterns || []).join(', ');
+        $('renameProjectName').value = project.name || '';
+        $('browserUrl').value = project.target_url || '';
+        $('cookieTarget').value = project.target_url || '';
       } catch (_) {}
       $('cookieValue').value = '';
       $('cookieFile').value = '';
-      await Promise.allSettled([loadHistory(), loadSitemap(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus(), loadCookies()]);
+      await Promise.allSettled([loadHistory(), loadSitemap(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus(), loadCookies(), loadProjectUsage()]);
     }
 
     $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
     $('refreshProjects').onclick = () => loadProjects().catch(e => status('sideStatus', e.message, 'err'));
-    $('createProject').onclick = async () => {
+    async function createProject(browse = false) {
       try {
         const hosts = $('scopeHosts').value.split(',').map(v => v.trim()).filter(Boolean);
         const excludedHosts = $('scopeExcludedHosts').value.split(',').map(v => v.trim()).filter(Boolean);
@@ -529,7 +571,55 @@ test
         const project = await api('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name: $('projectName').value.trim(), target_url: $('projectUrl').value.trim(), advanced }) });
         status('sideStatus', `Created project ${project.id}`, 'ok');
         await loadProjects(project.id);
+        if (browse) {
+          activateView('browser');
+          $('startBrowser').click();
+        }
       } catch (e) { status('sideStatus', e.message, 'err'); }
+    }
+    $('createProject').onclick = () => createProject(false);
+    $('createAndBrowse').onclick = () => createProject(true);
+
+    const humanBytes = value => {
+      let amount = Number(value || 0); const units = ['B', 'KiB', 'MiB', 'GiB']; let unit = 0;
+      while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
+      return `${amount.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+    };
+    async function loadProjectUsage() {
+      if (!state.projectId) return;
+      const usage = await api(`/api/v1/projects/${state.projectId}/usage`);
+      $('projectUsage').textContent = `${usage.exchange_count} exchanges · ${humanBytes(usage.approximate_total_bytes)} project data · ${humanBytes(usage.database_file_bytes)} database`;
+    }
+    $('renameProject').onclick = async () => {
+      if (!state.projectId) return;
+      try {
+        const project = await api(`/api/v1/projects/${state.projectId}`, { method: 'PATCH', body: JSON.stringify({ name: $('renameProjectName').value.trim() }) });
+        await loadProjects(project.id); status('sideStatus', 'Project renamed', 'ok');
+      } catch (error) { status('sideStatus', error.message, 'err'); }
+    };
+    $('deleteProject').onclick = async () => {
+      if (!state.projectId || !confirm(`Delete project ${state.projectId} and all of its saved data?`)) return;
+      try {
+        await api(`/api/v1/projects/${state.projectId}`, { method: 'DELETE' });
+        state.projectId = null; await loadProjects(); status('sideStatus', 'Project deleted', 'ok');
+      } catch (error) { status('sideStatus', error.message, 'err'); }
+    };
+    $('exportProject').onclick = async () => {
+      if (!state.projectId) return;
+      try {
+        const archive = await api(`/api/v1/projects/${state.projectId}/export`);
+        const blob = new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' });
+        const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `huntproxy-project-${state.projectId}.json`; link.click(); URL.revokeObjectURL(link.href);
+      } catch (error) { status('sideStatus', error.message, 'err'); }
+    };
+    $('importProject').onclick = () => $('importProjectFile').click();
+    $('importProjectFile').onchange = async event => {
+      const file = event.target.files?.[0]; if (!file) return;
+      try {
+        const project = await api('/api/v1/projects/import', { method: 'POST', body: await file.text() });
+        await loadProjects(project.id); status('sideStatus', 'Project imported', 'ok');
+      } catch (error) { status('sideStatus', error.message, 'err'); }
+      finally { event.target.value = ''; }
     };
     $('saveScope').onclick = async () => {
       if (!state.projectId) return status('sideStatus', 'Select a project', 'err');
@@ -626,23 +716,45 @@ test
       source.onerror = () => { $('liveDot').classList.remove('on'); $('liveText').textContent = 'reconnecting'; };
     }
 
-    async function loadHistory() {
+    function renderHistory() {
+      const items = state.historyItems;
+      $('historyRows').innerHTML = items.map(item => `<tr data-id="${item.exchange_id}" class="${state.selectedExchange === item.exchange_id ? 'selected' : ''}">
+        <td>${item.exchange_id}</td><td>${escapeHtml(item.method)}</td><td>${escapeHtml(item.host)}</td><td title="${escapeHtml(item.path)}">${escapeHtml(item.path.slice(0, 38))}</td>
+        <td>${item.status_code ?? '—'}</td><td>${item.response_length ?? '—'}</td><td>${item.duration_ms == null ? '—' : `${item.duration_ms} ms`}</td>
+        <td><span class="pill ${item.source}">${escapeHtml(item.source)}</span></td></tr>`).join('');
+      $('historyEmpty').classList.toggle('hidden', items.length > 0);
+      $('historyMore').classList.toggle('hidden', !state.historyCursor);
+      status('historyStatus', `Showing ${items.length} of ${state.historyTotal} exchange${state.historyTotal === 1 ? '' : 's'}`);
+    }
+
+    async function loadHistory(append = false) {
       if (!state.projectId) return;
       try {
         const q = new URLSearchParams({ limit: '100' });
         if ($('historyFilter').value.trim()) q.set('q', $('historyFilter').value.trim());
+        if (append && state.historyCursor) q.set('cursor', state.historyCursor);
         const result = await api(`/api/v1/projects/${state.projectId}/history?${q}`);
         const items = result.items || [];
-        $('historyRows').innerHTML = items.map(item => `<tr data-id="${item.exchange_id}" class="${state.selectedExchange === item.exchange_id ? 'selected' : ''}">
-          <td>${item.exchange_id}</td><td>${escapeHtml(item.method)}</td><td>${escapeHtml(item.host)}</td><td title="${escapeHtml(item.path)}">${escapeHtml(item.path.slice(0, 38))}</td>
-          <td>${item.status_code ?? '—'}</td><td>${item.response_length ?? '—'}</td><td>${item.duration_ms == null ? '—' : `${item.duration_ms} ms`}</td>
-          <td><span class="pill ${item.source}">${escapeHtml(item.source)}</span></td></tr>`).join('');
-        $('historyEmpty').classList.toggle('hidden', items.length > 0);
-        status('historyStatus', `${items.length} exchange${items.length === 1 ? '' : 's'}`);
+        state.historyItems = append ? state.historyItems.concat(items) : items;
+        state.historyCursor = result.next_cursor || null;
+        state.historyTotal = Number(result.total ?? state.historyItems.length);
+        renderHistory();
       } catch (e) { status('historyStatus', e.message, 'err'); }
     }
-    $('loadHistory').onclick = loadHistory;
-    $('historyFilter').onkeydown = e => { if (e.key === 'Enter') loadHistory(); };
+    $('loadHistory').onclick = () => loadHistory(false);
+    $('historyMore').onclick = () => loadHistory(true);
+    $('historyFilter').onkeydown = e => { if (e.key === 'Enter') loadHistory(false); };
+    $('clearHistory').onclick = async () => {
+      if (!state.projectId) return;
+      const local = $('historyClearBefore').value;
+      if (!local) return status('historyStatus', 'Choose a date and time', 'err');
+      const before = new Date(local).toISOString();
+      if (!confirm(`Delete saved history older than ${before}?`)) return;
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/history?before=${encodeURIComponent(before)}`, { method: 'DELETE' });
+        await loadHistory(false); await loadProjectUsage(); status('historyStatus', `Deleted ${result.deleted_exchanges} exchanges`, 'ok');
+      } catch (error) { status('historyStatus', error.message, 'err'); }
+    };
     $('historyRows').onclick = e => {
       const row = e.target.closest('tr[data-id]');
       if (row) selectExchange(Number(row.dataset.id));
@@ -652,23 +764,52 @@ test
     function formatHeaders(headers) {
       return (headers || []).map(h => `${h.name}: ${h.value}${h.redacted ? '  <redacted>' : ''}`).join('\n') || '—';
     }
-    async function loadExchangeBody(exchangeId, side) {
-      const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}/body?side=${side}&max_bytes=131072`);
-      const content = decodeBase64(result.data);
-      return `${content}${result.truncated ? `\n\n[truncated; ${result.total_length} bytes total]` : ''}` || '—';
+    function bodyIsRaw(side) {
+      return $(`${side}BodyMode`).value !== 'decoded';
+    }
+    function renderBody(side) {
+      const body = state.bodies[side];
+      const output = $(`${side}Body`);
+      if (!body || !body.bytes.length) output.textContent = '—';
+      else if ($(`${side}BodyMode`).value === 'hex') {
+        const lines = [];
+        for (let offset = 0; offset < body.bytes.length; offset += 16) {
+          const chunk = body.bytes.slice(offset, offset + 16);
+          const hex = Array.from(chunk, byte => byte.toString(16).padStart(2, '0')).join(' ').padEnd(47);
+          const ascii = Array.from(chunk, byte => byte >= 32 && byte < 127 ? String.fromCharCode(byte) : '.').join('');
+          lines.push(`${offset.toString(16).padStart(8, '0')}  ${hex}  |${ascii}|`);
+        }
+        output.textContent = lines.join('\n');
+      } else output.textContent = decoder.decode(body.bytes);
+      if (body && body.loaded < body.total) output.textContent += `\n\n[${body.loaded} of ${body.total} bytes loaded]`;
+      $(`${side}BodyMore`).disabled = !body || body.loaded >= body.total;
+      $(`${side}BodyDownload`).disabled = !body || body.total === 0;
+    }
+    async function loadExchangeBody(exchangeId, side, append = false) {
+      const existing = append ? state.bodies[side] : null;
+      const raw = bodyIsRaw(side);
+      const offset = existing?.loaded || 0;
+      const query = new URLSearchParams({ side, offset: String(offset), max_bytes: '131072', raw: String(raw) });
+      const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}/body?${query}`);
+      const chunk = decodeBase64Bytes(result.data);
+      const combined = new Uint8Array(offset + chunk.length);
+      if (existing) combined.set(existing.bytes);
+      combined.set(chunk, offset);
+      state.bodies[side] = { bytes: combined, loaded: offset + chunk.length, total: result.total_length || 0, raw };
+      renderBody(side);
     }
     async function selectExchange(exchangeId) {
       try {
         $('pageAnalysis').classList.add('hidden');
         const noisy = $('showNoisy').checked;
-        const [detail, requestBody, responseBody] = await Promise.all([
+        state.bodies = { request: null, response: null };
+        const [detail] = await Promise.all([
           api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}?include_noisy_headers=${noisy}`),
           loadExchangeBody(exchangeId, 'request'), loadExchangeBody(exchangeId, 'response'),
         ]);
         state.selectedExchange = exchangeId; state.selectedDetail = detail;
         $('requestHeaders').textContent = formatHeaders(detail.request_headers);
         $('responseHeaders').textContent = formatHeaders(detail.response_headers);
-        $('requestBody').textContent = requestBody; $('responseBody').textContent = responseBody;
         $('annotationTitle').value = detail.annotation?.display_title || detail.summary.display_title || '';
         $('annotationLabels').value = (detail.annotation?.labels || detail.summary.labels || []).join(', ');
         $('annotationNote').value = detail.annotation?.note || '';
@@ -678,6 +819,23 @@ test
         status('inspectorStatus', `${detail.summary.method} ${detail.summary.scheme}://${detail.summary.authority}${detail.summary.path} · ${detail.protocol}`);
         document.querySelectorAll('#historyRows tr').forEach(r => r.classList.toggle('selected', Number(r.dataset.id) === exchangeId));
       } catch (e) { status('inspectorStatus', e.message, 'err'); }
+    }
+
+    for (const side of ['request', 'response']) {
+      $(`${side}BodyMode`).onchange = () => state.selectedExchange && loadExchangeBody(state.selectedExchange, side, false).catch(error => status('inspectorStatus', error.message, 'err'));
+      $(`${side}BodyMore`).onclick = () => state.selectedExchange && loadExchangeBody(state.selectedExchange, side, true).catch(error => status('inspectorStatus', error.message, 'err'));
+      $(`${side}BodyDownload`).onclick = async () => {
+        if (!state.selectedExchange) return;
+        try {
+          while (state.bodies[side] && state.bodies[side].loaded < state.bodies[side].total) await loadExchangeBody(state.selectedExchange, side, true);
+          const body = state.bodies[side];
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(new Blob([body.bytes], { type: 'application/octet-stream' }));
+          link.download = `exchange-${state.selectedExchange}-${side}${body.raw ? '-raw' : ''}.bin`;
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(link.href), 0);
+        } catch (error) { status('inspectorStatus', error.message, 'err'); }
+      };
     }
 
     $('saveAnnotation').onclick = async () => {
@@ -741,6 +899,18 @@ test
       }
     };
 
+    function renderSitemapNodes(nodes) {
+      return (nodes || []).map(node => {
+        const route = node.route;
+        const metadata = route ? `<span class="pill">${escapeHtml(route.methods.join(', '))}</span>
+          ${route.status_codes.length ? `<span class="pill">${escapeHtml(route.status_codes.join(', '))}</span>` : ''}
+          ${route.content_types.length ? `<span class="pill" title="Content types">${escapeHtml(route.content_types.join(', '))}</span>` : ''}
+          ${route.parameters.length ? `<span class="small muted" title="Query parameters">? ${escapeHtml(route.parameters.join(', '))}</span>` : ''}
+          <span class="small muted">${route.exchange_count}×</span>` : '<span class="small muted">directory</span>';
+        return `<div class="sitemap-node"><div class="sitemap-route"><strong title="${escapeHtml(node.path)}">${escapeHtml(node.segment)}</strong>${metadata}</div>${renderSitemapNodes(node.children)}</div>`;
+      }).join('');
+    }
+
     async function loadSitemap() {
       if (!state.projectId) return;
       try {
@@ -748,7 +918,10 @@ test
         if ($('sitemapHost').value.trim()) query.set('host', $('sitemapHost').value.trim());
         const result = await api(`/api/v1/projects/${state.projectId}/sitemap?${query}`);
         const hosts = result.hosts || [];
-        $('sitemapHosts').innerHTML = hosts.map(host => `<div class="card"><div class="row"><strong>${escapeHtml(host.host)}</strong><span class="pill fit">${host.paths.length} route${host.paths.length === 1 ? '' : 's'}</span></div><pre class="mono">${host.paths.map(escapeHtml).join('\n')}</pre></div>`).join('');
+        $('sitemapHosts').innerHTML = hosts.map(host => {
+          const exchanges = (host.routes || []).reduce((sum, route) => sum + route.exchange_count, 0);
+          return `<div class="card"><div class="row"><strong>${escapeHtml(host.host)}</strong><span class="pill fit">${host.paths.length} route${host.paths.length === 1 ? '' : 's'} · ${exchanges} exchange${exchanges === 1 ? '' : 's'}</span></div><div class="sitemap-tree">${renderSitemapNodes(host.tree || [])}</div></div>`;
+        }).join('');
         $('sitemapEmpty').classList.toggle('hidden', hosts.length > 0);
         status('sitemapStatus', `${hosts.length} host${hosts.length === 1 ? '' : 's'}`);
       } catch (error) { status('sitemapStatus', error.message, 'err'); }
@@ -1049,7 +1222,22 @@ test
 
     async function loadBrowserStatus() {
       if (!state.projectId) return;
-      try { $('browserInstallStatus').textContent = JSON.stringify(await api(`/api/v1/projects/${state.projectId}/browser-sessions`), null, 2); }
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/browser-sessions`);
+        $('browserInstallStatus').textContent = JSON.stringify(result.runtime, null, 2);
+        const sessions = result.sessions || [];
+        state.browserSession = sessions.length ? sessions[sessions.length - 1] : null;
+        const active = state.browserSession;
+        $('switchBrowser').disabled = !active || active.engine === 'chromium';
+        $('stopBrowser').disabled = !active;
+        $('runBrowserAction').disabled = !active;
+        $('browserCurrent').classList.toggle('hidden', !active);
+        if (active) {
+          $('browserCurrent').innerHTML = `<strong>${escapeHtml(active.current_title || 'Untitled page')}</strong><div class="small muted">${escapeHtml(active.engine)} · session ${active.id}</div><div class="small" style="margin-top:.35rem;overflow-wrap:anywhere">${escapeHtml(active.current_url || 'No current URL')}</div>`;
+          $('browserUrl').value = active.current_url || $('browserUrl').value;
+          status('browserStatus', `Session ${active.id} active with ${active.engine}`, 'ok');
+        }
+      }
       catch (e) { $('browserInstallStatus').textContent = e.message; }
     }
     $('startBrowser').onclick = async () => {
@@ -1093,6 +1281,7 @@ test
         else action = { type };
         const result = await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession.id}/action`, { method: 'POST', body: JSON.stringify(action) });
         $('browserOutput').textContent = JSON.stringify(result, null, 2); status('browserStatus', result.message || 'Action complete', result.ok ? 'ok' : 'err');
+        await loadBrowserStatus();
       } catch (e) { status('browserStatus', e.message, 'err'); }
     };
 
@@ -1109,6 +1298,9 @@ test
     (async () => {
       await refreshHealth();
       try { await loadProjects(); } catch (e) { status('sideStatus', e.message, 'err'); }
+      const initialView = location.hash.slice(1);
+      const validViews = [...document.querySelectorAll('nav button')].map(button => button.dataset.view);
+      if (validViews.includes(initialView)) activateView(initialView, false);
       setInterval(refreshHealth, 10000);
     })();
   </script>

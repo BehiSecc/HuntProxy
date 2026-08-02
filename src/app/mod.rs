@@ -163,27 +163,36 @@ pub async fn run_daemon(config: Config) -> DomainResult<()> {
             None
         }
         result = servers.join_next() => {
-            state.shutdown.cancel();
-            match result {
-                Some(Ok(Err((name, error)))) => Some(DomainError::new(
-                    ErrorCode::Unavailable,
-                    format!("{name} server exited: {error}"),
-                )),
-                Some(Err(error)) => Some(DomainError::new(
-                    ErrorCode::Unavailable,
-                    format!("server task failed: {error}"),
-                )),
-                Some(Ok(Ok(()))) => Some(DomainError::new(
-                    ErrorCode::Unavailable,
-                    "server exited unexpectedly",
-                )),
-                None => Some(DomainError::new(ErrorCode::Unavailable, "no server tasks")),
+            if shutdown.is_cancelled() {
+                None
+            } else {
+                state.shutdown.cancel();
+                match result {
+                    Some(Ok(Err((name, error)))) => Some(DomainError::new(
+                        ErrorCode::Unavailable,
+                        format!("{name} server exited: {error}"),
+                    )),
+                    Some(Err(error)) => Some(DomainError::new(
+                        ErrorCode::Unavailable,
+                        format!("server task failed: {error}"),
+                    )),
+                    Some(Ok(Ok(()))) => Some(DomainError::new(
+                        ErrorCode::Unavailable,
+                        "server exited unexpectedly",
+                    )),
+                    None => Some(DomainError::new(ErrorCode::Unavailable, "no server tasks")),
+                }
             }
         }
     };
     state.shutdown.cancel();
-    if let Err(error) = state.browser.stop_all().await {
-        tracing::warn!(%error, "failed to stop every browser during shutdown");
+    match tokio::time::timeout(Duration::from_secs(5), state.browser.stop_all()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "failed to stop every browser during shutdown"),
+        Err(_) => {
+            tracing::warn!("browser shutdown timed out; terminating the worker");
+            state.browser.force_stop_all().await;
+        }
     }
     while servers.join_next().await.is_some() {}
     if let Some(idle_monitor) = idle_monitor {
@@ -318,13 +327,39 @@ fn acquire_daemon_lock(config: &Config) -> DomainResult<DaemonLock> {
 
 fn cleanup_daemon_files(config: &Config) {
     let _ = std::fs::remove_file(config.socket_path());
+    let _ = std::fs::remove_file(config.daemon_lock_path());
 }
 
 pub async fn stop_daemon(config: &Config) -> DomainResult<()> {
+    #[cfg(unix)]
+    if request_private_shutdown(config).await.is_ok() {
+        for _ in 0..50 {
+            if !config.socket_path().exists() && !config.daemon_lock_path().exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    if daemon_lock_is_stale(config)? {
+        cleanup_daemon_files(config);
+        return Err(DomainError::new(
+            ErrorCode::DaemonNotRunning,
+            "daemon not running; removed stale runtime files",
+        ));
+    }
+
     if let Ok(pid_str) = std::fs::read_to_string(config.daemon_lock_path()) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             #[cfg(unix)]
             {
+                if !process_is_huntproxy(pid) {
+                    return Err(DomainError::new(
+                        ErrorCode::DaemonNotRunning,
+                        "daemon lock does not identify a HuntProxy process; refusing to signal it",
+                    ));
+                }
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid),
                     nix::sys::signal::Signal::SIGTERM,
@@ -347,6 +382,85 @@ pub async fn stop_daemon(config: &Config) -> DomainResult<()> {
         ErrorCode::DaemonNotRunning,
         "daemon not running",
     ))
+}
+
+#[cfg(unix)]
+async fn request_private_shutdown(config: &Config) -> DomainResult<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::UnixStream::connect(config.socket_path())
+        .await
+        .map_err(|error| DomainError::new(ErrorCode::DaemonNotRunning, error.to_string()))?;
+    stream
+        .write_all(
+            b"POST /internal/shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .map_err(|_| DomainError::new(ErrorCode::Timeout, "private shutdown timed out"))?
+        .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+    if response.starts_with(b"HTTP/1.1 2") || response.starts_with(b"HTTP/1.0 2") {
+        Ok(())
+    } else {
+        Err(DomainError::new(
+            ErrorCode::ProtocolError,
+            "private shutdown request failed",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn daemon_lock_is_stale(config: &Config) -> DomainResult<bool> {
+    let path = config.daemon_lock_path();
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(DomainError::new(
+                ErrorCode::StorageError,
+                format!("daemon lock: {error}"),
+            ))
+        }
+    };
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(_) => Ok(true),
+        Err((_file, nix::errno::Errno::EWOULDBLOCK)) => Ok(false),
+        Err((_file, error)) => Err(DomainError::new(
+            ErrorCode::StorageError,
+            format!("daemon lock: {error}"),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_huntproxy(pid: i32) -> bool {
+    let Ok(executable) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("HuntProxy"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_huntproxy(pid: i32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|path| {
+            std::path::Path::new(path.trim())
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .is_some_and(|name| name.eq_ignore_ascii_case("HuntProxy"))
 }
 
 pub fn daemon_status(config: &Config) -> DomainResult<serde_json::Value> {
@@ -401,5 +515,25 @@ mod tests {
         assert_eq!(second.code(), ErrorCode::DaemonAlreadyRunning);
         drop(first);
         acquire_daemon_lock(&config).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_removes_stale_runtime_files_without_signaling_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            runtime_dir: temp.path().join("runtime"),
+            ..Config::default()
+        };
+        config.ensure_layout().unwrap();
+        std::fs::write(config.daemon_lock_path(), std::process::id().to_string()).unwrap();
+        std::fs::write(config.socket_path(), b"stale").unwrap();
+
+        let error = stop_daemon(&config).await.unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::DaemonNotRunning);
+        assert!(!config.daemon_lock_path().exists());
+        assert!(!config.socket_path().exists());
     }
 }

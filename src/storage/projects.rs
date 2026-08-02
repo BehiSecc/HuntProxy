@@ -21,6 +21,7 @@ impl Db {
         // The initial target remains required, but does not silently become a
         // capture restriction. Scope is an explicit, optional capture filter.
         crate::policy::TargetRef::from_url(&req.target_url)?;
+        let target_url = req.target_url.trim().to_string();
         let scope = req.advanced.unwrap_or_default();
         let limits = ProjectLimits::default();
         let name = req.name.trim().to_string();
@@ -35,9 +36,9 @@ impl Db {
 
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO projects (name, created_at, updated_at, scope_json, limits_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![name, ts, ts, scope_json, limits_json],
+                "INSERT INTO projects (name, target_url, created_at, updated_at, scope_json, limits_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![name, target_url, ts, ts, scope_json, limits_json],
             )
             .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             let id = conn.last_insert_rowid();
@@ -49,6 +50,7 @@ impl Db {
             Ok(Project {
                 id: ProjectId(id),
                 name,
+                target_url,
                 created_at: parse_time(&ts),
                 updated_at: parse_time(&ts),
                 scope,
@@ -64,7 +66,7 @@ impl Db {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, created_at, updated_at, scope_json, limits_json,
+                    "SELECT id, name, target_url, created_at, updated_at, scope_json, limits_json,
                             default_browser_profile, noise_policy FROM projects ORDER BY id",
                 )
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
@@ -79,18 +81,20 @@ impl Db {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 })
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             let mut out = Vec::new();
             for r in rows {
-                let (id, name, ca, ua, sj, lj, prof, noise) =
+                let (id, name, target_url, ca, ua, sj, lj, prof, noise) =
                     r.map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
                 let scope: ScopePolicy = serde_json::from_str(&sj).unwrap_or_default();
                 let limits: ProjectLimits = serde_json::from_str(&lj).unwrap_or_default();
                 out.push(Project {
                     id: ProjectId(id),
                     name,
+                    target_url,
                     created_at: parse_time(&ca),
                     updated_at: parse_time(&ua),
                     scope,
@@ -107,7 +111,7 @@ impl Db {
     pub async fn get_project(&self, id: ProjectId) -> DomainResult<Project> {
         self.with_conn(move |conn| {
             conn.query_row(
-                "SELECT id, name, created_at, updated_at, scope_json, limits_json,
+                "SELECT id, name, target_url, created_at, updated_at, scope_json, limits_json,
                         default_browser_profile, noise_policy FROM projects WHERE id=?1",
                 params![id.get()],
                 |row| {
@@ -120,6 +124,7 @@ impl Db {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
@@ -129,12 +134,13 @@ impl Db {
                 }
                 other => DomainError::new(ErrorCode::StorageError, other.to_string()),
             })
-            .map(|(id, name, ca, ua, sj, lj, prof, noise)| {
+            .map(|(id, name, target_url, ca, ua, sj, lj, prof, noise)| {
                 let scope: ScopePolicy = serde_json::from_str(&sj).unwrap_or_default();
                 let limits: ProjectLimits = serde_json::from_str(&lj).unwrap_or_default();
                 Project {
                     id: ProjectId(id),
                     name,
+                    target_url,
                     created_at: parse_time(&ca),
                     updated_at: parse_time(&ua),
                     scope,
@@ -176,5 +182,64 @@ impl Db {
         .await?;
         crate::policy::bump_policy_epoch();
         self.get_project(id).await
+    }
+
+    pub async fn rename_project(&self, id: ProjectId, name: String) -> DomainResult<Project> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(DomainError::invalid("project name required"));
+        }
+        if name.len() > 256 {
+            return Err(DomainError::invalid("project name exceeds 256 bytes"));
+        }
+        let timestamp = now_rfc3339();
+        self.with_conn(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE projects SET name=?1, updated_at=?2 WHERE id=?3",
+                    params![name, timestamp, id.get()],
+                )
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            if changed == 0 {
+                return Err(DomainError::not_found(format!("project {}", id.get())));
+            }
+            Ok(())
+        })
+        .await?;
+        self.get_project(id).await
+    }
+
+    pub async fn delete_project(&self, id: ProjectId) -> DomainResult<()> {
+        self.with_conn(move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            let changed = tx
+                .execute("DELETE FROM projects WHERE id=?1", params![id.get()])
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            if changed == 0 {
+                return Err(DomainError::not_found(format!("project {}", id.get())));
+            }
+            // Bodies are content-addressed but currently project-private in
+            // practice. Remove only objects no remaining exchange references.
+            tx.execute(
+                "DELETE FROM bodies WHERE id NOT IN (
+                    SELECT request_body_id FROM exchanges WHERE request_body_id IS NOT NULL
+                    UNION
+                    SELECT response_body_id FROM exchanges WHERE response_body_id IS NOT NULL
+                 )",
+                [],
+            )
+            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            tx.execute(
+                "DELETE FROM search_fts WHERE project_id=?1",
+                params![id.get()],
+            )
+            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            tx.commit()
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            Ok(())
+        })
+        .await
     }
 }

@@ -108,6 +108,25 @@ function rpcError(code, message) {
   return { code, message };
 }
 
+// Keep this deliberately narrow: ordinary site errors, locator timeouts, and
+// authentication failures must be returned to the caller. These messages
+// indicate CDP/browser features that Lightpanda does not currently implement.
+function isLightpandaCompatibilityError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  const explicitCompatibilityError = [
+    "not implemented",
+    "unsupported operation",
+    "unsupported command",
+    "method not found",
+    "unknown method",
+    "unknown command",
+  ].some((fragment) => message.includes(fragment));
+  const missingProtocolMethod =
+    (message.includes("wasn't found") || message.includes("was not found")) &&
+    (message.includes("method") || message.includes("command"));
+  return explicitCompatibilityError || missingProtocolMethod;
+}
+
 function existingChromiumExecutable() {
   const candidates = [
     process.env.BB_CHROME_EXECUTABLE,
@@ -274,11 +293,11 @@ async function launchEngine(engine, proxy, caCertPath, profileDir = null) {
 
 async function restoreProjectState(session, state) {
   if (!state || typeof state !== "object") return;
+  if (session.preferProfileState) return;
   session.restoreState = state;
   session.restoredOrigins = new Set();
-  if (session.engine === "chromium" && session.persistent) {
-    await session.context.clearCookies();
-  }
+  // For migrated/non-profile sessions, restore the portable checkpoint.
+  // Managed cookies are applied separately after this step.
   if (Array.isArray(state.cookies) && state.cookies.length) {
     const cookies = state.cookies
       .filter((cookie) => cookie && cookie.name && cookie.domain)
@@ -346,6 +365,7 @@ async function reconcileCurrentOriginStorage(session) {
 
 async function extractCheckpoint(session) {
   const url = session.page.url();
+  const title = await session.page.title().catch(() => "");
   const origin = (() => {
     try {
       const parsed = new URL(url);
@@ -382,6 +402,7 @@ async function extractCheckpoint(session) {
     .digest("hex");
   return {
     url,
+    title: title ? title.slice(0, 1024) : null,
     origin,
     cookie_count: cookies.length,
     local_keys: Object.keys(privateState.local_storage).length,
@@ -614,14 +635,14 @@ async function handle(req) {
           throw rpcError(-32602, "engine must be lightpanda or chromium");
         }
         const caCertPath = params.ca_cert_path || null;
-        const profileDir = params.persistent && engine === "chromium"
+        const profileDir = params.persistent
           ? params.profile_dir || null
           : null;
         const runtime = await launchEngine(
           engine,
           params.proxy || null,
           caCertPath,
-          profileDir,
+          engine === "chromium" ? profileDir : null,
         );
         const session = {
           ...runtime,
@@ -630,6 +651,7 @@ async function handle(req) {
           caCertPath,
           persistent: Boolean(params.persistent),
           profileDir,
+          preferProfileState: Boolean(params.prefer_profile_state),
         };
         trackJavascriptFiles(session);
         sessions.set(sessionId, session);
@@ -650,6 +672,9 @@ async function handle(req) {
           return respond(id, { session_id: sessionId, engine, checkpoint });
         } catch (error) {
           await closeSession(sessionId);
+          if (engine === "lightpanda" && isLightpandaCompatibilityError(error)) {
+            throw rpcError(-32005, String(error?.message || error));
+          }
           throw error;
         }
       }
@@ -657,9 +682,47 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        const result = await executeAction(session, params.action || {});
+        let activeSession = session;
+        let fallbackUsed = false;
+        let fallbackStatus = null;
+        let result;
+        try {
+          result = await executeAction(activeSession, params.action || {});
+        } catch (error) {
+          if (activeSession.engine !== "lightpanda" || !isLightpandaCompatibilityError(error)) {
+            throw error;
+          }
+          const migration = await migrateToChromium(
+            sessionId,
+            activeSession,
+            activeSession.persistent ? activeSession.profileDir : null,
+          );
+          activeSession = sessions.get(sessionId);
+          fallbackUsed = true;
+          fallbackStatus = migration.status;
+          logMeta("session.auto_fallback", {
+            session_id: sessionId,
+            status: migration.status,
+          });
+          try {
+            result = await executeAction(activeSession, params.action || {});
+          } catch (retryError) {
+            const checkpoint = await extractCheckpoint(activeSession);
+            return respond(id, {
+              ok: false,
+              untrusted: true,
+              message: String(retryError?.message || retryError),
+              error_code: "action_failed_after_fallback",
+              data: null,
+              checkpoint,
+              engine: activeSession.engine,
+              fallback_used: fallbackUsed,
+              fallback_status: fallbackStatus,
+            });
+          }
+        }
         // Every successful action is checkpointed before acknowledgement.
-        const checkpoint = await extractCheckpoint(session);
+        const checkpoint = await extractCheckpoint(activeSession);
         logMeta("session.action", { session_id: sessionId, action: params.action?.type });
         return respond(id, {
           ok: true,
@@ -667,6 +730,9 @@ async function handle(req) {
           message: result.message,
           data: result.data,
           checkpoint,
+          engine: activeSession.engine,
+          fallback_used: fallbackUsed,
+          fallback_status: fallbackStatus,
         });
       }
       case "session.set_cookies": {

@@ -80,6 +80,24 @@ control activity, the MCP bridge and daemon exit and browser processes close.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
 
+The UI restores an active browser after a page refresh and shows its current
+engine, URL, and title. Auto mode starts with Lightpanda and retries once with
+Chromium only for recognized compatibility failures; ordinary site, login, and
+timeout errors remain visible instead of silently changing engines.
+
+For a login that must be completed manually, stop HuntProxy first, find the
+`chromium_path` in `HuntProxy doctor`, and launch that executable with:
+
+```bash
+<chromium_path> --user-data-dir="$HOME/.huntproxy/browser-profiles/projects/<project-id>/chromium/default"
+```
+
+Complete the login, close Chromium fully, start HuntProxy again, and start or
+switch that project to Chromium. Lightpanda cannot read a Chromium profile.
+Never open the same profile manually while HuntProxy is using it. This is
+especially useful for Google or hardware-key sign-in that cannot be completed
+headlessly.
+
 Reply drafts accept `body_text` or `body_json` as convenient alternatives to
 byte-array `body_override`. When adapting a captured request to a different
 endpoint, set `inheritance: "cookies_auth_only"` to retain only Cookie,
@@ -124,6 +142,9 @@ scope; excluded hosts are never crawled.
 
 Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;
 restart the MCP client (or run `HuntProxy serve`) when you want to use it again.
+The stop command prefers the private local socket and only uses a verified PID
+as a fallback. `HuntProxy doctor` includes the bounded daemon log and the most
+recent startup output when troubleshooting.
 
 If your MCP client cannot find `HuntProxy`, use the absolute path printed by
 the installer (normally `/home/you/.local/bin/HuntProxy`); MCP clients do not
@@ -136,6 +157,23 @@ HuntProxy project create demo https://example.com
 HuntProxy project list
 HuntProxy doctor
 ```
+
+Project maintenance is available in the UI and CLI:
+
+```bash
+HuntProxy project rename 1 "Acme portal"
+HuntProxy project usage 1
+HuntProxy project export 1 ./acme-project.json
+HuntProxy project import ./acme-project.json
+HuntProxy history clear 1 --before 2026-01-01T00:00:00Z
+HuntProxy backup ./huntproxy-backup.sqlite3
+HuntProxy project delete 1
+```
+
+Exports contain project configuration, raw captured traffic, annotations,
+labels, and findings. Managed cookie profiles and transient browser, fuzzer,
+and Reply state are excluded, but captured headers and bodies can still contain
+credentials or cookies. Treat exports and SQLite backups as sensitive files.
 
 `HuntProxy serve` stays in the foreground. In the UI, create a project and a
 Proxy credential before sending traffic through `127.0.0.1:17891`.
@@ -171,3 +209,24 @@ empty include list with exclusions captures every host except those exclusions.
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Update and uninstall
+
+To update, download the latest checkout and run `./install.sh` again. The
+installer replaces the binary and browser worker while preserving
+`~/.huntproxy`. Back up first with `HuntProxy backup` when upgrading important
+data.
+
+To remove the program but keep your projects:
+
+```bash
+HuntProxy stop
+rm "$HOME/.local/bin/HuntProxy"
+```
+
+To remove all HuntProxy data as well, delete `~/.huntproxy` only after making
+any desired backup or project exports.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
