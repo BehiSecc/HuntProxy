@@ -147,7 +147,9 @@ async fn forward_request(
     forced_scheme: Option<&str>,
 ) -> DomainResult<Response<ProxyBody>> {
     let project = state.db.get_project(session.project_id).await?;
-    let (parts, incoming) = request.into_parts();
+    let (mut parts, incoming) = request.into_parts();
+    let internal_crawler_request =
+        take_internal_crawler_marker(&mut parts.headers, session.is_browser_bound);
     let url = request_url(&parts, forced_scheme)?;
     let target = TargetRef::from_url(&url)?;
     let capture = url_is_in_scope(&url, &project.scope)?;
@@ -226,6 +228,7 @@ async fn forward_request(
         project.limits.capture_body_bytes,
         start,
         capture,
+        internal_crawler_request,
     )
 }
 
@@ -378,6 +381,17 @@ fn is_html_content_type(content_type: Option<&str>) -> bool {
     })
 }
 
+fn take_internal_crawler_marker(headers: &mut http::HeaderMap, browser_bound: bool) -> bool {
+    // This marker must never be persisted or forwarded to the target. Only a
+    // browser-bound capture credential may use it to suppress recursive crawl.
+    let marked = browser_bound
+        && headers
+            .get("x-huntproxy-internal-crawler")
+            .is_some_and(|value| value.as_bytes() == b"1");
+    headers.remove("x-huntproxy-internal-crawler");
+    marked
+}
+
 #[allow(clippy::too_many_arguments)]
 fn streaming_response(
     state: Arc<AppState>,
@@ -390,6 +404,7 @@ fn streaming_response(
     capture_limit: u64,
     started: std::time::Instant,
     capture: bool,
+    suppress_crawl: bool,
 ) -> DomainResult<Response<ProxyBody>> {
     let (response_spool, response_file) =
         create_private_spool(&state.config.spool_dir, "response")?;
@@ -428,6 +443,7 @@ fn streaming_response(
         started,
         sender,
         capture,
+        suppress_crawl,
     ));
     Ok(response)
 }
@@ -448,13 +464,15 @@ async fn pump_streaming_response(
     started: std::time::Instant,
     sender: mpsc::Sender<Bytes>,
     capture: bool,
+    suppress_crawl: bool,
 ) {
     let response_headers = header_entries(&outbound.headers);
     let mime = response_headers
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("content-type"))
         .map(|header| String::from_utf8_lossy(&header.value).into_owned());
-    let crawl_html = session.is_browser_bound && is_html_content_type(mime.as_deref());
+    let crawl_html =
+        session.is_browser_bound && !suppress_crawl && is_html_content_type(mime.as_deref());
     let mut captured = 0u64;
     let mut truncated = false;
     let mut completion = CompletionState::Complete;
@@ -910,6 +928,7 @@ mod tests {
         let crawler = Arc::new(crate::crawler::CrawlerService::new(
             db.clone(),
             reply.clone(),
+            browser.clone(),
             events.clone(),
         ));
         let state = Arc::new(AppState {
@@ -1020,6 +1039,19 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[test]
+    fn internal_crawler_marker_is_private_and_browser_bound() {
+        let mut browser_headers = http::HeaderMap::new();
+        browser_headers.insert("x-huntproxy-internal-crawler", "1".parse().unwrap());
+        assert!(take_internal_crawler_marker(&mut browser_headers, true));
+        assert!(!browser_headers.contains_key("x-huntproxy-internal-crawler"));
+
+        let mut external_headers = http::HeaderMap::new();
+        external_headers.insert("x-huntproxy-internal-crawler", "1".parse().unwrap());
+        assert!(!take_internal_crawler_marker(&mut external_headers, false));
+        assert!(!external_headers.contains_key("x-huntproxy-internal-crawler"));
+    }
+
     #[tokio::test]
     async fn downstream_disconnect_finalizes_partial_evidence_and_cleans_spools() {
         let directory = tempfile::tempdir().unwrap();
@@ -1047,6 +1079,7 @@ mod tests {
             1024,
             std::time::Instant::now(),
             true,
+            false,
         )
         .unwrap();
         let mut body = response.into_body();
@@ -1103,6 +1136,7 @@ mod tests {
             1024,
             std::time::Instant::now(),
             true,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1152,6 +1186,7 @@ mod tests {
             1024,
             std::time::Instant::now(),
             false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1200,6 +1235,7 @@ mod tests {
             1024,
             std::time::Instant::now(),
             true,
+            false,
         )
         .unwrap();
         assert_eq!(

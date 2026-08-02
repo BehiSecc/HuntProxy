@@ -13,8 +13,8 @@ use rusqlite::{Transaction, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-const EXCHANGE_ACCOUNTING_OVERHEAD: u64 = 512;
-const HEADER_ACCOUNTING_OVERHEAD: u64 = 64;
+pub(crate) const EXCHANGE_ACCOUNTING_OVERHEAD: u64 = 512;
+pub(crate) const HEADER_ACCOUNTING_OVERHEAD: u64 = 64;
 
 const HISTORY_SELECT: &str =
     "SELECT exchange_id, source, started_at, duration_ms, method, scheme, authority, host, port, path, query,
@@ -852,6 +852,45 @@ fn insert_exchange_record_conn(
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
     }
 
+    let request_bytes = nonnegative_length(req_len);
+    let response_bytes = nonnegative_length(resp_len);
+    let header_bytes =
+        ex.request_headers
+            .iter()
+            .chain(&ex.response_headers)
+            .fold(0_u64, |total, header| {
+                total
+                    .saturating_add(header.name.len() as u64)
+                    .saturating_add(header.value.len() as u64)
+            });
+    let accounted_bytes = estimated_exchange_bytes(&ex, req_len, resp_len);
+    let changed = conn
+        .execute(
+            "UPDATE project_usage SET
+                exchange_count=exchange_count+1,
+                request_body_bytes=request_body_bytes+?1,
+                response_body_bytes=response_body_bytes+?2,
+                header_bytes=header_bytes+?3,
+                accounted_bytes=accounted_bytes+?4,
+                updated_at=?5
+             WHERE project_id=?6",
+            params![
+                as_i64(request_bytes),
+                as_i64(response_bytes),
+                as_i64(header_bytes),
+                as_i64(accounted_bytes),
+                now_rfc3339(),
+                ex.project_id.get(),
+            ],
+        )
+        .map_err(storage_error)?;
+    if changed != 1 {
+        return Err(DomainError::new(
+            ErrorCode::StorageError,
+            "project usage counter missing; run `HuntProxy project reconcile`",
+        ));
+    }
+
     Ok(exchange_id)
 }
 
@@ -861,15 +900,17 @@ fn enforce_project_disk_quota(
     request_length: Option<i64>,
     response_length: Option<i64>,
 ) -> DomainResult<()> {
-    let limits_json: String = conn
+    let (limits_json, current_usage): (String, i64) = conn
         .query_row(
-            "SELECT limits_json FROM projects WHERE id=?1",
+            "SELECT p.limits_json, u.accounted_bytes
+             FROM projects p JOIN project_usage u ON u.project_id=p.id
+             WHERE p.id=?1",
             params![ex.project_id.get()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|error| match error {
             rusqlite::Error::QueryReturnedNoRows => {
-                DomainError::not_found(format!("project {}", ex.project_id.get()))
+                crate::storage::lifecycle::missing_usage_or_project(conn, ex.project_id)
             }
             other => storage_error(other),
         })?;
@@ -880,40 +921,7 @@ fn enforce_project_disk_quota(
         )
     })?;
 
-    let exchange_usage: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(
-                ?2 + COALESCE(request_length, 0) + COALESCE(response_length, 0)
-                + length(CAST(protocol AS BLOB))
-                + length(CAST(method AS BLOB))
-                + length(CAST(scheme AS BLOB))
-                + length(CAST(authority AS BLOB))
-                + length(CAST(host AS BLOB))
-                + length(CAST(path AS BLOB))
-                + COALESCE(length(CAST(query AS BLOB)), 0)
-                + COALESCE(length(CAST(mime AS BLOB)), 0)
-                + COALESCE(length(CAST(transport_profile AS BLOB)), 0)
-                + COALESCE(length(CAST(page_title AS BLOB)), 0)
-                + COALESCE(length(CAST(error_message AS BLOB)), 0)
-            ), 0)
-             FROM exchanges WHERE project_id=?1",
-            params![ex.project_id.get(), EXCHANGE_ACCOUNTING_OVERHEAD as i64],
-            |row| row.get(0),
-        )
-        .map_err(storage_error)?;
-    let header_usage: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(
-                ?2 + length(CAST(name AS BLOB)) + length(value)
-            ), 0)
-             FROM message_headers WHERE project_id=?1",
-            params![ex.project_id.get(), HEADER_ACCOUNTING_OVERHEAD as i64],
-            |row| row.get(0),
-        )
-        .map_err(storage_error)?;
-    let current_usage = u64::try_from(exchange_usage)
-        .unwrap_or(u64::MAX)
-        .saturating_add(u64::try_from(header_usage).unwrap_or(u64::MAX));
+    let current_usage = u64::try_from(current_usage).unwrap_or(u64::MAX);
     let incoming_usage = estimated_exchange_bytes(ex, request_length, response_length);
     let projected_usage = current_usage.saturating_add(incoming_usage);
     if projected_usage > limits.max_disk_bytes {
@@ -973,6 +981,10 @@ fn nonnegative_length(value: Option<i64>) -> u64 {
     value
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(0)
+}
+
+fn as_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn alloc_exchange_id(

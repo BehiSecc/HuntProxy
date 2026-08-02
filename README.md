@@ -75,8 +75,9 @@ project without clearing its state. `browser_manage` status can omit
 `session_id` to list active project browsers. Use `op: "reset_profile"` with
 `confirm: true` to clear browser-derived state; cookies configured with the
 `cookies` tool remain separately managed and should also be cleared for a
-complete logout. After one hour without MCP/UI
-control activity, the MCP bridge and daemon exit and browser processes close.
+complete logout. After one hour without MCP/UI control activity, an MCP
+auto-started daemon exits and its browser processes close. A daemon started
+explicitly with `HuntProxy serve` stays running until stopped.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
 
@@ -135,10 +136,11 @@ included or loaded them. `get_words` builds a target-specific wordlist from
 saved traffic and includes JavaScript related to the requested site by default;
 set `include_js: false` to omit it.
 
-Browser-loaded HTML is crawled one level in the background: HuntProxy follows
-at most 64 discovered links/assets with four concurrent GETs. These requests
-are saved into History and Sitemap only when their destinations match capture
-scope; excluded hosts are never crawled.
+Browser-loaded HTML is crawled one level in the background: HuntProxy fetches
+passive assets and same-origin, query-free navigations that do not look
+state-changing, with at most 64 candidates and four concurrent GETs. When an
+authenticated browser session is available, matching same-origin requests use
+that browser context. Crawling still obeys capture scope and exclusions.
 
 Use `huntproxy_stop` to gracefully close HuntProxy and its browsers;
 restart the MCP client (or run `HuntProxy serve`) when you want to use it again.
@@ -163,12 +165,20 @@ Project maintenance is available in the UI and CLI:
 ```bash
 HuntProxy project rename 1 "Acme portal"
 HuntProxy project usage 1
+HuntProxy project reconcile 1
 HuntProxy project export 1 ./acme-project.json
 HuntProxy project import ./acme-project.json
 HuntProxy history clear 1 --before 2026-01-01T00:00:00Z
 HuntProxy backup ./huntproxy-backup.sqlite3
 HuntProxy project delete 1
 ```
+
+Usage is maintained transactionally. `project reconcile` recalculates counters
+from saved history after an interrupted migration or suspected inconsistency;
+omit the project ID to reconcile every project.
+
+Web/API imports have a configured request-size cap. For large project archives,
+use `HuntProxy project import <file>` so the HTTP envelope is not the limit.
 
 Exports contain project configuration, raw captured traffic, annotations,
 labels, and findings. Managed cookie profiles and transient browser, fuzzer,

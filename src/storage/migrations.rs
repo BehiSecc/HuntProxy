@@ -29,6 +29,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "007_browser_session_title",
         include_str!("../../migrations/007_browser_session_title.sql"),
     ),
+    (
+        "008_project_usage",
+        include_str!("../../migrations/008_project_usage.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {

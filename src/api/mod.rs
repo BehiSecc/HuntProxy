@@ -6,7 +6,7 @@ use crate::fuzzer::FuzzTemplate;
 use crate::history::parse_text_query;
 use crate::policy::PresentationOptions;
 use crate::storage::CreateCaptureSession;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -117,25 +117,40 @@ pub async fn serve_uds_listener(
 
 pub fn router(state: Arc<AppState>) -> Router {
     let activity_state = state.clone();
+    const SMALL_BODY_LIMIT: usize = 128 * 1024;
+    let payload_body_limit = api_payload_body_limit(state.config.max_body_bytes);
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/version", get(version))
-        .route("/api/v1/projects", get(list_projects).post(create_project))
-        .route("/api/v1/projects/import", post(import_project))
+        .route(
+            "/api/v1/projects",
+            get(list_projects)
+                .post(create_project)
+                .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            "/api/v1/projects/import",
+            post(import_project).layer(DefaultBodyLimit::max(payload_body_limit)),
+        )
         .route(
             "/api/v1/projects/{id}",
             get(get_project)
                 .patch(rename_project)
-                .delete(delete_project),
+                .delete(delete_project)
+                .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route("/api/v1/projects/{id}/usage", get(project_usage))
         .route("/api/v1/projects/{id}/export", get(export_project))
-        .route("/api/v1/projects/{id}/scope", post(update_project_scope))
+        .route(
+            "/api/v1/projects/{id}/scope",
+            post(update_project_scope).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
         .route(
             "/api/v1/projects/{id}/cookies",
             get(list_project_cookies)
                 .put(set_project_cookie)
-                .delete(clear_project_cookie),
+                .delete(clear_project_cookie)
+                .layer(DefaultBodyLimit::max(payload_body_limit)),
         )
         .route(
             "/api/v1/projects/{id}/capture-sessions",
@@ -157,7 +172,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/projects/{id}/words", get(get_words))
         .route(
             "/api/v1/projects/{id}/findings",
-            get(list_findings).post(create_finding),
+            get(list_findings)
+                .post(create_finding)
+                .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route(
             "/api/v1/projects/{id}/findings/{fid}",
@@ -166,7 +183,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/projects/{id}/exchanges/{eid}", get(get_exchange))
         .route(
             "/api/v1/projects/{id}/exchanges/{eid}/annotation",
-            get(get_annotation).post(upsert_annotation),
+            get(get_annotation)
+                .post(upsert_annotation)
+                .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route("/api/v1/projects/{id}/exchanges/{eid}/body", get(get_body))
         .route(
@@ -179,13 +198,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/projects/{id}/reply-tabs",
-            get(list_reply_tabs).post(upsert_reply_tab),
+            get(list_reply_tabs)
+                .post(upsert_reply_tab)
+                .layer(DefaultBodyLimit::max(payload_body_limit)),
         )
-        .route("/api/v1/projects/{id}/reply-send", post(reply_send))
-        .route("/api/v1/projects/{id}/reply-send-raw", post(reply_send_raw))
+        .route(
+            "/api/v1/projects/{id}/reply-send",
+            post(reply_send).layer(DefaultBodyLimit::max(payload_body_limit)),
+        )
+        .route(
+            "/api/v1/projects/{id}/reply-send-raw",
+            post(reply_send_raw).layer(DefaultBodyLimit::max(payload_body_limit)),
+        )
         .route(
             "/api/v1/projects/{id}/fuzz-jobs",
-            get(list_fuzz_jobs).post(start_fuzz),
+            get(list_fuzz_jobs)
+                .post(start_fuzz)
+                .layer(DefaultBodyLimit::max(payload_body_limit)),
         )
         .route(
             "/api/v1/projects/{id}/fuzz-jobs/{jid}/cancel",
@@ -197,11 +226,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/projects/{id}/browser-sessions",
-            get(browser_status).post(start_browser),
+            get(browser_status)
+                .post(start_browser)
+                .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route(
             "/api/v1/projects/{id}/browser-sessions/{bid}/action",
-            post(browser_action),
+            post(browser_action).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route(
             "/api/v1/projects/{id}/browser-sessions/{bid}/stop",
@@ -213,7 +244,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/projects/{id}/events", get(events))
         .route("/api/v1/doctor", get(doctor))
-        .route("/api/v1/codec", post(codec_transform))
+        .route(
+            "/api/v1/codec",
+            post(codec_transform).layer(DefaultBodyLimit::max(payload_body_limit)),
+        )
         .route("/", get(ui_index))
         .layer(axum::middleware::from_fn_with_state(
             activity_state,
@@ -237,12 +271,25 @@ async fn track_control_activity(
 }
 
 fn private_router(state: Arc<AppState>) -> Router {
+    let payload_body_limit = api_payload_body_limit(state.config.max_body_bytes);
     router(state.clone()).merge(
         Router::new()
-            .route("/internal/mcp/call", post(internal_mcp_call))
+            .route(
+                "/internal/mcp/call",
+                post(internal_mcp_call).layer(DefaultBodyLimit::max(payload_body_limit)),
+            )
             .route("/internal/shutdown", post(internal_shutdown))
             .with_state(state),
     )
+}
+
+fn api_payload_body_limit(max_body_bytes: u64) -> usize {
+    // Raw byte vectors may arrive as JSON integer arrays (up to roughly 4x
+    // their decoded size), while base64/text representations are smaller.
+    usize::try_from(max_body_bytes)
+        .unwrap_or(usize::MAX / 5)
+        .saturating_mul(5)
+        .max(128 * 1024)
 }
 
 async fn internal_shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {

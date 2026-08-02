@@ -73,6 +73,37 @@ async fn json_response(response: axum::response::Response) -> serde_json::Value 
 }
 
 #[tokio::test]
+async fn api_body_limits_are_route_specific() {
+    let (_directory, state, project_id) = test_state().await;
+    let app = bb::api::router(state);
+    let large_text = "x".repeat(140 * 1024);
+    let rename = serde_json::json!({ "name": large_text }).to_string();
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::patch(format!("/api/v1/projects/{}", project_id.get()))
+                .header("content-type", "application/json")
+                .body(Body::from(rename))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let codec = serde_json::json!({ "steps": ["raw"], "input_text": large_text }).to_string();
+    let accepted = app
+        .oneshot(
+            Request::post("/api/v1/codec")
+                .header("content-type", "application/json")
+                .body(Body::from(codec))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn history_filter_and_annotation_work_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let get_id = state
@@ -416,6 +447,15 @@ async fn background_crawler_fetches_one_level_and_obeys_scope_exclusions() {
         )
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/app.css"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/css")
+                .set_body_string("body { color: black; }"),
+        )
+        .mount(&server)
+        .await;
 
     let (_directory, state, project_id) = test_state().await;
     let base = url::Url::parse(&server.uri()).unwrap();
@@ -448,7 +488,15 @@ async fn background_crawler_fetches_one_level_and_obeys_scope_exclusions() {
         format!(
             r#"<a href="{}/about">About</a>
                 <script src="{}/app.js"></script>
+                <link rel="stylesheet" href="{}/app.css">
+                <form action="{}/delete-account"></form>
+                <a href="{}/logout">Log out</a>
+                <a href="{}/search?q=test">Search</a>
                 <a href="http://localhost:{port}/excluded">Excluded</a>"#,
+            server.uri(),
+            server.uri(),
+            server.uri(),
+            server.uri(),
             server.uri(),
             server.uri(),
         )
@@ -481,12 +529,19 @@ async fn background_crawler_fetches_one_level_and_obeys_scope_exclusions() {
     assert!(requests
         .iter()
         .any(|request| request.url.path() == "/about"));
+    assert!(requests
+        .iter()
+        .any(|request| request.url.path() == "/app.css"));
     assert!(!requests
         .iter()
         .any(|request| request.url.path() == "/app.js"));
     assert!(!requests
         .iter()
         .any(|request| request.url.path() == "/excluded"));
+    assert!(!requests.iter().any(|request| matches!(
+        request.url.path(),
+        "/delete-account" | "/logout" | "/search"
+    )));
 
     let (scripts, _) = state
         .db

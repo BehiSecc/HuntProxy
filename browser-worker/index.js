@@ -784,6 +784,67 @@ async function handle(req) {
         if (!session) throw rpcError(-32001, "session not found");
         return respond(id, { files: [...(session.javascriptFiles?.values() || [])] });
       }
+      case "session.authenticated_fetch": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        let target;
+        try {
+          target = new URL(String(params.url || ""));
+        } catch {
+          throw rpcError(-32602, "url must be a valid HTTP URL");
+        }
+        if (!new Set(["http:", "https:"]).has(target.protocol)) {
+          throw rpcError(-32602, "url must use HTTP or HTTPS");
+        }
+        let pageOrigin;
+        try {
+          pageOrigin = new URL(session.page.url()).origin;
+        } catch {
+          return respond(id, { used: false, cookie_count: 0 });
+        }
+        // Page fetch preserves the browser's actual proxy, cookies, Origin,
+        // Referer, and network fingerprint. Cross-origin candidates use the
+        // regular crawler transport rather than fighting CORS/preflights.
+        if (pageOrigin !== target.origin) {
+          return respond(id, { used: false, cookie_count: 0 });
+        }
+        const cookies = await session.context.cookies([target.href]);
+        const status = await session.page.evaluate(async (url) => {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 15_000);
+          try {
+            const response = await fetch(url, {
+              credentials: "include",
+              redirect: "follow",
+              headers: { "x-huntproxy-internal-crawler": "1" },
+              signal: controller.signal,
+            });
+            const reader = response.body?.getReader();
+            let received = 0;
+            let truncated = false;
+            while (reader) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              received += value?.byteLength || 0;
+              if (received > 8 * 1024 * 1024) {
+                truncated = true;
+                await reader.cancel();
+                break;
+              }
+            }
+            return { status: response.status, truncated };
+          } finally {
+            clearTimeout(timeout);
+          }
+        }, target.href);
+        return respond(id, {
+          used: true,
+          cookie_count: cookies.length,
+          status: status.status,
+          truncated: status.truncated,
+        });
+      }
       case "session.migrate_to_chromium": {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);

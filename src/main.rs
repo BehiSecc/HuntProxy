@@ -66,13 +66,32 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ProjectCmd {
-    Create { name: String, target_url: String },
+    Create {
+        name: String,
+        target_url: String,
+    },
     List,
-    Rename { id: i64, name: String },
-    Delete { id: i64 },
-    Usage { id: i64 },
-    Export { id: i64, output: PathBuf },
-    Import { input: PathBuf },
+    Rename {
+        id: i64,
+        name: String,
+    },
+    Delete {
+        id: i64,
+    },
+    Usage {
+        id: i64,
+    },
+    /// Recalculate persisted usage counters (all projects when ID is omitted).
+    Reconcile {
+        id: Option<i64>,
+    },
+    Export {
+        id: i64,
+        output: PathBuf,
+    },
+    Import {
+        input: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -134,9 +153,11 @@ async fn run(cli: Cli) -> DomainResult<()> {
             Ok(())
         }
         Commands::Serve { foreground: _ } => {
-            let cfg = Config::load(cli.data_dir)?;
+            let mut cfg = Config::load(cli.data_dir)?;
             bb::mcp::clear_stop_guard(&cfg);
-            let mirror_to_stderr = std::env::var_os("HUNTPROXY_DAEMONIZED").is_none();
+            let auto_started = std::env::var_os("HUNTPROXY_DAEMONIZED").is_some();
+            configure_daemon_mode(&mut cfg, auto_started);
+            let mirror_to_stderr = !auto_started;
             init_daemon_logging(&cfg.log_level, cfg.daemon_log_path(), mirror_to_stderr);
             // Ensure CA exists
             if !cfg.ca_cert_path().exists() {
@@ -271,6 +292,28 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     let value = daemon_get(&cfg, &format!("/api/v1/projects/{id}/usage")).await?;
                     println!("{value}");
                 }
+                ProjectCmd::Reconcile { id } => {
+                    let db = bb::storage::Db::open(&cfg).await?;
+                    let project_ids = match id {
+                        Some(id) => vec![bb::domain::ProjectId(id)],
+                        None => db
+                            .list_projects()
+                            .await?
+                            .into_iter()
+                            .map(|project| project.id)
+                            .collect(),
+                    };
+                    for project_id in project_ids {
+                        let result = db.reconcile_project_usage(project_id).await?;
+                        println!(
+                            "project {}: {} -> {} bytes{}",
+                            project_id.get(),
+                            result.previous_accounted_bytes,
+                            result.accounted_bytes,
+                            if result.changed { " (repaired)" } else { "" }
+                        );
+                    }
+                }
                 ProjectCmd::Export { id, output } => {
                     let db = bb::storage::Db::open(&cfg).await?;
                     let archive = db.export_project(bb::domain::ProjectId(id)).await?;
@@ -376,6 +419,12 @@ fn init_logging(level: &str) {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+fn configure_daemon_mode(config: &mut Config, auto_started: bool) {
+    if !auto_started {
+        config.idle_timeout_seconds = 0;
+    }
 }
 
 fn init_logging_stderr(level: &str) {
@@ -691,5 +740,22 @@ mod tests {
                 .len(),
             MAX_DAEMON_LOG_BYTES
         );
+    }
+
+    #[test]
+    fn explicitly_started_daemon_has_no_idle_shutdown() {
+        let mut explicit = Config {
+            idle_timeout_seconds: 3600,
+            ..Config::default()
+        };
+        configure_daemon_mode(&mut explicit, false);
+        assert_eq!(explicit.idle_timeout_seconds, 0);
+
+        let mut automatic = Config {
+            idle_timeout_seconds: 3600,
+            ..Config::default()
+        };
+        configure_daemon_mode(&mut automatic, true);
+        assert_eq!(automatic.idle_timeout_seconds, 3600);
     }
 }

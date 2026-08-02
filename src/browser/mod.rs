@@ -962,6 +962,40 @@ impl BrowserService {
             .clone()
     }
 
+    /// Fetch a crawler candidate through the browser's cookie-sharing request
+    /// context. Returns false when the session is inactive or has no cookies
+    /// for this URL, allowing the crawler to use its regular HTTP transport.
+    pub async fn authenticated_background_fetch(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        url: &str,
+    ) -> DomainResult<bool> {
+        let parsed = url::Url::parse(url)
+            .map_err(|error| DomainError::invalid(format!("invalid crawler URL: {error}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(DomainError::invalid("crawler URL must use HTTP or HTTPS"));
+        }
+        let active = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .is_some_and(|runtime| runtime.project_id == project_id);
+        if !active {
+            return Ok(false);
+        }
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
+        let result = self
+            .call_worker(
+                "session.authenticated_fetch",
+                json!({ "session_id": session_id.get(), "url": url }),
+            )
+            .await?;
+        Ok(result.get("used").and_then(Value::as_bool).unwrap_or(false))
+    }
+
     async fn save_cookie_checkpoint(
         &self,
         project_id: ProjectId,

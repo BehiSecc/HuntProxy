@@ -28,6 +28,14 @@ pub struct ProjectUsage {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ReconcileUsageResult {
+    pub project_id: ProjectId,
+    pub previous_accounted_bytes: u64,
+    pub accounted_bytes: u64,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ClearHistoryResult {
     pub project_id: ProjectId,
     pub deleted_exchanges: u64,
@@ -80,39 +88,44 @@ impl Db {
     pub async fn project_usage(&self, project_id: ProjectId) -> DomainResult<ProjectUsage> {
         let database_file_bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         self.with_conn(move |conn| {
-            let limits_json: String = conn
+            let (limits_json, count, request, response, headers, accounted): (
+                String,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+            ) = conn
                 .query_row(
-                    "SELECT limits_json FROM projects WHERE id=?1",
+                    "SELECT p.limits_json, u.exchange_count, u.request_body_bytes,
+                            u.response_body_bytes, u.header_bytes, u.accounted_bytes
+                     FROM projects p JOIN project_usage u ON u.project_id=p.id
+                     WHERE p.id=?1",
                     params![project_id.get()],
-                    |row| row.get(0),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
-                .map_err(not_found_project(project_id))?;
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        missing_usage_or_project(conn, project_id)
+                    }
+                    other => storage_error(other.to_string()),
+                })?;
             let limits: ProjectLimits = serde_json::from_str(&limits_json)
-                .map_err(|error| storage_error(error.to_string()))?;
-            let (count, request, response): (i64, i64, i64) = conn
-                .query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(request_length),0), COALESCE(SUM(response_length),0)
-                     FROM exchanges WHERE project_id=?1",
-                    params![project_id.get()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .map_err(|error| storage_error(error.to_string()))?;
-            let headers: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(length(CAST(name AS BLOB)) + length(value)),0)
-                     FROM message_headers WHERE project_id=?1",
-                    params![project_id.get()],
-                    |row| row.get(0),
-                )
                 .map_err(|error| storage_error(error.to_string()))?;
             let exchange_count = count.max(0) as u64;
             let request_body_bytes = request.max(0) as u64;
             let response_body_bytes = response.max(0) as u64;
             let header_bytes = headers.max(0) as u64;
-            let approximate_total_bytes = request_body_bytes
-                .saturating_add(response_body_bytes)
-                .saturating_add(header_bytes)
-                .saturating_add(exchange_count.saturating_mul(512));
+            let approximate_total_bytes = accounted.max(0) as u64;
             Ok(ProjectUsage {
                 project_id,
                 exchange_count,
@@ -123,6 +136,22 @@ impl Db {
                 database_file_bytes,
                 max_disk_bytes: limits.max_disk_bytes,
             })
+        })
+        .await
+    }
+
+    pub async fn reconcile_project_usage(
+        &self,
+        project_id: ProjectId,
+    ) -> DomainResult<ReconcileUsageResult> {
+        self.with_conn(move |conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|error| storage_error(error.to_string()))?;
+            let result = reconcile_project_usage_conn(&tx, project_id)?;
+            tx.commit()
+                .map_err(|error| storage_error(error.to_string()))?;
+            Ok(result)
         })
         .await
     }
@@ -182,6 +211,7 @@ impl Db {
                 [],
             )
             .map_err(|error| storage_error(error.to_string()))?;
+            reconcile_project_usage_conn(&tx, project_id)?;
             tx.commit()
                 .map_err(|error| storage_error(error.to_string()))?;
             Ok(ClearHistoryResult {
@@ -465,6 +495,99 @@ impl Db {
     }
 }
 
+pub(crate) fn reconcile_project_usage_conn(
+    conn: &rusqlite::Connection,
+    project_id: ProjectId,
+) -> DomainResult<ReconcileUsageResult> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
+            params![project_id.get()],
+            |row| row.get(0),
+        )
+        .map_err(|error| storage_error(error.to_string()))?;
+    if !exists {
+        return Err(DomainError::not_found(format!(
+            "project {}",
+            project_id.get()
+        )));
+    }
+    let previous: i64 = conn
+        .query_row(
+            "SELECT accounted_bytes FROM project_usage WHERE project_id=?1",
+            params![project_id.get()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| storage_error(error.to_string()))?
+        .unwrap_or(0);
+    let (count, request, response, exchange_accounted): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(request_length),0),
+                    COALESCE(SUM(response_length),0),
+                    COALESCE(SUM(
+                        ?2 + COALESCE(request_length,0) + COALESCE(response_length,0)
+                        + length(CAST(protocol AS BLOB)) + length(CAST(method AS BLOB))
+                        + length(CAST(scheme AS BLOB)) + length(CAST(authority AS BLOB))
+                        + length(CAST(host AS BLOB)) + length(CAST(path AS BLOB))
+                        + COALESCE(length(CAST(query AS BLOB)),0)
+                        + COALESCE(length(CAST(mime AS BLOB)),0)
+                        + COALESCE(length(CAST(transport_profile AS BLOB)),0)
+                        + COALESCE(length(CAST(page_title AS BLOB)),0)
+                        + COALESCE(length(CAST(error_message AS BLOB)),0)
+                    ),0)
+             FROM exchanges WHERE project_id=?1",
+            params![
+                project_id.get(),
+                crate::storage::exchanges::EXCHANGE_ACCOUNTING_OVERHEAD as i64
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| storage_error(error.to_string()))?;
+    let (header_bytes, header_accounted): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(length(CAST(name AS BLOB)) + length(value)),0),
+                    COALESCE(SUM(?2 + length(CAST(name AS BLOB)) + length(value)),0)
+             FROM message_headers WHERE project_id=?1",
+            params![
+                project_id.get(),
+                crate::storage::exchanges::HEADER_ACCOUNTING_OVERHEAD as i64
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| storage_error(error.to_string()))?;
+    let accounted = exchange_accounted.saturating_add(header_accounted).max(0);
+    conn.execute(
+        "INSERT INTO project_usage (
+            project_id, exchange_count, request_body_bytes, response_body_bytes,
+            header_bytes, accounted_bytes, updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(project_id) DO UPDATE SET
+            exchange_count=excluded.exchange_count,
+            request_body_bytes=excluded.request_body_bytes,
+            response_body_bytes=excluded.response_body_bytes,
+            header_bytes=excluded.header_bytes,
+            accounted_bytes=excluded.accounted_bytes,
+            updated_at=excluded.updated_at",
+        params![
+            project_id.get(),
+            count.max(0),
+            request.max(0),
+            response.max(0),
+            header_bytes.max(0),
+            accounted,
+            now_rfc3339(),
+        ],
+    )
+    .map_err(|error| storage_error(error.to_string()))?;
+    Ok(ReconcileUsageResult {
+        project_id,
+        previous_accounted_bytes: previous.max(0) as u64,
+        accounted_bytes: accounted as u64,
+        changed: previous != accounted,
+    })
+}
+
 fn load_archived_annotation(
     conn: &rusqlite::Connection,
     project_id: ProjectId,
@@ -527,12 +650,24 @@ fn storage_error(message: impl Into<String>) -> DomainError {
     DomainError::new(ErrorCode::StorageError, message.into())
 }
 
-fn not_found_project(project_id: ProjectId) -> impl FnOnce(rusqlite::Error) -> DomainError {
-    move |error| match error {
-        rusqlite::Error::QueryReturnedNoRows => {
-            DomainError::not_found(format!("project {}", project_id.get()))
-        }
-        other => storage_error(other.to_string()),
+pub(crate) fn missing_usage_or_project(
+    conn: &rusqlite::Connection,
+    project_id: ProjectId,
+) -> DomainError {
+    let exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
+            params![project_id.get()],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if exists {
+        DomainError::new(
+            ErrorCode::StorageError,
+            "project usage counter missing; run `HuntProxy project reconcile`",
+        )
+    } else {
+        DomainError::not_found(format!("project {}", project_id.get()))
     }
 }
 
@@ -612,6 +747,39 @@ mod tests {
             db.project_usage(project.id).await.unwrap().exchange_count,
             1
         );
+        let original_accounted = db
+            .project_usage(project.id)
+            .await
+            .unwrap()
+            .approximate_total_bytes;
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE project_usage SET accounted_bytes=1 WHERE project_id=?1",
+                params![project.id.get()],
+            )
+            .map_err(|error| storage_error(error.to_string()))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let repaired = db.reconcile_project_usage(project.id).await.unwrap();
+        assert!(repaired.changed);
+        assert_eq!(repaired.previous_accounted_bytes, 1);
+        assert_eq!(repaired.accounted_bytes, original_accounted);
+        db.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM project_usage WHERE project_id=?1",
+                params![project.id.get()],
+            )
+            .map_err(|error| storage_error(error.to_string()))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let missing = db.project_usage(project.id).await.unwrap_err();
+        assert_eq!(missing.code(), ErrorCode::StorageError);
+        assert!(missing.to_string().contains("project reconcile"));
+        db.reconcile_project_usage(project.id).await.unwrap();
         let archive = db.export_project(project.id).await.unwrap();
         let imported = db.import_project(archive).await.unwrap();
         assert_eq!(

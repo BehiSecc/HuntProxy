@@ -35,18 +35,28 @@ impl Db {
         let ts = now_rfc3339();
 
         self.with_conn(move |conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                DomainError::new(ErrorCode::StorageError, e.to_string())
+            })?;
+            tx.execute(
                 "INSERT INTO projects (name, target_url, created_at, updated_at, scope_json, limits_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![name, target_url, ts, ts, scope_json, limits_json],
             )
             .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-            let id = conn.last_insert_rowid();
-            conn.execute(
+            let id = tx.last_insert_rowid();
+            tx.execute(
                 "INSERT INTO project_seq (project_id, next_exchange_id) VALUES (?1, 1)",
                 params![id],
             )
             .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+            tx.execute(
+                "INSERT INTO project_usage (project_id, updated_at) VALUES (?1, ?2)",
+                params![id, ts],
+            )
+            .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+            tx.commit()
+                .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             Ok(Project {
                 id: ProjectId(id),
                 name,

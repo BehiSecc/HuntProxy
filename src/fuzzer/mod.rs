@@ -483,10 +483,14 @@ async fn run_job(
 ) -> DomainResult<()> {
     db.set_fuzz_job_state(project_id, job_id, FuzzJobState::Running, None)
         .await?;
+    // Wordlists are only needed by the case iterator. Move them out before
+    // sharing the remaining request template so neither this setup nor each
+    // concurrent case duplicates potentially multi-megabyte payload lists.
+    let (template, wordlists) = share_execution_template(template);
     let mut cases = CaseIterator::new(
         template.strategy,
         template.insertion_points.len(),
-        template.wordlists.clone(),
+        wordlists,
     );
     let mut running = FuturesUnordered::new();
     let mut exhausted = false;
@@ -546,21 +550,26 @@ async fn run_job(
     }
 }
 
+fn share_execution_template(mut template: FuzzTemplate) -> (Arc<FuzzTemplate>, Vec<Vec<String>>) {
+    let wordlists = std::mem::take(&mut template.wordlists);
+    (Arc::new(template), wordlists)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_case(
     db: Arc<Db>,
     reply: Arc<ReplyService>,
     project_id: ProjectId,
     job_id: FuzzJobId,
-    template: FuzzTemplate,
+    template: Arc<FuzzTemplate>,
     case: FuzzCasePayloads,
     limiter: Arc<ProjectFuzzLimiter>,
     cancel: CancellationToken,
 ) -> DomainResult<()> {
-    let prepared = prepare_case(&template, &case);
-    let payloads = match &prepared {
-        Ok(prepared) => prepared.payloads.clone(),
-        Err(error) => error.payloads.clone(),
+    let mut prepared = prepare_case(&template, &case);
+    let payloads = match &mut prepared {
+        Ok(prepared) => std::mem::take(&mut prepared.payloads),
+        Err(error) => std::mem::take(&mut error.payloads),
     };
     let persisted = db
         .create_fuzz_case(project_id, job_id, case.index, payloads)
@@ -1040,6 +1049,26 @@ mod tests {
         assert_eq!(cases.len(), 4);
         assert_eq!(cases[0].values, vec![Some("a".into()), Some("1".into())]);
         assert_eq!(cases[3].values, vec![Some("b".into()), Some("2".into())]);
+    }
+
+    #[test]
+    fn execution_template_moves_wordlists_instead_of_cloning_them() {
+        let payload = "x".repeat(1024 * 1024);
+        let template = FuzzTemplate {
+            wordlists: vec![vec![payload]],
+            ..serde_json::from_value(serde_json::json!({
+                "draft": {"url": "https://example.test/?q=§q§"},
+                "insertion_points": [{"name": "q", "location": "url"}]
+            }))
+            .unwrap()
+        };
+        let payload_ptr = template.wordlists[0][0].as_ptr();
+
+        let (shared, wordlists) = share_execution_template(template);
+
+        assert!(shared.wordlists.is_empty());
+        assert_eq!(wordlists[0][0].as_ptr(), payload_ptr);
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 
     #[test]

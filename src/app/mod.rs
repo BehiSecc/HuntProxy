@@ -271,6 +271,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
     let crawler = Arc::new(CrawlerService::new(
         db.clone(),
         reply.clone(),
+        browser.clone(),
         events.clone(),
     ));
     Ok(Arc::new(AppState {
