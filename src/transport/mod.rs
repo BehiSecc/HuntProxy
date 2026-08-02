@@ -1,17 +1,21 @@
 //! Semantic outbound HTTP transport.
 //!
-//! The primary path uses Wreq's pinned Chrome-compatible protocol profile. Both
-//! the primary and fallback paths use the addresses resolved for each send;
-//! neither transport silently performs a second DNS lookup.
+//! The primary path uses Wreq's pinned Chrome-compatible protocol profile.
+//! Short-lived clients reuse connections only while the approved address set
+//! and policy epoch remain unchanged; the resolver never performs a hidden
+//! second DNS lookup.
 
 use crate::domain::{DomainError, DomainResult, ErrorCode, TransportProvenance, ValidatedDial};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use wreq::dns::Resolve;
@@ -56,7 +60,7 @@ pub struct OutboundRequest {
     pub preserve_identity_headers: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolMode {
     Auto,
     Http1,
@@ -153,14 +157,133 @@ impl Resolve for ApprovedResolver {
     }
 }
 
-/// Chrome-profiled semantic egress. A client is built per request because the
-/// resolved DNS answer is request-specific. This prevents a pooled connection
-/// from silently surviving a new resolution.
-pub struct WreqTransport;
+const CLIENT_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_CACHED_CLIENTS: usize = 64;
+const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClientKey {
+    hostname: String,
+    port: u16,
+    scheme: String,
+    addresses: Vec<std::net::SocketAddr>,
+    policy_epoch: u64,
+    protocol: ProtocolMode,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+}
+
+impl ClientKey {
+    fn new(dial: &ValidatedDial, req: &OutboundRequest) -> Self {
+        let mut addresses = dial.approved_socket_addrs.clone();
+        addresses.sort_unstable();
+        addresses.dedup();
+        Self {
+            hostname: dial.hostname.trim_end_matches('.').to_ascii_lowercase(),
+            port: dial.port,
+            scheme: dial.scheme.to_ascii_lowercase(),
+            addresses,
+            policy_epoch: dial.policy_epoch,
+            protocol: req.protocol,
+            connect_timeout: req.connect_timeout,
+            total_timeout: req.total_timeout,
+        }
+    }
+
+    fn same_origin(&self, other: &Self) -> bool {
+        self.hostname == other.hostname && self.port == other.port && self.scheme == other.scheme
+    }
+
+    fn same_resolution_and_policy(&self, other: &Self) -> bool {
+        self.addresses == other.addresses && self.policy_epoch == other.policy_epoch
+    }
+}
+
+struct CachedClient {
+    client: wreq::Client,
+    created_at: Instant,
+    expires_at: Instant,
+}
+
+/// Chrome-profiled semantic egress with a small, short-lived connection pool.
+/// Cache entries are pinned to the validated DNS answer and policy epoch.
+/// A changed answer or policy immediately drops older clients for that origin.
+pub struct WreqTransport {
+    clients: Mutex<HashMap<ClientKey, CachedClient>>,
+}
 
 impl WreqTransport {
     pub fn new() -> Self {
-        Self
+        Self {
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn client_for(
+        &self,
+        dial: &ValidatedDial,
+        req: &OutboundRequest,
+    ) -> DomainResult<wreq::Client> {
+        let resolver = ApprovedResolver::new(dial)?;
+        let key = ClientKey::new(dial, req);
+        let now = Instant::now();
+        let dns_ttl = (dial.expires_at - time::OffsetDateTime::now_utc())
+            .try_into()
+            .unwrap_or(Duration::ZERO);
+        let ttl = CLIENT_CACHE_TTL.min(dns_ttl);
+        let mut clients = self.clients.lock();
+        clients.retain(|cached_key, cached| {
+            cached.expires_at > now
+                && (!cached_key.same_origin(&key)
+                    || (!ttl.is_zero() && cached_key.same_resolution_and_policy(&key)))
+        });
+        if let Some(cached) = clients.get(&key) {
+            return Ok(cached.client.clone());
+        }
+
+        let mut builder = wreq::Client::builder()
+            .no_proxy()
+            .redirect(wreq::redirect::Policy::none())
+            .connect_timeout(req.connect_timeout)
+            .timeout(req.total_timeout)
+            .pool_idle_timeout(ttl.max(Duration::from_millis(1)))
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
+            .pool_max_size(MAX_CACHED_CLIENTS)
+            .dns_resolver(resolver)
+            .emulation(Emulation::Chrome147);
+
+        builder = match req.protocol {
+            ProtocolMode::Auto => builder,
+            ProtocolMode::Http1 => builder.http1_only(),
+            ProtocolMode::Http2 => builder.http2_only(),
+        };
+        let client = builder.build().map_err(|error| {
+            DomainError::new(
+                ErrorCode::ProtocolError,
+                format!("transport build: {error}"),
+            )
+        })?;
+
+        if !ttl.is_zero() {
+            if clients.len() >= MAX_CACHED_CLIENTS {
+                if let Some(oldest) = clients
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.created_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    clients.remove(&oldest);
+                }
+            }
+            clients.insert(
+                key,
+                CachedClient {
+                    client: client.clone(),
+                    created_at: now,
+                    expires_at: now + ttl,
+                },
+            );
+        }
+        Ok(client)
     }
 }
 
@@ -198,25 +321,7 @@ impl SemanticTransport for WreqTransport {
         dial: &ValidatedDial,
         req: OutboundRequest,
     ) -> DomainResult<StreamingOutboundResponse> {
-        let resolver = ApprovedResolver::new(dial)?;
-        let mut builder = wreq::Client::builder()
-            .no_proxy()
-            .redirect(wreq::redirect::Policy::none())
-            .connect_timeout(req.connect_timeout)
-            .timeout(req.total_timeout)
-            .pool_max_idle_per_host(0)
-            .dns_resolver(resolver)
-            .emulation(Emulation::Chrome147);
-
-        builder = match req.protocol {
-            ProtocolMode::Auto => builder,
-            ProtocolMode::Http1 => builder.http1_only(),
-            ProtocolMode::Http2 => builder.http2_only(),
-        };
-
-        let client = builder.build().map_err(|e| {
-            DomainError::new(ErrorCode::ProtocolError, format!("transport build: {e}"))
-        })?;
+        let client = self.client_for(dial, &req)?;
 
         let mut request = client.request(req.method.clone(), &req.url);
         let body_len = req.body.len();
@@ -403,6 +508,134 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("refused DNS fallback"));
+    }
+
+    fn cache_request() -> OutboundRequest {
+        OutboundRequest {
+            method: Method::GET,
+            url: "https://cache.test/".into(),
+            headers: vec![],
+            body: OutboundBody::Empty,
+            protocol: ProtocolMode::Auto,
+            connect_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(5),
+            max_body_bytes: 1024,
+            preserve_identity_headers: true,
+        }
+    }
+
+    fn cache_dial(address: &str, policy_epoch: u64) -> ValidatedDial {
+        ValidatedDial {
+            hostname: "cache.test".into(),
+            port: 443,
+            approved_socket_addrs: vec![address.parse().unwrap()],
+            policy_epoch,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+            scheme: "https".into(),
+            path: "/".into(),
+        }
+    }
+
+    #[test]
+    fn client_cache_reuses_only_the_same_resolution_and_policy() {
+        let transport = WreqTransport::new();
+        let request = cache_request();
+        let first = cache_dial("192.0.2.10:443", 1);
+        transport.client_for(&first, &request).unwrap();
+        let first_created = transport.clients.lock().values().next().unwrap().created_at;
+        transport.client_for(&first, &request).unwrap();
+        let clients = transport.clients.lock();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients.values().next().unwrap().created_at, first_created);
+        drop(clients);
+
+        let changed_dns = cache_dial("192.0.2.11:443", 1);
+        transport.client_for(&changed_dns, &request).unwrap();
+        let clients = transport.clients.lock();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(
+            clients.keys().next().unwrap().addresses,
+            vec!["192.0.2.11:443".parse().unwrap()]
+        );
+        drop(clients);
+
+        let changed_policy = cache_dial("192.0.2.11:443", 2);
+        transport.client_for(&changed_policy, &request).unwrap();
+        let clients = transport.clients.lock();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients.keys().next().unwrap().policy_epoch, 2);
+    }
+
+    #[test]
+    fn expired_dns_approval_is_never_cached_or_reused() {
+        let transport = WreqTransport::new();
+        let request = cache_request();
+        let current = cache_dial("192.0.2.10:443", 1);
+        transport.client_for(&current, &request).unwrap();
+        assert_eq!(transport.clients.lock().len(), 1);
+
+        let mut expired = current;
+        expired.expires_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        transport.client_for(&expired, &request).unwrap();
+        assert!(transport.clients.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn short_lived_pool_reuses_a_live_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let server_connections = connections.clone();
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                server_connections.fetch_add(1, Ordering::SeqCst);
+                let server_requests = server_requests.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_: Request<hyper::body::Incoming>| {
+                        let server_requests = server_requests.clone();
+                        async move {
+                            server_requests.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(true)
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let dial = ValidatedDial {
+            hostname: "pool.test".into(),
+            port: address.port(),
+            approved_socket_addrs: vec![address],
+            policy_epoch: 1,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+            scheme: "http".into(),
+            path: "/".into(),
+        };
+        let request = || OutboundRequest {
+            method: Method::GET,
+            url: format!("http://pool.test:{}/", address.port()),
+            headers: vec![],
+            body: OutboundBody::Empty,
+            protocol: ProtocolMode::Http1,
+            connect_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(2),
+            max_body_bytes: 1024,
+            preserve_identity_headers: true,
+        };
+        let transport = WreqTransport::new();
+        assert_eq!(transport.send(&dial, request()).await.unwrap().body, "ok");
+        assert_eq!(transport.send(&dial, request()).await.unwrap().body, "ok");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]
