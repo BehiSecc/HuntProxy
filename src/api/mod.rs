@@ -6,11 +6,13 @@ use crate::fuzzer::FuzzTemplate;
 use crate::history::parse_text_query;
 use crate::policy::PresentationOptions;
 use crate::storage::CreateCaptureSession;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use futures::StreamExt;
@@ -141,9 +143,34 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/projects/{id}/usage", get(project_usage))
         .route("/api/v1/projects/{id}/export", get(export_project))
+        .route("/api/v1/projects/{id}/bundle", get(export_bundle))
+        .route(
+            "/api/v1/projects/{id}/har",
+            get(export_har)
+                .post(import_har)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/api/v1/projects/import-bundle",
+            post(import_bundle).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/api/v1/projects/{id}/scope",
             post(update_project_scope).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            "/api/v1/projects/{id}/request-rules",
+            get(list_request_rules)
+                .post(create_request_rule)
+                .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            "/api/v1/projects/{id}/request-rules/preview",
+            post(preview_request_rules).layer(DefaultBodyLimit::max(payload_body_limit)),
+        )
+        .route(
+            "/api/v1/projects/{id}/request-rules/{rid}",
+            patch(update_request_rule).delete(delete_request_rule),
         )
         .route(
             "/api/v1/projects/{id}/cookies",
@@ -179,6 +206,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/projects/{id}/findings/{fid}",
             delete(delete_finding),
+        )
+        .route(
+            "/api/v1/projects/{id}/exchanges/compare",
+            get(compare_exchanges),
         )
         .route("/api/v1/projects/{id}/exchanges/{eid}", get(get_exchange))
         .route(
@@ -223,6 +254,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/projects/{id}/fuzz-jobs/{jid}/cases",
             get(list_fuzz_cases),
+        )
+        .route(
+            "/api/v1/projects/{id}/fuzz-jobs/{jid}/groups",
+            get(list_fuzz_groups),
+        )
+        .route(
+            "/api/v1/projects/{id}/fuzz-jobs/{jid}/cases/{case_id}/diff",
+            get(fuzz_case_diff),
+        )
+        .route(
+            "/api/v1/projects/{id}/websockets",
+            get(list_websocket_connections),
+        )
+        .route(
+            "/api/v1/projects/{id}/websockets/{wid}/messages",
+            get(list_websocket_messages),
+        )
+        .route(
+            "/api/v1/projects/{id}/websockets/{wid}/send",
+            post(send_websocket_message).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route(
             "/api/v1/projects/{id}/browser-sessions",
@@ -447,6 +498,176 @@ async fn import_project(
 }
 
 #[derive(Deserialize)]
+struct BundleQuery {
+    include_secrets: Option<bool>,
+    include_chromium_profile: Option<bool>,
+}
+
+async fn export_bundle(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<BundleQuery>,
+) -> Response {
+    let include_secrets = query.include_secrets.unwrap_or(false);
+    let include_chromium_profile = query.include_chromium_profile.unwrap_or(false);
+    if include_chromium_profile && !include_secrets {
+        return error_response(DomainError::invalid(
+            "Chromium profile export requires include_secrets=true",
+        ));
+    }
+    let path = state.config.export_dir.join(format!(
+        "huntproxy-project-{id}-{}.huntproxy",
+        uuid::Uuid::new_v4()
+    ));
+    match state
+        .db
+        .export_bundle(
+            &state.config,
+            ProjectId(id),
+            path.clone(),
+            crate::transfer::BundleExportOptions {
+                secrets: if include_secrets {
+                    crate::transfer::SecretMode::Full
+                } else {
+                    crate::transfer::SecretMode::Sanitized
+                },
+                include_chromium_profile,
+            },
+        )
+        .await
+    {
+        Ok(_) => match tokio::fs::File::open(&path).await {
+            Ok(file) => {
+                let mut reader = tokio_util::io::ReaderStream::new(file);
+                let cleanup = DeleteOnDrop(path.clone());
+                let stream = async_stream::stream! {
+                    while let Some(chunk) = reader.next().await {
+                        yield chunk;
+                    }
+                    drop(cleanup);
+                };
+                let name = format!("huntproxy-project-{id}.huntproxy");
+                let mut response = Body::from_stream(stream).into_response();
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    "application/vnd.huntproxy.project+zstd".parse().unwrap(),
+                );
+                response.headers_mut().insert(
+                    CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{name}\"").parse().unwrap(),
+                );
+                response
+            }
+            Err(error) => {
+                error_response(DomainError::new(ErrorCode::StorageError, error.to_string()))
+            }
+        },
+        Err(error) => error_response(error),
+    }
+}
+
+async fn import_bundle(State(state): State<Arc<AppState>>, body: Body) -> Response {
+    let path = state
+        .config
+        .runtime_dir
+        .join(format!("bundle-upload-{}.huntproxy", uuid::Uuid::new_v4()));
+    match stream_body_to_file(body, &path, crate::transfer::MAX_BUNDLE_UPLOAD_BYTES).await {
+        Ok(()) => {
+            let result = state
+                .db
+                .import_bundle(&state.config, path.clone(), None)
+                .await;
+            let _ = tokio::fs::remove_file(path).await;
+            match result {
+                Ok(result) => (StatusCode::CREATED, Json(result)).into_response(),
+                Err(error) => error_response(error),
+            }
+        }
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct HarQuery {
+    include_secrets: Option<bool>,
+}
+
+async fn export_har(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<HarQuery>,
+) -> Response {
+    match state
+        .db
+        .export_har(ProjectId(id), query.include_secrets.unwrap_or(false))
+        .await
+    {
+        Ok(har) => Json(har).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn import_har(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    body: Body,
+) -> Response {
+    let path = state
+        .config
+        .runtime_dir
+        .join(format!("har-upload-{}.har", uuid::Uuid::new_v4()));
+    match stream_body_to_file(body, &path, crate::har::MAX_HAR_FILE_BYTES).await {
+        Ok(()) => {
+            let result = state.db.import_har_file(ProjectId(id), &path).await;
+            let _ = tokio::fs::remove_file(path).await;
+            match result {
+                Ok(result) => Json(result).into_response(),
+                Err(error) => error_response(error),
+            }
+        }
+        Err(error) => error_response(error),
+    }
+}
+
+async fn stream_body_to_file(
+    body: Body,
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> DomainResult<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = body.into_data_stream();
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| DomainError::invalid(format!("upload body: {error}")))?;
+        written = written.saturating_add(chunk.len() as u64);
+        if written > max_bytes {
+            let _ = tokio::fs::remove_file(path).await;
+            return Err(DomainError::invalid("upload exceeds size limit"));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+    }
+    file.flush()
+        .await
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+}
+
+struct DeleteOnDrop(std::path::PathBuf);
+
+impl Drop for DeleteOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Deserialize)]
 struct SetCookieBody {
     target_url: String,
     cookie: String,
@@ -500,6 +721,88 @@ async fn update_project_scope(
         .await
     {
         Ok(project) => Json(project).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn list_request_rules(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match state.db.list_request_rules(ProjectId(id)).await {
+        Ok(rules) => Json(serde_json::json!({ "rules": rules })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn create_request_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(input): Json<crate::request_rules::RequestRuleInput>,
+) -> Response {
+    match state.db.create_request_rule(ProjectId(id), input).await {
+        Ok(rule) => (StatusCode::CREATED, Json(rule)).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn update_request_rule(
+    State(state): State<Arc<AppState>>,
+    Path((id, rid)): Path<(i64, i64)>,
+    Json(input): Json<crate::request_rules::RequestRuleInput>,
+) -> Response {
+    match state
+        .db
+        .update_request_rule(ProjectId(id), rid, input)
+        .await
+    {
+        Ok(rule) => Json(rule).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn delete_request_rule(
+    State(state): State<Arc<AppState>>,
+    Path((id, rid)): Path<(i64, i64)>,
+) -> Response {
+    match state.db.delete_request_rule(ProjectId(id), rid).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RequestRulePreviewBody {
+    url: String,
+    #[serde(default)]
+    headers: Vec<RequestRulePreviewHeader>,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct RequestRulePreviewHeader {
+    name: String,
+    value: String,
+}
+
+async fn preview_request_rules(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RequestRulePreviewBody>,
+) -> Response {
+    let headers = body
+        .headers
+        .into_iter()
+        .map(|header| (header.name, header.value.into_bytes()))
+        .collect();
+    match crate::request_rules::preview(
+        &state.db,
+        ProjectId(id),
+        body.url,
+        headers,
+        body.body.into_bytes(),
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
         Err(error) => error_response(error),
     }
 }
@@ -768,6 +1071,35 @@ async fn delete_finding(
     }
 }
 
+#[derive(Deserialize)]
+struct CompareExchangesQuery {
+    left: i64,
+    right: i64,
+    #[serde(default)]
+    include_noisy_headers: bool,
+}
+
+async fn compare_exchanges(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<CompareExchangesQuery>,
+) -> Response {
+    match crate::compare::compare_saved_exchanges(
+        &state.db,
+        ProjectId(id),
+        ExchangeId(query.left),
+        ExchangeId(query.right),
+        crate::compare::CompareOptions {
+            include_noisy_headers: query.include_noisy_headers,
+        },
+    )
+    .await
+    {
+        Ok(comparison) => Json(comparison).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
 async fn get_exchange(
     State(state): State<Arc<AppState>>,
     Path((id, eid)): Path<(i64, i64)>,
@@ -791,6 +1123,14 @@ async fn get_exchange(
                 Ok(annotation) => annotation,
                 Err(error) => return error_response(error),
             };
+            let applied_rules = match state
+                .db
+                .list_exchange_request_rules(ProjectId(id), ExchangeId(eid))
+                .await
+            {
+                Ok(rules) => rules,
+                Err(error) => return error_response(error),
+            };
             let mut value = match serde_json::to_value(detail) {
                 Ok(value) => value,
                 Err(error) => {
@@ -802,6 +1142,10 @@ async fn get_exchange(
             };
             if let Some(object) = value.as_object_mut() {
                 object.insert("annotation".into(), serde_json::json!(annotation));
+                object.insert(
+                    "applied_request_rules".into(),
+                    serde_json::json!(applied_rules),
+                );
             }
             Json(value).into_response()
         }
@@ -1237,6 +1581,7 @@ async fn cancel_fuzz(
 struct FuzzCasesQuery {
     limit: Option<u32>,
     before_case_index: Option<u64>,
+    group_id: Option<String>,
 }
 
 async fn list_fuzz_cases(
@@ -1244,21 +1589,158 @@ async fn list_fuzz_cases(
     Path((id, jid)): Path<(i64, i64)>,
     Query(query): Query<FuzzCasesQuery>,
 ) -> Response {
-    match state
-        .fuzzer
-        .list_cases(
-            ProjectId(id),
-            FuzzJobId(jid),
-            query.limit.unwrap_or(100).min(500),
-            query.before_case_index,
-        )
-        .await
-    {
+    let result = if let Some(group_id) = query.group_id {
+        state
+            .fuzzer
+            .list_group_cases(
+                ProjectId(id),
+                FuzzJobId(jid),
+                group_id,
+                query.limit.unwrap_or(100).min(500),
+                query.before_case_index,
+            )
+            .await
+    } else {
+        state
+            .fuzzer
+            .list_cases(
+                ProjectId(id),
+                FuzzJobId(jid),
+                query.limit.unwrap_or(100).min(500),
+                query.before_case_index,
+            )
+            .await
+    };
+    match result {
         Ok((cases, next)) => Json(serde_json::json!({
             "cases": cases,
             "next_before_case_index": next,
         }))
         .into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn list_fuzz_groups(
+    State(state): State<Arc<AppState>>,
+    Path((id, jid)): Path<(i64, i64)>,
+) -> Response {
+    match state
+        .fuzzer
+        .list_response_groups(ProjectId(id), FuzzJobId(jid))
+        .await
+    {
+        Ok(groups) => Json(serde_json::json!({ "groups": groups })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct FuzzDiffQuery {
+    baseline_case_id: Option<i64>,
+    #[serde(default)]
+    include_text: bool,
+}
+
+async fn fuzz_case_diff(
+    State(state): State<Arc<AppState>>,
+    Path((id, jid, case_id)): Path<(i64, i64, i64)>,
+    Query(query): Query<FuzzDiffQuery>,
+) -> Response {
+    match state
+        .fuzzer
+        .response_diff(
+            ProjectId(id),
+            FuzzJobId(jid),
+            case_id,
+            query.baseline_case_id,
+            query.include_text,
+        )
+        .await
+    {
+        Ok(diff) => Json(diff).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct WebSocketListQuery {
+    limit: Option<u32>,
+}
+
+async fn list_websocket_connections(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<WebSocketListQuery>,
+) -> Response {
+    match state
+        .db
+        .list_websocket_connections(ProjectId(id), query.limit.unwrap_or(100))
+        .await
+    {
+        Ok(connections) => Json(serde_json::json!({ "connections": connections })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct WebSocketMessagesQuery {
+    after_id: Option<i64>,
+    limit: Option<u32>,
+}
+
+async fn list_websocket_messages(
+    State(state): State<Arc<AppState>>,
+    Path((id, wid)): Path<(i64, i64)>,
+    Query(query): Query<WebSocketMessagesQuery>,
+) -> Response {
+    match state
+        .db
+        .list_websocket_messages(
+            ProjectId(id),
+            wid,
+            query.after_id,
+            query.limit.unwrap_or(250),
+        )
+        .await
+    {
+        Ok(messages) => Json(serde_json::json!({ "messages": messages })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SendWebSocketMessage {
+    direction: String,
+    #[serde(default = "default_websocket_encoding")]
+    encoding: String,
+    payload: String,
+}
+
+fn default_websocket_encoding() -> String {
+    "text".into()
+}
+
+async fn send_websocket_message(
+    State(state): State<Arc<AppState>>,
+    Path((id, wid)): Path<(i64, i64)>,
+    Json(body): Json<SendWebSocketMessage>,
+) -> Response {
+    let to_server = match body.direction.as_str() {
+        "to_server" => true,
+        "to_client" => false,
+        _ => {
+            return error_response(DomainError::invalid(
+                "direction must be to_server or to_client",
+            ))
+        }
+    };
+    match state
+        .websocket
+        .send(ProjectId(id), wid, to_server, &body.encoding, &body.payload)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) => error_response(error),
     }
 }

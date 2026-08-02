@@ -120,6 +120,13 @@ or local UTF-8 `wordlist_files`, with one payload per line. Native
 mutations without requiring Python. Regex bypass defaults to URL-encoded byte
 mutations at the start, around separators, at the end, and in place of regex
 metacharacters (REcollapse by André Baptista, MIT).
+`request_rules` applies ordered, optional-host URL, header, and text-body
+match/replace rules to semantic traffic; Raw Reply remains exact. Fuzzer
+results are grouped by response signature and can be compared with the base or
+another case through `fuzz_manage`. Use `exchange_compare` for a bounded,
+secret-safe request/response diff between any two History entries.
+`websocket_manage` lists intercepted WebSocket connections and frames and can
+inject text or binary messages in either direction while a connection is live.
 The `sitemap` tool returns sorted routes for every saved host or one requested
 host. The `findings` tool links a title and description to an exchange and can
 list or remove those findings. `copy_as` converts any saved request to cURL or
@@ -166,8 +173,11 @@ Project maintenance is available in the UI and CLI:
 HuntProxy project rename 1 "Acme portal"
 HuntProxy project usage 1
 HuntProxy project reconcile 1
-HuntProxy project export 1 ./acme-project.json
-HuntProxy project import ./acme-project.json
+HuntProxy project export 1 ./acme-project.huntproxy
+HuntProxy project export 1 ./acme-full.huntproxy --include-secrets
+HuntProxy project import ./acme-project.huntproxy
+HuntProxy har export 1 ./acme-history.har
+HuntProxy har import 1 ./acme-history.har
 HuntProxy history clear 1 --before 2026-01-01T00:00:00Z
 HuntProxy backup ./huntproxy-backup.sqlite3
 HuntProxy project delete 1
@@ -177,13 +187,12 @@ Usage is maintained transactionally. `project reconcile` recalculates counters
 from saved history after an interrupted migration or suspected inconsistency;
 omit the project ID to reconcile every project.
 
-Web/API imports have a configured request-size cap. For large project archives,
-use `HuntProxy project import <file>` so the HTTP envelope is not the limit.
-
-Exports contain project configuration, raw captured traffic, annotations,
-labels, and findings. Managed cookie profiles and transient browser, fuzzer,
-and Reply state are excluded, but captured headers and bodies can still contain
-credentials or cookies. Treat exports and SQLite backups as sensitive files.
+Portable `.huntproxy` exports are sanitized by default. Add `--include-secrets`
+for a complete logical project including captured credentials, managed cookies,
+Reply/Fuzzer state, and the portable browser checkpoint. Add
+`--include-chromium-profile` only when a best-effort, same-platform Chromium
+profile is also required. Full exports and SQLite backups must be treated as
+sensitive files. HAR 1.2 transfer is intentionally limited to HTTP history.
 
 `HuntProxy serve` stays in the foreground. In the UI, create a project and a
 Proxy credential before sending traffic through `127.0.0.1:17891`.

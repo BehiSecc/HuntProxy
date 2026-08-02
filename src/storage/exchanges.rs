@@ -72,6 +72,84 @@ pub struct JavascriptProvenanceInput {
 }
 
 impl Db {
+    pub async fn set_static_page_title(
+        &self,
+        project_id: ProjectId,
+        exchange_id: ExchangeId,
+        title: String,
+    ) -> DomainResult<bool> {
+        self.with_conn(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE exchanges SET page_title=?1
+                     WHERE project_id=?2 AND exchange_id=?3 AND page_title IS NULL",
+                    params![title, project_id.get(), exchange_id.get()],
+                )
+                .map_err(storage_error)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Attach a rendered main-page title to the newest matching managed-browser
+    /// HTML document. Exact URL/session matching prevents titles leaking onto
+    /// subresources or another browser workspace.
+    pub async fn associate_browser_page_title(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        page_url: &str,
+        title: &str,
+    ) -> DomainResult<bool> {
+        let parsed = url::Url::parse(page_url)
+            .map_err(|error| DomainError::invalid(format!("invalid browser page URL: {error}")))?;
+        let Some(host) = parsed.host_str().map(str::to_ascii_lowercase) else {
+            return Ok(false);
+        };
+        let Some(port) = parsed.port_or_known_default() else {
+            return Ok(false);
+        };
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Ok(false);
+        }
+        let path = parsed.path().to_string();
+        let query = parsed.query().unwrap_or_default().to_string();
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title = title.chars().take(1024).collect::<String>();
+        if title.is_empty() {
+            return Ok(false);
+        }
+        self.with_conn(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE exchanges SET page_title=?1
+                     WHERE project_id=?2 AND exchange_id=(
+                       SELECT exchange_id FROM exchanges
+                       WHERE project_id=?2 AND browser_session_id=?3
+                         AND lower(scheme)=?4 AND lower(host)=?5 AND port=?6
+                         AND path=?7 AND COALESCE(query,'')=?8
+                         AND (lower(COALESCE(mime,'')) LIKE 'text/html%'
+                              OR lower(COALESCE(mime,'')) LIKE 'application/xhtml+xml%')
+                       ORDER BY exchange_id DESC LIMIT 1
+                     )",
+                    params![
+                        title,
+                        project_id.get(),
+                        session_id.get(),
+                        scheme,
+                        host,
+                        port,
+                        path,
+                        query
+                    ],
+                )
+                .map_err(storage_error)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     /// Remove URLs already present in project history while preserving the
     /// caller's order. Used by the background crawler to avoid duplicating
     /// resources the browser loaded itself.
@@ -1036,6 +1114,7 @@ fn source_str(s: ExchangeSource) -> &'static str {
         ExchangeSource::Reply => "reply",
         ExchangeSource::Fuzzer => "fuzzer",
         ExchangeSource::Proxy => "proxy",
+        ExchangeSource::Imported => "imported",
     }
 }
 pub(crate) fn parse_source(s: &str) -> ExchangeSource {
@@ -1043,6 +1122,7 @@ pub(crate) fn parse_source(s: &str) -> ExchangeSource {
         "browser" => ExchangeSource::Browser,
         "reply" => ExchangeSource::Reply,
         "fuzzer" => ExchangeSource::Fuzzer,
+        "imported" => ExchangeSource::Imported,
         _ => ExchangeSource::Proxy,
     }
 }
@@ -1599,5 +1679,72 @@ mod tests {
         assert_eq!(storage_counts(&db, project.id).await, (0, 0, 0, 1));
         assert!(request_path.exists());
         assert!(response_path.exists());
+    }
+
+    #[tokio::test]
+    async fn rendered_title_association_matches_session_url_and_html_only() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "titles".into(),
+                target_url: "https://example.com/app?a=1".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let session = db
+            .create_browser_session(project.id, BrowserEngine::Lightpanda, EnginePolicy::Auto)
+            .await
+            .unwrap();
+        let mut document = spool_exchange(project.id);
+        document.host = "example.com".into();
+        document.authority = "example.com".into();
+        document.path = "/app".into();
+        document.query = Some("a=1".into());
+        document.mime = Some("text/html; charset=utf-8".into());
+        document.lineage.browser_session_id = Some(session.id);
+        let document_id = db.insert_exchange(document).await.unwrap();
+        let mut asset = spool_exchange(project.id);
+        asset.host = "example.com".into();
+        asset.authority = "example.com".into();
+        asset.path = "/app".into();
+        asset.query = Some("a=1".into());
+        asset.mime = Some("application/javascript".into());
+        asset.lineage.browser_session_id = Some(session.id);
+        let asset_id = db.insert_exchange(asset).await.unwrap();
+
+        assert!(db
+            .associate_browser_page_title(
+                project.id,
+                session.id,
+                "https://example.com/app?a=1",
+                "  Rendered   title ",
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_exchange_detail(
+                project.id,
+                document_id,
+                crate::policy::PresentationOptions::default(),
+            )
+            .await
+            .unwrap()
+            .summary
+            .page_title
+            .as_deref(),
+            Some("Rendered title")
+        );
+        assert!(db
+            .get_exchange_detail(
+                project.id,
+                asset_id,
+                crate::policy::PresentationOptions::default(),
+            )
+            .await
+            .unwrap()
+            .summary
+            .page_title
+            .is_none());
     }
 }

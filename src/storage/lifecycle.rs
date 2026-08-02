@@ -48,6 +48,8 @@ pub struct ProjectArchive {
     pub version: u32,
     pub exported_at: String,
     pub project: ArchivedProject,
+    #[serde(default)]
+    pub request_rules: Vec<crate::request_rules::RequestRule>,
     pub exchanges: Vec<ArchivedExchange>,
 }
 
@@ -69,6 +71,8 @@ pub struct ArchivedExchange {
     pub exchange: NewExchange,
     pub annotation: Option<ArchivedAnnotation>,
     pub findings: Vec<ArchivedFinding>,
+    #[serde(default)]
+    pub applied_request_rules: Vec<crate::request_rules::AppliedRequestRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +266,7 @@ impl Db {
 
     pub async fn export_project(&self, project_id: ProjectId) -> DomainResult<ProjectArchive> {
         let project = self.get_project(project_id).await?;
+        let request_rules = self.list_request_rules(project_id).await?;
         self.with_conn(move |conn| {
             let mut statement = conn
                 .prepare(
@@ -358,6 +363,11 @@ impl Db {
                     display_title,
                     annotation: load_archived_annotation(conn, project_id, ExchangeId(id))?,
                     findings: load_archived_findings(conn, project_id, ExchangeId(id))?,
+                    applied_request_rules: load_applied_request_rules(
+                        conn,
+                        project_id,
+                        ExchangeId(id),
+                    )?,
                     exchange: NewExchange {
                         project_id,
                         source: parse_source(&source),
@@ -405,6 +415,7 @@ impl Db {
                     default_browser_profile: project.default_browser_profile,
                     noise_policy: project.noise_policy,
                 },
+                request_rules,
                 exchanges,
             })
         })
@@ -431,6 +442,29 @@ impl Db {
             Some(archive.project.limits.clone()),
         )
         .await?;
+        let mut rule_ids = HashMap::new();
+        for rule in archive.request_rules {
+            let old_id = rule.id;
+            let created = self
+                .create_request_rule(
+                    project.id,
+                    crate::request_rules::RequestRuleInput {
+                        name: rule.name,
+                        enabled: rule.enabled,
+                        position: rule.position,
+                        host_pattern: rule.host_pattern,
+                        target: rule.target,
+                        operation: rule.operation,
+                        header_name: rule.header_name,
+                        match_kind: rule.match_kind,
+                        pattern: rule.pattern,
+                        replacement: rule.replacement,
+                        replace_all: rule.replace_all,
+                    },
+                )
+                .await?;
+            rule_ids.insert(old_id, created.id);
+        }
         archive
             .exchanges
             .sort_by_key(|item| item.original_exchange_id);
@@ -461,6 +495,18 @@ impl Db {
             exchange.lineage.browser_action_id = None;
             exchange.lineage.capture_session_id = None;
             let new_id = self.insert_exchange(exchange).await?;
+            self.record_exchange_request_rules(
+                project.id,
+                new_id,
+                item.applied_request_rules
+                    .into_iter()
+                    .map(|applied| crate::request_rules::AppliedRequestRule {
+                        id: rule_ids.get(&applied.id).copied().unwrap_or(applied.id),
+                        name: applied.name,
+                    })
+                    .collect(),
+            )
+            .await?;
             ids.insert(item.original_exchange_id, new_id.get());
             let timestamp = item.started_at.clone();
             let title = item.display_title.clone();
@@ -632,6 +678,29 @@ fn load_archived_findings(
             Ok(ArchivedFinding {
                 title: row.get(0)?,
                 description: row.get(1)?,
+            })
+        })
+        .map_err(|error| storage_error(error.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| storage_error(error.to_string()))
+}
+
+fn load_applied_request_rules(
+    conn: &rusqlite::Connection,
+    project_id: ProjectId,
+    exchange_id: ExchangeId,
+) -> DomainResult<Vec<crate::request_rules::AppliedRequestRule>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT rule_id, rule_name FROM exchange_request_rules
+             WHERE project_id=?1 AND exchange_id=?2 ORDER BY rule_id",
+        )
+        .map_err(|error| storage_error(error.to_string()))?;
+    let rows = statement
+        .query_map(params![project_id.get(), exchange_id.get()], |row| {
+            Ok(crate::request_rules::AppliedRequestRule {
+                id: row.get(0)?,
+                name: row.get(1)?,
             })
         })
         .map_err(|error| storage_error(error.to_string()))?;

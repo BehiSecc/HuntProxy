@@ -12,6 +12,7 @@ pub enum ExchangeSource {
     Reply,
     Fuzzer,
     Proxy,
+    Imported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

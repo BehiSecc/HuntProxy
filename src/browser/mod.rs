@@ -825,6 +825,7 @@ impl BrowserService {
         {
             tracing::warn!(%error, session_id = session.id.get(), "could not persist JavaScript provenance");
         }
+        schedule_page_title_association(self.db.clone(), &session);
         Ok(session)
     }
 
@@ -1127,6 +1128,7 @@ impl BrowserService {
         {
             tracing::warn!(%error, session_id = session_id.get(), "could not persist JavaScript provenance");
         }
+        schedule_page_title_association(self.db.clone(), &session);
 
         Ok(ActionResult {
             ok: result.get("ok").and_then(Value::as_bool).unwrap_or(true),
@@ -1457,6 +1459,7 @@ impl BrowserService {
         session.checkpoint_status = Some(migration_status);
         session.checkpoint_hash = Some(saved.hash);
         self.db.update_browser_session(&session).await?;
+        schedule_page_title_association(self.db.clone(), &session);
         Ok(session)
     }
 
@@ -1724,6 +1727,35 @@ impl BrowserService {
             .await?;
         Ok(checkpoint)
     }
+}
+
+fn schedule_page_title_association(db: Arc<Db>, session: &BrowserSession) {
+    let (Some(url), Some(title)) = (session.current_url.clone(), session.current_title.clone())
+    else {
+        return;
+    };
+    let project_id = session.project_id;
+    let session_id = session.id;
+    tokio::spawn(async move {
+        // Browser navigation and proxy response persistence finish on separate
+        // tasks. Retry briefly so either completion order produces a title.
+        for delay in [0, 50, 150, 400, 1_000, 2_500] {
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            match db
+                .associate_browser_page_title(project_id, session_id, &url, &title)
+                .await
+            {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(%error, session_id = session_id.get(), "could not associate browser page title");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn decode_checkpoint(value: &Value) -> DomainResult<Checkpoint> {

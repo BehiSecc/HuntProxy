@@ -139,10 +139,12 @@
     <nav aria-label="Workbench">
       <button type="button" data-view="history" class="active">History</button>
       <button type="button" data-view="sitemap">Sitemap</button>
+      <button type="button" data-view="rules">Rules</button>
       <button type="button" data-view="words">Get Words</button>
       <button type="button" data-view="findings">Findings</button>
       <button type="button" data-view="reply">Reply</button>
       <button type="button" data-view="fuzzer">Fuzzer</button>
+      <button type="button" data-view="websockets">WebSockets</button>
       <button type="button" data-view="browser">Browser</button>
       <button type="button" data-view="codec">Codec</button>
     </nav>
@@ -182,12 +184,14 @@
           <button class="btn danger" id="deleteProject">Delete</button>
         </div>
         <div class="row" style="margin-top:.4rem">
-          <button class="btn" id="exportProject">Export</button>
+          <button class="btn" id="exportProject">Export sanitized</button>
+          <button class="btn" id="exportProjectFull">Export full…</button>
+          <button class="btn" id="exportHar">HAR</button>
           <button class="btn" id="importProject">Import</button>
-          <input class="hidden" id="importProjectFile" type="file" accept="application/json,.json" />
+          <input class="hidden" id="importProjectFile" type="file" accept=".huntproxy,.har,.json,application/json" />
         </div>
         <div class="small muted" id="projectUsage" style="margin-top:.45rem"></div>
-        <p class="small muted">Exports include raw captured traffic and may contain credentials or cookies.</p>
+        <p class="small muted">Sanitized exports omit authentication state. Full exports contain credentials and browser state; keep them private.</p>
       </details>
 
       <h3>Session cookies</h3>
@@ -268,6 +272,15 @@
                 <button class="btn" id="analyzePage" disabled>Analyze page</button>
                 <label class="fit" style="margin:0"><input type="checkbox" id="copyRedactSecrets" style="width:auto" /> redact secrets</label>
               </div>
+              <details>
+                <summary>Compare exchange</summary>
+                <div class="row" style="margin-top:.5rem">
+                  <div><label for="compareExchangeId">Compare selected with ID</label><input id="compareExchangeId" type="number" min="1" placeholder="Exchange ID" /></div>
+                  <label class="fit" style="margin:0"><input type="checkbox" id="compareNoisy" style="width:auto" /> noisy headers</label>
+                  <button class="btn fit" id="compareExchange">Compare</button>
+                </div>
+                <pre class="mono hidden" id="compareOutput"></pre>
+              </details>
               <div class="card hidden" id="pageAnalysis">
                 <div class="status" id="pageAnalysisStats"></div>
                 <h3>Endpoints</h3><pre class="mono" id="pageAnalysisEndpoints">—</pre>
@@ -288,6 +301,23 @@
         <div class="status" id="sitemapStatus"></div>
         <div class="stack" id="sitemapHosts"></div>
         <div class="empty hidden" id="sitemapEmpty">No saved routes.</div>
+      </section>
+
+      <section id="view-rules" class="panel hidden">
+        <div class="split">
+          <div class="card">
+            <h2>Request match/replace</h2>
+            <p class="small muted">Applied to semantic Proxy, Browser, Reply, Fuzzer, and crawler requests. Raw Reply remains exact.</p>
+            <div class="row"><div><label for="ruleName">Name</label><input id="ruleName" placeholder="Set API version" /></div><div><label for="ruleHost">Host <span class="muted">(optional)</span></label><input id="ruleHost" placeholder="*.example.com" /></div></div>
+            <div class="row"><div><label for="ruleTarget">Target</label><select id="ruleTarget"><option value="url">URL</option><option value="header">Header</option><option value="body">Body</option></select></div><div><label for="ruleOperation">Action</label><select id="ruleOperation"><option value="replace">Replace</option><option value="set">Set header</option><option value="remove">Remove header</option></select></div><div><label for="ruleMatchKind">Match</label><select id="ruleMatchKind"><option value="literal">Literal</option><option value="regex">Regex</option></select></div></div>
+            <label for="ruleHeader">Header name</label><input id="ruleHeader" placeholder="X-Api-Version" />
+            <label for="rulePattern">Pattern</label><input id="rulePattern" />
+            <label for="ruleReplacement">Replacement</label><input id="ruleReplacement" />
+            <div class="row" style="margin-top:.55rem"><label class="fit" style="margin:0"><input id="ruleEnabled" type="checkbox" style="width:auto" checked /> enabled</label><label class="fit" style="margin:0"><input id="ruleAll" type="checkbox" style="width:auto" checked /> replace all</label><button class="btn primary fit" id="addRule">Add rule</button></div>
+            <div class="status" id="ruleStatus"></div>
+          </div>
+          <div><div class="row"><h2>Ordered rules</h2><button class="btn fit" id="refreshRules">Refresh</button></div><div class="stack" id="ruleList"></div><h3>Preview</h3><input id="rulePreviewUrl" placeholder="https://example.com/path" /><button class="btn" id="previewRules" style="margin-top:.4rem">Preview URL</button><pre class="mono" id="rulePreviewOutput">—</pre></div>
+        </div>
       </section>
 
       <section id="view-words" class="panel hidden">
@@ -403,8 +433,10 @@ test
           <div class="card">
             <div class="row"><h2 style="margin:0">Jobs</h2><button class="btn fit" id="refreshFuzz">Refresh</button></div>
             <div class="table-wrap"><table><thead><tr><th>ID</th><th>State</th><th>Progress</th><th>Failed</th><th>Action</th></tr></thead><tbody id="fuzzJobs"></tbody></table></div>
-            <h3>Selected job cases</h3>
-            <div class="table-wrap"><table><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Exchange</th><th>Error</th></tr></thead><tbody id="fuzzCases"></tbody></table></div>
+            <div class="row"><h3 style="margin:0">Selected job results</h3><div><button class="btn fit" id="showFuzzGroups">Groups</button> <button class="btn fit" id="showFuzzCases">All cases</button></div></div>
+            <div id="fuzzGroupsPanel" class="table-wrap"><table><thead><tr><th>Count</th><th>Status</th><th>MIME</th><th>Size</th><th>Timing</th></tr></thead><tbody id="fuzzGroups"></tbody></table></div>
+            <div id="fuzzCasesPanel" class="table-wrap hidden"><table><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Exchange</th><th>Action</th></tr></thead><tbody id="fuzzCases"></tbody></table></div>
+            <pre class="mono hidden" id="fuzzDiff"></pre>
           </div>
         </div>
       </section>
@@ -431,6 +463,26 @@ test
             <label for="browserLocator">Locator JSON</label><textarea id="browserLocator" style="min-height:60px" placeholder='{"role":"button","name":"Log in"}'></textarea>
             <button class="btn primary" id="runBrowserAction" disabled>Run action</button>
             <pre class="mono" id="browserOutput">—</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-websockets" class="panel hidden">
+        <div class="split">
+          <div class="card">
+            <div class="row"><h2 style="margin:0">Connections</h2><button class="btn fit" id="refreshWebSockets">Refresh</button></div>
+            <div class="status" id="websocketStatus">Captured WebSocket upgrades appear here.</div>
+            <div class="table-wrap"><table><thead><tr><th>ID</th><th>State</th><th>URL</th><th>Messages</th></tr></thead><tbody id="websocketConnections"></tbody></table></div>
+          </div>
+          <div class="card">
+            <h2>Messages</h2>
+            <div class="table-wrap"><table><thead><tr><th>ID</th><th>Direction</th><th>Type</th><th>Payload</th></tr></thead><tbody id="websocketMessages"></tbody></table></div>
+            <label for="websocketPayload">Inject message</label><textarea id="websocketPayload" class="mono" style="min-height:70px"></textarea>
+            <div class="row">
+              <select id="websocketDirection"><option value="to_server">To server</option><option value="to_client">To client</option></select>
+              <select id="websocketEncoding"><option value="text">Text</option><option value="base64">Base64 binary</option></select>
+              <button class="btn primary" id="sendWebSocket" disabled>Send</button>
+            </div>
           </div>
         </div>
       </section>
@@ -464,7 +516,10 @@ test
       replyTabs: [],
       activeReplyTab: null,
       selectedFuzzJob: null,
+      fuzzResultsMode: 'groups',
+      selectedFuzzGroup: null,
       browserSession: null,
+      websocketConnection: null,
       events: null,
       fuzzTimer: null,
       historyItems: [],
@@ -508,9 +563,11 @@ test
       document.querySelectorAll('.workspace > section').forEach(s => s.classList.toggle('hidden', s.id !== `view-${name}`));
       if (updateHash) history.replaceState(null, '', `#${name}`);
       if (name === 'sitemap') loadSitemap();
+      if (name === 'rules') loadRules();
       if (name === 'words') loadWords();
       if (name === 'findings') loadFindings();
       if (name === 'fuzzer') loadFuzzJobs();
+      if (name === 'websockets') loadWebSockets();
       if (name === 'browser') loadBrowserStatus();
     }
     document.querySelectorAll('nav button').forEach(b => b.onclick = () => activateView(b.dataset.view));
@@ -535,6 +592,7 @@ test
     async function projectChanged() {
       state.selectedExchange = null;
       state.selectedDetail = null;
+      state.websocketConnection = null;
       state.historyItems = [];
       state.historyCursor = null;
       state.historyTotal = 0;
@@ -558,7 +616,7 @@ test
       } catch (_) {}
       $('cookieValue').value = '';
       $('cookieFile').value = '';
-      await Promise.allSettled([loadHistory(), loadSitemap(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadBrowserStatus(), loadCookies(), loadProjectUsage()]);
+      await Promise.allSettled([loadHistory(), loadSitemap(), loadRules(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadWebSockets(), loadBrowserStatus(), loadCookies(), loadProjectUsage()]);
     }
 
     $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
@@ -604,20 +662,44 @@ test
         state.projectId = null; await loadProjects(); status('sideStatus', 'Project deleted', 'ok');
       } catch (error) { status('sideStatus', error.message, 'err'); }
     };
+    async function downloadProject(path, filename) {
+      const response = await fetch(path);
+      if (!response.ok) { let message = `HTTP ${response.status}`; try { message = (await response.json()).message || message; } catch (_) {} throw new Error(message); }
+      const blob = await response.blob();
+      const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; link.click(); URL.revokeObjectURL(link.href);
+    }
     $('exportProject').onclick = async () => {
       if (!state.projectId) return;
       try {
-        const archive = await api(`/api/v1/projects/${state.projectId}/export`);
-        const blob = new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' });
-        const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `huntproxy-project-${state.projectId}.json`; link.click(); URL.revokeObjectURL(link.href);
+        await downloadProject(`/api/v1/projects/${state.projectId}/bundle`, `huntproxy-project-${state.projectId}.huntproxy`);
       } catch (error) { status('sideStatus', error.message, 'err'); }
+    };
+    $('exportProjectFull').onclick = async () => {
+      if (!state.projectId || !confirm('Full export includes raw credentials, cookies, bodies, Reply/Fuzzer data, and portable browser state. Continue?')) return;
+      try { await downloadProject(`/api/v1/projects/${state.projectId}/bundle?include_secrets=true`, `huntproxy-project-${state.projectId}-full.huntproxy`); }
+      catch (error) { status('sideStatus', error.message, 'err'); }
+    };
+    $('exportHar').onclick = async () => {
+      if (!state.projectId) return;
+      try { await downloadProject(`/api/v1/projects/${state.projectId}/har`, `huntproxy-project-${state.projectId}.har`); }
+      catch (error) { status('sideStatus', error.message, 'err'); }
     };
     $('importProject').onclick = () => $('importProjectFile').click();
     $('importProjectFile').onchange = async event => {
       const file = event.target.files?.[0]; if (!file) return;
       try {
-        const project = await api('/api/v1/projects/import', { method: 'POST', body: await file.text() });
-        await loadProjects(project.id); status('sideStatus', 'Project imported', 'ok');
+        const lower = file.name.toLowerCase();
+        if (lower.endsWith('.har')) {
+          if (!state.projectId) throw new Error('Select a destination project before importing HAR');
+          const result = await api(`/api/v1/projects/${state.projectId}/har`, { method: 'POST', body: file });
+          await projectChanged(); status('sideStatus', `Imported ${result.imported_entries} HAR entries`, 'ok');
+        } else if (lower.endsWith('.json')) {
+          const project = await api('/api/v1/projects/import', { method: 'POST', body: await file.text() });
+          await loadProjects(project.id); status('sideStatus', 'Legacy project imported', 'ok');
+        } else {
+          const result = await api('/api/v1/projects/import-bundle', { method: 'POST', body: file, headers: { 'content-type': 'application/vnd.huntproxy.project+zstd' } });
+          await loadProjects(result.project.id); status('sideStatus', 'Project bundle imported', 'ok');
+        }
       } catch (error) { status('sideStatus', error.message, 'err'); }
       finally { event.target.value = ''; }
     };
@@ -704,12 +786,13 @@ test
       const source = new EventSource(`/api/v1/projects/${state.projectId}/events`);
       state.events = source;
       source.addEventListener('ready', () => { $('liveDot').classList.add('on'); $('liveText').textContent = 'live'; });
-      for (const event of ['exchange', 'annotation', 'finding', 'fuzz', 'browser', 'capture']) {
+      for (const event of ['exchange', 'annotation', 'finding', 'fuzz', 'browser', 'websocket', 'capture']) {
         source.addEventListener(event, () => {
           if (event === 'exchange' || event === 'annotation') loadHistory();
           if (event === 'finding') loadFindings();
           if (event === 'fuzz') loadFuzzJobs();
           if (event === 'browser') loadBrowserStatus();
+          if (event === 'websocket') loadWebSockets();
         });
       }
       source.addEventListener('lagged', () => projectChanged());
@@ -760,6 +843,16 @@ test
       if (row) selectExchange(Number(row.dataset.id));
     };
     $('showNoisy').onchange = () => state.selectedExchange && selectExchange(state.selectedExchange);
+    $('compareExchange').onclick = async () => {
+      const right = Number($('compareExchangeId').value);
+      if (!state.selectedExchange || !right) return status('inspectorStatus', 'Select an exchange and enter another exchange ID', 'err');
+      try {
+        const query = new URLSearchParams({ left: String(state.selectedExchange), right: String(right), include_noisy_headers: String($('compareNoisy').checked) });
+        const result = await api(`/api/v1/projects/${state.projectId}/exchanges/compare?${query}`);
+        $('compareOutput').textContent = JSON.stringify(result, null, 2);
+        $('compareOutput').classList.remove('hidden');
+      } catch (error) { status('inspectorStatus', error.message, 'err'); }
+    };
 
     function formatHeaders(headers) {
       return (headers || []).map(h => `${h.name}: ${h.value}${h.redacted ? '  <redacted>' : ''}`).join('\n') || '—';
@@ -928,6 +1021,42 @@ test
     }
     $('loadSitemap').onclick = loadSitemap;
     $('sitemapHost').onkeydown = event => { if (event.key === 'Enter') loadSitemap(); };
+
+    async function loadRules() {
+      if (!state.projectId) return;
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/request-rules`);
+        $('ruleList').innerHTML = (result.rules || []).map(rule => `<div class="card"><div class="row"><div><strong>${escapeHtml(rule.name)}</strong><div class="small muted">${escapeHtml(rule.host_pattern || 'all hosts')} · ${escapeHtml(rule.target)} · ${escapeHtml(rule.operation)} · ${rule.enabled ? 'enabled' : 'disabled'}</div></div><button class="btn danger fit" data-delete-rule="${rule.id}">Delete</button></div><div class="mono small">${escapeHtml(rule.pattern)} → ${escapeHtml(rule.replacement ?? '')}</div></div>`).join('') || '<div class="empty">No request rules.</div>';
+      } catch (error) { status('ruleStatus', error.message, 'err'); }
+    }
+    $('refreshRules').onclick = loadRules;
+    $('addRule').onclick = async () => {
+      if (!state.projectId) return;
+      try {
+        const target = $('ruleTarget').value;
+        const operation = $('ruleOperation').value;
+        await api(`/api/v1/projects/${state.projectId}/request-rules`, { method: 'POST', body: JSON.stringify({
+          name: $('ruleName').value.trim(), enabled: $('ruleEnabled').checked, position: 0,
+          host_pattern: $('ruleHost').value.trim() || null, target, operation,
+          header_name: target === 'header' ? ($('ruleHeader').value.trim() || null) : null,
+          match_kind: $('ruleMatchKind').value, pattern: $('rulePattern').value,
+          replacement: operation === 'remove' ? null : $('ruleReplacement').value,
+          replace_all: $('ruleAll').checked,
+        }) });
+        status('ruleStatus', 'Rule added', 'ok'); await loadRules();
+      } catch (error) { status('ruleStatus', error.message, 'err'); }
+    };
+    $('ruleList').onclick = async event => {
+      const button = event.target.closest('[data-delete-rule]'); if (!button) return;
+      try { await api(`/api/v1/projects/${state.projectId}/request-rules/${button.dataset.deleteRule}`, { method: 'DELETE' }); await loadRules(); }
+      catch (error) { status('ruleStatus', error.message, 'err'); }
+    };
+    $('previewRules').onclick = async () => {
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/request-rules/preview`, { method: 'POST', body: JSON.stringify({ url: $('rulePreviewUrl').value.trim(), headers: [], body: '' }) });
+        $('rulePreviewOutput').textContent = `${result.url}\n\nApplied: ${(result.applied_rules || []).map(rule => rule.name).join(', ') || 'none'}`;
+      } catch (error) { status('ruleStatus', error.message, 'err'); }
+    };
 
     async function loadWords() {
       if (!state.projectId) return status('wordsStatus', 'Select a project', 'err');
@@ -1194,31 +1323,104 @@ test
         const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`);
         const jobs = result.jobs || [];
         $('fuzzJobs').innerHTML = jobs.map(j => `<tr data-id="${j.id}"><td>${j.id}</td><td>${escapeHtml(j.state)}</td><td>${j.completed_cases}/${j.estimated_cases}</td><td>${j.failed_cases}</td><td><button class="btn" data-view-cases="${j.id}">Cases</button> <button class="btn danger" data-cancel="${j.id}" ${['completed','failed','interrupted'].includes(j.state) ? 'disabled' : ''}>Cancel</button></td></tr>`).join('');
-        if (state.selectedFuzzJob) loadFuzzCases(state.selectedFuzzJob);
+        if (state.selectedFuzzJob) loadFuzzResults(state.selectedFuzzJob);
         clearTimeout(state.fuzzTimer);
         if (jobs.some(j => ['queued','running','cancelling'].includes(j.state))) state.fuzzTimer = setTimeout(loadFuzzJobs, 1200);
       } catch (e) { status('fuzzStatus', e.message, 'err'); }
     }
-    async function loadFuzzCases(jobId) {
+    function showFuzzResultsPanel(mode) {
+      state.fuzzResultsMode = mode;
+      $('fuzzGroupsPanel').classList.toggle('hidden', mode !== 'groups');
+      $('fuzzCasesPanel').classList.toggle('hidden', mode === 'groups');
+    }
+    async function loadFuzzResults(jobId) {
+      if (state.fuzzResultsMode === 'groups') return loadFuzzGroups(jobId);
+      return loadFuzzCases(jobId, state.selectedFuzzGroup);
+    }
+    async function loadFuzzGroups(jobId) {
       state.selectedFuzzJob = Number(jobId);
+      state.selectedFuzzGroup = null;
       try {
-        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/cases?limit=250`);
+        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/groups`);
+        $('fuzzGroups').innerHTML = (result.groups || []).map(group => {
+          const size = group.response_length_min == null ? '—' : group.response_length_min === group.response_length_max ? group.response_length_min : `${group.response_length_min}–${group.response_length_max}`;
+          const timing = group.duration_ms_avg == null ? '—' : `${Math.round(group.duration_ms_avg)} ms avg`;
+          return `<tr data-fuzz-group="${group.group_id}"><td>${group.case_count}</td><td>${group.status_code ?? escapeHtml(group.state)}</td><td>${escapeHtml(group.mime || '—')}</td><td>${size}</td><td>${timing}</td></tr>`;
+        }).join('');
+        showFuzzResultsPanel('groups');
+      } catch (e) { status('fuzzStatus', e.message, 'err'); }
+    }
+    async function loadFuzzCases(jobId, groupId = null) {
+      state.selectedFuzzJob = Number(jobId);
+      state.selectedFuzzGroup = groupId;
+      try {
+        const groupQuery = groupId ? `&group_id=${encodeURIComponent(groupId)}` : '';
+        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/cases?limit=250${groupQuery}`);
         $('fuzzCases').innerHTML = (result.cases || []).map(c => {
           const payload = c.payload_summary || JSON.stringify(c.payloads || []);
-          return `<tr><td>${c.case_index}</td><td title="${escapeHtml(payload)}">${escapeHtml(payload.slice(0, 60))}</td><td>${c.status_code ?? c.state ?? '—'}</td><td>${c.response_length ?? '—'}</td><td>${c.exchange_id ?? '—'}</td><td>${escapeHtml(c.error || '')}</td></tr>`;
+          const compare = c.exchange_id ? `<button class="btn fit" data-fuzz-compare="${c.id}">Compare</button>` : escapeHtml(c.error || '—');
+          return `<tr><td>${c.case_index}</td><td title="${escapeHtml(payload)}">${escapeHtml(payload.slice(0, 60))}</td><td>${c.status_code ?? c.state ?? '—'}</td><td>${c.response_length ?? '—'}</td><td>${c.exchange_id ?? '—'}</td><td>${compare}</td></tr>`;
         }).join('');
+        showFuzzResultsPanel('cases');
       } catch (e) { status('fuzzStatus', e.message, 'err'); }
     }
     $('fuzzJobs').onclick = async e => {
       const cases = e.target.closest('[data-view-cases]');
       const cancel = e.target.closest('[data-cancel]');
-      if (cases) loadFuzzCases(cases.dataset.viewCases);
+      if (cases) { state.fuzzResultsMode = 'groups'; loadFuzzGroups(cases.dataset.viewCases); }
       if (cancel) {
         try { await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${cancel.dataset.cancel}/cancel`, { method: 'POST' }); await loadFuzzJobs(); }
         catch (err) { status('fuzzStatus', err.message, 'err'); }
       }
     };
+    $('fuzzGroups').onclick = e => {
+      const row = e.target.closest('[data-fuzz-group]');
+      if (row) loadFuzzCases(state.selectedFuzzJob, row.dataset.fuzzGroup);
+    };
+    $('fuzzCases').onclick = async e => {
+      const compare = e.target.closest('[data-fuzz-compare]');
+      if (!compare) return;
+      try {
+        const diff = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${state.selectedFuzzJob}/cases/${compare.dataset.fuzzCompare}/diff`);
+        $('fuzzDiff').textContent = JSON.stringify(diff, null, 2);
+        $('fuzzDiff').classList.remove('hidden');
+      } catch (err) { status('fuzzStatus', err.message, 'err'); }
+    };
+    $('showFuzzGroups').onclick = () => state.selectedFuzzJob && loadFuzzGroups(state.selectedFuzzJob);
+    $('showFuzzCases').onclick = () => state.selectedFuzzJob && loadFuzzCases(state.selectedFuzzJob);
     $('refreshFuzz').onclick = loadFuzzJobs;
+
+    async function loadWebSockets() {
+      if (!state.projectId) return;
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/websockets?limit=200`);
+        const connections = result.connections || [];
+        $('websocketConnections').innerHTML = connections.map(connection => `<tr data-websocket-id="${connection.id}" class="${state.websocketConnection === connection.id ? 'selected' : ''}"><td>${connection.id}</td><td>${escapeHtml(connection.state)}</td><td title="${escapeHtml(connection.url)}">${escapeHtml(connection.url.slice(0, 55))}</td><td>${connection.message_count}</td></tr>`).join('');
+        status('websocketStatus', `${connections.length} connection${connections.length === 1 ? '' : 's'}`);
+        if (state.websocketConnection && connections.some(connection => connection.id === state.websocketConnection)) await loadWebSocketMessages();
+      } catch (error) { status('websocketStatus', error.message, 'err'); }
+    }
+    async function loadWebSocketMessages() {
+      if (!state.projectId || !state.websocketConnection) return;
+      const result = await api(`/api/v1/projects/${state.projectId}/websockets/${state.websocketConnection}/messages?limit=500`);
+      $('websocketMessages').innerHTML = (result.messages || []).map(message => `<tr><td>${message.id}</td><td>${escapeHtml(message.direction)}</td><td>${escapeHtml(message.opcode)}</td><td class="mono" title="${escapeHtml(message.payload)}">${escapeHtml(message.payload.slice(0, 100))}${message.truncated ? ' …' : ''}</td></tr>`).join('');
+      $('sendWebSocket').disabled = false;
+    }
+    $('websocketConnections').onclick = async event => {
+      const row = event.target.closest('tr[data-websocket-id]'); if (!row) return;
+      state.websocketConnection = Number(row.dataset.websocketId);
+      document.querySelectorAll('#websocketConnections tr').forEach(item => item.classList.toggle('selected', item === row));
+      await loadWebSocketMessages().catch(error => status('websocketStatus', error.message, 'err'));
+    };
+    $('refreshWebSockets').onclick = loadWebSockets;
+    $('sendWebSocket').onclick = async () => {
+      if (!state.websocketConnection) return;
+      try {
+        await api(`/api/v1/projects/${state.projectId}/websockets/${state.websocketConnection}/send`, { method: 'POST', body: JSON.stringify({ direction: $('websocketDirection').value, encoding: $('websocketEncoding').value, payload: $('websocketPayload').value }) });
+        $('websocketPayload').value = ''; status('websocketStatus', 'Message sent', 'ok');
+        await loadWebSocketMessages();
+      } catch (error) { status('websocketStatus', error.message, 'err'); }
+    };
 
     async function loadBrowserStatus() {
       if (!state.projectId) return;

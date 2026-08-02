@@ -60,6 +60,7 @@ base64 = "0.22"
 hex = "0.4"
 percent-encoding = "2"
 zstd = "0.13"
+tar = "0.4"
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
@@ -94,6 +95,7 @@ mime_guess = "2"
 async-stream = "0.3"
 
 tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [dev-dependencies]
 proptest = "1"

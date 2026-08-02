@@ -97,6 +97,15 @@ impl ReplyService {
             .iter()
             .find(|header| header.name.eq_ignore_ascii_case("content-type"))
             .map(|header| String::from_utf8_lossy(&header.value).into_owned());
+        let encoded = parsed.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("content-encoding")
+                && !String::from_utf8_lossy(&header.value)
+                    .trim()
+                    .eq_ignore_ascii_case("identity")
+        });
+        let page_title = (!encoded && crate::page_title::is_html_mime(mime.as_deref()))
+            .then(|| crate::page_title::extract_html_title(&parsed.body))
+            .flatten();
 
         // Scope is capture-only: the request was already sent regardless. An
         // out-of-scope response is returned to the caller but is not persisted.
@@ -136,7 +145,7 @@ impl ReplyService {
                         response_body: Some(parsed.body),
                         duration_ms: Some(started.elapsed().as_millis() as i64),
                         lineage: ReplySendContext::reply(None, tab_id).lineage,
-                        page_title: None,
+                        page_title,
                         error_message: truncated.then(|| {
                             "raw response truncated by project body limit or read timeout".into()
                         }),

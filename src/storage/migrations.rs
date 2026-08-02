@@ -33,6 +33,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "008_project_usage",
         include_str!("../../migrations/008_project_usage.sql"),
     ),
+    (
+        "009_websockets",
+        include_str!("../../migrations/009_websockets.sql"),
+    ),
+    (
+        "010_request_rules",
+        include_str!("../../migrations/010_request_rules.sql"),
+    ),
+    (
+        "011_fuzz_response_groups",
+        include_str!("../../migrations/011_fuzz_response_groups.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {

@@ -651,6 +651,10 @@ impl ReplyService {
             &self.placeholder_key,
         )
         .await?;
+        // URL rules run before managed cookie lookup so cookies are selected
+        // for the effective destination, not the draft destination.
+        let mut applied_rules =
+            crate::request_rules::apply_url_rules(&self.db, project_id, &mut mat.url).await?;
         let cookie_overridden = draft
             .header_overrides
             .iter()
@@ -671,6 +675,16 @@ impl ReplyService {
                     .push(("Cookie".into(), profile.cookie_header.into_bytes()));
             }
         }
+        applied_rules.extend(
+            crate::request_rules::apply_message_rules(
+                &self.db,
+                project_id,
+                &mat.url,
+                &mut mat.headers,
+                mat.body.as_mut(),
+            )
+            .await?,
+        );
 
         // Scope controls persistence only; it never blocks egress.
         let should_capture = url_is_in_scope(&mat.url, &project.scope)?;
@@ -763,8 +777,21 @@ impl ReplyService {
                 } else {
                     Ok(None)
                 };
-                if let Err(storage_error) = insert {
-                    tracing::warn!(%storage_error, "failed to preserve failed Reply exchange");
+                match insert {
+                    Ok(Some(exchange_id)) => {
+                        let _ = self
+                            .db
+                            .record_exchange_request_rules(
+                                project_id,
+                                exchange_id,
+                                applied_rules.clone(),
+                            )
+                            .await;
+                    }
+                    Ok(None) => {}
+                    Err(storage_error) => {
+                        tracing::warn!(%storage_error, "failed to preserve failed Reply exchange");
+                    }
                 }
                 return Err(error);
             }
@@ -795,6 +822,9 @@ impl ReplyService {
             }
             None => (out.body.to_vec(), false, None),
         };
+        let page_title = crate::page_title::is_html_mime(mime.as_deref())
+            .then(|| crate::page_title::extract_html_title(&preview_body))
+            .flatten();
         const REPLY_PREVIEW_BYTES: usize = 4096;
         let preview_end = preview_body.len().min(REPLY_PREVIEW_BYTES);
         let response_preview = ReplyBodyPreview {
@@ -855,7 +885,7 @@ impl ReplyService {
                         response_body: Some(out.body.to_vec()),
                         duration_ms: Some(duration_ms),
                         lineage: context.lineage.clone(),
-                        page_title: None,
+                        page_title,
                         error_message: out
                             .body_truncated
                             .then(|| "response body truncated by project body limit".into()),
@@ -865,6 +895,11 @@ impl ReplyService {
         } else {
             None
         };
+        if let Some(exchange_id) = exchange_id {
+            self.db
+                .record_exchange_request_rules(project_id, exchange_id, applied_rules.clone())
+                .await?;
+        }
 
         let _ = follow_redirects; // redirects: post-MVP partial — off by default in callers
 

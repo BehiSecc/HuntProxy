@@ -57,6 +57,11 @@ enum Commands {
     },
     /// Create a consistent SQLite database backup.
     Backup { destination: PathBuf },
+    /// HAR 1.2 history import/export.
+    Har {
+        #[command(subcommand)]
+        cmd: HarCmd,
+    },
     /// Browser artifact install helper.
     Browser {
         #[command(subcommand)]
@@ -88,8 +93,28 @@ enum ProjectCmd {
     Export {
         id: i64,
         output: PathBuf,
+        /// Include credentials, bodies, replay state, and browser state.
+        #[arg(long)]
+        include_secrets: bool,
+        /// Include the best-effort, same-platform Chromium profile.
+        #[arg(long, requires = "include_secrets")]
+        include_chromium_profile: bool,
     },
     Import {
+        input: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HarCmd {
+    Export {
+        project_id: i64,
+        output: PathBuf,
+        #[arg(long)]
+        include_secrets: bool,
+    },
+    Import {
+        project_id: i64,
         input: PathBuf,
     },
 }
@@ -314,25 +339,46 @@ async fn run(cli: Cli) -> DomainResult<()> {
                         );
                     }
                 }
-                ProjectCmd::Export { id, output } => {
+                ProjectCmd::Export {
+                    id,
+                    output,
+                    include_secrets,
+                    include_chromium_profile,
+                } => {
                     let db = bb::storage::Db::open(&cfg).await?;
-                    let archive = db.export_project(bb::domain::ProjectId(id)).await?;
-                    let encoded = serde_json::to_vec_pretty(&archive).map_err(|error| {
-                        DomainError::new(ErrorCode::StorageError, error.to_string())
-                    })?;
-                    bb::config::write_private_file(&output, &encoded)?;
+                    db.export_bundle(
+                        &cfg,
+                        bb::domain::ProjectId(id),
+                        output.clone(),
+                        bb::transfer::BundleExportOptions {
+                            secrets: if include_secrets {
+                                bb::transfer::SecretMode::Full
+                            } else {
+                                bb::transfer::SecretMode::Sanitized
+                            },
+                            include_chromium_profile,
+                        },
+                    )
+                    .await?;
                     println!("Exported project {id} to {}", output.display());
                 }
                 ProjectCmd::Import { input } => {
-                    let encoded = std::fs::read(&input).map_err(|error| {
-                        DomainError::new(ErrorCode::StorageError, error.to_string())
-                    })?;
-                    let archive: bb::storage::ProjectArchive = serde_json::from_slice(&encoded)
-                        .map_err(|error| {
-                            DomainError::invalid(format!("invalid project archive: {error}"))
-                        })?;
                     let db = bb::storage::Db::open(&cfg).await?;
-                    let project = db.import_project(archive).await?;
+                    let project = if input
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        let encoded = std::fs::read(&input).map_err(|error| {
+                            DomainError::new(ErrorCode::StorageError, error.to_string())
+                        })?;
+                        let archive: bb::storage::ProjectArchive = serde_json::from_slice(&encoded)
+                            .map_err(|error| {
+                                DomainError::invalid(format!("invalid v1 project archive: {error}"))
+                            })?;
+                        db.import_project(archive).await?
+                    } else {
+                        db.import_bundle(&cfg, input, None).await?.project
+                    };
                     println!("Imported project {} ({})", project.id.get(), project.name);
                 }
             }
@@ -365,6 +411,44 @@ async fn run(cli: Cli) -> DomainResult<()> {
             let db = bb::storage::Db::open(&cfg).await?;
             let path = db.backup_to(destination).await?;
             println!("Backup written to {}", path.display());
+            Ok(())
+        }
+        Commands::Har { cmd } => {
+            init_logging("error");
+            let cfg = Config::load(cli.data_dir)?;
+            let db = bb::storage::Db::open(&cfg).await?;
+            match cmd {
+                HarCmd::Export {
+                    project_id,
+                    output,
+                    include_secrets,
+                } => {
+                    let har = db
+                        .export_har(bb::domain::ProjectId(project_id), include_secrets)
+                        .await?;
+                    if let Some(parent) = output.parent() {
+                        bb::config::create_private_dir(parent)?;
+                    }
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(&output)
+                        .map_err(|error| {
+                            DomainError::new(ErrorCode::StorageError, error.to_string())
+                        })?;
+                    serde_json::to_writer(file, &har).map_err(|error| {
+                        DomainError::new(ErrorCode::StorageError, error.to_string())
+                    })?;
+                    println!("Exported HAR to {}", output.display());
+                }
+                HarCmd::Import { project_id, input } => {
+                    let result = db
+                        .import_har_file(bb::domain::ProjectId(project_id), &input)
+                        .await?;
+                    println!("Imported {} HAR entries", result.imported_entries);
+                }
+            }
             Ok(())
         }
         Commands::Browser { cmd } => {

@@ -1,13 +1,15 @@
 //! Bounded fuzzer execution, payload transforms, cancellation, and persisted results.
 
-use crate::codec::apply_pipeline;
+use crate::codec::{apply_pipeline, decode_content_encodings};
 use crate::domain::*;
+use crate::policy::PresentationOptions;
 use crate::reply::{PlaceholderKey, ReplySendContext, ReplyService};
 use crate::storage::Db;
 use base64::Engine;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -17,6 +19,65 @@ use tokio_util::sync::CancellationToken;
 mod generators;
 
 pub use generators::PayloadGenerator;
+
+pub const MAX_FUZZ_DIFF_TEXT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzResponseGroup {
+    pub group_id: String,
+    pub state: FuzzCaseState,
+    pub case_count: u64,
+    pub representative_case_id: i64,
+    pub representative_case_index: u64,
+    pub representative_exchange_id: Option<ExchangeId>,
+    pub status_code: Option<u16>,
+    pub mime: Option<String>,
+    pub body_hash: Option<String>,
+    pub response_length_min: Option<i64>,
+    pub response_length_max: Option<i64>,
+    pub duration_ms_min: Option<i64>,
+    pub duration_ms_avg: Option<f64>,
+    pub duration_ms_max: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzBaselineKind {
+    BaseExchange,
+    FirstCompleted,
+    ExplicitCase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzHeaderChange {
+    pub name: String,
+    pub kind: String,
+    pub baseline_values: Vec<String>,
+    pub case_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzResponseDiff {
+    pub case_id: i64,
+    pub case_exchange_id: ExchangeId,
+    pub baseline_kind: FuzzBaselineKind,
+    pub baseline_case_id: Option<i64>,
+    pub baseline_exchange_id: ExchangeId,
+    pub status_baseline: Option<u16>,
+    pub status_case: Option<u16>,
+    pub status_changed: bool,
+    pub mime_baseline: Option<String>,
+    pub mime_case: Option<String>,
+    pub mime_changed: bool,
+    pub body_hash_equal: Option<bool>,
+    pub response_length_delta: Option<i64>,
+    pub response_length_delta_percent: Option<f64>,
+    pub duration_ms_delta: Option<i64>,
+    pub duration_ratio: Option<f64>,
+    pub header_changes: Vec<FuzzHeaderChange>,
+    pub text_diff: Option<String>,
+    pub text_diff_warning: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsertionPoint {
@@ -433,6 +494,345 @@ impl FuzzerService {
             .list_fuzz_cases(project_id, job_id, limit, before_case_index)
             .await
     }
+
+    pub async fn list_response_groups(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+    ) -> DomainResult<Vec<FuzzResponseGroup>> {
+        self.db.list_fuzz_response_groups(project_id, job_id).await
+    }
+
+    pub async fn list_group_cases(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+        group_id: String,
+        limit: u32,
+        before_case_index: Option<u64>,
+    ) -> DomainResult<(Vec<FuzzCaseResult>, Option<u64>)> {
+        self.db
+            .list_fuzz_cases_in_group(project_id, job_id, group_id, limit, before_case_index)
+            .await
+    }
+
+    pub async fn response_diff(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+        case_id: i64,
+        baseline_case_id: Option<i64>,
+        include_text: bool,
+    ) -> DomainResult<FuzzResponseDiff> {
+        let job = self.db.get_fuzz_job(project_id, job_id).await?;
+        let case = self.db.get_fuzz_case(project_id, job_id, case_id).await?;
+        let case_exchange_id = case
+            .exchange_id
+            .ok_or_else(|| DomainError::invalid("fuzz case has no saved response"))?;
+
+        let (baseline_kind, resolved_baseline_case_id, baseline_exchange_id) =
+            if let Some(explicit_case_id) = baseline_case_id {
+                let baseline = self
+                    .db
+                    .get_fuzz_case(project_id, job_id, explicit_case_id)
+                    .await?;
+                let exchange_id = baseline.exchange_id.ok_or_else(|| {
+                    DomainError::invalid("explicit baseline case has no saved response")
+                })?;
+                (
+                    FuzzBaselineKind::ExplicitCase,
+                    Some(explicit_case_id),
+                    exchange_id,
+                )
+            } else if let Some(exchange_id) = job.base_exchange_id {
+                match self
+                    .db
+                    .get_exchange_detail(project_id, exchange_id, PresentationOptions::default())
+                    .await
+                {
+                    Ok(detail) if detail.summary.status_code.is_some() => {
+                        (FuzzBaselineKind::BaseExchange, None, exchange_id)
+                    }
+                    Ok(_) | Err(_) => self.first_completed_baseline(project_id, job_id).await?,
+                }
+            } else {
+                self.first_completed_baseline(project_id, job_id).await?
+            };
+
+        let baseline = self
+            .db
+            .get_exchange_detail(
+                project_id,
+                baseline_exchange_id,
+                PresentationOptions::default(),
+            )
+            .await?;
+        let current = self
+            .db
+            .get_exchange_detail(project_id, case_exchange_id, PresentationOptions::default())
+            .await?;
+        let baseline_mime = normalize_response_mime(baseline.summary.mime.as_deref());
+        let current_mime = normalize_response_mime(current.summary.mime.as_deref());
+        let length_delta = option_delta(
+            current.summary.response_length,
+            baseline.summary.response_length,
+        );
+        let duration_delta =
+            option_delta(current.summary.duration_ms, baseline.summary.duration_ms);
+        let header_changes =
+            compare_response_headers(&baseline.response_headers, &current.response_headers);
+
+        let (text_diff, text_diff_warning) = if include_text {
+            self.load_text_diff(
+                project_id,
+                baseline_exchange_id,
+                case_exchange_id,
+                baseline.summary.mime.as_deref(),
+                current.summary.mime.as_deref(),
+                &baseline.response_headers,
+                &current.response_headers,
+            )
+            .await
+        } else {
+            (None, None)
+        };
+
+        Ok(FuzzResponseDiff {
+            case_id,
+            case_exchange_id,
+            baseline_kind,
+            baseline_case_id: resolved_baseline_case_id,
+            baseline_exchange_id,
+            status_baseline: baseline.summary.status_code,
+            status_case: current.summary.status_code,
+            status_changed: baseline.summary.status_code != current.summary.status_code,
+            mime_changed: baseline_mime != current_mime,
+            mime_baseline: baseline_mime,
+            mime_case: current_mime,
+            body_hash_equal: match (
+                baseline.response_body_hash.as_ref(),
+                current.response_body_hash.as_ref(),
+            ) {
+                (Some(left), Some(right)) => Some(left == right),
+                _ => None,
+            },
+            response_length_delta: length_delta,
+            response_length_delta_percent: match (length_delta, baseline.summary.response_length) {
+                (Some(0), Some(0)) => Some(0.0),
+                (Some(_), Some(0)) => None,
+                (Some(delta), Some(base)) => Some(delta as f64 * 100.0 / base as f64),
+                _ => None,
+            },
+            duration_ms_delta: duration_delta,
+            duration_ratio: match (current.summary.duration_ms, baseline.summary.duration_ms) {
+                (Some(current), Some(base)) if base != 0 => Some(current as f64 / base as f64),
+                _ => None,
+            },
+            header_changes,
+            text_diff,
+            text_diff_warning,
+        })
+    }
+
+    async fn first_completed_baseline(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+    ) -> DomainResult<(FuzzBaselineKind, Option<i64>, ExchangeId)> {
+        let (case_id, exchange_id) = self
+            .db
+            .first_completed_fuzz_case_exchange(project_id, job_id)
+            .await?
+            .ok_or_else(|| DomainError::invalid("fuzz job has no completed response baseline"))?;
+        Ok((FuzzBaselineKind::FirstCompleted, Some(case_id), exchange_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_text_diff(
+        &self,
+        project_id: ProjectId,
+        baseline_exchange_id: ExchangeId,
+        case_exchange_id: ExchangeId,
+        baseline_mime: Option<&str>,
+        case_mime: Option<&str>,
+        baseline_headers: &[PresentedHeader],
+        case_headers: &[PresentedHeader],
+    ) -> (Option<String>, Option<String>) {
+        if !is_textual_mime(baseline_mime) || !is_textual_mime(case_mime) {
+            return (
+                None,
+                Some("text diff is available only for textual responses".into()),
+            );
+        }
+        let baseline_body = match self
+            .db
+            .load_raw_body(project_id, baseline_exchange_id, MessageSide::Response)
+            .await
+        {
+            Ok(Some(body)) => body,
+            Ok(None) => return (None, Some("baseline response body is unavailable".into())),
+            Err(error) => return (None, Some(error.to_string())),
+        };
+        let case_body = match self
+            .db
+            .load_raw_body(project_id, case_exchange_id, MessageSide::Response)
+            .await
+        {
+            Ok(Some(body)) => body,
+            Ok(None) => return (None, Some("case response body is unavailable".into())),
+            Err(error) => return (None, Some(error.to_string())),
+        };
+        let decode = |body: Vec<u8>, headers: &[PresentedHeader]| -> DomainResult<String> {
+            let encoding = headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+                .map(|header| header.value.as_str())
+                .filter(|value| !value.trim().is_empty());
+            let mut bytes = if let Some(encoding) = encoding {
+                decode_content_encodings(&body, encoding, MAX_FUZZ_DIFF_TEXT_BYTES)?
+            } else {
+                body.into_iter()
+                    .take(MAX_FUZZ_DIFF_TEXT_BYTES)
+                    .collect::<Vec<_>>()
+            };
+            match std::str::from_utf8(&bytes) {
+                Ok(_) => String::from_utf8(bytes)
+                    .map_err(|_| DomainError::invalid("response body is not valid UTF-8")),
+                Err(error)
+                    if error.error_len().is_none() && error.valid_up_to() + 4 >= bytes.len() =>
+                {
+                    bytes.truncate(error.valid_up_to());
+                    String::from_utf8(bytes)
+                        .map_err(|_| DomainError::invalid("response body is not valid UTF-8"))
+                }
+                Err(_) => Err(DomainError::invalid("response body is not valid UTF-8")),
+            }
+        };
+        match (
+            decode(baseline_body, baseline_headers),
+            decode(case_body, case_headers),
+        ) {
+            (Ok(left), Ok(right)) => (Some(bounded_text_diff(&left, &right)), None),
+            (Err(error), _) | (_, Err(error)) => (None, Some(error.to_string())),
+        }
+    }
+}
+
+fn option_delta(current: Option<i64>, baseline: Option<i64>) -> Option<i64> {
+    current
+        .zip(baseline)
+        .map(|(current, baseline)| current - baseline)
+}
+
+fn normalize_response_mime(mime: Option<&str>) -> Option<String> {
+    mime.map(|value| {
+        value
+            .split(';')
+            .next()
+            .unwrap_or(value)
+            .trim()
+            .to_ascii_lowercase()
+    })
+    .filter(|value| !value.is_empty())
+}
+
+fn is_textual_mime(mime: Option<&str>) -> bool {
+    let Some(mime) = normalize_response_mime(mime) else {
+        return true;
+    };
+    mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("xml")
+        || mime.contains("javascript")
+        || mime == "application/x-www-form-urlencoded"
+        || mime == "application/graphql"
+}
+
+fn compare_response_headers(
+    baseline: &[PresentedHeader],
+    current: &[PresentedHeader],
+) -> Vec<FuzzHeaderChange> {
+    const VOLATILE: &[&str] = &[
+        "date",
+        "set-cookie",
+        "expires",
+        "age",
+        "server-timing",
+        "x-request-id",
+        "x-correlation-id",
+        "traceparent",
+        "tracestate",
+        "cf-ray",
+        "x-amzn-trace-id",
+        "content-length",
+    ];
+    let group = |headers: &[PresentedHeader]| {
+        let mut grouped = BTreeMap::<String, Vec<String>>::new();
+        for header in headers {
+            let name = header.name.to_ascii_lowercase();
+            if !VOLATILE.contains(&name.as_str()) {
+                grouped.entry(name).or_default().push(header.value.clone());
+            }
+        }
+        grouped
+    };
+    let baseline = group(baseline);
+    let current = group(current);
+    let names = baseline
+        .keys()
+        .chain(current.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let left = baseline.get(&name).cloned().unwrap_or_default();
+            let right = current.get(&name).cloned().unwrap_or_default();
+            (left != right).then(|| FuzzHeaderChange {
+                kind: if left.is_empty() {
+                    "added"
+                } else if right.is_empty() {
+                    "removed"
+                } else {
+                    "changed"
+                }
+                .into(),
+                name,
+                baseline_values: left,
+                case_values: right,
+            })
+        })
+        .collect()
+}
+
+fn bounded_text_diff(left: &str, right: &str) -> String {
+    let mut output = String::new();
+    let left_lines = left.lines().collect::<Vec<_>>();
+    let right_lines = right.lines().collect::<Vec<_>>();
+    for index in 0..left_lines.len().max(right_lines.len()).min(400) {
+        let left_line = left_lines.get(index).copied().unwrap_or("");
+        let right_line = right_lines.get(index).copied().unwrap_or("");
+        if left_line == right_line {
+            continue;
+        }
+        let change = format!("- {left_line}\n+ {right_line}\n");
+        let remaining = MAX_FUZZ_DIFF_TEXT_BYTES.saturating_sub(output.len());
+        if remaining == 0 {
+            break;
+        }
+        if change.len() <= remaining {
+            output.push_str(&change);
+        } else {
+            let boundary = change
+                .char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= remaining)
+                .last()
+                .unwrap_or(0);
+            output.push_str(&change[..boundary]);
+        }
+    }
+    output
 }
 
 const MAX_WORDLIST_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -1423,6 +1823,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cases.len(), 2);
+        let groups = db
+            .list_fuzz_response_groups(project.id, job.id)
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| group.case_count == 1));
         assert!(cases.iter().all(|case| case.exchange_id.is_some()));
         for case in cases {
             let detail = db
@@ -1437,5 +1843,47 @@ mod tests {
             assert_eq!(detail.lineage.fuzz_job_id, Some(job.id));
             assert_eq!(detail.lineage.fuzz_case_id, Some(case.id));
         }
+    }
+
+    #[test]
+    fn response_header_diff_ignores_volatile_headers() {
+        let header = |name: &str, value: &str| PresentedHeader {
+            name: name.into(),
+            value: value.into(),
+            redacted: false,
+            noisy: false,
+        };
+        let baseline = vec![
+            header("Date", "yesterday"),
+            header("X-Request-Id", "one"),
+            header("X-Feature", "off"),
+        ];
+        let current = vec![
+            header("Date", "today"),
+            header("X-Request-Id", "two"),
+            header("X-Feature", "on"),
+        ];
+        let changes = compare_response_headers(&baseline, &current);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, "x-feature");
+        assert_eq!(changes[0].kind, "changed");
+    }
+
+    #[test]
+    fn bounded_diff_and_mime_normalization_are_predictable() {
+        assert_eq!(
+            normalize_response_mime(Some("Application/JSON; charset=utf-8")),
+            Some("application/json".into())
+        );
+        assert!(is_textual_mime(Some("application/json")));
+        assert!(!is_textual_mime(Some("application/octet-stream")));
+        assert_eq!(
+            bounded_text_diff("same\nold", "same\nnew"),
+            "- old\n+ new\n"
+        );
+        assert!(
+            bounded_text_diff(&"a".repeat(70_000), &"b".repeat(70_000)).len()
+                <= MAX_FUZZ_DIFF_TEXT_BYTES
+        );
     }
 }

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[async_trait::async_trait]
@@ -290,15 +291,39 @@ fn fuzz_template_schema() -> Value {
     })
 }
 
+fn request_rules_tool_def() -> Value {
+    serde_json::from_str(r#"{
+      "name":"request_rules",
+      "description":"Manage ordered project request match/replace rules for semantic Proxy, Browser, Reply, Fuzzer, and crawler traffic. Raw Reply is never modified.",
+      "inputSchema":{"type":"object","properties":{
+        "project_id":{"type":"integer"},
+        "action":{"type":"string","enum":["list","add","update","remove","preview"]},
+        "rule_id":{"type":"integer"},
+        "rule":{"type":"object","properties":{
+          "name":{"type":"string"},"enabled":{"type":"boolean","default":true},
+          "position":{"type":"integer","default":0},"host_pattern":{"type":["string","null"]},
+          "target":{"type":"string","enum":["url","header","body"]},
+          "operation":{"type":"string","enum":["replace","set","remove"]},
+          "header_name":{"type":["string","null"]},
+          "match_kind":{"type":"string","enum":["literal","regex"],"default":"literal"},
+          "pattern":{"type":"string","default":""},"replacement":{"type":["string","null"]},
+          "replace_all":{"type":"boolean","default":true}},"required":["name","target","operation"]},
+        "url":{"type":"string"},"headers":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}},
+        "body":{"type":"string"}},"required":["project_id","action"]}
+    }"#).expect("request rules tool schema is valid JSON")
+}
+
 fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List, create, or set optional capture scope. Host patterns may be exact or wildcard suffixes such as *.example.com; excluded_host_patterns always take precedence. Empty host_patterns captures every host except exclusions. Scope only controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"type":"string"},"file_path":{"type":"string"}},"required":["project_id","action"]}},
+        request_rules_tool_def(),
         {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; (request:~this OR request:~that OR request:~\":smtg\") method:PUT.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. request:~text searches the request target, headers, and body. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
         {"name":"sitemap","description":"Return an alphanumerically sorted host/path tree derived from saved project history, including methods, statuses, query parameters, content types, and exchange counts. Omit host for every host or provide one exact host.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive."}},"required":["project_id"]}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
+        {"name":"exchange_compare","description":"Compare the saved request and response of two exchanges. Sensitive values stay redacted, while changes are still detected. Text body diffs are bounded.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"left_exchange_id":{"type":"integer"},"right_exchange_id":{"type":"integer"},"include_noisy_headers":{"type":"boolean","default":false}},"required":["project_id","left_exchange_id","right_exchange_id"],"additionalProperties":false}},
         {"name":"page_analyzer","description":"Extract sorted, unique endpoints, absolute URLs, and emails from JavaScript or HTML without executing it. Provide exactly one saved exchange_id or absolute URL. URL mode sends a semantic GET with project cookies and analyzes the complete response; secrets are never scanned or returned.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer","description":"Saved exchange whose decoded response body should be analyzed."},"url":{"type":"string","description":"Absolute http/https URL to fetch and analyze."}},"required":["project_id"],"oneOf":[{"required":["exchange_id"]},{"required":["url"]}],"additionalProperties":false}},
         {"name":"copy_as","description":"Convert a saved request to cURL or Python requests. The output includes the original sensitive headers by default so it is immediately runnable; set include_secrets=false to produce a redacted copy.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"format":{"type":"string","enum":["curl","python_requests"]},"include_secrets":{"type":"boolean","default":true}},"required":["project_id","exchange_id","format"],"additionalProperties":false}},
         {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
@@ -307,7 +332,8 @@ fn tool_defs() -> Value {
         {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]}},"required":["project_id"]}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes for CRLF and protocol testing","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
-        {"name":"fuzz_manage","description":"List, inspect, cancel, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases"]},"job_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
+        {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
+        {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume the project's persistent browser workspace. Omit url to resume the last page. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, migrate Lightpanda state to Chromium, or reset the persistent browser workspace. Status without session_id lists active browser sessions. Stop operations preserve browser state. Switching requires chromium_reason=user_requested or lightpanda_incompatible. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop and switch_chromium; optional for status."},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium","reset_profile"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
@@ -316,6 +342,7 @@ fn tool_defs() -> Value {
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply byte transforms, including gzip_decode/gunzip and brotli_decode","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string","enum":["utf8","base64","hex"]},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
+        {"name":"project_transfer","description":"Import or export a project bundle or HAR through a local file. Sanitized export is the default; include_secrets must be explicitly true for credentials and browser state. Returns a summary/path, never archive bytes.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export","import"]},"format":{"type":"string","enum":["huntproxy","har"]},"project_id":{"type":"integer","description":"Required for export and HAR import."},"file_path":{"type":"string","description":"Required for import; optional export destination under the configured exports directory."},"include_secrets":{"type":"boolean","default":false},"include_chromium_profile":{"type":"boolean","default":false}},"required":["action","format"],"additionalProperties":false}},
         {"name":"exchange_annotate","description":"Set an exchange title, note, and labels","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
     ])
 }
@@ -829,6 +856,74 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 _ => Err(DomainError::invalid("action must be set|list|clear")),
             }
         }
+        "request_rules" => {
+            let project_id = require_project_id(&args)?;
+            match args.get("action").and_then(Value::as_str).unwrap_or("list") {
+                "list" => Ok(json!({ "rules": state.db.list_request_rules(project_id).await? })),
+                "add" | "update" => {
+                    let input: crate::request_rules::RequestRuleInput = serde_json::from_value(
+                        args.get("rule")
+                            .cloned()
+                            .ok_or_else(|| DomainError::invalid("rule required"))?,
+                    )
+                    .map_err(|error| DomainError::invalid(error.to_string()))?;
+                    let rule = if args.get("action").and_then(Value::as_str) == Some("add") {
+                        state.db.create_request_rule(project_id, input).await?
+                    } else {
+                        let id = args
+                            .get("rule_id")
+                            .and_then(Value::as_i64)
+                            .ok_or_else(|| DomainError::invalid("rule_id required"))?;
+                        state.db.update_request_rule(project_id, id, input).await?
+                    };
+                    Ok(json!(rule))
+                }
+                "remove" => {
+                    let id = args
+                        .get("rule_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("rule_id required"))?;
+                    state.db.delete_request_rule(project_id, id).await?;
+                    Ok(json!({ "ok": true }))
+                }
+                "preview" => {
+                    let url = args
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("url required"))?
+                        .to_string();
+                    let headers = args
+                        .get("headers")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|header| {
+                            Some((
+                                header.get("name")?.as_str()?.to_string(),
+                                header.get("value")?.as_str()?.as_bytes().to_vec(),
+                            ))
+                        })
+                        .collect();
+                    Ok(json!(
+                        crate::request_rules::preview(
+                            &state.db,
+                            project_id,
+                            url,
+                            headers,
+                            args.get("body")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                        .await?
+                    ))
+                }
+                _ => Err(DomainError::invalid(
+                    "action must be list|add|update|remove|preview",
+                )),
+            }
+        }
         "history_search" => {
             let project_id = require_project_id(&args)?;
             let filter = args
@@ -958,6 +1053,32 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 object.insert("annotation".into(), json!(annotation));
             }
             Ok(value)
+        }
+        "exchange_compare" => {
+            let project_id = require_project_id(&args)?;
+            let left = args
+                .get("left_exchange_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| DomainError::invalid("left_exchange_id required"))?;
+            let right = args
+                .get("right_exchange_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| DomainError::invalid("right_exchange_id required"))?;
+            Ok(json!(
+                crate::compare::compare_saved_exchanges(
+                    &state.db,
+                    project_id,
+                    ExchangeId(left),
+                    ExchangeId(right),
+                    crate::compare::CompareOptions {
+                        include_noisy_headers: args
+                            .get("include_noisy_headers")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
+                )
+                .await?
+            ))
         }
         "page_analyzer" => {
             let project_id = require_project_id(&args)?;
@@ -1437,7 +1558,128 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .await?;
                     Ok(json!({ "cases": cases, "next_before_case_index": next }))
                 }
-                _ => Err(DomainError::invalid("action must be list|cancel|get|cases")),
+                "groups" => {
+                    let jid = args
+                        .get("job_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    Ok(json!({
+                        "groups": state.fuzzer
+                            .list_response_groups(project_id, FuzzJobId(jid)).await?
+                    }))
+                }
+                "group_cases" => {
+                    let jid = args
+                        .get("job_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let group_id = args
+                        .get("group_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("group_id required"))?;
+                    let limit = args
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(100)
+                        .min(500) as u32;
+                    let (cases, next) = state
+                        .fuzzer
+                        .list_group_cases(
+                            project_id,
+                            FuzzJobId(jid),
+                            group_id.to_string(),
+                            limit,
+                            args.get("before_case_index").and_then(Value::as_u64),
+                        )
+                        .await?;
+                    Ok(json!({ "cases": cases, "next_before_case_index": next }))
+                }
+                "diff" => {
+                    let jid = args
+                        .get("job_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let case_id = args
+                        .get("case_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("case_id required"))?;
+                    Ok(json!(
+                        state
+                            .fuzzer
+                            .response_diff(
+                                project_id,
+                                FuzzJobId(jid),
+                                case_id,
+                                args.get("baseline_case_id").and_then(Value::as_i64),
+                                args.get("include_text")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                            )
+                            .await?
+                    ))
+                }
+                _ => Err(DomainError::invalid(
+                    "action must be list|cancel|get|cases|groups|group_cases|diff",
+                )),
+            }
+        }
+        "websocket_manage" => {
+            let project_id = require_project_id(&args)?;
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(250) as u32;
+            match action {
+                "list" => Ok(json!({
+                    "connections": state.db.list_websocket_connections(project_id, limit).await?
+                })),
+                "messages" => {
+                    let connection_id = args
+                        .get("connection_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("connection_id required"))?;
+                    Ok(json!({
+                        "messages": state.db.list_websocket_messages(
+                            project_id,
+                            connection_id,
+                            args.get("after_id").and_then(Value::as_i64),
+                            limit,
+                        ).await?
+                    }))
+                }
+                "send" => {
+                    let connection_id = args
+                        .get("connection_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("connection_id required"))?;
+                    let direction = args
+                        .get("direction")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("direction required"))?;
+                    let to_server = match direction {
+                        "to_server" => true,
+                        "to_client" => false,
+                        _ => {
+                            return Err(DomainError::invalid(
+                                "direction must be to_server or to_client",
+                            ))
+                        }
+                    };
+                    let payload = args
+                        .get("payload")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("payload required"))?;
+                    let encoding = args
+                        .get("encoding")
+                        .and_then(Value::as_str)
+                        .unwrap_or("text");
+                    state
+                        .websocket
+                        .send(project_id, connection_id, to_server, encoding, payload)
+                        .await?;
+                    Ok(json!({"ok": true}))
+                }
+                _ => Err(DomainError::invalid(
+                    "action must be list, messages, or send",
+                )),
             }
         }
         "browser_start" => {
@@ -1754,6 +1996,122 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 )
                 .await;
             Ok(json!({ "path": path.display().to_string() }))
+        }
+        "project_transfer" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let format = args
+                .get("format")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let include_secrets = args
+                .get("include_secrets")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let include_chromium = args
+                .get("include_chromium_profile")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let project_id = args
+                .get("project_id")
+                .and_then(Value::as_i64)
+                .map(ProjectId);
+            let supplied_path = args
+                .get("file_path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            match (action, format) {
+                ("export", "huntproxy") => {
+                    let project_id = project_id
+                        .ok_or_else(|| DomainError::invalid("project_id required for export"))?;
+                    if include_chromium && !include_secrets {
+                        return Err(DomainError::invalid(
+                            "Chromium profile export requires include_secrets=true",
+                        ));
+                    }
+                    crate::config::create_private_dir(&state.config.export_dir)?;
+                    let path = supplied_path.unwrap_or_else(|| {
+                        state
+                            .config
+                            .export_dir
+                            .join(format!("huntproxy-project-{}.huntproxy", project_id.get()))
+                    });
+                    state
+                        .db
+                        .export_bundle(
+                            &state.config,
+                            project_id,
+                            path.clone(),
+                            crate::transfer::BundleExportOptions {
+                                secrets: if include_secrets {
+                                    crate::transfer::SecretMode::Full
+                                } else {
+                                    crate::transfer::SecretMode::Sanitized
+                                },
+                                include_chromium_profile: include_chromium,
+                            },
+                        )
+                        .await?;
+                    state.db.audit(Some(project_id), "project_export", Some("mcp"), Some("project"), Some(&project_id.get().to_string()), serde_json::json!({"format":"huntproxy","include_secrets":include_secrets})).await?;
+                    Ok(json!({"path":path,"format":"huntproxy","include_secrets":include_secrets}))
+                }
+                ("import", "huntproxy") => {
+                    let path = supplied_path
+                        .ok_or_else(|| DomainError::invalid("file_path required for import"))?;
+                    let result = state.db.import_bundle(&state.config, path, None).await?;
+                    Ok(json!(result))
+                }
+                ("export", "har") => {
+                    let project_id = project_id
+                        .ok_or_else(|| DomainError::invalid("project_id required for export"))?;
+                    crate::config::create_private_dir(&state.config.export_dir)?;
+                    let path = supplied_path.unwrap_or_else(|| {
+                        state
+                            .config
+                            .export_dir
+                            .join(format!("huntproxy-project-{}.har", project_id.get()))
+                    });
+                    let har = state.db.export_har(project_id, include_secrets).await?;
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(&path)
+                        .map_err(|error| {
+                            DomainError::new(ErrorCode::StorageError, error.to_string())
+                        })?;
+                    serde_json::to_writer(file, &har).map_err(|error| {
+                        DomainError::new(ErrorCode::StorageError, error.to_string())
+                    })?;
+                    state
+                        .db
+                        .audit(
+                            Some(project_id),
+                            "project_export",
+                            Some("mcp"),
+                            Some("project"),
+                            Some(&project_id.get().to_string()),
+                            serde_json::json!({"format":"har","include_secrets":include_secrets}),
+                        )
+                        .await?;
+                    Ok(
+                        json!({"path":path,"format":"har","include_secrets":include_secrets,"entries":har.log.entries.len()}),
+                    )
+                }
+                ("import", "har") => {
+                    let project_id = project_id.ok_or_else(|| {
+                        DomainError::invalid("project_id required for HAR import")
+                    })?;
+                    let path = supplied_path
+                        .ok_or_else(|| DomainError::invalid("file_path required for import"))?;
+                    Ok(json!(state.db.import_har_file(project_id, &path).await?))
+                }
+                _ => Err(DomainError::invalid(
+                    "unsupported project transfer action or format",
+                )),
+            }
         }
         "exchange_annotate" => {
             let project_id = require_project_id(&args)?;

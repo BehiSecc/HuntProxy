@@ -1,9 +1,12 @@
 //! Project-scoped fuzz job and case persistence.
 
 use crate::domain::*;
+use crate::fuzzer::FuzzResponseGroup;
 use crate::storage::projects::{now_rfc3339, parse_time};
 use crate::storage::Db;
 use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 impl Db {
     pub async fn create_fuzz_job(
@@ -393,6 +396,130 @@ impl Db {
         .await
     }
 
+    pub async fn get_fuzz_case(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+        case_id: i64,
+    ) -> DomainResult<FuzzCaseResult> {
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT fc.id, fc.job_id, fj.project_id, fc.case_index, fc.state, fc.payloads_json,
+                        fc.exchange_id, fc.status_code, fc.response_length, fc.duration_ms, fc.error,
+                        fc.body_hash, fc.created_at, fc.started_at, fc.finished_at
+                 FROM fuzz_cases fc JOIN fuzz_jobs fj ON fj.id=fc.job_id
+                 WHERE fc.id=?1 AND fc.job_id=?2 AND fj.project_id=?3",
+                params![case_id, job_id.get(), project_id.get()],
+                map_fuzz_case,
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => DomainError::not_found("fuzz case"),
+                other => storage_error(other),
+            })
+        })
+        .await
+    }
+
+    pub async fn first_completed_fuzz_case_exchange(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+    ) -> DomainResult<Option<(i64, ExchangeId)>> {
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT fc.id, fc.exchange_id
+                 FROM fuzz_cases fc JOIN fuzz_jobs fj ON fj.id=fc.job_id
+                 WHERE fc.job_id=?1 AND fj.project_id=?2 AND fc.state='completed'
+                   AND fc.exchange_id IS NOT NULL
+                 ORDER BY fc.case_index ASC LIMIT 1",
+                params![job_id.get(), project_id.get()],
+                |row| Ok((row.get(0)?, ExchangeId(row.get(1)?))),
+            )
+            .optional()
+            .map_err(storage_error)
+        })
+        .await
+    }
+
+    pub async fn list_fuzz_response_groups(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+    ) -> DomainResult<Vec<FuzzResponseGroup>> {
+        self.with_conn(move |conn| {
+            let rows = load_grouping_cases(conn, project_id, job_id)?;
+            let mut groups = BTreeMap::<String, GroupAccumulator>::new();
+            for row in rows {
+                let signature = grouping_signature(&row);
+                groups
+                    .entry(signature)
+                    .and_modify(|group| group.add(&row))
+                    .or_insert_with(|| GroupAccumulator::new(&row));
+            }
+            let mut result = groups
+                .into_iter()
+                .map(|(signature, group)| group.finish(group_id(&signature)))
+                .collect::<Vec<_>>();
+            result.sort_by(|left, right| {
+                right.case_count.cmp(&left.case_count).then_with(|| {
+                    left.representative_case_index
+                        .cmp(&right.representative_case_index)
+                })
+            });
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn list_fuzz_cases_in_group(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+        wanted_group_id: String,
+        limit: u32,
+        before_case_index: Option<u64>,
+    ) -> DomainResult<(Vec<FuzzCaseResult>, Option<u64>)> {
+        let limit = limit.clamp(1, 500) as usize;
+        self.with_conn(move |conn| {
+            let grouping = load_grouping_cases(conn, project_id, job_id)?;
+            let all_matching_indexes = grouping
+                .into_iter()
+                .filter(|row| group_id(&grouping_signature(row)) == wanted_group_id)
+                .map(|row| row.case_index)
+                .collect::<std::collections::BTreeSet<_>>();
+            if all_matching_indexes.is_empty() {
+                return Err(DomainError::not_found("fuzz response group"));
+            }
+            let matching_indexes = all_matching_indexes
+                .into_iter()
+                .filter(|index| before_case_index.is_none_or(|before| *index < before))
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT fc.id, fc.job_id, fj.project_id, fc.case_index, fc.state, fc.payloads_json,
+                            fc.exchange_id, fc.status_code, fc.response_length, fc.duration_ms, fc.error,
+                            fc.body_hash, fc.created_at, fc.started_at, fc.finished_at
+                     FROM fuzz_cases fc JOIN fuzz_jobs fj ON fj.id=fc.job_id
+                     WHERE fc.job_id=?1 AND fj.project_id=?2 ORDER BY fc.case_index DESC",
+                )
+                .map_err(storage_error)?;
+            let all = stmt
+                .query_map(params![job_id.get(), project_id.get()], map_fuzz_case)
+                .map_err(storage_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage_error)?;
+            let mut cases = all
+                .into_iter()
+                .filter(|case| matching_indexes.contains(&case.case_index))
+                .collect::<Vec<_>>();
+            let has_more = cases.len() > limit;
+            cases.truncate(limit);
+            let next = has_more.then(|| cases.last().expect("group page is non-empty").case_index);
+            Ok((cases, next))
+        })
+        .await
+    }
+
     pub async fn mark_fuzz_jobs_interrupted(&self) -> DomainResult<u64> {
         let ts = now_rfc3339();
         self.with_conn(move |conn| {
@@ -415,6 +542,195 @@ impl Db {
             Ok(changed as u64)
         })
         .await
+    }
+}
+
+#[derive(Debug)]
+struct GroupingCase {
+    id: i64,
+    case_index: u64,
+    state: FuzzCaseState,
+    exchange_id: Option<ExchangeId>,
+    status_code: Option<u16>,
+    mime: Option<String>,
+    body_hash: Option<String>,
+    response_length: Option<i64>,
+    duration_ms: Option<i64>,
+    error: Option<String>,
+}
+
+fn load_grouping_cases(
+    conn: &rusqlite::Connection,
+    project_id: ProjectId,
+    job_id: FuzzJobId,
+) -> DomainResult<Vec<GroupingCase>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM fuzz_jobs WHERE id=?1 AND project_id=?2)",
+            params![job_id.get(), project_id.get()],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)?;
+    if !exists {
+        return Err(DomainError::not_found("fuzz job"));
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT fc.id, fc.case_index, fc.state, fc.exchange_id, fc.status_code,
+                    e.mime, fc.body_hash, fc.response_length, fc.duration_ms, fc.error
+             FROM fuzz_cases fc
+             JOIN fuzz_jobs fj ON fj.id=fc.job_id
+             LEFT JOIN exchanges e ON e.project_id=fj.project_id AND e.exchange_id=fc.exchange_id
+             WHERE fc.job_id=?1 AND fj.project_id=?2
+             ORDER BY fc.case_index ASC",
+        )
+        .map_err(storage_error)?;
+    let rows = stmt
+        .query_map(params![job_id.get(), project_id.get()], |row| {
+            Ok(GroupingCase {
+                id: row.get(0)?,
+                case_index: row.get::<_, i64>(1)? as u64,
+                state: parse_fuzz_case_state(&row.get::<_, String>(2)?),
+                exchange_id: row.get::<_, Option<i64>>(3)?.map(ExchangeId),
+                status_code: row.get::<_, Option<i64>>(4)?.map(|value| value as u16),
+                mime: row.get::<_, Option<String>>(5)?.and_then(normalize_mime),
+                body_hash: row.get(6)?,
+                response_length: row.get(7)?,
+                duration_ms: row.get(8)?,
+                error: row.get(9)?,
+            })
+        })
+        .map_err(storage_error)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage_error)
+}
+
+fn normalize_mime(value: String) -> Option<String> {
+    let value = value
+        .split(';')
+        .next()
+        .unwrap_or(&value)
+        .trim()
+        .to_ascii_lowercase();
+    (!value.is_empty()).then_some(value)
+}
+
+fn canonical_error(error: Option<&str>) -> String {
+    let value = error.unwrap_or("unknown").trim().to_ascii_lowercase();
+    value
+        .split_once(':')
+        .map(|(category, _)| category.trim().to_string())
+        .or_else(|| value.split_whitespace().next().map(str::to_string))
+        .filter(|category| !category.is_empty())
+        .unwrap_or(value)
+}
+
+fn grouping_signature(row: &GroupingCase) -> String {
+    let state = fuzz_case_state_str(row.state);
+    if row.state == FuzzCaseState::Failed {
+        return format!("{state}|error:{}", canonical_error(row.error.as_deref()));
+    }
+    let identity = row
+        .body_hash
+        .as_deref()
+        .filter(|hash| !hash.is_empty())
+        .map(|hash| format!("hash:{hash}"))
+        .unwrap_or_else(|| format!("length:{:?}", row.response_length));
+    format!(
+        "{state}|status:{:?}|mime:{}|{identity}",
+        row.status_code,
+        row.mime.as_deref().unwrap_or("")
+    )
+}
+
+fn group_id(signature: &str) -> String {
+    hex::encode(Sha256::digest(signature.as_bytes()))[..16].to_string()
+}
+
+struct GroupAccumulator {
+    representative: GroupingCase,
+    count: u64,
+    response_length_min: Option<i64>,
+    response_length_max: Option<i64>,
+    duration_ms_min: Option<i64>,
+    duration_ms_max: Option<i64>,
+    duration_ms_total: i128,
+    duration_count: u64,
+}
+
+impl GroupAccumulator {
+    fn new(row: &GroupingCase) -> Self {
+        Self {
+            representative: GroupingCase {
+                id: row.id,
+                case_index: row.case_index,
+                state: row.state,
+                exchange_id: row.exchange_id,
+                status_code: row.status_code,
+                mime: row.mime.clone(),
+                body_hash: row.body_hash.clone(),
+                response_length: row.response_length,
+                duration_ms: row.duration_ms,
+                error: row.error.clone(),
+            },
+            count: 1,
+            response_length_min: row.response_length,
+            response_length_max: row.response_length,
+            duration_ms_min: row.duration_ms,
+            duration_ms_max: row.duration_ms,
+            duration_ms_total: i128::from(row.duration_ms.unwrap_or_default()),
+            duration_count: u64::from(row.duration_ms.is_some()),
+        }
+    }
+
+    fn add(&mut self, row: &GroupingCase) {
+        self.count += 1;
+        if row.case_index < self.representative.case_index {
+            self.representative.id = row.id;
+            self.representative.case_index = row.case_index;
+            self.representative.exchange_id = row.exchange_id;
+        }
+        update_min_max(
+            row.response_length,
+            &mut self.response_length_min,
+            &mut self.response_length_max,
+        );
+        update_min_max(
+            row.duration_ms,
+            &mut self.duration_ms_min,
+            &mut self.duration_ms_max,
+        );
+        if let Some(duration) = row.duration_ms {
+            self.duration_ms_total += i128::from(duration);
+            self.duration_count += 1;
+        }
+    }
+
+    fn finish(self, group_id: String) -> FuzzResponseGroup {
+        FuzzResponseGroup {
+            group_id,
+            state: self.representative.state,
+            case_count: self.count,
+            representative_case_id: self.representative.id,
+            representative_case_index: self.representative.case_index,
+            representative_exchange_id: self.representative.exchange_id,
+            status_code: self.representative.status_code,
+            mime: self.representative.mime,
+            body_hash: self.representative.body_hash,
+            response_length_min: self.response_length_min,
+            response_length_max: self.response_length_max,
+            duration_ms_min: self.duration_ms_min,
+            duration_ms_avg: (self.duration_count > 0)
+                .then(|| self.duration_ms_total as f64 / self.duration_count as f64),
+            duration_ms_max: self.duration_ms_max,
+        }
+    }
+}
+
+fn update_min_max(value: Option<i64>, min: &mut Option<i64>, max: &mut Option<i64>) {
+    if let Some(value) = value {
+        *min = Some(min.map_or(value, |current| current.min(value)));
+        *max = Some(max.map_or(value, |current| current.max(value)));
     }
 }
 
@@ -576,4 +892,58 @@ fn not_found_fuzz_job(error: rusqlite::Error) -> DomainError {
 
 fn storage_error(error: rusqlite::Error) -> DomainError {
     DomainError::new(ErrorCode::StorageError, error.to_string())
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::*;
+
+    fn row(hash: Option<&str>, status: u16, mime: &str, length: i64) -> GroupingCase {
+        GroupingCase {
+            id: 1,
+            case_index: 0,
+            state: FuzzCaseState::Completed,
+            exchange_id: Some(ExchangeId(1)),
+            status_code: Some(status),
+            mime: normalize_mime(mime.into()),
+            body_hash: hash.map(str::to_string),
+            response_length: Some(length),
+            duration_ms: Some(5),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn exact_group_signature_uses_status_mime_and_hash() {
+        let base = row(Some("same"), 200, "Text/Plain; charset=utf-8", 10);
+        let same = row(Some("same"), 200, "text/plain", 999);
+        assert_eq!(grouping_signature(&base), grouping_signature(&same));
+        assert_ne!(
+            grouping_signature(&base),
+            grouping_signature(&row(Some("different"), 200, "text/plain", 10))
+        );
+        assert_ne!(
+            grouping_signature(&base),
+            grouping_signature(&row(Some("same"), 404, "text/plain", 10))
+        );
+        assert_ne!(
+            grouping_signature(&base),
+            grouping_signature(&row(Some("same"), 200, "application/json", 10))
+        );
+    }
+
+    #[test]
+    fn missing_hash_falls_back_to_length_and_failed_errors_are_canonical() {
+        assert_ne!(
+            grouping_signature(&row(None, 200, "text/plain", 10)),
+            grouping_signature(&row(None, 200, "text/plain", 11))
+        );
+        let mut left = row(None, 0, "", 0);
+        left.state = FuzzCaseState::Failed;
+        left.error = Some("timeout: host one".into());
+        let mut right = row(None, 0, "", 999);
+        right.state = FuzzCaseState::Failed;
+        right.error = Some("TIMEOUT: host two".into());
+        assert_eq!(grouping_signature(&left), grouping_signature(&right));
+    }
 }

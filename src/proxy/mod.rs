@@ -4,6 +4,8 @@
 //! requests and responses are stored in History. Upstream traffic still goes
 //! through the semantic transport and its `ValidatedDial` resolver.
 
+mod websocket;
+
 use crate::app::AppState;
 use crate::domain::*;
 use crate::policy::scope::{resolve_validated_dial, url_is_in_scope, TargetRef};
@@ -146,11 +148,16 @@ async fn forward_request(
     session: CaptureSession,
     forced_scheme: Option<&str>,
 ) -> DomainResult<Response<ProxyBody>> {
+    if websocket::is_upgrade(&request) {
+        return websocket::handle(state, request, session, forced_scheme).await;
+    }
     let project = state.db.get_project(session.project_id).await?;
     let (mut parts, incoming) = request.into_parts();
     let internal_crawler_request =
         take_internal_crawler_marker(&mut parts.headers, session.is_browser_bound);
-    let url = request_url(&parts, forced_scheme)?;
+    let mut url = request_url(&parts, forced_scheme)?;
+    let mut applied_rules =
+        crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut url).await?;
     let target = TargetRef::from_url(&url)?;
     let capture = url_is_in_scope(&url, &project.scope)?;
     let dial = resolve_validated_dial(&url, &project.scope, Duration::from_secs(60)).await?;
@@ -160,18 +167,64 @@ async fn forward_request(
     } else {
         ProtocolMode::Auto
     };
-    let headers = parts
+    let mut headers = parts
         .headers
         .iter()
         .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("proxy-connection"))
         .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
         .collect::<Vec<_>>();
-    let request_spool = spool_request_body(
+    let mut request_spool = spool_request_body(
         incoming,
         project.limits.capture_body_bytes,
         &state.config.spool_dir,
     )
     .await?;
+    let rewrite_body =
+        crate::request_rules::has_applicable_body_rules(&state.db, session.project_id, &url)
+            .await?;
+    let mut body = if rewrite_body {
+        if request_spool.as_ref().is_some_and(|(_, length)| {
+            *length > crate::request_rules::MAX_REWRITE_BODY_BYTES as u64
+        }) {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "request body exceeds 2 MiB rewrite limit",
+            ));
+        }
+        match &request_spool {
+            Some((spool, _)) => tokio::fs::read(spool.path())
+                .await
+                .map_err(spool_io_error)?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    applied_rules.extend(
+        crate::request_rules::apply_message_rules(
+            &state.db,
+            session.project_id,
+            &url,
+            &mut headers,
+            rewrite_body.then_some(&mut body),
+        )
+        .await?,
+    );
+    if rewrite_body {
+        if let Some((spool, length)) = request_spool.as_mut() {
+            tokio::fs::write(spool.path(), &body)
+                .await
+                .map_err(spool_io_error)?;
+            *length = body.len() as u64;
+        } else if !body.is_empty() {
+            let (spool, mut file) = create_private_spool(&state.config.spool_dir, "request")?;
+            file.write_all(&body).await.map_err(spool_io_error)?;
+            file.flush().await.map_err(spool_io_error)?;
+            file.sync_data().await.map_err(spool_io_error)?;
+            drop(file);
+            request_spool = Some((spool, body.len() as u64));
+        }
+    }
     let request_body = request_spool
         .as_ref()
         .map(|(spool, len)| OutboundBody::Spool {
@@ -211,6 +264,7 @@ async fn forward_request(
                     request_spool,
                     start.elapsed(),
                     &error,
+                    &applied_rules,
                 )
                 .await;
             }
@@ -229,6 +283,7 @@ async fn forward_request(
         start,
         capture,
         internal_crawler_request,
+        applied_rules,
     )
 }
 
@@ -302,6 +357,7 @@ async fn record_failed_exchange(
     request_spool: Option<(SpoolGuard, u64)>,
     duration: Duration,
     error: &DomainError,
+    applied_rules: &[crate::request_rules::AppliedRequestRule],
 ) {
     let completion = completion_for_error(error);
     let request_path = request_spool
@@ -350,6 +406,14 @@ async fn record_failed_exchange(
         .await;
     match result {
         Ok(exchange_id) => {
+            let _ = state
+                .db
+                .record_exchange_request_rules(
+                    session.project_id,
+                    exchange_id,
+                    applied_rules.to_vec(),
+                )
+                .await;
             let _ = state.events.send(crate::app::AppEvent {
                 project_id: session.project_id.get(),
                 kind: "exchange".into(),
@@ -405,6 +469,7 @@ fn streaming_response(
     started: std::time::Instant,
     capture: bool,
     suppress_crawl: bool,
+    applied_rules: Vec<crate::request_rules::AppliedRequestRule>,
 ) -> DomainResult<Response<ProxyBody>> {
     let (response_spool, response_file) =
         create_private_spool(&state.config.spool_dir, "response")?;
@@ -444,6 +509,7 @@ fn streaming_response(
         sender,
         capture,
         suppress_crawl,
+        applied_rules,
     ));
     Ok(response)
 }
@@ -465,14 +531,15 @@ async fn pump_streaming_response(
     sender: mpsc::Sender<Bytes>,
     capture: bool,
     suppress_crawl: bool,
+    applied_rules: Vec<crate::request_rules::AppliedRequestRule>,
 ) {
     let response_headers = header_entries(&outbound.headers);
     let mime = response_headers
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("content-type"))
         .map(|header| String::from_utf8_lossy(&header.value).into_owned());
-    let crawl_html =
-        session.is_browser_bound && !suppress_crawl && is_html_content_type(mime.as_deref());
+    let html_response = is_html_content_type(mime.as_deref());
+    let crawl_html = session.is_browser_bound && !suppress_crawl && html_response;
     let mut captured = 0u64;
     let mut truncated = false;
     let mut completion = CompletionState::Complete;
@@ -548,6 +615,18 @@ async fn pump_streaming_response(
         .as_ref()
         .map(|(spool, _)| spool.path().to_path_buf());
     let response_path = response_spool_valid.then(|| response_spool.path().to_path_buf());
+    let document_url = format!(
+        "{}://{}{}{}",
+        target.scheme,
+        target.authority(),
+        target.path,
+        target
+            .query
+            .as_deref()
+            .filter(|query| !query.is_empty())
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default()
+    );
     let result = state
         .db
         .insert_exchange_from_spools(
@@ -595,6 +674,10 @@ async fn pump_streaming_response(
         .await;
     match result {
         Ok(exchange_id) => {
+            let _ = state
+                .db
+                .record_exchange_request_rules(session.project_id, exchange_id, applied_rules)
+                .await;
             let _ = state.events.send(crate::app::AppEvent {
                 project_id: session.project_id.get(),
                 kind: "exchange".into(),
@@ -604,6 +687,38 @@ async fn pump_streaming_response(
                     "completion": completion,
                 }),
             });
+            if html_response {
+                if let Err(error) = crate::page_title::populate_static_exchange_title(
+                    &state.db,
+                    session.project_id,
+                    exchange_id,
+                )
+                .await
+                {
+                    tracing::debug!(%error, exchange_id = exchange_id.get(), "could not extract static page title");
+                }
+            }
+            if crawl_html {
+                if let Some(browser_session_id) = session.browser_session_id {
+                    if let Ok(browser_session) = state
+                        .db
+                        .get_browser_session(session.project_id, browser_session_id)
+                        .await
+                    {
+                        if let Some(title) = browser_session.current_title.as_deref() {
+                            let _ = state
+                                .db
+                                .associate_browser_page_title(
+                                    session.project_id,
+                                    browser_session_id,
+                                    &document_url,
+                                    title,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
             if crawl_html {
                 let crawler = state.crawler.clone();
                 tokio::spawn(async move {
@@ -746,7 +861,7 @@ async fn handle_connect(
             }
         };
         let builder = AutoServerBuilder::new(TokioExecutor::new());
-        let connection = builder.serve_connection(TokioIo::new(tls), service);
+        let connection = builder.serve_connection_with_upgrades(TokioIo::new(tls), service);
         tokio::select! {
             _ = shutdown.cancelled() => {}
             _ = revocation => {}
@@ -903,6 +1018,15 @@ mod tests {
         config.export_dir = config.data_dir.join("exports");
         config.runtime_dir = config.data_dir.join("runtime");
         config.ensure_layout().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["HuntProxy test CA".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        crate::config::write_private_file(&config.ca_cert_path(), ca_cert.pem().as_bytes())
+            .unwrap();
+        crate::config::write_private_file(&config.ca_key_path(), ca_key.serialize_pem().as_bytes())
+            .unwrap();
         let worker = directory.path().join("worker.js");
         std::fs::write(&worker, "// test worker").unwrap();
 
@@ -939,6 +1063,7 @@ mod tests {
             fuzzer,
             browser,
             crawler,
+            websocket: Arc::new(crate::websocket::WebSocketService::new()),
             events,
             shutdown: CancellationToken::new(),
             activity: crate::app::ActivityTracker::new(),
@@ -1002,6 +1127,136 @@ mod tests {
             request_url(&parts, Some("https")).unwrap(),
             "https://example.com/a?b=1"
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_proxy_captures_relays_and_injects_messages() {
+        use futures::SinkExt;
+        use tokio::net::TcpStream;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (state, project, session) = proxy_test_fixture(&directory).await;
+        state
+            .db
+            .create_request_rule(
+                project.id,
+                crate::request_rules::RequestRuleInput {
+                    name: "WebSocket marker".into(),
+                    enabled: true,
+                    position: 0,
+                    host_pattern: None,
+                    target: crate::request_rules::RequestRuleTarget::Header,
+                    operation: crate::request_rules::RequestRuleOperation::Set,
+                    header_name: Some("X-HuntProxy-Rule".into()),
+                    match_kind: crate::request_rules::RequestRuleMatchKind::Literal,
+                    pattern: String::new(),
+                    replacement: Some("applied".into()),
+                    replace_all: true,
+                },
+            )
+            .await
+            .unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (socket, _) = target.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(message) = websocket.next().await {
+                let message = message.unwrap();
+                let closed = matches!(message, Message::Close(_));
+                if closed {
+                    break;
+                }
+                websocket.send(message).await.unwrap();
+            }
+        });
+
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let url = format!("ws://{target_addr}/events");
+        let mut request = url.clone().into_client_request().unwrap();
+        request.headers_mut().insert(
+            "proxy-authorization",
+            format!("Bearer {}", session.token_once.as_deref().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let (mut client, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+        client.send(Message::Text("hello".into())).await.unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap().into_text().unwrap(),
+            "hello"
+        );
+
+        let connection = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(connection) = state
+                    .db
+                    .list_websocket_connections(project.id, 10)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    break connection;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state
+            .websocket
+            .send(project.id, connection.id, true, "text", "injected")
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap().into_text().unwrap(),
+            "injected"
+        );
+        client.close(None).await.unwrap();
+        echo.await.unwrap();
+
+        let messages = state
+            .db
+            .list_websocket_messages(project.id, connection.id, None, 20)
+            .await
+            .unwrap();
+        assert!(messages.len() >= 4);
+        assert!(messages
+            .iter()
+            .any(|message| message.direction == "injected_to_server"));
+        let handshake_id = ExchangeId(connection.handshake_exchange_id.unwrap());
+        let request_headers = state
+            .db
+            .load_raw_headers(project.id, handshake_id, MessageSide::Request)
+            .await
+            .unwrap();
+        assert!(request_headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("x-huntproxy-rule") && header.value == b"applied"
+        }));
+        assert_eq!(
+            state
+                .db
+                .list_exchange_request_rules(project.id, handshake_id)
+                .await
+                .unwrap()[0]
+                .name,
+            "WebSocket marker"
+        );
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1080,6 +1335,7 @@ mod tests {
             std::time::Instant::now(),
             true,
             false,
+            vec![],
         )
         .unwrap();
         let mut body = response.into_body();
@@ -1137,6 +1393,7 @@ mod tests {
             std::time::Instant::now(),
             true,
             false,
+            vec![],
         )
         .unwrap();
         assert_eq!(
@@ -1187,6 +1444,7 @@ mod tests {
             std::time::Instant::now(),
             false,
             false,
+            vec![],
         )
         .unwrap();
         assert_eq!(
@@ -1236,6 +1494,7 @@ mod tests {
             std::time::Instant::now(),
             true,
             false,
+            vec![],
         )
         .unwrap();
         assert_eq!(

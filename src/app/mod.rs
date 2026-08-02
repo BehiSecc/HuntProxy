@@ -31,6 +31,7 @@ pub struct AppState {
     pub fuzzer: Arc<FuzzerService>,
     pub browser: Arc<BrowserService>,
     pub crawler: Arc<CrawlerService>,
+    pub websocket: crate::websocket::SharedWebSocketService,
     pub events: broadcast::Sender<AppEvent>,
     pub shutdown: CancellationToken,
     pub activity: ActivityTracker,
@@ -274,6 +275,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         browser.clone(),
         events.clone(),
     ));
+    let websocket = Arc::new(crate::websocket::WebSocketService::new());
     Ok(Arc::new(AppState {
         db,
         config,
@@ -282,6 +284,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         fuzzer,
         browser,
         crawler,
+        websocket,
         events,
         shutdown: CancellationToken::new(),
         activity: ActivityTracker::new(),
