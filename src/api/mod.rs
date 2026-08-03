@@ -289,10 +289,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/projects/{id}/browser-sessions/{bid}/stop",
             post(stop_browser),
         )
-        .route(
-            "/api/v1/projects/{id}/browser-sessions/{bid}/switch-chromium",
-            post(switch_browser_to_chromium),
-        )
         .route("/api/v1/projects/{id}/events", get(events))
         .route("/api/v1/doctor", get(doctor))
         .route(
@@ -1783,11 +1779,16 @@ async fn start_browser(
     Path(id): Path<i64>,
     Json(body): Json<StartBrowser>,
 ) -> Response {
-    let policy = match body.engine_policy.as_deref() {
-        Some("chromium") => EnginePolicy::Chromium,
-        _ => EnginePolicy::Auto,
-    };
-    match state.browser.start(ProjectId(id), body.url, policy).await {
+    if body
+        .engine_policy
+        .as_deref()
+        .is_some_and(|policy| !matches!(policy, "auto" | "chromium"))
+    {
+        return error_response(DomainError::invalid(
+            "engine_policy is obsolete; omit it to use Chromium",
+        ));
+    }
+    match state.browser.start(ProjectId(id), body.url).await {
         Ok(session) => {
             let _ = state.events.send(AppEvent {
                 project_id: id,
@@ -1840,32 +1841,6 @@ async fn stop_browser(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => error_response(e),
-    }
-}
-
-async fn switch_browser_to_chromium(
-    State(state): State<Arc<AppState>>,
-    Path((id, bid)): Path<(i64, i64)>,
-) -> Response {
-    match state
-        .browser
-        .switch_to_chromium(ProjectId(id), BrowserSessionId(bid))
-        .await
-    {
-        Ok(session) => {
-            let _ = state.events.send(AppEvent {
-                project_id: id,
-                kind: "browser".into(),
-                payload: serde_json::json!({
-                    "session_id": bid,
-                    "state": session.state,
-                    "engine": session.engine,
-                    "checkpoint_status": session.checkpoint_status,
-                }),
-            });
-            Json(session).into_response()
-        }
-        Err(error) => error_response(error),
     }
 }
 

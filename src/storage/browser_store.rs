@@ -9,29 +9,23 @@ impl Db {
     pub async fn create_browser_session(
         &self,
         project_id: ProjectId,
-        engine: BrowserEngine,
-        engine_policy: EnginePolicy,
     ) -> DomainResult<BrowserSession> {
         let ts = now_rfc3339();
-        let engine_s = engine_str(engine);
-        let policy_s = policy_str(engine_policy);
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO browser_sessions (project_id, engine, engine_policy, state, fallback_used, checkpoint_version, created_at, updated_at)
                  VALUES (?1,?2,?3,'starting',0,0,?4,?5)",
-                params![project_id.get(), engine_s, policy_s, ts, ts],
+                params![project_id.get(), "chromium", "chromium", ts, ts],
             )
             .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             let id = conn.last_insert_rowid();
             Ok(BrowserSession {
                 id: BrowserSessionId(id),
                 project_id,
-                engine,
-                engine_policy,
+                engine: BrowserEngine::Chromium,
                 current_url: None,
                 current_title: None,
                 state: BrowserSessionState::Starting,
-                fallback_used: false,
                 checkpoint_status: None,
                 checkpoint_hash: None,
                 created_at: parse_time(&ts),
@@ -48,15 +42,14 @@ impl Db {
         let state_s = browser_state_str(session.state);
         let url = session.current_url.clone();
         let title = session.current_title.clone();
-        let fallback = session.fallback_used as i64;
         let cp_status = session.checkpoint_status.clone();
         let cp_hash = session.checkpoint_hash.clone();
         self.with_conn(move |conn| {
             conn.execute(
-                "UPDATE browser_sessions SET engine=?1, current_url=?2, current_title=?3,
-                 state=?4, fallback_used=?5, checkpoint_status=?6, checkpoint_hash=?7,
-                 updated_at=?8 WHERE id=?9",
-                params![engine_s, url, title, state_s, fallback, cp_status, cp_hash, ts, id],
+                "UPDATE browser_sessions SET engine=?1, engine_policy='chromium', fallback_used=0,
+                 current_url=?2, current_title=?3, state=?4, checkpoint_status=?5,
+                 checkpoint_hash=?6, updated_at=?7 WHERE id=?8",
+                params![engine_s, url, title, state_s, cp_status, cp_hash, ts, id],
             )
             .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             Ok(())
@@ -111,24 +104,22 @@ impl Db {
     ) -> DomainResult<BrowserSession> {
         self.with_conn(move |conn| {
             conn.query_row(
-                "SELECT id, project_id, engine, engine_policy, current_url, current_title,
-                        state, fallback_used, checkpoint_status, checkpoint_hash, created_at, updated_at
+                "SELECT id, project_id, engine, current_url, current_title,
+                        state, checkpoint_status, checkpoint_hash, created_at, updated_at
                  FROM browser_sessions WHERE id=?1 AND project_id=?2",
                 params![id.get(), project_id.get()],
                 |row| {
                     Ok(BrowserSession {
                         id: BrowserSessionId(row.get(0)?),
                         project_id: ProjectId(row.get(1)?),
-                        engine: parse_engine(&row.get::<_, String>(2)?),
-                        engine_policy: parse_policy(&row.get::<_, String>(3)?),
-                        current_url: row.get(4)?,
-                        current_title: row.get(5)?,
-                        state: parse_browser_state(&row.get::<_, String>(6)?),
-                        fallback_used: row.get::<_, i64>(7)? != 0,
-                        checkpoint_status: row.get(8)?,
-                        checkpoint_hash: row.get(9)?,
-                        created_at: parse_time(&row.get::<_, String>(10)?),
-                        updated_at: parse_time(&row.get::<_, String>(11)?),
+                        engine: parse_engine(&row.get::<_, String>(2)?, 2)?,
+                        current_url: row.get(3)?,
+                        current_title: row.get(4)?,
+                        state: parse_browser_state(&row.get::<_, String>(5)?),
+                        checkpoint_status: row.get(6)?,
+                        checkpoint_hash: row.get(7)?,
+                        created_at: parse_time(&row.get::<_, String>(8)?),
+                        updated_at: parse_time(&row.get::<_, String>(9)?),
                     })
                 },
             )
@@ -158,34 +149,32 @@ impl Db {
 
 fn engine_str(e: BrowserEngine) -> &'static str {
     match e {
-        BrowserEngine::Lightpanda => "lightpanda",
         BrowserEngine::Chromium => "chromium",
     }
 }
-fn parse_engine(s: &str) -> BrowserEngine {
+fn parse_engine(s: &str, column: usize) -> rusqlite::Result<BrowserEngine> {
     match s {
-        "chromium" => BrowserEngine::Chromium,
-        _ => BrowserEngine::Lightpanda,
+        // Legacy Lightpanda rows and imports resume through Chromium using the
+        // portable browser checkpoint.
+        "chromium" | "lightpanda" => Ok(BrowserEngine::Chromium),
+        _ => Err(invalid_browser_metadata(column, "engine", s)),
     }
 }
-fn policy_str(p: EnginePolicy) -> &'static str {
-    match p {
-        EnginePolicy::Auto => "auto",
-        EnginePolicy::Chromium => "chromium",
-    }
-}
-fn parse_policy(s: &str) -> EnginePolicy {
-    match s {
-        "chromium" => EnginePolicy::Chromium,
-        _ => EnginePolicy::Auto,
-    }
+fn invalid_browser_metadata(column: usize, field: &str, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown browser {field}: {value}"),
+        )),
+    )
 }
 fn browser_state_str(s: BrowserSessionState) -> &'static str {
     match s {
         BrowserSessionState::Starting => "starting",
         BrowserSessionState::Ready => "ready",
         BrowserSessionState::Busy => "busy",
-        BrowserSessionState::Migrating => "migrating",
         BrowserSessionState::Interrupted => "interrupted",
         BrowserSessionState::Stopped => "stopped",
         BrowserSessionState::Failed => "failed",
@@ -195,7 +184,7 @@ fn parse_browser_state(s: &str) -> BrowserSessionState {
     match s {
         "ready" => BrowserSessionState::Ready,
         "busy" => BrowserSessionState::Busy,
-        "migrating" => BrowserSessionState::Migrating,
+        "migrating" => BrowserSessionState::Interrupted,
         "interrupted" => BrowserSessionState::Interrupted,
         "stopped" => BrowserSessionState::Stopped,
         "failed" => BrowserSessionState::Failed,

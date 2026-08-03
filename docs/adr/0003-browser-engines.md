@@ -1,23 +1,30 @@
-# ADR 0003: Browser engines and migration
+# ADR 0003: Chromium browser engine
 
 **Status:** Accepted  
-**Date:** 2026-07-24
+**Date:** 2026-08-03
 
 ## Context
 
-Lightpanda is the fast engine; Chromium is compatibility fallback.
+HuntProxy needs one reliable browser engine for modern applications, persistent
+authenticated profiles, complete Playwright behavior, and future user takeover.
+The previous Lightpanda-first design failed too many real websites and made
+browser startup, state migration, and public controls unnecessarily complex.
 
 ## Decision
 
-- Pin Playwright worker (`playwright-core`) over CDP for Lightpanda; `chromium.launch()` for Chromium.
-- After `connectOverCDP`, always `browser.newContext()` + `newPage()` (default context unusable on tested Lightpanda build).
-- Extract cookies via `context.cookies()` and storage via `page.evaluate` — do **not** trust Lightpanda `storageState().origins`.
+- Chromium is the only supported browser engine.
+- The pinned Playwright worker launches Chromium directly.
+- Persistent profiles remain under each project's existing `chromium/default`
+  directory so upgrades preserve manual logins and service-worker state.
+- Portable checkpoints retain cookies plus local/session storage. A legacy
+  checkpoint is imported when a project has no initialized Chromium profile.
 - Checkpoint values stay in daemon memory only; SQLite stores version/status/hash.
-- Lightpanda proxy: `--proxy-bearer-token` and/or Basic in `--http-proxy` URL.
-- Chromium/external: Basic user `bb` + same token as password.
-- Auto fallback at most once per session; explicit “Switch to Chromium” always available.
-- `LIGHTPANDA_DISABLE_TELEMETRY=true`.
+- Chromium authenticates to HuntProxy's proxy with Basic user `bb` and the
+  capture token as its password.
+- Browser start requires no engine policy, fallback reason, or migration action.
 
-## Proven
+## Compatibility
 
-Phase 0 spike (`spikes/lightpanda_spike`): 16/16 PASS including cookie + localStorage + sessionStorage transfer to system Chrome.
+Legacy database rows and project imports are normalized to Chromium metadata.
+HuntProxy does not delete previously installed unsupported browser binaries or
+unknown keys in an existing user configuration.

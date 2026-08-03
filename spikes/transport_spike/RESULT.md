@@ -246,4 +246,4 @@ spikes/transport_spike/
 2. macOS arm64/x86_64 and Linux arm64 release builds of the same pins.
 3. `cargo deny` + full notice file packaging for BoringSSL.
 4. Wire `SemanticTransport` behind a trait in `bb` with pool key `(authority, approved_ip, profile, policy_epoch, expires_at)`.
-5. Confirm “transport-only” emulation without unwanted default identity headers for Lightpanda path.
+5. Confirm protocol-profile emulation without unwanted default identity headers.

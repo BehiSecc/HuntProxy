@@ -464,8 +464,7 @@ test
             <div class="card hidden" id="browserCurrent"></div>
             <label for="browserUrl">URL</label><input id="browserUrl" placeholder="https://app.example.com" />
             <div class="row">
-              <button class="btn primary" id="startBrowser">Start Auto</button>
-              <button class="btn" id="switchBrowser" disabled>Switch to Chromium</button>
+              <button class="btn primary" id="startBrowser">Start Chromium</button>
               <button class="btn danger" id="stopBrowser" disabled>Stop</button>
             </div>
             <div class="status" id="browserStatus"></div>
@@ -1452,7 +1451,6 @@ test
         const sessions = result.sessions || [];
         state.browserSession = sessions.length ? sessions[sessions.length - 1] : null;
         const active = state.browserSession;
-        $('switchBrowser').disabled = !active || active.engine === 'chromium';
         $('stopBrowser').disabled = !active;
         $('runBrowserAction').disabled = !active;
         $('browserCurrent').classList.toggle('hidden', !active);
@@ -1467,17 +1465,9 @@ test
     $('startBrowser').onclick = async () => {
       if (!state.projectId) return status('browserStatus', 'Select a project', 'err');
       try {
-        const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, { method: 'POST', body: JSON.stringify({ url: $('browserUrl').value.trim(), engine_policy: 'auto' }) });
-        state.browserSession = session; $('switchBrowser').disabled = false; $('stopBrowser').disabled = false; $('runBrowserAction').disabled = false;
+        const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, { method: 'POST', body: JSON.stringify({ url: $('browserUrl').value.trim() }) });
+        state.browserSession = session; $('stopBrowser').disabled = false; $('runBrowserAction').disabled = false;
         status('browserStatus', `Session ${session.id} running with ${session.engine}`, 'ok');
-        $('browserOutput').textContent = JSON.stringify(session, null, 2);
-      } catch (e) { status('browserStatus', e.message, 'err'); }
-    };
-    $('switchBrowser').onclick = async () => {
-      if (!state.browserSession) return;
-      try {
-        const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession.id}/switch-chromium`, { method: 'POST' });
-        state.browserSession = session; status('browserStatus', `Migrated to Chromium: ${session.checkpoint_status}`, session.checkpoint_status === 'ok' ? 'ok' : 'warn');
         $('browserOutput').textContent = JSON.stringify(session, null, 2);
       } catch (e) { status('browserStatus', e.message, 'err'); }
     };
@@ -1485,7 +1475,7 @@ test
       if (!state.browserSession) return;
       try {
         await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession.id}/stop`, { method: 'POST' });
-        state.browserSession = null; $('switchBrowser').disabled = true; $('stopBrowser').disabled = true; $('runBrowserAction').disabled = true;
+        state.browserSession = null; $('stopBrowser').disabled = true; $('runBrowserAction').disabled = true;
         status('browserStatus', 'Session stopped', 'ok');
       } catch (e) { status('browserStatus', e.message, 'err'); }
     };

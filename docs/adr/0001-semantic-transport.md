@@ -5,7 +5,7 @@
 
 ## Context
 
-Reply, Fuzzer, proxy intercept path, and Lightpanda forwarding need a semantic HTTP client that:
+Reply, Fuzzer, proxy intercept path, and crawler requests need a semantic HTTP client that:
 - dials only `ValidatedDial` approved IPs (no second DNS lookup),
 - can apply protocol-profile matching (TLS/H2) without claiming undetectability,
 - remains permissively licensed (no GPL `wreq-util 2.2.6`).
@@ -16,8 +16,7 @@ Reply, Fuzzer, proxy intercept path, and Lightpanda forwarding need a semantic H
 2. **Default runtime path:** `GenericTransport` (Hyper/rustls-style raw HTTP/1.1 over approved-IP TCP/TLS) with `transport_profile=generic_unprofiled` and provenance `generic_unprofiled`.
 3. **Profile path:** exact-pinned `wreq =6.0.0-rc.29` + `wreq-util =3.0.0-rc.14` (Apache-2.0) behind the trait when the Phase 0 spike confirms clean builds on target platforms. Isolated factory: `try_wreq_transport()`.
 4. **Fallback if Wreq/BoringSSL fails:** keep GenericTransport only; do not retain two half-working stacks.
-5. **Lightpanda:** transport-only profile mode; preserve engine UA/client hints; label `protocol_profile_only`.
-6. **Language:** “protocol-profile matching” / “compatibility mode” — never “undetectable”.
+5. **Language:** “protocol-profile matching” / “compatibility mode” — never “undetectable”.
 
 ## Consequences
 

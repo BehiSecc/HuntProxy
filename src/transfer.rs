@@ -498,7 +498,7 @@ fn import_sql(old: i64, new: i64, o: &IdOffsets) -> String {
         r#"
 INSERT INTO bodies SELECT id+{body},sha256,original_length,stored_length,codec,mime_class,content FROM hp_archive.bodies;
 INSERT INTO browser_sessions (id,project_id,engine,engine_policy,current_url,state,fallback_used,checkpoint_status,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title)
- SELECT id+{browser},{new},engine,engine_policy,current_url,'interrupted',fallback_used,checkpoint_status,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title FROM hp_archive.browser_sessions WHERE project_id={old};
+ SELECT id+{browser},{new},'chromium','chromium',current_url,'interrupted',0,CASE WHEN checkpoint_status='fallback_chromium' THEN 'ok' ELSE checkpoint_status END,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title FROM hp_archive.browser_sessions WHERE project_id={old};
 INSERT INTO browser_actions SELECT id+{action},session_id+{browser},{new},action_type,CASE WHEN status IN ('running','queued') THEN 'failed' ELSE status END,error_code,created_at,finished_at FROM hp_archive.browser_actions WHERE project_id={old};
 INSERT INTO capture_sessions SELECT id+{capture},{new},CASE WHEN browser_session_id IS NULL THEN NULL ELSE browser_session_id+{browser} END,CASE WHEN browser_action_id IS NULL THEN NULL ELSE browser_action_id+{action} END,created_at,expires_at,COALESCE(revoked_at,created_at),'revoked',is_browser_bound,randomblob(32),randomblob(16) FROM hp_archive.capture_sessions WHERE project_id={old};
 INSERT INTO labels SELECT id+{label},{new},name FROM hp_archive.labels WHERE project_id={old};

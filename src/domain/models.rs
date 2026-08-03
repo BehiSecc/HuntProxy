@@ -404,14 +404,6 @@ pub struct FuzzJob {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserEngine {
-    Lightpanda,
-    Chromium,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnginePolicy {
-    Auto,
     Chromium,
 }
 
@@ -421,7 +413,6 @@ pub enum BrowserSessionState {
     Starting,
     Ready,
     Busy,
-    Migrating,
     Interrupted,
     Stopped,
     Failed,
@@ -432,12 +423,10 @@ pub struct BrowserSession {
     pub id: BrowserSessionId,
     pub project_id: ProjectId,
     pub engine: BrowserEngine,
-    pub engine_policy: EnginePolicy,
     pub current_url: Option<String>,
     /// Last title reported by the active page, retained for client reattachment.
     pub current_title: Option<String>,
     pub state: BrowserSessionState,
-    pub fallback_used: bool,
     pub checkpoint_status: Option<String>,
     pub checkpoint_hash: Option<String>,
     #[serde(with = "rfc3339")]

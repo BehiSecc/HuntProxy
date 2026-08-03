@@ -28,9 +28,7 @@ const EMBEDDED_WORKER_LOCK: &str = include_str!("../../browser-worker/package-lo
 pub struct BrowserInstallStatus {
     pub node_available: bool,
     pub worker_available: bool,
-    pub lightpanda_available: bool,
     pub chromium_available: bool,
-    pub lightpanda_path: Option<String>,
     pub chromium_path: Option<String>,
     pub node_path: Option<String>,
     pub install_hint: Option<String>,
@@ -143,7 +141,6 @@ pub struct ActionResult {
 struct RuntimeSession {
     project_id: ProjectId,
     capture_session_id: CaptureSessionId,
-    engine: BrowserEngine,
     persistent: bool,
 }
 
@@ -184,7 +181,6 @@ impl WorkerProcess {
     async fn spawn(
         node_path: &Path,
         worker_path: &Path,
-        lightpanda_path: Option<&Path>,
         playwright_core_path: Option<&Path>,
         chromium_path: Option<&Path>,
     ) -> Result<Self, WorkerCallFailure> {
@@ -198,9 +194,6 @@ impl WorkerProcess {
         if let Some(parent) = worker_path.parent() {
             command.current_dir(parent);
         }
-        if let Some(path) = lightpanda_path {
-            command.env("LIGHTPANDA_PATH", path);
-        }
         if let Some(path) = playwright_core_path {
             command.env("BB_PLAYWRIGHT_CORE_PATH", path);
             if path.join(".local-browsers").is_dir() {
@@ -210,7 +203,6 @@ impl WorkerProcess {
         if let Some(path) = chromium_path {
             command.env("BB_CHROME_EXECUTABLE", path);
         }
-        command.env("LIGHTPANDA_DISABLE_TELEMETRY", "true");
         #[cfg(unix)]
         {
             // Browser crashes should not leave large core files on a VPS.
@@ -337,8 +329,6 @@ impl WorkerProcess {
                 -32602 => ErrorCode::InvalidArgument,
                 -32001 => ErrorCode::NotFound,
                 -32003 => ErrorCode::ChromiumNotInstalled,
-                -32004 => ErrorCode::LightpandaNotInstalled,
-                -32005 => ErrorCode::EngineFallback,
                 _ => ErrorCode::Unavailable,
             };
             return Err(WorkerCallFailure::Rpc(DomainError::new(
@@ -393,7 +383,6 @@ impl Drop for WorkerProcess {
 
 pub struct BrowserService {
     pub db: Arc<Db>,
-    pub lightpanda_path: Option<PathBuf>,
     pub node_path: Option<PathBuf>,
     pub worker_path: Option<PathBuf>,
     proxy_server: String,
@@ -410,19 +399,13 @@ pub struct BrowserService {
 }
 
 impl BrowserService {
-    pub fn new(
-        db: Arc<Db>,
-        lightpanda_path: Option<PathBuf>,
-        node_path: Option<PathBuf>,
-        worker_path: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(db: Arc<Db>, node_path: Option<PathBuf>, worker_path: Option<PathBuf>) -> Self {
         let profiles_root = default_profiles_root(&db);
         let proxy_server = std::env::var("BB_BROWSER_PROXY_SERVER")
             .unwrap_or_else(|_| DEFAULT_BROWSER_PROXY.to_string());
         let ca_cert_path = std::env::var_os("BB_BROWSER_CA_CERT").map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
-            lightpanda_path,
             node_path,
             worker_path,
             proxy_server,
@@ -434,7 +417,6 @@ impl BrowserService {
     /// Proxy-aware constructor for daemon integration with non-default proxy binds.
     pub fn new_with_proxy(
         db: Arc<Db>,
-        lightpanda_path: Option<PathBuf>,
         node_path: Option<PathBuf>,
         worker_path: Option<PathBuf>,
         proxy_server: String,
@@ -443,7 +425,6 @@ impl BrowserService {
         let ca_cert_path = std::env::var_os("BB_BROWSER_CA_CERT").map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
-            lightpanda_path,
             node_path,
             worker_path,
             proxy_server,
@@ -455,7 +436,6 @@ impl BrowserService {
     /// Proxy- and CA-aware constructor for the daemon's managed browser sessions.
     pub fn new_with_proxy_and_ca(
         db: Arc<Db>,
-        lightpanda_path: Option<PathBuf>,
         node_path: Option<PathBuf>,
         worker_path: Option<PathBuf>,
         proxy_server: String,
@@ -470,7 +450,6 @@ impl BrowserService {
         let chromium_path = chromium_executable(playwright_core_path.as_deref());
         Self {
             db,
-            lightpanda_path: existing_path(lightpanda_path, "lightpanda"),
             node_path: existing_path(node_path, "node"),
             worker_path,
             proxy_server,
@@ -489,10 +468,6 @@ impl BrowserService {
 
     pub fn status(&self) -> BrowserInstallStatus {
         let node_available = self.node_path.as_ref().is_some_and(|path| path.exists());
-        let lightpanda_available = self
-            .lightpanda_path
-            .as_ref()
-            .is_some_and(|path| path.exists());
         let worker_script_available = self.worker_path.as_ref().is_some_and(|path| path.exists());
         let worker_available =
             node_available && worker_script_available && self.playwright_core_path.is_some();
@@ -515,8 +490,8 @@ impl BrowserService {
             Some(format!(
                 "playwright-core missing; run `npm install` in {directory}"
             ))
-        } else if !lightpanda_available && !chromium_available {
-            Some("Install Lightpanda or Chromium: HuntProxy browser install".into())
+        } else if !chromium_available {
+            Some("Install Chromium: HuntProxy browser install".into())
         } else {
             None
         };
@@ -524,12 +499,7 @@ impl BrowserService {
         BrowserInstallStatus {
             node_available,
             worker_available,
-            lightpanda_available,
             chromium_available,
-            lightpanda_path: self
-                .lightpanda_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
             chromium_path: self
                 .chromium_path
                 .as_ref()
@@ -542,31 +512,22 @@ impl BrowserService {
         }
     }
 
-    pub async fn start(
-        &self,
-        project_id: ProjectId,
-        url: String,
-        policy: EnginePolicy,
-    ) -> DomainResult<BrowserSession> {
-        self.start_with_persistence(project_id, url, policy, true)
-            .await
+    pub async fn start(&self, project_id: ProjectId, url: String) -> DomainResult<BrowserSession> {
+        self.start_with_persistence(project_id, url, true).await
     }
 
     pub async fn start_ephemeral(
         &self,
         project_id: ProjectId,
         url: String,
-        policy: EnginePolicy,
     ) -> DomainResult<BrowserSession> {
-        self.start_with_persistence(project_id, url, policy, false)
-            .await
+        self.start_with_persistence(project_id, url, false).await
     }
 
     async fn start_with_persistence(
         &self,
         project_id: ProjectId,
         url: String,
-        policy: EnginePolicy,
         persistent: bool,
     ) -> DomainResult<BrowserSession> {
         if persistent {
@@ -592,9 +553,7 @@ impl BrowserService {
                 ));
             }
         }
-        let result = self
-            .start_runtime(project_id, url, policy, persistent)
-            .await;
+        let result = self.start_runtime(project_id, url, persistent).await;
         if result.is_err() && persistent {
             self.profile_leases.lock().await.remove(&project_id.get());
         }
@@ -605,7 +564,6 @@ impl BrowserService {
         &self,
         project_id: ProjectId,
         mut url: String,
-        policy: EnginePolicy,
         persistent: bool,
     ) -> DomainResult<BrowserSession> {
         let status = self.status();
@@ -657,34 +615,14 @@ impl BrowserService {
             }
         }
 
-        let engine = match policy {
-            EnginePolicy::Chromium => {
-                if !status.chromium_available {
-                    return Err(DomainError::new(
-                        ErrorCode::ChromiumNotInstalled,
-                        "Chromium not installed; run HuntProxy browser install",
-                    ));
-                }
-                BrowserEngine::Chromium
-            }
-            EnginePolicy::Auto => {
-                if status.lightpanda_available {
-                    BrowserEngine::Lightpanda
-                } else if status.chromium_available {
-                    BrowserEngine::Chromium
-                } else {
-                    return Err(DomainError::new(
-                        ErrorCode::BrowserNotInstalled,
-                        "No browser engine installed",
-                    ));
-                }
-            }
-        };
+        if !status.chromium_available {
+            return Err(DomainError::new(
+                ErrorCode::ChromiumNotInstalled,
+                "Chromium not installed; run HuntProxy browser install",
+            ));
+        }
 
-        let mut session = self
-            .db
-            .create_browser_session(project_id, engine, policy)
-            .await?;
+        let mut session = self.db.create_browser_session(project_id).await?;
         let capture = self
             .db
             .create_capture_session(CreateCaptureSession {
@@ -706,9 +644,12 @@ impl BrowserService {
         let profile_dir = persistent
             .then(|| self.chromium_profile_dir(project_id))
             .transpose()?;
-        let mut start_params = json!({
+        let prefer_profile_state = profile_dir
+            .as_deref()
+            .is_some_and(chromium_profile_has_state);
+        let start_params = json!({
             "session_id": session.id.get(),
-            "engine": engine_name(engine),
+            "engine": "chromium",
             "url": url,
             "proxy": {
                 "server": self.proxy_server.clone(),
@@ -720,48 +661,22 @@ impl BrowserService {
             "cookies": managed_cookies,
             "restore_state": restored_profile,
             "persistent": persistent,
-            // A directly started persistent Chromium profile is authoritative
-            // because it may contain a manual login. Lightpanda fallback
-            // disables this so its checkpoint can be transferred instead.
-            "prefer_profile_state": persistent && engine == BrowserEngine::Chromium,
-            // The worker also needs the Chromium profile path if an active
-            // Lightpanda session later performs its one automatic fallback.
+            // An initialized Chromium profile is authoritative because it may
+            // contain manual login and service-worker state. An empty profile
+            // imports the portable checkpoint left by an older browser build.
+            "prefer_profile_state": prefer_profile_state,
             "profile_dir": if persistent {
                 profile_dir.as_ref().map(|path| path.display().to_string())
             } else {
                 None
             },
         });
-        let mut effective_engine = engine;
-        let mut checkpoint_status = if persistent && restored_profile.is_some() {
+        let checkpoint_status = if persistent && restored_profile.is_some() {
             "restored"
         } else {
             "ok"
         };
-        let mut worker_result = self
-            .call_worker("session.start", start_params.clone())
-            .await;
-        if worker_result
-            .as_ref()
-            .is_err_and(|error| error.code() == ErrorCode::EngineFallback)
-            && policy == EnginePolicy::Auto
-            && engine == BrowserEngine::Lightpanda
-            && status.chromium_available
-        {
-            start_params["engine"] = json!(engine_name(BrowserEngine::Chromium));
-            start_params["prefer_profile_state"] = json!(false);
-            if persistent {
-                start_params["profile_dir"] =
-                    json!(profile_dir.as_ref().map(|path| path.display().to_string()));
-            }
-            worker_result = self.call_worker("session.start", start_params).await;
-            if worker_result.is_ok() {
-                effective_engine = BrowserEngine::Chromium;
-                checkpoint_status = "fallback_chromium";
-                session.fallback_used = true;
-            }
-        }
-        let result = match worker_result {
+        let result = match self.call_worker("session.start", start_params).await {
             Ok(result) => result,
             Err(error) => {
                 session.state = BrowserSessionState::Failed;
@@ -799,7 +714,7 @@ impl BrowserService {
                 return Err(error);
             }
         };
-        session.engine = effective_engine;
+        session.engine = BrowserEngine::Chromium;
         session.current_url = saved.url;
         session.current_title = saved.title;
         session.state = BrowserSessionState::Ready;
@@ -815,7 +730,6 @@ impl BrowserService {
             RuntimeSession {
                 project_id,
                 capture_session_id: capture.id,
-                engine: effective_engine,
                 persistent,
             },
         );
@@ -849,8 +763,8 @@ impl BrowserService {
     }
 
     /// Apply a managed cookie profile to every active browser session in the
-    /// project. The worker checkpoints each session so Lightpanda→Chromium
-    /// migration carries the imported cookies forward.
+    /// project. The worker checkpoints each session so imported cookies survive
+    /// browser suspension and daemon restarts.
     pub async fn apply_cookie_profile(
         &self,
         project_id: ProjectId,
@@ -1089,12 +1003,7 @@ impl BrowserService {
         let checkpoint = result.get("checkpoint").ok_or_else(|| {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
-        let checkpoint_status =
-            if result.get("fallback_used").and_then(Value::as_bool) == Some(true) {
-                "fallback_chromium"
-            } else {
-                "ok"
-            };
+        let checkpoint_status = "ok";
         let saved = self
             .save_checkpoint(
                 project_id,
@@ -1106,18 +1015,6 @@ impl BrowserService {
             .await?;
         session.current_url = saved.url;
         session.current_title = saved.title;
-        if result.get("fallback_used").and_then(Value::as_bool) == Some(true) {
-            session.engine = BrowserEngine::Chromium;
-            session.fallback_used = true;
-            if let Some(active) = self
-                .runtime_sessions
-                .lock()
-                .await
-                .get_mut(&session_id.get())
-            {
-                active.engine = BrowserEngine::Chromium;
-            }
-        }
         session.state = BrowserSessionState::Ready;
         session.checkpoint_status = Some(checkpoint_status.into());
         session.checkpoint_hash = Some(saved.hash);
@@ -1333,136 +1230,6 @@ impl BrowserService {
         }
     }
 
-    pub async fn switch_to_chromium(
-        &self,
-        project_id: ProjectId,
-        session_id: BrowserSessionId,
-    ) -> DomainResult<BrowserSession> {
-        let operation_lock = self.session_operation_lock(session_id).await;
-        let _operation_guard = operation_lock.lock().await;
-        let status = self.status();
-        if !status.chromium_available {
-            return Err(DomainError::new(
-                ErrorCode::ChromiumNotInstalled,
-                "Chromium not installed; run HuntProxy browser install",
-            ));
-        }
-        let mut session = self.db.get_browser_session(project_id, session_id).await?;
-        let runtime = self
-            .runtime_sessions
-            .lock()
-            .await
-            .get(&session_id.get())
-            .cloned();
-        let Some(runtime) = runtime else {
-            return Err(DomainError::new(
-                ErrorCode::Unavailable,
-                "browser runtime is not attached; start a new browser session",
-            ));
-        };
-        if runtime.engine != BrowserEngine::Lightpanda {
-            if session.engine != runtime.engine {
-                session.engine = runtime.engine;
-                session.fallback_used = true;
-                session.state = BrowserSessionState::Ready;
-                let _ = self.db.update_browser_session(&session).await;
-            }
-            return Err(DomainError::new(
-                ErrorCode::EngineFallback,
-                "only Lightpanda sessions can switch to Chromium",
-            ));
-        }
-        if session.fallback_used {
-            return Err(DomainError::new(
-                ErrorCode::EngineFallback,
-                "fallback already used for this session",
-            ));
-        }
-
-        session.state = BrowserSessionState::Migrating;
-        let _ = self.db.update_browser_session(&session).await;
-        let result = match self
-            .call_worker(
-                "session.migrate_to_chromium",
-                json!({
-                    "session_id": session_id.get(),
-                    "profile_dir": if runtime.persistent {
-                        Some(self.chromium_profile_dir(project_id)?.display().to_string())
-                    } else {
-                        None
-                    },
-                }),
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                session.state = if self.worker.lock().await.is_some() {
-                    BrowserSessionState::Ready
-                } else {
-                    BrowserSessionState::Interrupted
-                };
-                session.checkpoint_status = Some("migration_failed".into());
-                let _ = self.db.update_browser_session(&session).await;
-                return Err(error);
-            }
-        };
-        let migration_status = result
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("migrated_partial")
-            .to_string();
-        session.engine = BrowserEngine::Chromium;
-        session.fallback_used = true;
-        session.state = BrowserSessionState::Ready;
-        session.checkpoint_status = Some(migration_status.clone());
-        if let Some(runtime) = self
-            .runtime_sessions
-            .lock()
-            .await
-            .get_mut(&session_id.get())
-        {
-            runtime.engine = BrowserEngine::Chromium;
-        }
-        self.db.update_browser_session(&session).await?;
-
-        let Some(checkpoint) = result.get("checkpoint") else {
-            session.checkpoint_status = Some("migrated_state_unavailable".into());
-            let _ = self.db.update_browser_session(&session).await;
-            return Err(DomainError::new(
-                ErrorCode::ProtocolError,
-                "browser migrated to Chromium but the worker omitted its checkpoint",
-            ));
-        };
-        let saved = match self
-            .save_checkpoint(
-                project_id,
-                session_id,
-                checkpoint,
-                &migration_status,
-                runtime.persistent,
-            )
-            .await
-        {
-            Ok(saved) => saved,
-            Err(error) => {
-                session.checkpoint_status = Some("migrated_state_save_failed".into());
-                let _ = self.db.update_browser_session(&session).await;
-                return Err(DomainError::new(
-                    ErrorCode::StorageError,
-                    format!("browser migrated to Chromium but state save failed: {error}"),
-                ));
-            }
-        };
-        session.current_url = saved.url;
-        session.current_title = saved.title;
-        session.checkpoint_status = Some(migration_status);
-        session.checkpoint_hash = Some(saved.hash);
-        self.db.update_browser_session(&session).await?;
-        schedule_page_title_association(self.db.clone(), &session);
-        Ok(session)
-    }
-
     async fn call_worker(&self, method: &str, params: Value) -> DomainResult<Value> {
         let node_path = self.node_path.as_deref().ok_or_else(|| {
             DomainError::new(ErrorCode::BrowserDisabled, "Node.js is not available")
@@ -1479,7 +1246,6 @@ impl BrowserService {
                 WorkerProcess::spawn(
                     node_path,
                     worker_path,
-                    self.lightpanda_path.as_deref(),
                     self.playwright_core_path.as_deref(),
                     self.chromium_path.as_deref(),
                 )
@@ -1819,13 +1585,6 @@ fn checkpoint_hash(checkpoint: &Checkpoint) -> DomainResult<String> {
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
-fn engine_name(engine: BrowserEngine) -> &'static str {
-    match engine {
-        BrowserEngine::Lightpanda => "lightpanda",
-        BrowserEngine::Chromium => "chromium",
-    }
-}
-
 fn default_profiles_root(db: &Db) -> PathBuf {
     db.path
         .parent()
@@ -1834,6 +1593,14 @@ fn default_profiles_root(db: &Db) -> PathBuf {
         .unwrap_or_else(|| {
             std::env::temp_dir().join(format!("huntproxy-browser-profiles-{}", std::process::id()))
         })
+}
+
+fn chromium_profile_has_state(profile_dir: &Path) -> bool {
+    profile_dir.join("Local State").is_file()
+        || profile_dir
+            .join("Default")
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some())
 }
 
 fn merge_persistent_profile(profile: &mut PersistentBrowserProfile, checkpoint: &Checkpoint) {
@@ -2130,10 +1897,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut session = db
-            .create_browser_session(project.id, BrowserEngine::Lightpanda, EnginePolicy::Auto)
-            .await
-            .unwrap();
+        let mut session = db.create_browser_session(project.id).await.unwrap();
         session.current_url = Some("https://example.test/dashboard".into());
         session.current_title = Some("Dashboard".into());
         session.state = BrowserSessionState::Ready;
@@ -2145,7 +1909,7 @@ mod tests {
             .unwrap();
         assert_eq!(restored.current_url, session.current_url);
         assert_eq!(restored.current_title.as_deref(), Some("Dashboard"));
-        assert_eq!(restored.engine, BrowserEngine::Lightpanda);
+        assert_eq!(restored.engine, BrowserEngine::Chromium);
         assert_eq!(restored.state, BrowserSessionState::Ready);
     }
 
@@ -2213,7 +1977,6 @@ mod tests {
             db,
             None,
             None,
-            None,
             "http://127.0.0.1:17891".into(),
             None,
             directory.path().join("profiles"),
@@ -2271,7 +2034,6 @@ mod tests {
             db,
             None,
             None,
-            None,
             "http://127.0.0.1:17891".into(),
             None,
             directory.path().join("profiles"),
@@ -2314,6 +2076,17 @@ mod tests {
         let worker = directory.path().join("index.js");
         std::fs::write(&worker, "// worker").unwrap();
         assert_eq!(resolve_worker_path(Some(worker.clone())), Some(worker));
+    }
+
+    #[test]
+    fn chromium_profile_requires_real_browser_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("chromium");
+        std::fs::create_dir_all(profile.join("Default")).unwrap();
+        assert!(!chromium_profile_has_state(&profile));
+
+        std::fs::write(profile.join("Default").join("Preferences"), "{}").unwrap();
+        assert!(chromium_profile_has_state(&profile));
     }
 
     #[test]

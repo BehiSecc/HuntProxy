@@ -12,7 +12,7 @@ From a source checkout:
 ```
 
 The installer supports Linux and macOS on x86_64 and ARM64. It installs
-HuntProxy, Node.js when needed, Lightpanda, Playwright, and Chromium, then
+HuntProxy, Node.js when needed, Playwright, and Chromium, then
 initializes `~/.huntproxy`. After release binaries are published, the same
 script can be piped to Bash with the platform's binary URL:
 
@@ -81,21 +81,20 @@ explicitly with `HuntProxy serve` stays running until stopped.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
 
-The UI restores an active browser after a page refresh and shows its current
-engine, URL, and title. Auto mode starts with Lightpanda and retries once with
-Chromium only for recognized compatibility failures; ordinary site, login, and
-timeout errors remain visible instead of silently changing engines.
+The UI restores an active Chromium browser after a page refresh and shows its
+current URL and title. Browser startup and navigation errors remain visible to
+the caller.
 
-For a login that must be completed manually, stop HuntProxy first, find the
-`chromium_path` in `HuntProxy doctor`, and launch that executable with:
+For a login that must be completed manually, note the `chromium_path` from
+`HuntProxy doctor` while the daemon is running, then stop HuntProxy and launch
+that executable with:
 
 ```bash
 <chromium_path> --user-data-dir="$HOME/.huntproxy/browser-profiles/projects/<project-id>/chromium/default"
 ```
 
-Complete the login, close Chromium fully, start HuntProxy again, and start or
-switch that project to Chromium. Lightpanda cannot read a Chromium profile.
-Never open the same profile manually while HuntProxy is using it. This is
+Complete the login, close Chromium fully, start HuntProxy again, and start that
+project's browser. Never open the same profile manually while HuntProxy is using it. This is
 especially useful for Google or hardware-key sign-in that cannot be completed
 headlessly.
 
@@ -146,8 +145,8 @@ returns sorted, unique endpoints, URLs, and emails from decoded JavaScript or
 HTML. It performs static text analysis only and does not scan or return secrets.
 
 Use `js_files` with only `project_id` to list JavaScript from saved history,
-add `domain` to filter it, or add `url` to perform a fresh, ephemeral,
-Lightpanda-first load. JavaScript results retain the page URLs and hosts that
+add `domain` to filter it, or add `url` to perform a fresh, ephemeral Chromium
+load. JavaScript results retain the page URLs and hosts that
 included or loaded them. `get_words` builds a target-specific wordlist from
 saved traffic and includes JavaScript related to the requested site by default;
 set `include_js: false` to omit it.

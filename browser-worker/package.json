@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "version": "0.1.0",
-  "description": "Pinned Playwright sidecar for Lightpanda and Chromium",
+  "description": "Pinned Playwright sidecar for Chromium",
   "dependencies": {
     "playwright-core": "1.49.1"
   }

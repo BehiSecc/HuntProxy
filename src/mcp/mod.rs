@@ -334,10 +334,10 @@ fn tool_defs() -> Value {
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"browser_start","description":"Start or resume the project's persistent browser workspace. Omit url to resume the last page. Normally omit engine_policy or use auto: it tries Lightpanda first and falls back to Chromium when startup/navigation fails. Chromium-first is allowed only when the user explicitly requested it and requires chromium_reason=user_requested.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."},"engine_policy":{"type":"string","enum":["auto","chromium"],"default":"auto"},"chromium_reason":{"type":"string","enum":["user_requested"],"description":"Required only when engine_policy is chromium; confirms that the user explicitly requested Chromium."}},"required":["project_id"]}},
+        {"name":"browser_start","description":"Start or resume the project's persistent Chromium workspace. Omit url to resume the last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
-        {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, migrate Lightpanda state to Chromium, or reset the persistent browser workspace. Status without session_id lists active browser sessions. Stop operations preserve browser state. Switching requires chromium_reason=user_requested or lightpanda_incompatible. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop and switch_chromium; optional for status."},"op":{"type":"string","enum":["status","stop","stop_all","switch_chromium","reset_profile"]},"chromium_reason":{"type":"string","enum":["user_requested","lightpanda_incompatible"],"description":"Required only for switch_chromium; confirms a user request or an incompatibility observed in the active Lightpanda session."},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
-        {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page Lightpanda-first. A domain filter matches either the JavaScript host or its related page host, including subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
+        {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset the persistent Chromium workspace. Status without session_id lists active browser sessions. Stop operations preserve browser state. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
+        {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page in Chromium. A domain filter matches either the JavaScript host or its related page host, including subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
         {"name":"get_words","description":"Build a sorted target-specific wordlist from saved request paths, parameter names, and textual responses. Related JavaScript files are included by default. Optionally filter by a domain and its subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"domain":{"type":"string","description":"Optional hostname, wildcard hostname, or HTTP URL."},"include_js":{"type":"boolean","default":true},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":5000}},"required":["project_id"],"additionalProperties":false}},
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply byte transforms, including gzip_decode/gunzip and brotli_decode","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string","enum":["utf8","base64","hex"]},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
@@ -591,24 +591,6 @@ fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
         .and_then(|v| v.as_i64())
         .ok_or_else(|| DomainError::invalid("project_id required"))?;
     Ok(ProjectId(id))
-}
-
-fn require_chromium_start_reason(args: &Value) -> DomainResult<()> {
-    match args.get("chromium_reason").and_then(Value::as_str) {
-        Some("user_requested") => Ok(()),
-        _ => Err(DomainError::invalid(
-            "forcing Chromium requires chromium_reason=user_requested; otherwise use engine_policy=auto so Lightpanda is tried first",
-        )),
-    }
-}
-
-fn require_chromium_switch_reason(args: &Value) -> DomainResult<()> {
-    match args.get("chromium_reason").and_then(Value::as_str) {
-        Some("user_requested" | "lightpanda_incompatible") => Ok(()),
-        _ => Err(DomainError::invalid(
-            "switch_chromium requires chromium_reason=user_requested or lightpanda_incompatible",
-        )),
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1691,15 +1673,16 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(|v| v.as_str())
                 .unwrap_or("about:blank")
                 .to_string();
-            let policy = match args.get("engine_policy").and_then(Value::as_str) {
-                Some("chromium") => {
-                    require_chromium_start_reason(&args)?;
-                    EnginePolicy::Chromium
-                }
-                Some("auto") | None => EnginePolicy::Auto,
-                Some(_) => return Err(DomainError::invalid("engine_policy must be auto|chromium")),
-            };
-            Ok(json!(state.browser.start(project_id, url, policy).await?))
+            if args
+                .get("engine_policy")
+                .and_then(Value::as_str)
+                .is_some_and(|policy| !matches!(policy, "auto" | "chromium"))
+            {
+                return Err(DomainError::invalid(
+                    "engine_policy is obsolete; omit it to use Chromium",
+                ));
+            }
+            Ok(json!(state.browser.start(project_id, url).await?))
         }
         "browser_action" => {
             let project_id = require_project_id(&args)?;
@@ -1764,17 +1747,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .await?;
                     Ok(json!(s))
                 }
-                "switch_chromium" => {
-                    require_chromium_switch_reason(&args)?;
-                    Ok(json!(
-                        state
-                            .browser
-                            .switch_to_chromium(project_id, BrowserSessionId(sid))
-                            .await?
-                    ))
-                }
                 _ => Err(DomainError::invalid(
-                    "op must be stop|stop_all|status|switch_chromium|reset_profile",
+                    "op must be stop|stop_all|status|reset_profile",
                 )),
             }
         }
@@ -1796,7 +1770,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 }
                 let session = state
                     .browser
-                    .start_ephemeral(project_id, url.to_string(), EnginePolicy::Auto)
+                    .start_ephemeral(project_id, url.to_string())
                     .await?;
                 let settle_ms = args
                     .get("settle_ms")
@@ -1849,8 +1823,6 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Some(json!({
                         "session_id": session.id,
                         "engine": session.engine,
-                        "engine_policy": session.engine_policy,
-                        "fallback_used": session.fallback_used,
                         "stopped": true,
                     })),
                 ))
@@ -2230,28 +2202,6 @@ mod tests {
     }
 
     #[test]
-    fn forcing_chromium_requires_an_explicit_reason() {
-        assert!(require_chromium_start_reason(&json!({})).is_err());
-        assert!(require_chromium_start_reason(&json!({ "chromium_reason": "  " })).is_err());
-        assert!(require_chromium_start_reason(
-            &json!({ "chromium_reason": "lightpanda_incompatible" })
-        )
-        .is_err());
-        assert!(
-            require_chromium_start_reason(&json!({ "chromium_reason": "user_requested" })).is_ok()
-        );
-
-        assert!(require_chromium_switch_reason(&json!({})).is_err());
-        assert!(
-            require_chromium_switch_reason(&json!({ "chromium_reason": "user_requested" })).is_ok()
-        );
-        assert!(require_chromium_switch_reason(
-            &json!({ "chromium_reason": "lightpanda_incompatible" })
-        )
-        .is_ok());
-    }
-
-    #[test]
     fn explicit_stop_guard_blocks_only_the_same_parent_client() {
         let directory = tempfile::tempdir().unwrap();
         let config = Config {
@@ -2326,27 +2276,29 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "chromium_reason"));
-        assert_eq!(
-            browser_manage["inputSchema"]["properties"]["chromium_reason"]["enum"],
-            json!(["user_requested", "lightpanda_incompatible"])
-        );
+        assert!(browser_manage["inputSchema"]["properties"]
+            .get("chromium_reason")
+            .is_none());
+        assert!(!browser_manage["inputSchema"]["properties"]["op"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "switch_chromium"));
         let browser_start = tools
             .iter()
             .find(|tool| tool["name"] == "browser_start")
             .unwrap();
-        assert_eq!(
-            browser_start["inputSchema"]["properties"]["engine_policy"]["default"],
-            "auto"
-        );
+        assert!(browser_start["inputSchema"]["properties"]
+            .get("engine_policy")
+            .is_none());
         assert!(!browser_start["inputSchema"]["required"]
             .as_array()
             .unwrap()
             .iter()
             .any(|value| value == "chromium_reason"));
-        assert_eq!(
-            browser_start["inputSchema"]["properties"]["chromium_reason"]["enum"],
-            json!(["user_requested"])
-        );
+        assert!(browser_start["inputSchema"]["properties"]
+            .get("chromium_reason")
+            .is_none());
         let fuzz_start = tools
             .iter()
             .find(|tool| tool["name"] == "fuzz_start")

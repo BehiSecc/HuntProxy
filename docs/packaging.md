@@ -31,7 +31,8 @@ docker build -t huntproxy:local .
 docker run --rm -p 17890:17890 -p 17891:17891 -v huntproxy-data:/data huntproxy:local
 ```
 
-Browser engines (Lightpanda/Chromium) remain optional installable artifacts.
+Chromium remains an optional installable artifact for deployments that use the
+browser workspace.
 
 ## Project license
 

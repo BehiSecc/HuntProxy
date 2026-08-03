@@ -1042,7 +1042,6 @@ mod tests {
         let browser = Arc::new(BrowserService::new_with_proxy_and_ca(
             db.clone(),
             None,
-            None,
             Some(worker),
             "http://127.0.0.1:17891".into(),
             None,

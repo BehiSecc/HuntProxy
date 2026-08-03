@@ -45,6 +45,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "011_fuzz_response_groups",
         include_str!("../../migrations/011_fuzz_response_groups.sql"),
     ),
+    (
+        "012_chromium_only_browser",
+        include_str!("../../migrations/012_chromium_only_browser.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {
@@ -109,5 +113,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn legacy_browser_sessions_are_normalized_to_chromium() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, "NORMAL", 5000).unwrap();
+        conn.execute_batch(MIGRATIONS[0].1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO projects (name,created_at,updated_at,scope_json,limits_json) VALUES ('legacy','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}','{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO browser_sessions (project_id,engine,engine_policy,state,fallback_used,checkpoint_status,created_at,updated_at) VALUES (1,'lightpanda','auto','migrating',1,'fallback_chromium','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let values: (String, String, String, i64, String) = conn
+            .query_row(
+                "SELECT engine,engine_policy,state,fallback_used,checkpoint_status FROM browser_sessions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            values,
+            (
+                "chromium".into(),
+                "chromium".into(),
+                "interrupted".into(),
+                0,
+                "ok".into(),
+            )
+        );
     }
 }

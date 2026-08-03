@@ -233,11 +233,6 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!("  proxy:    {}", cfg.proxy_listen);
             println!("  idle:     {} seconds", cfg.idle_timeout_seconds);
             println!("  log:      {}", cfg.daemon_log_path().display());
-            if let Some(p) = &cfg.lightpanda_path {
-                println!("  lightpanda: {} exists={}", p.display(), p.exists());
-            } else {
-                println!("  lightpanda: (not in PATH)");
-            }
             if let Some(p) = &cfg.node_path {
                 println!("  node:       {} exists={}", p.display(), p.exists());
             } else {

@@ -6,9 +6,7 @@
  * never request data, DOM content, cookies, credentials, or storage values.
  */
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
 import fs from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
@@ -108,25 +106,6 @@ function rpcError(code, message) {
   return { code, message };
 }
 
-// Keep this deliberately narrow: ordinary site errors, locator timeouts, and
-// authentication failures must be returned to the caller. These messages
-// indicate CDP/browser features that Lightpanda does not currently implement.
-function isLightpandaCompatibilityError(error) {
-  const message = String(error?.message || error || "").toLowerCase();
-  const explicitCompatibilityError = [
-    "not implemented",
-    "unsupported operation",
-    "unsupported command",
-    "method not found",
-    "unknown method",
-    "unknown command",
-  ].some((fragment) => message.includes(fragment));
-  const missingProtocolMethod =
-    (message.includes("wasn't found") || message.includes("was not found")) &&
-    (message.includes("method") || message.includes("command"));
-  return explicitCompatibilityError || missingProtocolMethod;
-}
-
 function existingChromiumExecutable() {
   const candidates = [
     process.env.BB_CHROME_EXECUTABLE,
@@ -155,14 +134,6 @@ function chromiumProxy(proxy) {
     password: proxy.password || undefined,
     bypass: "<-loopback>",
   };
-}
-
-function lightpandaProxyUrl(proxy) {
-  if (!proxy?.server) return null;
-  const url = new URL(proxy.server);
-  if (proxy.username) url.username = proxy.username;
-  if (proxy.password) url.password = proxy.password;
-  return url.toString();
 }
 
 function chromiumLaunchOptions(proxy, caCertPath) {
@@ -202,7 +173,6 @@ async function launchChromium(proxy, caCertPath, profileDir = null) {
       browser: null,
       context,
       page,
-      lightpandaProc: null,
       persistent: true,
       profileDir,
     };
@@ -214,81 +184,7 @@ async function launchChromium(proxy, caCertPath, profileDir = null) {
     ignoreHTTPSErrors,
   });
   const page = await context.newPage();
-  return { browser, context, page, lightpandaProc: null, persistent: false, profileDir: null };
-}
-
-async function waitForCdp(endpoint, child, timeoutMs = 15_000) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
-      throw rpcError(-32004, "Lightpanda exited before CDP became ready");
-    }
-    try {
-      const response = await fetch(`${endpoint}/json/version`, {
-        signal: AbortSignal.timeout(750),
-      });
-      if (response.ok) return;
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw rpcError(
-    -32004,
-    `Lightpanda CDP did not become ready: ${lastError?.message || "timeout"}`,
-  );
-}
-
-async function availableLoopbackPort() {
-  const server = net.createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : null;
-  await new Promise((resolve) => server.close(resolve));
-  if (!port) throw rpcError(-32004, "could not allocate a Lightpanda CDP port");
-  return port;
-}
-
-async function launchLightpanda(proxy, caCertPath) {
-  const lightpanda = process.env.LIGHTPANDA_PATH || "lightpanda";
-  const port = await availableLoopbackPort();
-  const args = ["serve", "--host", "127.0.0.1", "--port", String(port)];
-  const proxyUrl = lightpandaProxyUrl(proxy);
-  if (proxyUrl) args.push("--http-proxy", proxyUrl);
-  if (proxy?.bearer_token && !proxy?.username) {
-    args.push("--proxy-bearer-token", proxy.bearer_token);
-  }
-  if (caCertPath) args.push("--ca-cert", caCertPath);
-
-  const lightpandaProc = spawn(lightpanda, args, {
-    env: {
-      ...process.env,
-      LIGHTPANDA_DISABLE_TELEMETRY: "true",
-    },
-    stdio: ["ignore", "ignore", "ignore"],
-  });
-  const endpoint = `http://127.0.0.1:${port}`;
-  try {
-    await waitForCdp(endpoint, lightpandaProc);
-    const browser = await chromium.connectOverCDP(endpoint, { timeout: 15_000 });
-    // Lightpanda's default CDP context is not usable; create an explicit one.
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    return { browser, context, page, lightpandaProc };
-  } catch (error) {
-    lightpandaProc.kill("SIGTERM");
-    throw error;
-  }
-}
-
-async function launchEngine(engine, proxy, caCertPath, profileDir = null) {
-  return engine === "lightpanda"
-    ? launchLightpanda(proxy, caCertPath)
-    : launchChromium(proxy, caCertPath, profileDir);
+  return { browser, context, page, persistent: false, profileDir: null };
 }
 
 async function restoreProjectState(session, state) {
@@ -296,7 +192,7 @@ async function restoreProjectState(session, state) {
   if (session.preferProfileState) return;
   session.restoreState = state;
   session.restoredOrigins = new Set();
-  // For migrated/non-profile sessions, restore the portable checkpoint.
+  // For new/non-profile sessions, restore the portable checkpoint.
   // Managed cookies are applied separately after this step.
   if (Array.isArray(state.cookies) && state.cookies.length) {
     const cookies = state.cookies
@@ -316,7 +212,7 @@ async function restoreProjectState(session, state) {
         if (typeof cookie.expires === "number" && cookie.expires > 0) {
           restored.expires = cookie.expires;
         }
-        if (session.engine === "chromium" && cookie.partitionKey) {
+        if (cookie.partitionKey) {
           restored.partitionKey = cookie.partitionKey;
         }
         return restored;
@@ -409,39 +305,6 @@ async function extractCheckpoint(session) {
     session_keys: Object.keys(privateState.session_storage).length,
     state_hash: stateHash,
     _private: privateState,
-  };
-}
-
-function cookieKey(cookie) {
-  return `${cookie.name}\u0000${String(cookie.domain || "").replace(/^\./, "")}\u0000${cookie.path || "/"}`;
-}
-
-function cookieProjection(cookie) {
-  return {
-    value: cookie.value,
-    httpOnly: Boolean(cookie.httpOnly),
-    secure: Boolean(cookie.secure),
-    sameSite: cookie.sameSite || "Lax",
-  };
-}
-
-function compareCookies(expected, actual) {
-  const actualMap = new Map(actual.map((cookie) => [cookieKey(cookie), cookieProjection(cookie)]));
-  let matched = 0;
-  for (const cookie of expected) {
-    const found = actualMap.get(cookieKey(cookie));
-    if (found && JSON.stringify(found) === JSON.stringify(cookieProjection(cookie))) matched += 1;
-  }
-  return { expected: expected.length, matched, verified: matched === expected.length };
-}
-
-function compareStorage(expected, actual) {
-  const expectedEntries = Object.entries(expected || {}).sort();
-  const matched = expectedEntries.filter(([key, value]) => actual?.[key] === value).length;
-  return {
-    expected: expectedEntries.length,
-    matched,
-    verified: matched === expectedEntries.length,
   };
 }
 
@@ -550,70 +413,6 @@ async function executeAction(session, action = {}) {
   }
 }
 
-async function migrateToChromium(sessionId, session, profileDir = null) {
-  if (session.engine !== "lightpanda") {
-    throw rpcError(-32602, "only Lightpanda sessions can migrate to Chromium");
-  }
-  const sourceCheckpoint = await extractCheckpoint(session);
-  const source = sourceCheckpoint._private;
-  const replacement = await launchChromium(session.proxy, session.caCertPath, profileDir);
-  try {
-    const migrated = {
-      ...replacement,
-      engine: "chromium",
-      proxy: session.proxy,
-      caCertPath: session.caCertPath,
-      persistent: Boolean(profileDir),
-      profileDir,
-    };
-    const localByOrigin = source.origin
-      ? { [source.origin]: source.local_storage || {} }
-      : {};
-    const sessionByOrigin = source.origin
-      ? { [source.origin]: source.session_storage || {} }
-      : {};
-    await restoreProjectState(migrated, {
-      cookies: source.cookies,
-      local_storage: localByOrigin,
-      session_storage: sessionByOrigin,
-    });
-    if (sourceCheckpoint.url && sourceCheckpoint.url !== "about:blank") {
-      await migrated.page.goto(sourceCheckpoint.url, {
-        waitUntil: "domcontentloaded",
-        timeout: 30_000,
-      });
-      await reconcileCurrentOriginStorage(migrated);
-    }
-    const restoredCheckpoint = await extractCheckpoint(migrated);
-    const restored = restoredCheckpoint._private;
-    const cookieVerification = compareCookies(source.cookies, restored.cookies);
-    const localVerification = compareStorage(source.local_storage, restored.local_storage);
-    const sessionVerification = compareStorage(source.session_storage, restored.session_storage);
-    const verified =
-      cookieVerification.verified &&
-      localVerification.verified &&
-      sessionVerification.verified;
-
-    await closeRuntime(session);
-    trackJavascriptFiles(migrated, new Map(session.javascriptFiles || []));
-    sessions.set(sessionId, migrated);
-    return {
-      ok: true,
-      status: verified ? "migrated" : "migrated_partial",
-      verified,
-      verification: {
-        cookies: cookieVerification,
-        local_storage: localVerification,
-        session_storage: sessionVerification,
-      },
-      checkpoint: restoredCheckpoint,
-    };
-  } catch (error) {
-    await closeRuntime(replacement);
-    throw error;
-  }
-}
-
 async function handle(req) {
   const { id, method, params = {} } = req;
   try {
@@ -621,8 +420,8 @@ async function handle(req) {
       case "hello":
         return respond(id, {
           protocol: PROTOCOL,
-          engines: ["lightpanda", "chromium"],
-          capabilities: ["actions", "checkpoints", "lightpanda_to_chromium"],
+          engines: ["chromium"],
+          capabilities: ["actions", "checkpoints"],
         });
       case "session.start": {
         const sessionId = Number(params.session_id);
@@ -631,19 +430,14 @@ async function handle(req) {
         }
         if (sessions.has(sessionId)) await closeSession(sessionId);
         const engine = params.engine || "chromium";
-        if (!new Set(["lightpanda", "chromium"]).has(engine)) {
-          throw rpcError(-32602, "engine must be lightpanda or chromium");
+        if (engine !== "chromium") {
+          throw rpcError(-32602, "engine must be chromium");
         }
         const caCertPath = params.ca_cert_path || null;
         const profileDir = params.persistent
           ? params.profile_dir || null
           : null;
-        const runtime = await launchEngine(
-          engine,
-          params.proxy || null,
-          caCertPath,
-          engine === "chromium" ? profileDir : null,
-        );
+        const runtime = await launchChromium(params.proxy || null, caCertPath, profileDir);
         const session = {
           ...runtime,
           engine,
@@ -672,9 +466,6 @@ async function handle(req) {
           return respond(id, { session_id: sessionId, engine, checkpoint });
         } catch (error) {
           await closeSession(sessionId);
-          if (engine === "lightpanda" && isLightpandaCompatibilityError(error)) {
-            throw rpcError(-32005, String(error?.message || error));
-          }
           throw error;
         }
       }
@@ -682,47 +473,9 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        let activeSession = session;
-        let fallbackUsed = false;
-        let fallbackStatus = null;
-        let result;
-        try {
-          result = await executeAction(activeSession, params.action || {});
-        } catch (error) {
-          if (activeSession.engine !== "lightpanda" || !isLightpandaCompatibilityError(error)) {
-            throw error;
-          }
-          const migration = await migrateToChromium(
-            sessionId,
-            activeSession,
-            activeSession.persistent ? activeSession.profileDir : null,
-          );
-          activeSession = sessions.get(sessionId);
-          fallbackUsed = true;
-          fallbackStatus = migration.status;
-          logMeta("session.auto_fallback", {
-            session_id: sessionId,
-            status: migration.status,
-          });
-          try {
-            result = await executeAction(activeSession, params.action || {});
-          } catch (retryError) {
-            const checkpoint = await extractCheckpoint(activeSession);
-            return respond(id, {
-              ok: false,
-              untrusted: true,
-              message: String(retryError?.message || retryError),
-              error_code: "action_failed_after_fallback",
-              data: null,
-              checkpoint,
-              engine: activeSession.engine,
-              fallback_used: fallbackUsed,
-              fallback_status: fallbackStatus,
-            });
-          }
-        }
+        const result = await executeAction(session, params.action || {});
         // Every successful action is checkpointed before acknowledgement.
-        const checkpoint = await extractCheckpoint(activeSession);
+        const checkpoint = await extractCheckpoint(session);
         logMeta("session.action", { session_id: sessionId, action: params.action?.type });
         return respond(id, {
           ok: true,
@@ -730,9 +483,7 @@ async function handle(req) {
           message: result.message,
           data: result.data,
           checkpoint,
-          engine: activeSession.engine,
-          fallback_used: fallbackUsed,
-          fallback_status: fallbackStatus,
+          engine: session.engine,
         });
       }
       case "session.set_cookies": {
@@ -845,18 +596,6 @@ async function handle(req) {
           truncated: status.truncated,
         });
       }
-      case "session.migrate_to_chromium": {
-        const sessionId = Number(params.session_id);
-        const session = sessions.get(sessionId);
-        if (!session) throw rpcError(-32001, "session not found");
-        const result = await migrateToChromium(sessionId, session, params.profile_dir || null);
-        logMeta("session.migrate", {
-          session_id: sessionId,
-          status: result.status,
-          verified: result.verified,
-        });
-        return respond(id, result);
-      }
       case "session.stop": {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
@@ -883,7 +622,6 @@ async function closeRuntime(runtime) {
   try { await runtime.page?.close(); } catch {}
   try { await runtime.context?.close(); } catch {}
   try { await runtime.browser?.close(); } catch {}
-  try { runtime.lightpandaProc?.kill("SIGTERM"); } catch {}
 }
 
 async function closeSession(sessionId) {

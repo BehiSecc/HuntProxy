@@ -170,38 +170,9 @@ install_huntproxy() {
   ok "HuntProxy: $HUNTPROXY_BIN"
 }
 
-install_lightpanda() {
-  local destination="$INSTALL_DIR/lightpanda"
-  if command -v lightpanda >/dev/null 2>&1 || [[ -x "$destination" ]]; then
-    ok 'Lightpanda already installed'
-    return
-  fi
-  if [[ "$platform" == linux ]] && command -v ldd >/dev/null 2>&1 \
-    && ldd --version 2>&1 | grep -qi musl; then
-    warn 'Lightpanda nightly requires glibc; continuing with Chromium only'
-    return
-  fi
-  command -v curl >/dev/null 2>&1 || die 'curl is required to download Lightpanda'
-  info 'Downloading the official Lightpanda nightly'
-  if ! curl --proto '=https' --tlsv1.2 -fL \
-    "https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-${architecture}-${platform}" \
-    -o "$TEMP_DIR/lightpanda"; then
-    warn 'Lightpanda download failed; continuing with Chromium'
-    return
-  fi
-  chmod 755 "$TEMP_DIR/lightpanda"
-  if ! "$TEMP_DIR/lightpanda" version >/dev/null 2>&1; then
-    warn 'Lightpanda verification failed; continuing with Chromium'
-    return
-  fi
-  install -m 0755 "$TEMP_DIR/lightpanda" "$destination"
-  ok "Lightpanda: $destination"
-}
-
 install_curl
 install_huntproxy
 install_node
-install_lightpanda
 
 export PATH="$INSTALL_DIR:$PATH"
 export HUNTPROXY_DATA_DIR="$DATA_DIR"

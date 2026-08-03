@@ -261,7 +261,6 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
     });
     let browser = Arc::new(BrowserService::new_with_proxy_and_ca(
         db.clone(),
-        config.lightpanda_path.clone(),
         config.node_path.clone(),
         managed_worker,
         format!("http://{}", config.proxy_listen),

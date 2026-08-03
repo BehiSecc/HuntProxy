@@ -34,7 +34,6 @@ pub struct Config {
     pub spool_dir: PathBuf,
     pub export_dir: PathBuf,
     pub runtime_dir: PathBuf,
-    pub lightpanda_path: Option<PathBuf>,
     pub node_path: Option<PathBuf>,
     pub browser_worker_path: Option<PathBuf>,
     pub auto_start_daemon: bool,
@@ -58,7 +57,6 @@ impl Default for Config {
             spool_dir: data_dir.join("spool"),
             export_dir: data_dir.join("exports"),
             runtime_dir: data_dir.join("runtime"),
-            lightpanda_path: which_path("lightpanda"),
             node_path: which_path("node"),
             browser_worker_path: None,
             auto_start_daemon: true,
@@ -127,9 +125,6 @@ impl Config {
         }
         if let Some(v) = f.idle_timeout_seconds {
             self.idle_timeout_seconds = v;
-        }
-        if let Some(v) = f.lightpanda_path {
-            self.lightpanda_path = Some(PathBuf::from(v));
         }
         if let Some(v) = f.node_path {
             self.node_path = Some(PathBuf::from(v));
@@ -227,10 +222,6 @@ impl Config {
             max_body_bytes: Some(self.max_body_bytes),
             auto_start_daemon: Some(self.auto_start_daemon),
             idle_timeout_seconds: Some(self.idle_timeout_seconds),
-            lightpanda_path: self
-                .lightpanda_path
-                .as_ref()
-                .map(|p| p.display().to_string()),
             node_path: self.node_path.as_ref().map(|p| p.display().to_string()),
         };
         let text = toml::to_string_pretty(&file).map_err(|e| {
@@ -253,7 +244,6 @@ struct ConfigFile {
     max_body_bytes: Option<u64>,
     auto_start_daemon: Option<bool>,
     idle_timeout_seconds: Option<u64>,
-    lightpanda_path: Option<String>,
     node_path: Option<String>,
 }
 

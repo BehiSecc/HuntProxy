@@ -42,7 +42,7 @@ cargo build --release
 | Create project + capture session | OK |
 | `HuntProxy doctor` | OK |
 | `HuntProxy stop` | OK |
-| Lightpanda CDP + cookie/storage → Chromium | Spike 16/16 PASS |
+| Chromium browser worker + persistent cookie/storage state | Full suite PASS |
 | Hudsucker ValidatedDial CONNECT / streaming | Spike 9/9 PASS |
 | Wreq + primp ValidatedDial / H1+H2 | Spike 11/11 PASS each |
 
