@@ -317,7 +317,7 @@ fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List, create, or set optional capture scope. Host patterns may be exact or wildcard suffixes such as *.example.com; excluded_host_patterns always take precedence. Empty host_patterns captures every host except exclusions. Scope only controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
-        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"type":"string"},"file_path":{"type":"string"}},"required":["project_id","action"]}},
+        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
         {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; (request:~this OR request:~that OR request:~\":smtg\") method:PUT.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. request:~text searches the request target, headers, and body. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
         {"name":"sitemap","description":"Return an alphanumerically sorted host/path tree derived from saved project history, including methods, statuses, query parameters, content types, and exchange counts. Omit host for every host or provide one exact host.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive."}},"required":["project_id"]}},
@@ -803,10 +803,10 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .get("target_url")
                         .and_then(Value::as_str)
                         .ok_or_else(|| DomainError::invalid("target_url required"))?;
-                    let inline = args.get("cookie").and_then(Value::as_str);
+                    let inline = args.get("cookie");
                     let file_path = args.get("file_path").and_then(Value::as_str);
                     let cookie = match (inline, file_path) {
-                        (Some(value), None) => value.to_string(),
+                        (Some(value), None) => crate::cookies::cookie_input_from_json_value(value)?,
                         (None, Some(path)) => {
                             crate::cookies::read_cookie_file(std::path::Path::new(path))?
                         }
@@ -2233,6 +2233,16 @@ mod tests {
         assert!(reply["inputSchema"]["properties"]["draft"]["properties"]
             .get("body_text")
             .is_some());
+        let cookies = tools.iter().find(|tool| tool["name"] == "cookies").unwrap();
+        let cookie_inputs = cookies["inputSchema"]["properties"]["cookie"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(cookie_inputs[0]["type"], "string");
+        assert_eq!(cookie_inputs[1]["type"], "array");
+        assert_eq!(
+            cookie_inputs[1]["items"]["required"],
+            json!(["name", "value"])
+        );
         assert_eq!(
             reply["inputSchema"]["properties"]["draft"]["properties"]["body_format"]["enum"],
             json!(["raw", "json", "xml", "form_urlencoded", "multipart", null])

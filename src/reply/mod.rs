@@ -669,10 +669,12 @@ impl ReplyService {
                 .get_cookie_profile_for_url(project_id, &mat.url)
                 .await?
             {
-                mat.headers
-                    .retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
-                mat.headers
-                    .push(("Cookie".into(), profile.cookie_header.into_bytes()));
+                if let Some(cookie_header) = profile.cookie_header_for_url(&mat.url)? {
+                    mat.headers
+                        .retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+                    mat.headers
+                        .push(("Cookie".into(), cookie_header.into_bytes()));
+                }
             }
         }
         applied_rules.extend(

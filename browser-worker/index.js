@@ -413,6 +413,20 @@ async function executeAction(session, action = {}) {
   }
 }
 
+async function clearCookieIdentities(context, cookies, fieldName) {
+  if (!Array.isArray(cookies)) return;
+  for (const cookie of cookies) {
+    if (!cookie || typeof cookie.name !== "string" || typeof cookie.domain !== "string" || typeof cookie.path !== "string") {
+      throw rpcError(-32602, `${fieldName} entries require name, domain, and path`);
+    }
+    await context.clearCookies({
+      name: cookie.name,
+      domain: cookie.domain,
+      path: cookie.path,
+    });
+  }
+}
+
 async function handle(req) {
   const { id, method, params = {} } = req;
   try {
@@ -451,6 +465,7 @@ async function handle(req) {
         sessions.set(sessionId, session);
         try {
           await restoreProjectState(session, params.restore_state);
+          await clearCookieIdentities(session.context, params.clear_cookies, "clear_cookies");
           if (Array.isArray(params.cookies) && params.cookies.length) {
             await session.context.addCookies(params.cookies);
           }
@@ -493,6 +508,7 @@ async function handle(req) {
         if (!Array.isArray(params.cookies) || !params.cookies.length) {
           throw rpcError(-32602, "cookies must be a non-empty array");
         }
+        await clearCookieIdentities(session.context, params.clear_cookies, "clear_cookies");
         if (Array.isArray(params.clear_names) && params.clear_names.length) {
           if (typeof params.target_url !== "string") {
             throw rpcError(-32602, "target_url is required when replacing cookies");
@@ -511,9 +527,10 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        if (typeof params.target_url !== "string" || !Array.isArray(params.names)) {
-          throw rpcError(-32602, "target_url and names are required");
+        if (typeof params.target_url !== "string" || !Array.isArray(params.names) || !Array.isArray(params.cookies)) {
+          throw rpcError(-32602, "target_url, names, and cookies are required");
         }
+        await clearCookieIdentities(session.context, params.cookies, "cookies");
         const expired = params.names.map((name) => ({
           name,
           value: "",

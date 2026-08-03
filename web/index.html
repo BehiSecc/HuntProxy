@@ -197,15 +197,15 @@
       <h3>Session cookies</h3>
       <label for="cookieTarget">Target URL</label>
       <input id="cookieTarget" placeholder="https://app.example.com" />
-      <label for="cookieValue">Cookie header value</label>
-      <textarea id="cookieValue" class="mono" style="min-height:70px" placeholder="session=...; csrf=..."></textarea>
+      <label for="cookieValue">Cookie header or JSON cookie array</label>
+      <textarea id="cookieValue" class="mono" style="min-height:70px" placeholder='session=...; csrf=...  or  [{"name":"session","value":"...","domain":".example.com"}]'></textarea>
       <label for="cookieFile">Or load a cookie file</label>
-      <input id="cookieFile" type="file" />
+      <input id="cookieFile" type="file" accept=".txt,.json,text/plain,application/json" />
       <div class="row" style="margin-top:.4rem">
         <button class="btn primary" id="setCookies">Set</button>
         <button class="btn" id="clearCookies">Clear</button>
       </div>
-      <p class="small muted">Values stay hidden. Applies to Reply, Fuzzer, Raw opt-in, and Browser.</p>
+      <p class="small muted">JSON exports are filtered for the target domain and retain browser cookie rules. Values stay hidden. Applies to Reply, Fuzzer, Raw opt-in, and Browser.</p>
       <div class="status" id="cookieStatus"></div>
 
       <h3>Proxy credential</h3>

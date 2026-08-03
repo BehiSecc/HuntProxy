@@ -66,6 +66,7 @@ hmac = "0.12"
 subtle = "2"
 mime = "0.3"
 url = "2"
+psl = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-human-readable"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 

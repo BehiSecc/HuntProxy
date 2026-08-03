@@ -600,7 +600,7 @@ async fn optional_capture_scope_can_be_updated_through_http_api() {
 #[tokio::test]
 async fn managed_cookies_are_configured_without_exposing_values() {
     let (_directory, state, project_id) = test_state().await;
-    let app = bb::api::router(state);
+    let app = bb::api::router(state.clone());
     let set = app
         .clone()
         .oneshot(
@@ -643,6 +643,60 @@ async fn managed_cookies_are_configured_without_exposing_values() {
     .unwrap();
     assert!(!list_text.contains("super-secret"));
     assert!(list_text.contains("example.com"));
+
+    let json_set = app
+        .clone()
+        .oneshot(
+            Request::put(format!("/api/v1/projects/{}/cookies", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "target_url": "https://example.com/login",
+                        "cookie": [
+                            {
+                                "domain": ".example.com",
+                                "name": "json_sid",
+                                "value": "json-super-secret",
+                                "secure": true,
+                                "session": true
+                            },
+                            {
+                                "domain": "unrelated.example",
+                                "name": "ignored",
+                                "value": "unrelated-secret"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_set.status(), StatusCode::OK);
+    let json_set_text = String::from_utf8(
+        json_set
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(json_set_text.contains("json_sid"));
+    assert!(!json_set_text.contains("json-super-secret"));
+    assert!(!json_set_text.contains("unrelated-secret"));
+    let stored = state
+        .db
+        .get_cookie_profile_for_url(project_id, "https://example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.cookie_header, "json_sid=json-super-secret");
+    let managed = &stored.managed_cookies.as_ref().unwrap()[0];
+    assert!(managed.secure);
+    assert_eq!(managed.domain, "example.com");
 
     let clear = app
         .oneshot(

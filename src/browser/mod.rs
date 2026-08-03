@@ -71,6 +71,8 @@ struct PersistentBrowserProfile {
     local_storage: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     session_storage: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pending_cookie_clears: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,6 +643,10 @@ impl BrowserService {
         })?;
         let managed_cookies =
             browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
+        let pending_cookie_clears = restored_profile
+            .as_ref()
+            .map(|profile| profile.pending_cookie_clears.clone())
+            .unwrap_or_default();
         let profile_dir = persistent
             .then(|| self.chromium_profile_dir(project_id))
             .transpose()?;
@@ -659,6 +665,7 @@ impl BrowserService {
             },
             "ca_cert_path": self.ca_cert_path.as_ref().map(|path| path.display().to_string()),
             "cookies": managed_cookies,
+            "clear_cookies": pending_cookie_clears.clone(),
             "restore_state": restored_profile,
             "persistent": persistent,
             // An initialized Chromium profile is authoritative because it may
@@ -714,6 +721,16 @@ impl BrowserService {
                 return Err(error);
             }
         };
+        if persistent {
+            if let Err(error) = self
+                .acknowledge_cookie_clears(project_id, &pending_cookie_clears)
+                .await
+            {
+                self.cleanup_failed_start(project_id, &mut session, capture.id)
+                    .await;
+                return Err(error);
+            }
+        }
         session.engine = BrowserEngine::Chromium;
         session.current_url = saved.url;
         session.current_title = saved.title;
@@ -773,12 +790,25 @@ impl BrowserService {
     ) -> DomainResult<usize> {
         let cookies = browser_cookies(std::slice::from_ref(profile))?;
         let previous_names = previous
+            .filter(|profile| profile.managed_cookies.is_none())
             .map(StoredCookieProfile::pairs)
             .transpose()?
             .unwrap_or_default()
             .into_iter()
             .map(|pair| pair.name)
             .collect::<Vec<_>>();
+        let previous_cookies = previous
+            .map(profile_cookie_identities)
+            .transpose()?
+            .unwrap_or_default();
+        let current_identities = profile_cookie_identities(profile)?;
+        let removed_identities = previous_cookies
+            .iter()
+            .filter(|identity| !current_identities.contains(identity))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.queue_cookie_clears(project_id, &removed_identities)
+            .await?;
         let session_ids = self.active_session_ids(project_id).await;
         for session_id in &session_ids {
             let operation_lock = self.session_operation_lock(*session_id).await;
@@ -791,6 +821,7 @@ impl BrowserService {
                         "cookies": cookies.clone(),
                         "target_url": profile.target_url,
                         "clear_names": previous_names,
+                        "clear_cookies": previous_cookies,
                     }),
                 )
                 .await?;
@@ -806,7 +837,13 @@ impl BrowserService {
         profile: &StoredCookieProfile,
     ) -> DomainResult<usize> {
         let session_ids = self.active_session_ids(project_id).await;
-        let pairs = profile.pairs()?;
+        let pairs = if profile.managed_cookies.is_none() {
+            profile.pairs()?
+        } else {
+            Vec::new()
+        };
+        let cookies = profile_cookie_identities(profile)?;
+        self.queue_cookie_clears(project_id, &cookies).await?;
         for session_id in &session_ids {
             let operation_lock = self.session_operation_lock(*session_id).await;
             let _operation_guard = operation_lock.lock().await;
@@ -817,6 +854,7 @@ impl BrowserService {
                         "session_id": session_id.get(),
                         "target_url": profile.target_url,
                         "names": pairs.iter().map(|pair| &pair.name).collect::<Vec<_>>(),
+                        "cookies": cookies,
                     }),
                 )
                 .await?;
@@ -1357,6 +1395,91 @@ impl BrowserService {
         })
     }
 
+    async fn queue_cookie_clears(
+        &self,
+        project_id: ProjectId,
+        identities: &[Value],
+    ) -> DomainResult<()> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+        self.update_persistent_profile(project_id, |profile| {
+            for identity in identities {
+                if !profile.pending_cookie_clears.contains(identity) {
+                    profile.pending_cookie_clears.push(identity.clone());
+                }
+            }
+        })
+        .await
+    }
+
+    async fn acknowledge_cookie_clears(
+        &self,
+        project_id: ProjectId,
+        acknowledged: &[Value],
+    ) -> DomainResult<()> {
+        self.update_persistent_profile(project_id, |profile| {
+            profile
+                .pending_cookie_clears
+                .retain(|identity| !acknowledged.contains(identity));
+        })
+        .await
+    }
+
+    async fn update_persistent_profile(
+        &self,
+        project_id: ProjectId,
+        update: impl FnOnce(&mut PersistentBrowserProfile),
+    ) -> DomainResult<()> {
+        let _guard = self.profile_io.lock().await;
+        let path = self.profile_state_path(project_id);
+        let mut profile = match std::fs::read(&path) {
+            Ok(encoded) if encoded.len() <= MAX_PERSISTENT_PROFILE_BYTES => {
+                serde_json::from_slice(&encoded).map_err(|_| {
+                    DomainError::new(
+                        ErrorCode::StorageError,
+                        "browser profile state is invalid; reset the project browser profile",
+                    )
+                })?
+            }
+            Ok(_) => {
+                return Err(DomainError::new(
+                    ErrorCode::StorageError,
+                    "browser profile state exceeds the 25 MiB safety limit; reset the project browser profile",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PersistentBrowserProfile::default()
+            }
+            Err(error) => {
+                return Err(DomainError::new(
+                    ErrorCode::StorageError,
+                    format!("read browser profile state: {error}"),
+                ))
+            }
+        };
+        update(&mut profile);
+        let encoded = serde_json::to_vec(&profile)
+            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+        if encoded.len() > MAX_PERSISTENT_PROFILE_BYTES {
+            return Err(DomainError::new(
+                ErrorCode::StorageError,
+                "browser profile state exceeds the 25 MiB safety limit",
+            ));
+        }
+        let directory = self.project_profile_dir(project_id);
+        create_private_dir(&directory)?;
+        let temporary = directory.join(format!(".state-{}.tmp", std::process::id()));
+        write_private_file(&temporary, &encoded)?;
+        std::fs::rename(&temporary, &path).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            DomainError::new(
+                ErrorCode::StorageError,
+                format!("commit browser profile state: {error}"),
+            )
+        })
+    }
+
     async fn persist_checkpoint(
         &self,
         project_id: ProjectId,
@@ -1619,8 +1742,42 @@ fn merge_persistent_profile(profile: &mut PersistentBrowserProfile, checkpoint: 
 }
 
 fn browser_cookies(profiles: &[StoredCookieProfile]) -> DomainResult<Vec<Value>> {
-    let mut output = Vec::new();
+    let mut output = BTreeMap::<(String, String, String), Value>::new();
     for profile in profiles {
+        if let Some(cookies) = &profile.managed_cookies {
+            for cookie in cookies {
+                let mut value = serde_json::Map::from_iter([
+                    ("name".into(), json!(cookie.name)),
+                    ("value".into(), json!(cookie.value)),
+                    (
+                        "domain".into(),
+                        json!(if cookie.host_only {
+                            cookie.domain.clone()
+                        } else {
+                            format!(".{}", cookie.domain)
+                        }),
+                    ),
+                    ("path".into(), json!(cookie.path)),
+                    ("httpOnly".into(), json!(cookie.http_only)),
+                    ("secure".into(), json!(cookie.secure)),
+                ]);
+                if let Some(same_site) = &cookie.same_site {
+                    value.insert("sameSite".into(), json!(same_site));
+                }
+                if let Some(expires) = cookie.expires {
+                    value.insert("expires".into(), json!(expires));
+                }
+                output.insert(
+                    (
+                        cookie.name.clone(),
+                        cookie.domain.clone(),
+                        cookie.path.clone(),
+                    ),
+                    Value::Object(value),
+                );
+            }
+            continue;
+        }
         // A Cookie header can contain duplicate names from different paths,
         // but it carries no path metadata. For browser import, the last value
         // wins and becomes a host-only, root-path session cookie.
@@ -1628,15 +1785,52 @@ fn browser_cookies(profiles: &[StoredCookieProfile]) -> DomainResult<Vec<Value>>
         for pair in profile.pairs()? {
             pairs.insert(pair.name.clone(), pair);
         }
-        output.extend(pairs.into_values().map(|pair| {
+        for pair in pairs.into_values() {
+            output.insert(
+                (pair.name.clone(), profile.host.clone(), "/".into()),
+                json!({
+                    "name": pair.name,
+                    "value": pair.value,
+                    "url": profile.target_url,
+                }),
+            );
+        }
+    }
+    Ok(output.into_values().collect())
+}
+
+fn cookie_identities(cookies: &[crate::cookies::ManagedCookie]) -> Vec<Value> {
+    cookies
+        .iter()
+        .map(|cookie| {
+            json!({
+                "name": cookie.name,
+                "domain": if cookie.host_only {
+                    cookie.domain.clone()
+                } else {
+                    format!(".{}", cookie.domain)
+                },
+                "path": cookie.path,
+            })
+        })
+        .collect()
+}
+
+fn profile_cookie_identities(profile: &StoredCookieProfile) -> DomainResult<Vec<Value>> {
+    if let Some(cookies) = &profile.managed_cookies {
+        return Ok(cookie_identities(cookies));
+    }
+    Ok(profile
+        .pairs()?
+        .into_iter()
+        .map(|pair| {
             json!({
                 "name": pair.name,
-                "value": pair.value,
-                "url": profile.target_url,
+                "domain": profile.host,
+                "path": "/",
             })
-        }));
-    }
-    Ok(output)
+        })
+        .collect())
 }
 
 fn existing_path(configured: Option<PathBuf>, executable_name: &str) -> Option<PathBuf> {
@@ -2019,6 +2213,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_cookie_clears_survive_until_browser_start_consumes_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let project_id = ProjectId(43);
+        let identity = json!({"name":"sid","domain":".example.test","path":"/admin"});
+        service
+            .queue_cookie_clears(project_id, std::slice::from_ref(&identity))
+            .await
+            .unwrap();
+        let loaded = service
+            .load_persistent_profile(project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.pending_cookie_clears, vec![identity.clone()]);
+
+        let second = json!({"name":"other","domain":"example.test","path":"/"});
+        service
+            .queue_cookie_clears(project_id, std::slice::from_ref(&second))
+            .await
+            .unwrap();
+        service
+            .acknowledge_cookie_clears(project_id, std::slice::from_ref(&identity))
+            .await
+            .unwrap();
+        let loaded = service
+            .load_persistent_profile(project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.pending_cookie_clears, vec![second]);
+    }
+
+    #[tokio::test]
     async fn reset_profile_recovers_from_corrupt_state() {
         let directory = tempfile::tempdir().unwrap();
         let db = Arc::new(Db::open_in_memory().await.unwrap());
@@ -2058,6 +2294,7 @@ mod tests {
             target_url: "https://example.com/".into(),
             cookie_header: "sid=old; theme=dark; sid=new".into(),
             names: vec!["sid".into(), "theme".into()],
+            managed_cookies: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -2068,6 +2305,76 @@ mod tests {
                 && cookie["value"] == "new"
                 && cookie["url"] == "https://example.com/"
         }));
+        let identities = profile_cookie_identities(&StoredCookieProfile {
+            project_id: ProjectId(1),
+            host: "example.com".into(),
+            target_url: "https://example.com/".into(),
+            cookie_header: "sid=value".into(),
+            names: vec!["sid".into()],
+            managed_cookies: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            identities,
+            vec![json!({"name":"sid","domain":"example.com","path":"/"})]
+        );
+    }
+
+    #[test]
+    fn browser_cookie_import_preserves_json_attributes_and_paths() {
+        let validated = crate::cookies::validate_cookie_profile(
+            "https://app.example.com/admin",
+            r#"[{"domain":".example.com","name":"sid","path":"/","secure":true,"session":true,"value":"root"},{"domain":".example.com","expirationDate":4102444800.5,"httpOnly":true,"name":"sid","path":"/admin","sameSite":"lax","secure":true,"value":"admin"}]"#.into(),
+        )
+        .unwrap();
+        let profile = StoredCookieProfile {
+            project_id: ProjectId(1),
+            host: validated.host,
+            target_url: validated.target_url,
+            cookie_header: validated.cookie_header,
+            names: validated.names,
+            managed_cookies: validated.managed_cookies,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let cookies = browser_cookies(&[profile]).unwrap();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0]["domain"], ".example.com");
+        assert_eq!(cookies[0]["path"], "/");
+        assert_eq!(cookies[0]["secure"], true);
+        assert!(cookies[0].get("expires").is_none());
+        assert_eq!(cookies[1]["path"], "/admin");
+        assert_eq!(cookies[1]["httpOnly"], true);
+        assert_eq!(cookies[1]["sameSite"], "Lax");
+        assert_eq!(cookies[1]["expires"], 4102444800.5_f64);
+    }
+
+    #[test]
+    fn browser_cookie_import_deduplicates_identity_with_latest_profile_winning() {
+        let make_profile = |value: &str| {
+            let validated = crate::cookies::validate_cookie_profile(
+                "https://app.example.com/",
+                format!(
+                    r#"[{{"domain":".example.com","name":"sid","path":"/","secure":true,"session":true,"value":"{value}"}}]"#
+                ),
+            )
+            .unwrap();
+            StoredCookieProfile {
+                project_id: ProjectId(1),
+                host: "app.example.com".into(),
+                target_url: validated.target_url,
+                cookie_header: validated.cookie_header,
+                names: validated.names,
+                managed_cookies: validated.managed_cookies,
+                created_at: String::new(),
+                updated_at: String::new(),
+            }
+        };
+        let cookies = browser_cookies(&[make_profile("older"), make_profile("newer")]).unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0]["value"], "newer");
     }
 
     #[test]

@@ -666,7 +666,7 @@ impl Drop for DeleteOnDrop {
 #[derive(Deserialize)]
 struct SetCookieBody {
     target_url: String,
-    cookie: String,
+    cookie: serde_json::Value,
 }
 
 async fn list_project_cookies(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
@@ -681,8 +681,11 @@ async fn set_project_cookie(
     Path(id): Path<i64>,
     Json(body): Json<SetCookieBody>,
 ) -> Response {
-    match crate::cookies::set_project_cookie(&state, ProjectId(id), &body.target_url, body.cookie)
-        .await
+    let cookie = match crate::cookies::cookie_input_from_json_value(&body.cookie) {
+        Ok(cookie) => cookie,
+        Err(error) => return error_response(error),
+    };
+    match crate::cookies::set_project_cookie(&state, ProjectId(id), &body.target_url, cookie).await
     {
         Ok(result) => Json(result).into_response(),
         Err(error) => error_response(error),

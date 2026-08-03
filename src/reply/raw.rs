@@ -154,7 +154,10 @@ impl ReplyService {
                 .ok_or_else(|| {
                     DomainError::not_found("no managed cookies configured for target host")
                 })?;
-            request_bytes = inject_cookie_header(&request_bytes, &profile.cookie_header)?;
+            let cookie_header = profile.cookie_header_for_url(target_url)?.ok_or_else(|| {
+                DomainError::not_found("no managed cookies apply to the target URL")
+            })?;
+            request_bytes = inject_cookie_header(&request_bytes, &cookie_header)?;
         }
         let request_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
         if request_bytes.len() as u64 > request_cap {

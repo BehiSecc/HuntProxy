@@ -1,4 +1,6 @@
-use crate::cookies::{CookieProfileStatus, StoredCookieProfile, ValidatedCookieProfile};
+use crate::cookies::{
+    CookieProfileStatus, ManagedCookie, StoredCookieProfile, ValidatedCookieProfile,
+};
 use crate::domain::{DomainError, DomainResult, ErrorCode, ProjectId};
 use crate::storage::projects::now_rfc3339;
 use crate::storage::Db;
@@ -12,8 +14,15 @@ impl Db {
     ) -> DomainResult<CookieProfileStatus> {
         self.get_project(project_id).await?;
         let now = now_rfc3339();
-        let names_json = serde_json::to_string(&profile.names)
-            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+        let names_json = if let Some(managed_cookies) = &profile.managed_cookies {
+            serde_json::to_string(&CookieMetadata::Structured {
+                names: profile.names.clone(),
+                managed_cookies: managed_cookies.clone(),
+            })
+        } else {
+            serde_json::to_string(&CookieMetadata::Legacy(profile.names.clone()))
+        }
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
         self.with_conn(move |connection| {
             connection
                 .execute(
@@ -78,7 +87,8 @@ impl Db {
             let mut statement = connection
                 .prepare(
                     "SELECT host, target_url, cookie_header, names_json, created_at, updated_at
-                     FROM project_cookies WHERE project_id=?1 ORDER BY host",
+                     FROM project_cookies WHERE project_id=?1
+                     ORDER BY julianday(updated_at), updated_at, host",
                 )
                 .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
             let rows = statement
@@ -95,6 +105,116 @@ impl Db {
     }
 
     pub async fn get_cookie_profile_for_url(
+        &self,
+        project_id: ProjectId,
+        target_url: &str,
+    ) -> DomainResult<Option<StoredCookieProfile>> {
+        let (host, normalized_url) = crate::cookies::normalize_target(target_url)?;
+        self.with_conn(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT host, target_url, cookie_header, names_json, created_at, updated_at
+                     FROM project_cookies WHERE project_id=?1
+                     ORDER BY julianday(updated_at), updated_at, host",
+                )
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            let profiles = statement
+                .query_map(params![project_id.get()], |row| {
+                    row_to_profile(project_id, row)
+                })
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            let mut by_identity = std::collections::BTreeMap::new();
+            for profile in &profiles {
+                if let Some(cookies) = &profile.managed_cookies {
+                    for cookie in cookies
+                        .iter()
+                        .filter(|cookie| cookie.domain_matches_host(&host))
+                    {
+                        by_identity.insert(
+                            (
+                                cookie.name.clone(),
+                                cookie.domain.clone(),
+                                cookie.path.clone(),
+                            ),
+                            cookie.clone(),
+                        );
+                    }
+                } else if profile.host == host {
+                    // Raw cookies are exact-host root session cookies. Insert
+                    // them in the same updated-at order as structured rows so
+                    // Chromium and HTTP request selection choose the same
+                    // winner for an identical name/domain/path identity.
+                    for pair in profile.pairs()? {
+                        let cookie = ManagedCookie {
+                            name: pair.name,
+                            value: pair.value,
+                            domain: host.clone(),
+                            host_only: true,
+                            path: "/".into(),
+                            http_only: false,
+                            secure: false,
+                            same_site: None,
+                            expires: None,
+                        };
+                        by_identity.insert(
+                            (
+                                cookie.name.clone(),
+                                cookie.domain.clone(),
+                                cookie.path.clone(),
+                            ),
+                            cookie,
+                        );
+                    }
+                }
+            }
+            let mut cookies = by_identity.into_values().collect::<Vec<_>>();
+            if cookies.is_empty() {
+                return Ok(None);
+            }
+            cookies.sort_by(|left, right| {
+                right
+                    .path
+                    .len()
+                    .cmp(&left.path.len())
+                    .then_with(|| left.domain.cmp(&right.domain))
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            let names = cookies
+                .iter()
+                .map(|cookie| cookie.name.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let cookie_header = cookies
+                .iter()
+                .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let created_at = profiles
+                .first()
+                .map(|profile| profile.created_at.clone())
+                .unwrap_or_default();
+            let updated_at = profiles
+                .last()
+                .map(|profile| profile.updated_at.clone())
+                .unwrap_or_default();
+            Ok(Some(StoredCookieProfile {
+                project_id,
+                host,
+                target_url: normalized_url,
+                cookie_header,
+                names,
+                managed_cookies: Some(cookies),
+                created_at,
+                updated_at,
+            }))
+        })
+        .await
+    }
+
+    pub async fn get_cookie_profile_for_target(
         &self,
         project_id: ProjectId,
         target_url: &str,
@@ -149,18 +269,36 @@ fn row_to_profile(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<StoredCookieProfile> {
     let names_json: String = row.get(3)?;
-    let names = serde_json::from_str(&names_json).map_err(|error| {
+    let metadata: CookieMetadata = serde_json::from_str(&names_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    let (names, managed_cookies) = match metadata {
+        CookieMetadata::Legacy(names) => (names, None),
+        CookieMetadata::Structured {
+            names,
+            managed_cookies,
+        } => (names, Some(managed_cookies)),
+    };
     Ok(StoredCookieProfile {
         project_id,
         host: row.get(0)?,
         target_url: row.get(1)?,
         cookie_header: row.get(2)?,
         names,
+        managed_cookies,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
     })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum CookieMetadata {
+    Legacy(Vec<String>),
+    Structured {
+        names: Vec<String>,
+        managed_cookies: Vec<ManagedCookie>,
+    },
 }
 
 #[cfg(test)]
@@ -208,5 +346,138 @@ mod tests {
         let status = db.list_cookie_profiles(first.id).await.unwrap();
         assert_eq!(status[0].names, vec!["sid"]);
         assert!(!serde_json::to_string(&status).unwrap().contains("secret"));
+
+        db.upsert_cookie_profile(
+            first.id,
+            validate_cookie_profile(
+                "https://example.com/admin",
+                r#"[{"domain":".example.com","name":"json_sid","path":"/admin","httpOnly":true,"secure":true,"sameSite":"strict","expirationDate":4102444800,"value":"json-secret"}]"#.into(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let stored = db
+            .get_cookie_profile_for_url(first.id, "https://example.com/admin")
+            .await
+            .unwrap()
+            .unwrap();
+        let cookie = &stored.managed_cookies.as_ref().unwrap()[0];
+        assert_eq!(cookie.path, "/admin");
+        assert!(cookie.http_only);
+        assert!(cookie.secure);
+        assert_eq!(cookie.same_site.as_deref(), Some("Strict"));
+        let sibling = db
+            .get_cookie_profile_for_url(first.id, "https://api.example.com/admin/users")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sibling
+                .cookie_header_for_url("https://api.example.com/admin/users")
+                .unwrap()
+                .as_deref(),
+            Some("json_sid=json-secret")
+        );
+
+        db.upsert_cookie_profile(
+            first.id,
+            validate_cookie_profile(
+                "https://api.example.com/admin",
+                r#"[{"domain":".example.com","name":"json_sid","path":"/admin","secure":true,"session":true,"value":"newer-secret"}]"#.into(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let merged = db
+            .get_cookie_profile_for_url(first.id, "https://api.example.com/admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged
+                .cookie_header_for_url("https://api.example.com/admin")
+                .unwrap()
+                .as_deref(),
+            Some("json_sid=newer-secret")
+        );
+
+        db.upsert_cookie_profile(
+            first.id,
+            validate_cookie_profile("https://api.example.com", "raw=raw-secret".into()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let merged = db
+            .get_cookie_profile_for_url(first.id, "https://api.example.com/admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged
+                .cookie_header_for_url("https://api.example.com/admin")
+                .unwrap()
+                .as_deref(),
+            Some("json_sid=json-secret; raw=raw-secret")
+        );
+
+        db.upsert_cookie_profile(
+            first.id,
+            validate_cookie_profile("https://api.example.com", "identity=raw-older".into())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.upsert_cookie_profile(
+            first.id,
+            validate_cookie_profile(
+                "https://sub.api.example.com",
+                r#"[{"domain":".api.example.com","name":"identity","path":"/","secure":true,"session":true,"value":"structured-newer"}]"#.into(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let merged = db
+            .get_cookie_profile_for_url(first.id, "https://api.example.com/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged
+                .managed_cookies
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|cookie| cookie.name == "identity")
+                .unwrap()
+                .value,
+            "structured-newer"
+        );
+
+        db.upsert_cookie_profile(
+            first.id,
+            validate_cookie_profile("https://api.example.com", "identity=raw-newer".into())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let merged = db
+            .get_cookie_profile_for_url(first.id, "https://api.example.com/")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged
+                .managed_cookies
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|cookie| cookie.name == "identity")
+                .unwrap()
+                .value,
+            "raw-newer"
+        );
     }
 }

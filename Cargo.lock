@@ -350,6 +350,7 @@ dependencies = [
  "percent-encoding",
  "predicates",
  "proptest",
+ "psl",
  "rand 0.8.7",
  "rcgen",
  "regex",
@@ -2059,6 +2060,15 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "psl"
+version = "2.1.223"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0dedad316e05de220cbf3fd8bfb69f3df8755dde2d7d479211827b595168a93"
+dependencies = [
+ "psl-types",
 ]
 
 [[package]]

@@ -61,8 +61,12 @@ args = ["mcp"]
 require an explicit `project_id`.
 
 To reuse an authenticated session, call the `cookies` tool with `action: "set"`,
-the project's ID, a target URL, and either the exact Cookie header value in
-`cookie` or a local `file_path`. Values remain hidden from normal tool output.
+the project's ID, a target URL, and either a raw Cookie header or browser-export
+JSON cookie array in `cookie`, or a local UTF-8 `file_path` containing either
+format. JSON cookies for unrelated domains and expired cookies are skipped.
+Domain, path, expiry, HTTP-only, Secure, and
+SameSite attributes are retained for Chromium, and HuntProxy selects applicable
+cookie pairs for each managed request URL. Values remain hidden from normal tool output.
 Matching cookies are then used automatically by Reply, Fuzzer, and new or
 active browser sessions. Raw Reply remains byte-exact unless
 `use_project_cookies: true` is explicitly set.
