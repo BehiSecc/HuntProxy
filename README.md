@@ -111,6 +111,15 @@ validate/serialize the body and update Content-Type. Form formats use ordered
 `body_params` name/value entries. Explicit method changes do not accidentally
 inherit the old request body or entity headers.
 
+`reply_send_raw` is the explicit byte-preserving HTTP/1.1 path for framing and
+desynchronization checks. It can split one request at `pause_at_byte`, pause,
+optionally half-close the write side, and collect multiple responses with
+`response_mode: "until_idle"`. The default remains one ordinary complete
+response. Use base64 input when offsets or non-UTF-8 bytes matter. Raw response
+transcripts are preserved; `exchange_body` presents the first entity normally
+and returns the complete transcript with `raw: true`. Malformed HTTP/2 framing
+is not supported because semantic HTTP/2 clients normalize messages.
+
 History filters support Boolean expressions, for example
 `(request:~this OR request:~that) method:PUT`; `request:~text` searches the
 request target, headers, and body. Fuzzer templates accept inline `wordlists`

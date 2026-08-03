@@ -8,6 +8,9 @@ use http_body_util::BodyExt;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+use base64::Engine;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 async fn test_state() -> (TempDir, std::sync::Arc<bb::app::AppState>, ProjectId) {
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
@@ -922,4 +925,131 @@ async fn copy_as_includes_secrets_by_default_and_can_explicitly_redact_them() {
     assert!(!content.contains("Bearer top-secret"));
     assert!(content.contains("\"X-Repeat\": \"one, two\""));
     assert!(content.contains("https://example.com/submit?from=history"));
+}
+
+#[tokio::test]
+async fn raw_reply_preserves_framing_and_collects_response_sequences() {
+    let (_directory, state, project_id) = test_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let raw_request = format!(
+        "POST / HTTP/1.1\r\nHost: {address}\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /next HTTP/1.1\r\nHost: {address}\r\n\r\n"
+    );
+    let expected = raw_request.as_bytes().to_vec();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = vec![0_u8; expected.len()];
+        socket.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, expected);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        socket
+            .write_all(b"HTTP/1.1 201 OK\r\nContent-Length: 3\r\n\r\ntwo")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    });
+    let app = bb::api::router(state.clone());
+    let sent = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/projects/{}/reply-send-raw",
+                project_id.get()
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "target_url": format!("http://{address}/"),
+                    "request": raw_request,
+                    "encoding": "utf8",
+                    "response_mode": "until_idle",
+                    "idle_timeout_ms": 50,
+                    "read_timeout_ms": 1000
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.status(), StatusCode::OK);
+    let sent = json_response(sent).await;
+    assert_eq!(sent["read_outcome"], "idle");
+    assert_eq!(sent["responses"].as_array().unwrap().len(), 2);
+    let exchange_id = sent["exchange_id"].as_i64().unwrap();
+
+    let presented = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{exchange_id}/body?side=response",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let presented = json_response(presented).await;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(presented["data"].as_str().unwrap())
+            .unwrap(),
+        b"one"
+    );
+
+    let raw = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{exchange_id}/body?side=response&raw=true",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let raw = json_response(raw).await;
+    let transcript = base64::engine::general_purpose::STANDARD
+        .decode(raw["data"].as_str().unwrap())
+        .unwrap();
+    assert!(transcript
+        .windows(b"HTTP/1.1 201 ".len())
+        .any(|window| window == b"HTTP/1.1 201 "));
+
+    let mcp_presented = bb::mcp::call_tool(
+        state.clone(),
+        "exchange_body",
+        serde_json::json!({
+            "project_id": project_id.get(),
+            "exchange_id": exchange_id,
+            "side": "response"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_presented["preview"], "one");
+    assert_eq!(mcp_presented["total"], 3);
+
+    let mcp_raw = bb::mcp::call_tool(
+        state,
+        "exchange_body",
+        serde_json::json!({
+            "project_id": project_id.get(),
+            "exchange_id": exchange_id,
+            "side": "response",
+            "raw": true
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(mcp_raw["preview"]
+        .as_str()
+        .unwrap()
+        .starts_with("HTTP/1.1 200 OK\r\n"));
+    server.abort();
 }

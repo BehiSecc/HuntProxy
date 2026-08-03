@@ -1289,6 +1289,19 @@ async fn get_body(
                     }
                 }
             } else if !q.raw.unwrap_or(false) {
+                if let Ok(detail) = state
+                    .db
+                    .get_exchange_detail(
+                        ProjectId(id),
+                        ExchangeId(eid),
+                        PresentationOptions::default(),
+                    )
+                    .await
+                {
+                    if detail.protocol == "HTTP/1.1 raw" {
+                        body = crate::reply::presented_raw_response_body(&body);
+                    }
+                }
                 let headers = match state
                     .db
                     .load_raw_headers(ProjectId(id), ExchangeId(eid), MessageSide::Response)
@@ -1470,6 +1483,8 @@ struct RawReplySendBody {
     tab_id: Option<i64>,
     #[serde(default)]
     use_project_cookies: bool,
+    #[serde(flatten)]
+    options: crate::reply::RawHttp1Options,
 }
 
 async fn reply_send_raw(
@@ -1500,6 +1515,7 @@ async fn reply_send_raw(
             &body.target_url,
             request_bytes,
             body.use_project_cookies,
+            body.options,
         )
         .await
     {

@@ -133,6 +133,9 @@ pub async fn analyze_exchange(
         .load_raw_body(project_id, exchange_id, MessageSide::Response)
         .await?
         .unwrap_or_default();
+    if detail.protocol == "HTTP/1.1 raw" {
+        body = crate::reply::presented_raw_response_body(&body);
+    }
     let headers = db
         .load_raw_headers(project_id, exchange_id, MessageSide::Response)
         .await?;

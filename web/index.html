@@ -379,6 +379,21 @@
             <textarea id="rawReplyRequest" class="mono" style="min-height:180px" placeholder="GET / HTTP/1.1&#10;Host: example.com&#10;Connection: close&#10;&#10;"></textarea>
             <label><input type="checkbox" id="rawReplyCrlf" checked style="width:auto" /> Convert editor line breaks to CRLF</label>
             <label><input type="checkbox" id="rawReplyCookies" style="width:auto" /> Use managed cookies for this target</label>
+            <details>
+              <summary>Connection and desync controls</summary>
+              <p class="small muted">Optional HTTP/1.1-only controls. The pause offset counts UTF-8 bytes in this editor; use API/MCP base64 for arbitrary bytes. Split writes cannot be combined with managed-cookie injection because injection changes byte offsets.</p>
+              <div class="row">
+                <div><label for="rawReplyPauseAt">Pause at byte</label><input id="rawReplyPauseAt" type="number" min="1" placeholder="disabled" /></div>
+                <div><label for="rawReplyPauseMs">Pause milliseconds</label><input id="rawReplyPauseMs" type="number" min="1" max="120000" placeholder="disabled" /></div>
+                <div><label for="rawReplyReadTimeout">Read timeout ms</label><input id="rawReplyReadTimeout" type="number" min="1" max="120000" value="60000" /></div>
+                <div><label for="rawReplyIdleTimeout">Idle timeout ms</label><input id="rawReplyIdleTimeout" type="number" min="1" max="10000" value="1000" /></div>
+              </div>
+              <div class="row">
+                <div><label for="rawReplyResponseMode">Response collection</label><select id="rawReplyResponseMode"><option value="auto">First complete response</option><option value="until_idle">All responses until idle</option><option value="until_close">Until peer closes</option></select></div>
+                <label class="fit"><input type="checkbox" id="rawReplyHalfClose" style="width:auto" /> Half-close write side after sending</label>
+              </div>
+              <p class="small muted">Malformed HTTP/2 framing is not supported here; semantic HTTP/2 normalizes messages.</p>
+            </details>
             <button class="btn primary" id="sendRawReply">Send raw HTTP/1.1</button>
           </details>
           <pre class="mono hidden" id="replyResult"></pre>
@@ -1224,6 +1239,7 @@ test
       if (!targetUrl) return status('replyStatus', 'Enter a connection target', 'err');
       let request = $('rawReplyRequest').value;
       if ($('rawReplyCrlf').checked) request = request.replace(/\r?\n/g, '\r\n');
+      const optionalInteger = id => $(id).value.trim() ? Number($(id).value) : null;
       try {
         const result = await api(`/api/v1/projects/${state.projectId}/reply-send-raw`, {
           method: 'POST',
@@ -1233,6 +1249,12 @@ test
             encoding: 'utf8',
             tab_id: state.activeReplyTab?.id || null,
             use_project_cookies: $('rawReplyCookies').checked,
+            pause_at_byte: optionalInteger('rawReplyPauseAt'),
+            pause_ms: optionalInteger('rawReplyPauseMs'),
+            half_close_write: $('rawReplyHalfClose').checked,
+            response_mode: $('rawReplyResponseMode').value,
+            read_timeout_ms: Number($('rawReplyReadTimeout').value),
+            idle_timeout_ms: Number($('rawReplyIdleTimeout').value),
           }),
         });
         $('replyResult').classList.remove('hidden'); $('replyResult').textContent = JSON.stringify(result, null, 2);

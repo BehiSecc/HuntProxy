@@ -155,7 +155,7 @@ async fn load_exchange(
     project_id: ProjectId,
     exchange_id: ExchangeId,
 ) -> DomainResult<CompareExchange> {
-    let detail = db
+    let mut detail = db
         .get_exchange_detail(project_id, exchange_id, Default::default())
         .await?;
     let request_headers = db
@@ -164,12 +164,22 @@ async fn load_exchange(
     let response_headers = db
         .load_raw_headers(project_id, exchange_id, MessageSide::Response)
         .await?;
-    let request_body = db
+    let mut request_body = db
         .load_raw_body(project_id, exchange_id, MessageSide::Request)
         .await?;
-    let response_body = db
+    let mut response_body = db
         .load_raw_body(project_id, exchange_id, MessageSide::Response)
         .await?;
+    if detail.protocol == "HTTP/1.1 raw" {
+        request_body = request_body.map(|body| crate::reply::redact_raw_request_headers(&body));
+        response_body = response_body.map(|body| crate::reply::presented_raw_response_body(&body));
+        detail.summary.request_length = request_body
+            .as_ref()
+            .and_then(|body| i64::try_from(body.len()).ok());
+        detail.summary.response_length = response_body
+            .as_ref()
+            .and_then(|body| i64::try_from(body.len()).ok());
+    }
     Ok(CompareExchange {
         summary: detail.summary,
         body_representation: detail.body_representation,
