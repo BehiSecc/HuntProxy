@@ -33,6 +33,8 @@ pub struct FuzzResponseGroup {
     pub status_code: Option<u16>,
     pub mime: Option<String>,
     pub body_hash: Option<String>,
+    pub body_hash_matches_baseline: Option<bool>,
+    pub different_from_baseline: Option<bool>,
     pub response_length_min: Option<i64>,
     pub response_length_max: Option<i64>,
     pub duration_ms_min: Option<i64>,
@@ -500,7 +502,48 @@ impl FuzzerService {
         project_id: ProjectId,
         job_id: FuzzJobId,
     ) -> DomainResult<Vec<FuzzResponseGroup>> {
-        self.db.list_fuzz_response_groups(project_id, job_id).await
+        let mut groups = self
+            .db
+            .list_fuzz_response_groups(project_id, job_id)
+            .await?;
+        let job = self.db.get_fuzz_job(project_id, job_id).await?;
+        let baseline_exchange_id = if let Some(exchange_id) = job.base_exchange_id {
+            match self
+                .db
+                .get_exchange_detail(project_id, exchange_id, PresentationOptions::default())
+                .await
+            {
+                Ok(detail) if detail.summary.status_code.is_some() => Some(exchange_id),
+                Ok(_) | Err(_) => self
+                    .db
+                    .first_completed_fuzz_case_exchange(project_id, job_id)
+                    .await?
+                    .map(|(_, exchange_id)| exchange_id),
+            }
+        } else {
+            self.db
+                .first_completed_fuzz_case_exchange(project_id, job_id)
+                .await?
+                .map(|(_, exchange_id)| exchange_id)
+        };
+        if let Some(exchange_id) = baseline_exchange_id {
+            if let Ok(baseline) = self
+                .db
+                .get_exchange_detail(project_id, exchange_id, PresentationOptions::default())
+                .await
+            {
+                for group in &mut groups {
+                    annotate_group_with_baseline(
+                        group,
+                        baseline.summary.status_code,
+                        baseline.summary.mime.as_deref(),
+                        baseline.response_body_hash.as_deref(),
+                        baseline.summary.response_length,
+                    );
+                }
+            }
+        }
+        Ok(groups)
     }
 
     pub async fn list_group_cases(
@@ -716,6 +759,30 @@ impl FuzzerService {
             (Err(error), _) | (_, Err(error)) => (None, Some(error.to_string())),
         }
     }
+}
+
+fn annotate_group_with_baseline(
+    group: &mut FuzzResponseGroup,
+    status_code: Option<u16>,
+    mime: Option<&str>,
+    body_hash: Option<&str>,
+    response_length: Option<i64>,
+) {
+    if group.representative_exchange_id.is_none() {
+        return;
+    }
+    group.body_hash_matches_baseline = match (group.body_hash.as_deref(), body_hash) {
+        (Some(group), Some(baseline)) => Some(group == baseline),
+        _ => None,
+    };
+    let length_matches = group.response_length_min == response_length
+        && group.response_length_max == response_length;
+    group.different_from_baseline = Some(
+        group.status_code != status_code
+            || normalize_response_mime(group.mime.as_deref()) != normalize_response_mime(mime)
+            || group.body_hash_matches_baseline == Some(false)
+            || !length_matches,
+    );
 }
 
 fn option_delta(current: Option<i64>, baseline: Option<i64>) -> Option<i64> {
@@ -2014,6 +2081,48 @@ mod tests {
             assert_eq!(detail.lineage.fuzz_job_id, Some(job.id));
             assert_eq!(detail.lineage.fuzz_case_id, Some(case.id));
         }
+    }
+
+    #[test]
+    fn response_groups_expose_baseline_hash_and_semantic_outliers() {
+        let mut group = FuzzResponseGroup {
+            group_id: "group".into(),
+            state: FuzzCaseState::Completed,
+            case_count: 2,
+            representative_case_id: 1,
+            representative_case_index: 0,
+            representative_exchange_id: Some(ExchangeId(1)),
+            status_code: Some(200),
+            mime: Some("text/plain; charset=utf-8".into()),
+            body_hash: Some("same-hash".into()),
+            body_hash_matches_baseline: None,
+            different_from_baseline: None,
+            response_length_min: Some(10),
+            response_length_max: Some(10),
+            duration_ms_min: Some(1),
+            duration_ms_avg: Some(1.0),
+            duration_ms_max: Some(1),
+        };
+
+        annotate_group_with_baseline(
+            &mut group,
+            Some(200),
+            Some("text/plain"),
+            Some("same-hash"),
+            Some(10),
+        );
+        assert_eq!(group.body_hash_matches_baseline, Some(true));
+        assert_eq!(group.different_from_baseline, Some(false));
+
+        annotate_group_with_baseline(
+            &mut group,
+            Some(200),
+            Some("text/plain"),
+            Some("different-hash"),
+            Some(10),
+        );
+        assert_eq!(group.body_hash_matches_baseline, Some(false));
+        assert_eq!(group.different_from_baseline, Some(true));
     }
 
     #[test]

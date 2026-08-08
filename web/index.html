@@ -452,7 +452,8 @@ test
             <div class="row"><h2 style="margin:0">Jobs</h2><button class="btn fit" id="refreshFuzz">Refresh</button></div>
             <div class="table-wrap"><table><thead><tr><th>ID</th><th>State</th><th>Progress</th><th>Failed</th><th>Action</th></tr></thead><tbody id="fuzzJobs"></tbody></table></div>
             <div class="row"><h3 style="margin:0">Selected job results</h3><div><button class="btn fit" id="showFuzzGroups">Groups</button> <button class="btn fit" id="showFuzzCases">All cases</button></div></div>
-            <div id="fuzzGroupsPanel" class="table-wrap"><table><thead><tr><th>Count</th><th>Status</th><th>MIME</th><th>Size</th><th>Timing</th></tr></thead><tbody id="fuzzGroups"></tbody></table></div>
+            <div id="fuzzGroupControls" class="row" style="margin-bottom:.45rem"><label style="margin:0"><input id="fuzzOnlyDifferent" type="checkbox" style="width:auto" /> Different from baseline only</label><label style="margin:0">Sort <select id="fuzzGroupSort" style="width:auto"><option value="count">Count</option><option value="status">Status</option><option value="size">Size</option></select></label></div>
+            <div id="fuzzGroupsPanel" class="table-wrap"><table><thead><tr><th>Count</th><th>Baseline</th><th>Status</th><th>MIME</th><th>Size</th><th>Timing</th></tr></thead><tbody id="fuzzGroups"></tbody></table></div>
             <div id="fuzzCasesPanel" class="hidden"><div class="table-wrap"><table><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Exchange</th><th>Action</th></tr></thead><tbody id="fuzzCases"></tbody></table></div><button class="btn fit hidden" id="loadMoreFuzzCases" style="margin-top:.55rem">Load more</button></div>
             <pre class="mono hidden" id="fuzzDiff"></pre>
           </div>
@@ -541,6 +542,7 @@ test
       fuzzTimer: null,
       fuzzCases: [],
       fuzzCasesCursor: null,
+      fuzzGroups: [],
       historyItems: [],
       historyCursor: null,
       historyTotal: 0,
@@ -671,7 +673,9 @@ test
     async function loadProjectUsage() {
       if (!state.projectId) return;
       const usage = await api(`/api/v1/projects/${state.projectId}/usage`);
-      $('projectUsage').textContent = `${usage.exchange_count} exchanges · ${humanBytes(usage.approximate_total_bytes)} project data · ${humanBytes(usage.database_file_bytes)} database`;
+      const percent = usage.max_disk_bytes ? (100 * usage.approximate_total_bytes / usage.max_disk_bytes) : 0;
+      $('projectUsage').textContent = `${usage.exchange_count} exchanges · ${humanBytes(usage.approximate_total_bytes)} / ${humanBytes(usage.max_disk_bytes)} (${percent.toFixed(1)}%) · responses ${humanBytes(usage.response_body_bytes)} · requests ${humanBytes(usage.request_body_bytes)} · headers ${humanBytes(usage.header_bytes)} · database ${humanBytes(usage.database_file_bytes)}`;
+      $('projectUsage').style.color = percent >= 90 ? 'var(--warning)' : '';
     }
     $('renameProject').onclick = async () => {
       if (!state.projectId) return;
@@ -691,7 +695,7 @@ test
       const response = await fetch(path);
       if (!response.ok) { let message = `HTTP ${response.status}`; try { message = (await response.json()).message || message; } catch (_) {} throw new Error(message); }
       const blob = await response.blob();
-      const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; link.click(); URL.revokeObjectURL(link.href);
+      const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(link.href), 0);
     }
     $('exportProject').onclick = async () => {
       if (!state.projectId) return;
@@ -1202,7 +1206,11 @@ test
         body_params: [],
         body_cleared: clearBody,
       };
-      if (clearBody || !bodyValue) return draft;
+      if (clearBody) return draft;
+      if (!bodyValue) {
+        if (format === 'form_urlencoded') draft.body_format = format;
+        return draft;
+      }
       if (format === 'raw') draft.body_override = bytes(bodyValue);
       else if (format === 'json') { draft.body_format = 'json'; draft.body_json = JSON.parse(bodyValue); }
       else if (format === 'xml') { draft.body_format = 'xml'; draft.body_text = bodyValue; }
@@ -1379,6 +1387,7 @@ test
     }
     function showFuzzResultsPanel(mode) {
       state.fuzzResultsMode = mode;
+      $('fuzzGroupControls').classList.toggle('hidden', mode !== 'groups');
       $('fuzzGroupsPanel').classList.toggle('hidden', mode !== 'groups');
       $('fuzzCasesPanel').classList.toggle('hidden', mode === 'groups');
     }
@@ -1391,14 +1400,29 @@ test
       state.selectedFuzzGroup = null;
       try {
         const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/groups`);
-        $('fuzzGroups').innerHTML = (result.groups || []).map(group => {
-          const size = group.response_length_min == null ? '—' : group.response_length_min === group.response_length_max ? group.response_length_min : `${group.response_length_min}–${group.response_length_max}`;
-          const timing = group.duration_ms_avg == null ? '—' : `${Math.round(group.duration_ms_avg)} ms avg`;
-          return `<tr data-fuzz-group="${group.group_id}"><td>${group.case_count}</td><td>${group.status_code ?? escapeHtml(group.state)}</td><td>${escapeHtml(group.mime || '—')}</td><td>${size}</td><td>${timing}</td></tr>`;
-        }).join('');
+        state.fuzzGroups = result.groups || [];
+        renderFuzzGroups();
         showFuzzResultsPanel('groups');
       } catch (e) { status('fuzzStatus', e.message, 'err'); }
     }
+    function renderFuzzGroups() {
+      const onlyDifferent = $('fuzzOnlyDifferent').checked;
+      const sort = $('fuzzGroupSort').value;
+      const groups = state.fuzzGroups.filter(group => !onlyDifferent || group.different_from_baseline === true).slice();
+      groups.sort((left, right) => {
+        if (sort === 'status') return (left.status_code ?? 9999) - (right.status_code ?? 9999) || right.case_count - left.case_count;
+        if (sort === 'size') return (right.response_length_max ?? -1) - (left.response_length_max ?? -1) || right.case_count - left.case_count;
+        return right.case_count - left.case_count;
+      });
+      $('fuzzGroups').innerHTML = groups.map(group => {
+          const size = group.response_length_min == null ? '—' : group.response_length_min === group.response_length_max ? group.response_length_min : `${group.response_length_min}–${group.response_length_max}`;
+          const timing = group.duration_ms_avg == null ? '—' : `${Math.round(group.duration_ms_avg)} ms avg`;
+          const baseline = group.different_from_baseline == null ? '—' : group.different_from_baseline ? 'Different' : 'Same';
+          return `<tr data-fuzz-group="${group.group_id}"><td>${group.case_count}</td><td>${baseline}</td><td>${group.status_code ?? escapeHtml(group.state)}</td><td>${escapeHtml(group.mime || '—')}</td><td>${size}</td><td>${timing}</td></tr>`;
+        }).join('');
+    }
+    $('fuzzOnlyDifferent').onchange = renderFuzzGroups;
+    $('fuzzGroupSort').onchange = renderFuzzGroups;
     async function loadFuzzCases(jobId, groupId = null, append = false) {
       state.selectedFuzzJob = Number(jobId);
       state.selectedFuzzGroup = groupId;

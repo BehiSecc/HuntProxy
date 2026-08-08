@@ -717,6 +717,8 @@ impl GroupAccumulator {
             status_code: self.representative.status_code,
             mime: self.representative.mime,
             body_hash: self.representative.body_hash,
+            body_hash_matches_baseline: None,
+            different_from_baseline: None,
             response_length_min: self.response_length_min,
             response_length_max: self.response_length_max,
             duration_ms_min: self.duration_ms_min,

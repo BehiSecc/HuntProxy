@@ -243,6 +243,9 @@ async fn embedded_ui_exposes_the_complete_workbench() {
         "Copy as cURL",
         "Exclude hosts",
         "Body format",
+        "Different from baseline only",
+        "Load more",
+        "Open response",
     ] {
         assert!(html.contains(expected), "missing UI workflow: {expected}");
     }
@@ -332,6 +335,23 @@ async fn fuzzer_number_generator_runs_through_http_api() {
         .collect::<Vec<_>>();
     ids.sort();
     assert_eq!(ids, ["1", "10", "4", "7"]);
+
+    let groups = bb::api::router(state)
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/fuzz-jobs/{}/groups",
+                project_id.get(),
+                job["id"].as_i64().unwrap()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(groups.status(), StatusCode::OK);
+    let groups = json_response(groups).await;
+    assert_eq!(groups["groups"][0]["body_hash_matches_baseline"], true);
+    assert_eq!(groups["groups"][0]["different_from_baseline"], false);
 }
 
 #[tokio::test]
