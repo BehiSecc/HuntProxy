@@ -185,23 +185,21 @@ impl ReplyService {
             return Err(DomainError::invalid("raw HTTP/1.1 request cannot be empty"));
         }
         options.validate(request_bytes.len())?;
-        if use_project_cookies && options.pause_at_byte.is_some() {
-            return Err(DomainError::invalid(
-                "split writes cannot be combined with managed cookie injection because injection changes wire byte offsets",
-            ));
-        }
         if use_project_cookies {
-            let profile = self
+            if let Some(profile) = self
                 .db
                 .get_cookie_profile_for_url(project_id, target_url)
                 .await?
-                .ok_or_else(|| {
-                    DomainError::not_found("no managed cookies configured for target host")
-                })?;
-            let cookie_header = profile.cookie_header_for_url(target_url)?.ok_or_else(|| {
-                DomainError::not_found("no managed cookies apply to the target URL")
-            })?;
-            request_bytes = inject_cookie_header(&request_bytes, &cookie_header)?;
+            {
+                if let Some(cookie_header) = profile.cookie_header_for_url(target_url)? {
+                    if options.pause_at_byte.is_some() {
+                        return Err(DomainError::invalid(
+                            "split writes cannot be combined with managed cookie injection because injection changes wire byte offsets",
+                        ));
+                    }
+                    request_bytes = inject_cookie_header(&request_bytes, &cookie_header)?;
+                }
+            }
         }
         let request_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
         if request_bytes.len() as u64 > request_cap {

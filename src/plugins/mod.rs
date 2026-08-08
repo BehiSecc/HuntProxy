@@ -1673,20 +1673,16 @@ impl PluginService {
             ];
             let mut ordinary = materialized.headers;
             if request.use_project_cookies {
-                let profile = self
+                if let Some(profile) = self
                     .db
                     .get_cookie_profile_for_url(project_id, &materialized.url)
                     .await?
-                    .ok_or_else(|| {
-                        DomainError::not_found("no managed cookies configured for race target")
-                    })?;
-                let cookie = profile
-                    .cookie_header_for_url(&materialized.url)?
-                    .ok_or_else(|| {
-                        DomainError::not_found("no managed cookies apply to race target")
-                    })?;
-                ordinary.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
-                ordinary.push(("cookie".into(), cookie.into_bytes()));
+                {
+                    if let Some(cookie) = profile.cookie_header_for_url(&materialized.url)? {
+                        ordinary.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+                        ordinary.push(("cookie".into(), cookie.into_bytes()));
+                    }
+                }
             }
             let has_content_length = ordinary
                 .iter()
