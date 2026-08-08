@@ -133,9 +133,11 @@ limits, cancellation, history, and findings. Generated requests appear in
 History with `plugin`, the extension name, and `plugin:<id>` labels. Packages
 are SHA-256 integrity-pinned; this first version does not yet include a
 publisher-signature trust store. The low-level HTTP/1 path supports exact bytes
-and synchronized final-byte release. Malformed HTTP/2 and true HTTP/2
-single-packet release are reported as unsupported instead of silently falling
-back to a weaker technique.
+and synchronized final-byte release. Extensions can also send ordered raw
+HTTP/2 fields—including duplicate pseudo-headers and CRLF values—and release
+the final DATA frames for a race group in one write. Unsupported protocol
+negotiation is reported explicitly; HuntProxy never falls back to a weaker
+technique.
 
 The UI restores an active Chromium browser after a page refresh and shows its
 current URL and title. Browser startup and navigation errors remain visible to
@@ -168,7 +170,8 @@ inherit the old request body or entity headers.
 
 `reply_send_raw` is the explicit byte-preserving HTTP/1.1 path for framing and
 desynchronization checks. It can split one request at `pause_at_byte`, pause,
-optionally half-close the write side, and collect multiple responses with
+optionally read an early response before continuing the same socket, half-close
+the write side, and collect multiple responses with
 `response_mode: "until_idle"`. The default remains one ordinary complete
 response. Use base64 input when offsets or non-UTF-8 bytes matter. Raw response
 transcripts are preserved; `exchange_body` presents the first entity normally
