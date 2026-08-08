@@ -930,10 +930,7 @@ impl PluginService {
                 observations.push(Ok(observation));
                 if failed && plan.stop_on_error {
                     for skipped in operations {
-                        observations.push(Ok(json!({
-                            "id": skipped.id(),
-                            "skipped": {"reason":"previous operation failed"},
-                        })));
+                        observations.push(Ok(skipped_operation_observation(&skipped)));
                     }
                     break;
                 }
@@ -2956,6 +2953,47 @@ fn race_request_has_placeholder(request: &RaceRequest) -> bool {
                 .ok()
                 .is_some_and(|value| value.contains(PREFIX))
         })
+        || request
+            .success
+            .as_ref()
+            .is_some_and(race_success_has_placeholder)
+}
+
+fn race_text_has_placeholder(predicate: &RaceTextPredicate) -> bool {
+    [
+        predicate.equals.as_deref(),
+        predicate.contains.as_deref(),
+        predicate.regex.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.contains("{{extract:"))
+}
+
+fn race_success_has_placeholder(predicate: &RaceSuccessPredicate) -> bool {
+    predicate
+        .body_contains
+        .as_deref()
+        .is_some_and(|value| value.contains("{{extract:"))
+        || predicate
+            .body_regex
+            .as_deref()
+            .is_some_and(|value| value.contains("{{extract:"))
+        || predicate
+            .headers
+            .iter()
+            .any(|header| race_text_has_placeholder(&header.value))
+        || predicate
+            .redirect_location
+            .as_ref()
+            .is_some_and(race_text_has_placeholder)
+        || predicate.json.iter().any(|check| {
+            check
+                .equals
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.contains("{{extract:"))
+        })
 }
 
 fn validate_race_data_flow(plan: &PluginPlan) -> DomainResult<()> {
@@ -2989,7 +3027,7 @@ fn validate_race_data_flow(plan: &PluginPlan) -> DomainResult<()> {
         }
         if extract_count > 0 && !matches!(group.technique, RaceTechnique::SequentialControl) {
             return Err(DomainError::invalid(
-                "race response extraction is allowed only on sequential setup groups",
+                "race response extraction is allowed only on sequential control, setup, or validation groups",
             ));
         }
         for request in &group.requests {
@@ -3065,6 +3103,61 @@ fn substitute_race_operation(
             let value = std::str::from_utf8(&header.value)
                 .map_err(|_| DomainError::invalid("templated race headers must contain UTF-8"))?;
             header.value = substitute_workflow_template(value, values)?.into_bytes();
+        }
+        if let Some(predicate) = &mut request.success {
+            substitute_race_success(predicate, values)?;
+        }
+    }
+    Ok(())
+}
+
+fn substitute_race_text(
+    predicate: &mut RaceTextPredicate,
+    values: &HashMap<String, String>,
+) -> DomainResult<()> {
+    if let Some(value) = &mut predicate.equals {
+        *value = substitute_workflow_template(value, values)?;
+    }
+    if let Some(value) = &mut predicate.contains {
+        *value = substitute_workflow_template(value, values)?;
+    }
+    if predicate
+        .regex
+        .as_deref()
+        .is_some_and(|value| value.contains("{{extract:"))
+    {
+        return Err(DomainError::invalid(
+            "race extract placeholders are not supported in regex predicates; use equals or contains",
+        ));
+    }
+    Ok(())
+}
+
+fn substitute_race_success(
+    predicate: &mut RaceSuccessPredicate,
+    values: &HashMap<String, String>,
+) -> DomainResult<()> {
+    if let Some(value) = &mut predicate.body_contains {
+        *value = substitute_workflow_template(value, values)?;
+    }
+    if predicate
+        .body_regex
+        .as_deref()
+        .is_some_and(|value| value.contains("{{extract:"))
+    {
+        return Err(DomainError::invalid(
+            "race extract placeholders are not supported in regex predicates; use body_contains",
+        ));
+    }
+    for header in &mut predicate.headers {
+        substitute_race_text(&mut header.value, values)?;
+    }
+    if let Some(redirect) = &mut predicate.redirect_location {
+        substitute_race_text(redirect, values)?;
+    }
+    for check in &mut predicate.json {
+        if let Some(Value::String(value)) = &mut check.equals {
+            *value = substitute_workflow_template(value, values)?;
         }
     }
     Ok(())
@@ -3279,6 +3372,13 @@ fn isolate_operation_result(
         })),
         Ok(observation) => Ok(observation),
     }
+}
+
+fn skipped_operation_observation(operation: &PluginOperation) -> Value {
+    json!({
+        "id": operation.id(),
+        "skipped": {"reason":"previous operation failed"},
+    })
 }
 
 fn redact_value(value: &mut Value, secrets: &[String], key: Option<&str>) {
@@ -3713,6 +3813,19 @@ mod tests {
         .unwrap();
         assert_eq!(default.execution, PluginExecution::Parallel);
         assert!(!default.stop_on_error);
+
+        let later: PluginOperation = serde_json::from_value(json!({
+            "type": "race_group",
+            "id": "race-1",
+            "technique": "parallel",
+            "attempt": 1,
+            "requests": [{"id":"copy-0","url":"https://example.test/"}]
+        }))
+        .unwrap();
+        let skipped = skipped_operation_observation(&later);
+        assert_eq!(skipped["id"], "race-1");
+        assert_eq!(skipped["skipped"]["reason"], "previous operation failed");
+        assert_eq!(skipped.as_object().unwrap().len(), 2);
     }
 
     #[test]
@@ -3959,6 +4072,26 @@ mod tests {
                     "headers": [{"name":"X-CSRF","value":"{{extract:csrf.0}}"}],
                     "body_text": "csrf={{extract:csrf.0}}"
                 }]
+            }, {
+                "id": "validate-0-0",
+                "type": "race_group",
+                "technique": "sequential_control",
+                "attempt": 0,
+                "requests": [{
+                    "id": "validation-shape-0",
+                    "url": "https://example.test/message/one",
+                    "extract": [{"from":"body_regex","name":"token.0","pattern":"token=([^&]+)","group":1}]
+                }]
+            }, {
+                "id": "validate-0-1",
+                "type": "race_group",
+                "technique": "sequential_control",
+                "attempt": 0,
+                "requests": [{
+                    "id": "validation-shape-1",
+                    "url": "https://example.test/message/two",
+                    "success": {"body_contains":"{{extract:token.0}}"}
+                }]
             }]
         });
         let plan: PluginPlan = serde_json::from_value(plan_value).unwrap();
@@ -3996,13 +4129,50 @@ mod tests {
             group.requests[0].body_text.as_deref(),
             Some("csrf=secret%2B%2Ftoken")
         );
+        let validation_extraction = race_extraction_plan(&plan.operations[2]);
+        let mut validation_observation = json!({
+            "responses": [{
+                "id": "validation-shape-0",
+                "_extract": {
+                    "response_headers": [],
+                    "response_body_base64": base64::engine::general_purpose::STANDARD.encode(b"token=private-match&done=1")
+                }
+            }]
+        });
+        apply_race_extractions(
+            &mut validation_observation,
+            &validation_extraction,
+            &mut values,
+            &mut total,
+        )
+        .unwrap();
+        let mut validation = plan.operations[3].clone();
+        substitute_race_operation(&mut validation, &values).unwrap();
+        let PluginOperation::RaceGroup(validation) = validation else {
+            panic!("expected validation group")
+        };
+        assert_eq!(
+            validation.requests[0]
+                .success
+                .as_ref()
+                .unwrap()
+                .body_contains
+                .as_deref(),
+            Some("private-match")
+        );
         let mut transport_error = json!({
-            "error": {"code":"protocol_error","message":"request https://example.test/submit?csrf=secret%2B%2Ftoken failed"}
+            "error": {"code":"protocol_error","message":"request https://example.test/submit?csrf=secret%2B%2Ftoken failed"},
+            "success": {"checks":[{"type":"body_contains","expected":"private-match","matched":true}]}
         });
         let secrets = values.values().cloned().collect::<Vec<_>>();
         redact_value(&mut transport_error, &secrets, None);
         assert!(!transport_error.to_string().contains("secret%2B%2Ftoken"));
+        assert!(!transport_error.to_string().contains("private-match"));
         assert_eq!(transport_error["error"]["message"], "<redacted>");
+        assert_eq!(
+            transport_error["success"]["checks"][0]["expected"],
+            "<redacted>"
+        );
     }
 
     #[test]
@@ -4076,6 +4246,25 @@ mod tests {
             validate_race_data_flow(&oversized).unwrap_err().code(),
             ErrorCode::CombinationLimit
         );
+
+        let mut regex_operation: PluginOperation = serde_json::from_value(json!({
+            "id": "validate",
+            "type": "race_group",
+            "technique": "sequential_control",
+            "attempt": 0,
+            "requests": [{
+                "id": "check",
+                "url": "https://example.test/",
+                "success": {"body_regex":"^{{extract:token}}$"}
+            }]
+        }))
+        .unwrap();
+        let mut values = HashMap::new();
+        values.insert("token".into(), "private".into());
+        assert!(substitute_race_operation(&mut regex_operation, &values)
+            .unwrap_err()
+            .to_string()
+            .contains("not supported in regex predicates"));
     }
 
     #[test]
