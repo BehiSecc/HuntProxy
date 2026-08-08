@@ -161,6 +161,16 @@ enum PluginOperation {
     RaceGroup(PluginRaceGroup),
 }
 
+impl PluginOperation {
+    fn id(&self) -> &str {
+        match self {
+            Self::HttpRequest(request) => &request.id,
+            Self::RawHttp1(request) => &request.id,
+            Self::RaceGroup(group) => &group.id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct PluginRaceGroup {
     id: String,
@@ -565,6 +575,7 @@ impl PluginService {
                     let scope = project.scope.clone();
                     let target_host = target_host.clone();
                     async move {
+                        let operation_id = operation.id().to_string();
                         let completed_count = match &operation {
                             PluginOperation::RaceGroup(group) => group.requests.len(),
                             _ => 1,
@@ -578,7 +589,7 @@ impl PluginService {
                     .execute_operation(project_id, &plugin_id, &plugin_name, operation, &scope, target_host.as_deref(), &job.cancel)
                     .await;
                         job.view.write().completed_operations += completed_count;
-                result
+                isolate_operation_result(operation_id, result)
             }
         }))
         .buffer_unordered(concurrency)
@@ -870,6 +881,7 @@ impl PluginService {
     ) -> DomainResult<Value> {
         match operation {
             PluginOperation::HttpRequest(request) => {
+                let operation_id = request.id.clone();
                 let effective_url = if let Some(url) = request.url.as_deref() {
                     url.to_string()
                 } else if let Some(base_exchange_id) = request.base_exchange_id {
@@ -1061,8 +1073,14 @@ impl PluginService {
                 let mut response_body_base64 = None;
                 let mut response_body_truncated = false;
                 if let Some(exchange_id) = response.exchange_id {
-                    self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name)
-                        .await?;
+                    self.annotate_plugin_exchange(
+                        project_id,
+                        exchange_id,
+                        plugin_id,
+                        plugin_name,
+                        &operation_id,
+                    )
+                    .await?;
                     response_headers = self
                         .db
                         .load_raw_headers(project_id, exchange_id, MessageSide::Response)
@@ -1097,6 +1115,7 @@ impl PluginService {
                 }))
             }
             PluginOperation::RawHttp1(request) => {
+                let operation_id = request.id.clone();
                 let has_utf8 = request.request_utf8.is_some();
                 let has_base64 = request.request_base64.is_some();
                 if has_utf8 == has_base64 {
@@ -1116,11 +1135,27 @@ impl PluginService {
                 };
                 let response = tokio::select! {
                     _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                    response = self.reply.send_raw_http1(project_id, None, &request.target_url, bytes, request.use_project_cookies, request.options) => response?,
+                    response = self.reply.send_raw_http1_with_context(
+                        project_id,
+                        &request.target_url,
+                        bytes,
+                        request.use_project_cookies,
+                        request.options,
+                        ReplySendContext {
+                            source: ExchangeSource::Plugin,
+                            lineage: ExchangeLineage::default(),
+                        },
+                    ) => response?,
                 };
                 if let Some(exchange_id) = response.exchange_id {
-                    self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name)
-                        .await?;
+                    self.annotate_plugin_exchange(
+                        project_id,
+                        exchange_id,
+                        plugin_id,
+                        plugin_name,
+                        &operation_id,
+                    )
+                    .await?;
                 }
                 Ok(json!({"id":request.id,"raw":response}))
             }
@@ -1285,7 +1320,14 @@ impl PluginService {
                 response = self.reply.send_with_context(project_id, Some(request.base_exchange_id), &draft, ProtocolPreference::Auto, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: Some(request.base_exchange_id), ..Default::default() } }) => response?,
             };
             if let Some(exchange_id) = response.exchange_id {
-                self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name).await?;
+                self.annotate_plugin_exchange(
+                    project_id,
+                    exchange_id,
+                    plugin_id,
+                    plugin_name,
+                    &request.id,
+                )
+                .await?;
             }
             Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_length,"response_body_hash":response.response_body_hash,"duration_ms":response.duration_ms,"error":Value::Null}))
         }.await;
@@ -1319,9 +1361,31 @@ impl PluginService {
             let options = crate::reply::RawHttp1Options { pause_at_byte: Some(bytes.len() - 1), pause_ms: Some(hold_timeout_ms), release_barrier: Some(barrier), ..Default::default() };
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                response = self.reply.send_raw_http1(project_id, None, &target_url, bytes, false, options) => response?,
+                response = self.reply.send_raw_http1_with_context(
+                    project_id,
+                    &target_url,
+                    bytes,
+                    false,
+                    options,
+                    ReplySendContext {
+                        source: ExchangeSource::Plugin,
+                        lineage: ExchangeLineage {
+                            parent_exchange_id: Some(request.base_exchange_id),
+                            ..Default::default()
+                        },
+                    },
+                ) => response?,
             };
-            if let Some(exchange_id) = response.exchange_id { self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name).await?; }
+            if let Some(exchange_id) = response.exchange_id {
+                self.annotate_plugin_exchange(
+                    project_id,
+                    exchange_id,
+                    plugin_id,
+                    plugin_name,
+                    &request.id,
+                )
+                .await?;
+            }
             Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_bytes,"response_body_hash":Value::Null,"duration_ms":Value::Null,"error":Value::Null}))
         }.await;
         result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
@@ -1333,6 +1397,7 @@ impl PluginService {
         exchange_id: ExchangeId,
         plugin_id: &str,
         plugin_name: &str,
+        operation_id: &str,
     ) -> DomainResult<()> {
         let existing = self.db.get_annotation(project_id, exchange_id).await?;
         let mut labels = existing
@@ -1343,6 +1408,7 @@ impl PluginService {
             "plugin".into(),
             plugin_name.into(),
             format!("plugin:{plugin_id}"),
+            format!("plugin-op:{}", normalize_operation_label(operation_id)),
         ]);
         labels.sort_by_key(|label| label.to_ascii_lowercase());
         labels.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
@@ -1387,6 +1453,41 @@ fn prune_finished_jobs(jobs: &DashMap<Uuid, Arc<PluginJob>>) {
         .collect::<Vec<_>>();
     for id in removable {
         jobs.remove(&id);
+    }
+}
+
+fn normalize_operation_label(operation_id: &str) -> String {
+    let mut label = operation_id
+        .chars()
+        .take(80)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if label.is_empty() {
+        label.push_str("operation");
+    }
+    label
+}
+
+fn isolate_operation_result(
+    operation_id: String,
+    result: DomainResult<Value>,
+) -> DomainResult<Value> {
+    match result {
+        Err(error) if error.code() == ErrorCode::Cancelled => Err(error),
+        Err(error) => Ok(json!({
+            "id": operation_id,
+            "error": {
+                "code": error.code().as_str(),
+                "message": error.to_string(),
+            }
+        })),
+        Ok(observation) => Ok(observation),
     }
 }
 
@@ -1810,5 +1911,24 @@ mod tests {
 
         assert_eq!(jobs.len(), MAX_RETAINED_JOBS - 1);
         assert!(jobs.contains_key(&active_id));
+    }
+
+    #[test]
+    fn operation_failures_become_observations_but_cancellation_still_stops_the_job() {
+        let observation = isolate_operation_result(
+            "probe:one".into(),
+            Err(DomainError::new(ErrorCode::ProtocolError, "bad response")),
+        )
+        .unwrap();
+        assert_eq!(observation["id"], "probe:one");
+        assert_eq!(observation["error"]["code"], "protocol_error");
+
+        let cancelled = isolate_operation_result(
+            "probe:two".into(),
+            Err(DomainError::new(ErrorCode::Cancelled, "cancelled")),
+        )
+        .unwrap_err();
+        assert_eq!(cancelled.code(), ErrorCode::Cancelled);
+        assert_eq!(normalize_operation_label("a:b/c"), "a_b_c");
     }
 }

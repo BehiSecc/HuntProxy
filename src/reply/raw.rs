@@ -140,9 +140,29 @@ impl ReplyService {
         project_id: ProjectId,
         tab_id: Option<ReplyTabId>,
         target_url: &str,
+        request_bytes: Vec<u8>,
+        use_project_cookies: bool,
+        options: RawHttp1Options,
+    ) -> DomainResult<RawReplyResult> {
+        self.send_raw_http1_with_context(
+            project_id,
+            target_url,
+            request_bytes,
+            use_project_cookies,
+            options,
+            ReplySendContext::reply(None, tab_id),
+        )
+        .await
+    }
+
+    pub async fn send_raw_http1_with_context(
+        &self,
+        project_id: ProjectId,
+        target_url: &str,
         mut request_bytes: Vec<u8>,
         use_project_cookies: bool,
         options: RawHttp1Options,
+        context: ReplySendContext,
     ) -> DomainResult<RawReplyResult> {
         let project = self.db.get_project(project_id).await?;
         let target = TargetRef::from_url(target_url)?;
@@ -226,7 +246,7 @@ impl ReplyService {
                 self.db
                     .insert_exchange(NewExchange {
                         project_id,
-                        source: ExchangeSource::Reply,
+                        source: context.source,
                         protocol: "HTTP/1.1 raw".into(),
                         method,
                         scheme: target.scheme.clone(),
@@ -253,7 +273,7 @@ impl ReplyService {
                         request_body: Some(request_bytes),
                         response_body: Some(raw_response.clone()),
                         duration_ms: Some(started.elapsed().as_millis() as i64),
-                        lineage: ReplySendContext::reply(None, tab_id).lineage,
+                        lineage: context.lineage,
                         page_title,
                         error_message: truncated.then(|| match read.outcome {
                             RawReadOutcome::Limit => {
@@ -273,8 +293,16 @@ impl ReplyService {
                 .db
                 .audit(
                     Some(project_id),
-                    "reply_send_raw",
-                    Some("reply"),
+                    if context.source == ExchangeSource::Plugin {
+                        "plugin_send_raw"
+                    } else {
+                        "reply_send_raw"
+                    },
+                    Some(if context.source == ExchangeSource::Plugin {
+                        "plugin"
+                    } else {
+                        "reply"
+                    }),
                     Some("exchange"),
                     Some(&exchange_id.to_string()),
                     serde_json::json!({ "target_url": target_url }),
