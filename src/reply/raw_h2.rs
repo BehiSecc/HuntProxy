@@ -280,9 +280,9 @@ impl ReplyService {
                             } else {
                                 CompletionState::TruncatedByPolicy
                             },
-                            capture_quality: CaptureQuality::WirePreserved,
-                            header_representation: HeaderRepresentation::WirePreserved,
-                            body_representation: BodyRepresentation::WireEncoded,
+                            capture_quality: CaptureQuality::Mixed,
+                            header_representation: HeaderRepresentation::Mixed,
+                            body_representation: BodyRepresentation::Mixed,
                             cache_provenance: CacheProvenance::None,
                             transport_provenance: Some(TransportProvenance::GenericUnprofiled),
                             transport_profile: Some("raw_http2_frames_v1".into()),

@@ -1155,6 +1155,7 @@ pub(crate) fn parse_completion(s: &str) -> CompletionState {
 fn capture_quality_str(c: CaptureQuality) -> &'static str {
     match c {
         CaptureQuality::WirePreserved => "wire_preserved",
+        CaptureQuality::Mixed => "mixed",
         CaptureQuality::Semantic => "semantic",
         CaptureQuality::BrowserObserved => "browser_observed",
     }
@@ -1162,6 +1163,7 @@ fn capture_quality_str(c: CaptureQuality) -> &'static str {
 pub(crate) fn parse_capture_quality(s: &str) -> CaptureQuality {
     match s {
         "wire_preserved" => CaptureQuality::WirePreserved,
+        "mixed" => CaptureQuality::Mixed,
         "browser_observed" => CaptureQuality::BrowserObserved,
         _ => CaptureQuality::Semantic,
     }
@@ -1169,6 +1171,7 @@ pub(crate) fn parse_capture_quality(s: &str) -> CaptureQuality {
 fn header_rep_str(h: HeaderRepresentation) -> &'static str {
     match h {
         HeaderRepresentation::WirePreserved => "wire_preserved",
+        HeaderRepresentation::Mixed => "mixed",
         HeaderRepresentation::Semantic => "semantic",
         HeaderRepresentation::BrowserObserved => "browser_observed",
     }
@@ -1176,6 +1179,7 @@ fn header_rep_str(h: HeaderRepresentation) -> &'static str {
 pub(crate) fn parse_header_rep(s: &str) -> HeaderRepresentation {
     match s {
         "wire_preserved" => HeaderRepresentation::WirePreserved,
+        "mixed" => HeaderRepresentation::Mixed,
         "browser_observed" => HeaderRepresentation::BrowserObserved,
         _ => HeaderRepresentation::Semantic,
     }
@@ -1183,6 +1187,7 @@ pub(crate) fn parse_header_rep(s: &str) -> HeaderRepresentation {
 fn body_rep_str(b: BodyRepresentation) -> &'static str {
     match b {
         BodyRepresentation::WireEncoded => "wire_encoded",
+        BodyRepresentation::Mixed => "mixed",
         BodyRepresentation::SemanticEncoded => "semantic_encoded",
         BodyRepresentation::BrowserDecoded => "browser_decoded",
         BodyRepresentation::Unavailable => "unavailable",
@@ -1191,6 +1196,7 @@ fn body_rep_str(b: BodyRepresentation) -> &'static str {
 pub(crate) fn parse_body_rep(s: &str) -> BodyRepresentation {
     match s {
         "wire_encoded" => BodyRepresentation::WireEncoded,
+        "mixed" => BodyRepresentation::Mixed,
         "browser_decoded" => BodyRepresentation::BrowserDecoded,
         "unavailable" => BodyRepresentation::Unavailable,
         _ => BodyRepresentation::SemanticEncoded,
@@ -1263,6 +1269,16 @@ fn storage_error(error: rusqlite::Error) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_evidence_representations_round_trip() {
+        assert_eq!(capture_quality_str(CaptureQuality::Mixed), "mixed");
+        assert_eq!(parse_capture_quality("mixed"), CaptureQuality::Mixed);
+        assert_eq!(header_rep_str(HeaderRepresentation::Mixed), "mixed");
+        assert_eq!(parse_header_rep("mixed"), HeaderRepresentation::Mixed);
+        assert_eq!(body_rep_str(BodyRepresentation::Mixed), "mixed");
+        assert_eq!(parse_body_rep("mixed"), BodyRepresentation::Mixed);
+    }
 
     async fn storage_counts(db: &Db, project_id: ProjectId) -> (i64, i64, i64, i64) {
         db.with_conn(move |conn| {

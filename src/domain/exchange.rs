@@ -34,6 +34,8 @@ pub enum CompletionState {
 pub enum CaptureQuality {
     /// Best-effort wire preservation through Hyper/Hudsucker.
     WirePreserved,
+    /// Exact evidence on one message side and decoded/semantic evidence on the other.
+    Mixed,
     /// Semantic proxy path (Hyper/Wreq serialization).
     Semantic,
     /// Playwright/CDP observation.
@@ -44,6 +46,7 @@ pub enum CaptureQuality {
 #[serde(rename_all = "snake_case")]
 pub enum HeaderRepresentation {
     WirePreserved,
+    Mixed,
     Semantic,
     BrowserObserved,
 }
@@ -52,6 +55,7 @@ pub enum HeaderRepresentation {
 #[serde(rename_all = "snake_case")]
 pub enum BodyRepresentation {
     WireEncoded,
+    Mixed,
     SemanticEncoded,
     BrowserDecoded,
     Unavailable,
