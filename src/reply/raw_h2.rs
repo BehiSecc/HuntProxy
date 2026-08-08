@@ -427,11 +427,6 @@ fn prepare_streams(
                 "raw HTTP/2 request bodies exceed the initial 65535-byte connection window",
             ));
         }
-        if final_data_together && body.is_empty() {
-            return Err(DomainError::invalid(
-                "final_data_together requires a non-empty body on every stream",
-            ));
-        }
         output.push(PreparedStream {
             id: stream.id,
             stream_id,
@@ -472,10 +467,12 @@ fn encode_connection(
                 "raw HTTP/2 HPACK block exceeds 1 MiB",
             ));
         }
-        let end_on_headers = stream.body.is_empty();
+        let end_on_headers = stream.body.is_empty() && !final_data_together;
         append_header_block_frames(&mut prefix, stream.stream_id, &header_block, end_on_headers)?;
-        if !stream.body.is_empty() {
-            if final_data_together {
+        if final_data_together {
+            if stream.body.is_empty() {
+                append_frame(&mut release, 0, 0x1, stream.stream_id, &[])?;
+            } else {
                 if stream.body.len() > 1 {
                     append_data_frames(
                         &mut prefix,
@@ -491,9 +488,9 @@ fn encode_connection(
                     stream.stream_id,
                     &stream.body[stream.body.len() - 1..],
                 )?;
-            } else {
-                append_data_frames(&mut prefix, stream.stream_id, &stream.body, true)?;
             }
+        } else if !stream.body.is_empty() {
+            append_data_frames(&mut prefix, stream.stream_id, &stream.body, true)?;
         }
     }
     Ok((prefix, release))
@@ -513,10 +510,12 @@ fn encode_stream_wire(stream: &PreparedStream, final_data_together: bool) -> Dom
         &mut output,
         stream.stream_id,
         &header_block,
-        stream.body.is_empty(),
+        stream.body.is_empty() && !final_data_together,
     )?;
-    if !stream.body.is_empty() {
-        if final_data_together && stream.body.len() > 1 {
+    if final_data_together {
+        if stream.body.is_empty() {
+            append_frame(&mut output, 0, 0x1, stream.stream_id, &[])?;
+        } else if stream.body.len() > 1 {
             append_data_frames(
                 &mut output,
                 stream.stream_id,
@@ -533,6 +532,8 @@ fn encode_stream_wire(stream: &PreparedStream, final_data_together: bool) -> Dom
         } else {
             append_data_frames(&mut output, stream.stream_id, &stream.body, true)?;
         }
+    } else if !stream.body.is_empty() {
+        append_data_frames(&mut output, stream.stream_id, &stream.body, true)?;
     }
     Ok(output)
 }
@@ -755,6 +756,75 @@ mod tests {
         assert_eq!(release[13], 0);
         assert_eq!(release[14], 1);
         assert_eq!(release[19], b'b');
+    }
+
+    #[test]
+    fn single_packet_release_ends_empty_streams_with_zero_length_data() {
+        let streams = (0..2)
+            .map(|index| RawHttp2Stream {
+                id: format!("empty-{index}"),
+                stream_id: None,
+                headers: vec![RawHttp2Header {
+                    name: ":method".into(),
+                    value: "POST".into(),
+                }],
+                body_text: Some(String::new()),
+                body_base64: None,
+            })
+            .collect();
+        let prepared = prepare_streams(streams, 1024, true).unwrap();
+        let (prefix, release) = encode_connection(&prepared, true).unwrap();
+
+        assert_eq!(release.len(), 18);
+        for offset in [0, 9] {
+            assert_eq!(&release[offset..offset + 3], &[0, 0, 0]);
+            assert_eq!(release[offset + 3], 0);
+            assert_eq!(release[offset + 4], 0x1);
+        }
+        assert_eq!(&release[5..9], &1u32.to_be_bytes());
+        assert_eq!(&release[14..18], &3u32.to_be_bytes());
+        // Persisted request evidence must include the same zero-length DATA
+        // terminator instead of claiming END_STREAM on the earlier HEADERS.
+        let stream_wire = encode_stream_wire(&prepared[0], true).unwrap();
+        assert_eq!(&stream_wire[stream_wire.len() - 9..], &release[..9]);
+        assert!(!prefix.is_empty());
+    }
+
+    #[test]
+    fn single_packet_release_supports_mixed_empty_and_nonempty_streams() {
+        let prepared = prepare_streams(
+            vec![
+                RawHttp2Stream {
+                    id: "empty".into(),
+                    stream_id: None,
+                    headers: vec![RawHttp2Header {
+                        name: ":method".into(),
+                        value: "POST".into(),
+                    }],
+                    body_text: Some(String::new()),
+                    body_base64: None,
+                },
+                RawHttp2Stream {
+                    id: "body".into(),
+                    stream_id: None,
+                    headers: vec![RawHttp2Header {
+                        name: ":method".into(),
+                        value: "POST".into(),
+                    }],
+                    body_text: Some("ab".into()),
+                    body_base64: None,
+                },
+            ],
+            1024,
+            true,
+        )
+        .unwrap();
+        let (prefix, release) = encode_connection(&prepared, true).unwrap();
+        assert!(prefix.contains(&b'a'));
+        assert_eq!(release.len(), 19);
+        assert_eq!(&release[..9], &[0, 0, 0, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(release[9..18], [0, 0, 1, 0, 1, 0, 0, 0, 3]);
+        assert_eq!(release[18], b'b');
     }
 
     #[test]

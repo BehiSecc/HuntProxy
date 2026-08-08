@@ -2175,17 +2175,6 @@ impl PluginService {
                 target_url = Some(materialized.url.clone());
             }
             let body = materialized.body.unwrap_or_default();
-            if body.is_empty() {
-                return Ok(json!({
-                    "id": group_id,
-                    "technique": "h2_single_packet",
-                    "attempt": attempt,
-                    "synchronized": false,
-                    "release_skew_ms": Value::Null,
-                    "responses": [],
-                    "error": {"code":"protocol_incompatible","message":"h2_single_packet requires a non-empty request body on every request"},
-                }));
-            }
             let authority = match (parsed.host_str(), parsed.port()) {
                 (Some(host), Some(port)) if host.contains(':') => format!("[{host}]:{port}"),
                 (Some(host), Some(port)) => format!("{host}:{port}"),
