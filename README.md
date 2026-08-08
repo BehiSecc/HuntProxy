@@ -85,6 +85,58 @@ explicitly with `HuntProxy serve` stays running until stopped.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
 
+Outbound requests are direct by default. To use an HTTP or SOCKS5 upstream
+proxy globally or for selected hosts, add this to `~/.huntproxy/config.toml`
+and restart HuntProxy:
+
+```toml
+[upstream_proxies]
+default = "http://127.0.0.1:8080" # optional fallback
+
+[[upstream_proxies.rules]]
+host = "*.example.com"
+proxy = "socks5h://user:password@127.0.0.1:1080"
+
+[[upstream_proxies.rules]]
+host = "api.example.com"
+proxy = "http://127.0.0.1:8888"
+```
+
+Exact host rules win over wildcard rules; the longest matching wildcard wins.
+`*.example.com` matches subdomains, not the apex. `reply_send` and
+`reply_send_raw` also accept a transient `upstream_proxy` override. Supported
+schemes are `http`, `socks5` (local DNS), and `socks5h` (proxy DNS).
+
+## Extensions
+
+HuntProxy loads first-party extensions from `~/.huntproxy/plugins` when the
+daemon starts. Copy each extension directory directly beneath that path, or
+point development installs at a checkout of the extension pack:
+
+```toml
+plugin_dir = "/home/administrator/HuntProxy-Plugins/plugins"
+```
+
+Restart HuntProxy after installing, updating, enabling, or disabling an
+extension. Nothing runs merely because it is installed. An agent uses this
+bounded flow:
+
+```text
+extension_list
+  -> extension_describe(plugin_id)
+  -> extension_run(project_id, plugin_id, action, base_exchange_id, input)
+  -> job_status(job_id) / job_results(job_id) / job_cancel(job_id)
+```
+
+HuntProxy owns all extension network I/O, scope checks, concurrency, rate
+limits, cancellation, history, and findings. Generated requests appear in
+History with `plugin`, the extension name, and `plugin:<id>` labels. Packages
+are SHA-256 integrity-pinned; this first version does not yet include a
+publisher-signature trust store. The low-level HTTP/1 path supports exact bytes
+and synchronized final-byte release. Malformed HTTP/2 and true HTTP/2
+single-packet release are reported as unsupported instead of silently falling
+back to a weaker technique.
+
 The UI restores an active Chromium browser after a page refresh and shows its
 current URL and title. Browser startup and navigation errors remain visible to
 the caller.
