@@ -70,6 +70,9 @@ cookie pairs for each managed request URL. Values remain hidden from normal tool
 Matching cookies are then used automatically by Reply, Fuzzer, and new or
 active browser sessions. Raw Reply remains byte-exact unless
 `use_project_cookies: true` is explicitly set.
+The managed cookie jar is explicit: proxy and Reply `Set-Cookie` responses do
+not silently overwrite it. Browser responses update the separate persistent
+Chromium profile in the normal browser way.
 
 Browser state is private and persistent per project. Cookies and site storage
 survive `stop`, daemon restarts, and idle shutdown; omit `url` from the next
@@ -169,6 +172,9 @@ Set `body_format` to `json`, `xml`, `form_urlencoded`, or `multipart` to
 validate/serialize the body and update Content-Type. Form formats use ordered
 `body_params` name/value entries. Explicit method changes do not accidentally
 inherit the old request body or entity headers.
+Semantic multipart fields are text name/value pairs. For filenames, per-part
+Content-Type, binary files, or an exact boundary, use `body_override` with an
+explicit Content-Type or `reply_send_raw`.
 
 `reply_send_raw` is the explicit byte-preserving HTTP/1.1 path for framing and
 desynchronization checks. It can split one request at `pause_at_byte`, pause,

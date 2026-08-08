@@ -249,6 +249,26 @@ async fn embedded_ui_exposes_the_complete_workbench() {
 }
 
 #[tokio::test]
+async fn reply_send_rejects_flat_request_fields_instead_of_sending_defaults() {
+    let (_directory, state, project_id) = test_state().await;
+    let response = bb::api::router(state)
+        .oneshot(
+            Request::post(format!("/api/v1/projects/{}/reply-send", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"method":"GET","url":"https://example.com/"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let message = String::from_utf8_lossy(&body);
+    assert!(message.contains("unknown field `method`"));
+}
+
+#[tokio::test]
 async fn fuzzer_number_generator_runs_through_http_api() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

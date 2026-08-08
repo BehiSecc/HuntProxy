@@ -62,7 +62,9 @@ pub fn migrate(conn: &Connection) -> DomainResult<i32> {
     if version > target {
         return Err(DomainError::new(
             ErrorCode::MigrationError,
-            format!("database schema version {version} is newer than binary {target}"),
+            format!(
+                "database schema version {version} is newer than this binary supports ({target}); run the same or a newer HuntProxy build, or reinstall/update HuntProxy"
+            ),
         ));
     }
     while version < target {
@@ -113,6 +115,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn newer_database_error_explains_the_safe_recovery() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i32 + 1)
+            .unwrap();
+        let error = migrate(&conn).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::MigrationError);
+        assert!(error.to_string().contains("newer HuntProxy build"));
     }
 
     #[test]

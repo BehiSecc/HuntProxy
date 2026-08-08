@@ -22,6 +22,7 @@ pub enum FilterNode {
 }
 
 const ALLOWED_FIELDS: &[&str] = &[
+    "exchange_id",
     "host",
     "authority",
     "path",
@@ -39,8 +40,11 @@ const ALLOWED_FIELDS: &[&str] = &[
     "display_title",
     "parent",
     "browser_session",
+    "capture_session",
     "reply_tab",
     "fuzz_job",
+    "request_hash",
+    "response_hash",
     "time",
     "error",
     "request",
@@ -130,6 +134,7 @@ fn compile_node(node: &FilterNode, binds: &mut Vec<String>) -> DomainResult<Stri
 
 fn col(field: &str) -> DomainResult<&'static str> {
     Ok(match field {
+        "exchange_id" => "exchange_id",
         "host" => "host",
         "authority" => "authority",
         "path" => "path",
@@ -146,8 +151,11 @@ fn col(field: &str) -> DomainResult<&'static str> {
         "display_title" => "display_title",
         "parent" => "parent_exchange_id",
         "browser_session" => "browser_session_id",
+        "capture_session" => "capture_session_id",
         "reply_tab" => "reply_tab_id",
         "fuzz_job" => "fuzz_job_id",
+        "request_hash" => "request_body_hash",
+        "response_hash" => "response_body_hash",
         "time" => "started_at",
         "error" => "error_message",
         "label" => "exchange_id", // special-cased
@@ -684,6 +692,20 @@ mod tests {
         assert!(sql.contains("host"));
         assert!(sql.contains("method"));
         assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
+    fn lineage_ids_and_body_hashes_are_filterable() {
+        let filter = parse_text_query(
+            "exchange_id:3011 capture_session:42 request_hash:abc response_hash:~def",
+        )
+        .unwrap();
+        let (sql, binds) = filter_to_sql(&filter).unwrap();
+        assert!(sql.contains("exchange_id="));
+        assert!(sql.contains("capture_session_id="));
+        assert!(sql.contains("request_body_hash="));
+        assert!(sql.contains("response_body_hash LIKE"));
+        assert_eq!(binds, vec!["3011", "42", "abc", "%def%"]);
     }
 
     #[test]

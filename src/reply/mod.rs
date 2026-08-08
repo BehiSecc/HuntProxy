@@ -428,6 +428,8 @@ pub fn normalize_reply_draft(mut draft: ReplyDraft) -> DomainResult<ReplyDraft> 
                 draft.body_params.clear();
             } else if let Some(text) = draft.body_text.take() {
                 draft.body_override = Some(text.into_bytes());
+            } else if draft.body_override.is_none() {
+                draft.body_override = Some(Vec::new());
             }
             require_body(&draft)?;
             set_content_type(&mut draft, "application/x-www-form-urlencoded", true);
@@ -1357,6 +1359,17 @@ mod tests {
             form.body_override.as_deref(),
             Some(b"a=hello+world&a=two".as_slice())
         );
+
+        let empty_form = normalize_reply_draft(ReplyDraft {
+            body_format: Some(ReplyBodyFormat::FormUrlencoded),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(empty_form.body_override.as_deref(), Some([].as_slice()));
+        assert!(empty_form.header_overrides.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("content-type")
+                && header.value == b"application/x-www-form-urlencoded"
+        }));
 
         let multipart = normalize_reply_draft(ReplyDraft {
             body_format: Some(ReplyBodyFormat::Multipart),

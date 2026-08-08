@@ -315,7 +315,7 @@ fn request_rules_tool_def() -> Value {
 
 fn tool_defs() -> Value {
     json!([
-        {"name":"projects","description":"List, create, or set optional capture scope. Host patterns may be exact or wildcard suffixes such as *.example.com; excluded_host_patterns always take precedence. Empty host_patterns captures every host except exclusions. Scope only controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
+        {"name":"projects","description":"List, create, inspect storage usage, or set optional capture scope. Host patterns may be exact or wildcard suffixes such as *.example.com; excluded_host_patterns always take precedence. Empty host_patterns captures every host except exclusions. Scope only controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope"]},"project_id":{"type":"integer","description":"Required for usage and set_scope."},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List installed HuntProxy extensions and their enabled state.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
         {"name":"extension_run","description":"Start an asynchronous extension job. Top-level project_id and base_exchange_id select HuntProxy evidence; input is passed only to the named plugin action. Supplying base_exchange_id lets the extension derive request shapes while cookies and authorization remain host-side.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"HuntProxy project that owns the job and evidence."},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer","description":"Optional saved request inherited host-side without copying secrets into action input."},"input":{"type":"object","description":"Plugin action arguments matching extension_describe.input_schema.","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
@@ -325,7 +325,7 @@ fn tool_defs() -> Value {
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
-        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; (request:~this OR request:~that OR request:~\":smtg\") method:PUT.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. request:~text searches the request target, headers, and body. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"]}},
+        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; exchange_id:3011; response_hash:abc123; (request:~this OR request:~that) method:PUT.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and body. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Return an alphanumerically sorted host/path tree derived from saved project history, including methods, statuses, query parameters, content types, and exchange counts. Omit host for every host or provide one exact host.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive."}},"required":["project_id"]}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
@@ -335,10 +335,10 @@ fn tool_defs() -> Value {
         {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"]}},
+        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
-        {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
+        {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; use exchange_body to read the full response without replaying it. Continue case pages with next_before_case_index.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume the project's persistent Chromium workspace. Omit url to resume the last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."}},"required":["project_id"]}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
@@ -776,7 +776,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             .await?
                     ))
                 }
-                _ => Err(DomainError::invalid("action must be list|create|set_scope")),
+                "usage" => {
+                    let project_id = require_project_id(&args)?;
+                    Ok(json!(state.db.project_usage(project_id).await?))
+                }
+                _ => Err(DomainError::invalid(
+                    "action must be list|create|usage|set_scope",
+                )),
             }
         }
         "capture_sessions" => {
@@ -1083,10 +1089,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get_exchange_detail(project_id, ExchangeId(eid), PresentationOptions::default())
                 .await?;
             let annotation = state.db.get_annotation(project_id, ExchangeId(eid)).await?;
+            let applied_rules = state
+                .db
+                .list_exchange_request_rules(project_id, ExchangeId(eid))
+                .await?;
             let mut value = serde_json::to_value(detail)
                 .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?;
             if let Some(object) = value.as_object_mut() {
                 object.insert("annotation".into(), json!(annotation));
+                object.insert("applied_request_rules".into(), json!(applied_rules));
             }
             Ok(value)
         }
@@ -1431,6 +1442,23 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "reply_send" => {
             let project_id = require_project_id(&args)?;
+            for field in [
+                "url",
+                "method",
+                "headers",
+                "header_overrides",
+                "body",
+                "body_text",
+                "body_json",
+                "body_params",
+                "body_format",
+            ] {
+                if args.get(field).is_some() {
+                    return Err(DomainError::invalid(format!(
+                        "put request field `{field}` under `draft`"
+                    )));
+                }
+            }
             let draft: ReplyDraft = args
                 .get("draft")
                 .cloned()
@@ -2274,10 +2302,20 @@ mod tests {
     fn tool_schemas_describe_nested_reply_and_browser_inputs() {
         let tools = tool_defs();
         let tools = tools.as_array().unwrap();
+        let projects = tools
+            .iter()
+            .find(|tool| tool["name"] == "projects")
+            .unwrap();
+        assert!(projects["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "usage"));
         let reply = tools
             .iter()
             .find(|tool| tool["name"] == "reply_send")
             .unwrap();
+        assert_eq!(reply["inputSchema"]["additionalProperties"], false);
         assert_eq!(
             reply["inputSchema"]["properties"]["draft"]["properties"]["header_overrides"]["type"],
             "array"

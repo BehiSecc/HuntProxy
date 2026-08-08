@@ -1513,6 +1513,7 @@ async fn upsert_reply_tab(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplySendBody {
     tab_id: Option<i64>,
     base_exchange_id: Option<i64>,
@@ -2081,6 +2082,7 @@ fn status_for_error(e: &DomainError) -> StatusCode {
         ErrorCode::Forbidden | ErrorCode::ScopeDenied => StatusCode::FORBIDDEN,
         ErrorCode::Conflict | ErrorCode::RevisionConflict => StatusCode::CONFLICT,
         ErrorCode::RateLimited | ErrorCode::ConcurrencyLimited => StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::DiskQuotaExceeded => StatusCode::INSUFFICIENT_STORAGE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -2099,5 +2101,11 @@ mod tests {
     fn request_supplied_config_values_are_bad_requests() {
         let error = DomainError::new(ErrorCode::ConfigInvalid, "invalid upstream proxy URL");
         assert_eq!(status_for_error(&error), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn disk_quota_errors_use_insufficient_storage() {
+        let error = DomainError::new(ErrorCode::DiskQuotaExceeded, "project quota exceeded");
+        assert_eq!(status_for_error(&error), StatusCode::INSUFFICIENT_STORAGE);
     }
 }
