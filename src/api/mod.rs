@@ -310,11 +310,27 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(codec_transform).layer(DefaultBodyLimit::max(payload_body_limit)),
         )
         .route("/", get(ui_index))
+        .layer(axum::middleware::from_fn(prevent_api_caching))
         .layer(axum::middleware::from_fn_with_state(
             activity_state,
             track_control_activity,
         ))
         .with_state(state)
+}
+
+async fn prevent_api_caching(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    if is_api {
+        response.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 async fn track_control_activity(

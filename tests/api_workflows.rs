@@ -108,6 +108,24 @@ async fn api_body_limits_are_route_specific() {
 }
 
 #[tokio::test]
+async fn dynamic_api_responses_are_never_browser_cached() {
+    let (_directory, state, _project_id) = test_state().await;
+    let response = bb::api::router(state)
+        .oneshot(
+            Request::get("/api/v1/projects")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+}
+
+#[tokio::test]
 async fn history_filter_and_annotation_work_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let get_id = state
