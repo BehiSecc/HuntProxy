@@ -149,8 +149,7 @@ impl Db {
         project_id: ProjectId,
     ) -> DomainResult<ReconcileUsageResult> {
         self.with_conn(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
+            let tx = crate::storage::write_transaction(conn)
                 .map_err(|error| storage_error(error.to_string()))?;
             let result = reconcile_project_usage_conn(&tx, project_id)?;
             tx.commit()
@@ -172,8 +171,7 @@ impl Db {
                 .map_err(|error| DomainError::invalid(error.to_string()))?;
         let cutoff_for_query = cutoff.clone();
         self.with_conn(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
+            let tx = crate::storage::write_transaction(conn)
                 .map_err(|error| storage_error(error.to_string()))?;
             let exists: bool = tx
                 .query_row(

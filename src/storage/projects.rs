@@ -1,7 +1,7 @@
 //! Project CRUD.
 
 use crate::domain::*;
-use crate::storage::Db;
+use crate::storage::{write_transaction, Db};
 use rusqlite::params;
 use time::OffsetDateTime;
 
@@ -35,7 +35,7 @@ impl Db {
         let ts = now_rfc3339();
 
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(|e| {
+            let tx = write_transaction(conn).map_err(|e| {
                 DomainError::new(ErrorCode::StorageError, e.to_string())
             })?;
             tx.execute(
@@ -221,8 +221,7 @@ impl Db {
 
     pub async fn delete_project(&self, id: ProjectId) -> DomainResult<()> {
         self.with_conn(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
+            let tx = write_transaction(conn)
                 .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
             let changed = tx
                 .execute("DELETE FROM projects WHERE id=?1", params![id.get()])

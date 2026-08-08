@@ -3,7 +3,7 @@
 use crate::domain::*;
 use crate::fuzzer::FuzzResponseGroup;
 use crate::storage::projects::{now_rfc3339, parse_time};
-use crate::storage::Db;
+use crate::storage::{write_transaction, Db};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -21,7 +21,7 @@ impl Db {
         let ts = now_rfc3339();
         let strategy_s = strategy_str(strategy);
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tx = write_transaction(conn).map_err(storage_error)?;
             let project_exists: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
@@ -277,7 +277,7 @@ impl Db {
         let ts = now_rfc3339();
         let state_s = fuzz_case_state_str(state);
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tx = write_transaction(conn).map_err(storage_error)?;
             if let Some(exchange_id) = exchange_id {
                 let changed = tx
                     .execute(
@@ -523,7 +523,7 @@ impl Db {
     pub async fn mark_fuzz_jobs_interrupted(&self) -> DomainResult<u64> {
         let ts = now_rfc3339();
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tx = write_transaction(conn).map_err(storage_error)?;
             tx.execute(
                 "UPDATE fuzz_cases SET state='cancelled', finished_at=?1
                  WHERE state IN ('queued','running')

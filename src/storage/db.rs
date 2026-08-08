@@ -108,6 +108,10 @@ impl Db {
     }
 }
 
+pub(crate) fn write_transaction(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+}
+
 pub fn configure_connection(
     conn: &Connection,
     synchronous: &str,

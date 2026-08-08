@@ -2,7 +2,7 @@
 
 use crate::domain::*;
 use crate::storage::projects::{now_rfc3339, parse_time};
-use crate::storage::Db;
+use crate::storage::{write_transaction, Db};
 use rusqlite::params;
 
 impl Db {
@@ -28,7 +28,7 @@ impl Db {
         let base_id = base_exchange_id.map(|e| e.get());
 
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tx = write_transaction(conn).map_err(storage_error)?;
             let tab = if let Some(id) = tab_id {
                 let current: i64 = tx
                     .query_row(

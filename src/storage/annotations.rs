@@ -2,7 +2,7 @@
 
 use crate::domain::*;
 use crate::storage::projects::{now_rfc3339, parse_time};
-use crate::storage::Db;
+use crate::storage::{write_transaction, Db};
 use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeSet;
 
@@ -35,7 +35,7 @@ impl Db {
         let ts = now_rfc3339();
 
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tx = write_transaction(conn).map_err(storage_error)?;
             let exchange_exists: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM exchanges WHERE project_id=?1 AND exchange_id=?2)",
@@ -324,6 +324,52 @@ mod tests {
                 .revision,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_annotation_writes_wait_instead_of_failing_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            data_dir: directory.path().to_path_buf(),
+            spool_dir: directory.path().join("spool"),
+            export_dir: directory.path().join("exports"),
+            runtime_dir: directory.path().join("runtime"),
+            plugin_dir: directory.path().join("plugins"),
+            ..crate::config::Config::default()
+        };
+        let db = Db::open(&config).await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "concurrent annotations".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let mut exchange_ids = Vec::new();
+        for _ in 0..8 {
+            exchange_ids.push(db.insert_exchange(exchange(project.id)).await.unwrap());
+        }
+
+        let writes = exchange_ids.into_iter().map(|exchange_id| {
+            let db = db.clone();
+            async move {
+                db.upsert_annotation(
+                    project.id,
+                    exchange_id,
+                    AnnotationUpdate {
+                        display_title: None,
+                        note: Some("generated concurrently".into()),
+                        labels: vec!["plugin".into()],
+                        expected_revision: None,
+                    },
+                )
+                .await
+            }
+        });
+        let results = futures::future::join_all(writes).await;
+
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
     }
 
     fn exchange(project_id: ProjectId) -> NewExchange {
