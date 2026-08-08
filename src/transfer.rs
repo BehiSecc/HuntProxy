@@ -671,6 +671,7 @@ mod tests {
         config.spool_dir = config.data_dir.join("spool");
         config.export_dir = config.data_dir.join("exports");
         config.runtime_dir = config.data_dir.join("runtime");
+        config.plugin_dir = config.data_dir.join("plugins");
         config.ensure_layout().unwrap();
         config
     }

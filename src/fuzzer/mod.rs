@@ -1662,6 +1662,7 @@ mod tests {
             db: db.clone(),
             transport: Arc::new(FailingTransport),
             placeholder_key: PlaceholderKey::from_bytes(vec![5; 32]),
+            upstream_proxies: Default::default(),
         });
         let service = FuzzerService::new(db, reply, PlaceholderKey::from_bytes(vec![6; 32]));
         let first = service.project_limiter(&project).unwrap();
@@ -1711,6 +1712,7 @@ mod tests {
             db: db.clone(),
             transport: Arc::new(FailingTransport),
             placeholder_key: PlaceholderKey::from_bytes(vec![7; 32]),
+            upstream_proxies: Default::default(),
         });
 
         run_job(
@@ -1798,6 +1800,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             }),
             placeholder_key: PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
         });
 
         run_job(

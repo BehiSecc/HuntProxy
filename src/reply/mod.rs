@@ -604,6 +604,7 @@ pub struct ReplyService {
     pub db: Arc<Db>,
     pub transport: Arc<dyn SemanticTransport>,
     pub placeholder_key: PlaceholderKey,
+    pub upstream_proxies: crate::config::UpstreamProxyConfig,
 }
 
 impl ReplyService {
@@ -622,13 +623,36 @@ impl ReplyService {
         protocol: ProtocolPreference,
         follow_redirects: u32,
     ) -> DomainResult<ReplySendResult> {
-        self.send_with_context(
+        self.send_with_proxy(
+            project_id,
+            tab_id,
+            base_exchange_id,
+            draft,
+            protocol,
+            follow_redirects,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_with_proxy(
+        &self,
+        project_id: ProjectId,
+        tab_id: Option<ReplyTabId>,
+        base_exchange_id: Option<ExchangeId>,
+        draft: &ReplyDraft,
+        protocol: ProtocolPreference,
+        follow_redirects: u32,
+        upstream_proxy: Option<&str>,
+    ) -> DomainResult<ReplySendResult> {
+        self.send_with_context_and_proxy(
             project_id,
             base_exchange_id,
             draft,
             protocol,
             follow_redirects,
             ReplySendContext::reply(base_exchange_id, tab_id),
+            upstream_proxy,
         )
         .await
     }
@@ -641,6 +665,28 @@ impl ReplyService {
         protocol: ProtocolPreference,
         follow_redirects: u32,
         context: ReplySendContext,
+    ) -> DomainResult<ReplySendResult> {
+        self.send_with_context_and_proxy(
+            project_id,
+            base_exchange_id,
+            draft,
+            protocol,
+            follow_redirects,
+            context,
+            None,
+        )
+        .await
+    }
+
+    async fn send_with_context_and_proxy(
+        &self,
+        project_id: ProjectId,
+        base_exchange_id: Option<ExchangeId>,
+        draft: &ReplyDraft,
+        protocol: ProtocolPreference,
+        follow_redirects: u32,
+        context: ReplySendContext,
+        upstream_proxy_override: Option<&str>,
     ) -> DomainResult<ReplySendResult> {
         let project = self.db.get_project(project_id).await?;
         let mut mat = materialize_request(
@@ -697,6 +743,9 @@ impl ReplyService {
             DomainError::invalid(format!("invalid HTTP method {}: {error}", mat.method))
         })?;
         let target = TargetRef::from_url(&mat.url)?;
+        let upstream_proxy = self
+            .upstream_proxies
+            .proxy_for(&target.host, upstream_proxy_override)?;
         let req_headers: Vec<HeaderEntry> = mat
             .headers
             .iter()
@@ -731,6 +780,7 @@ impl ReplyService {
                     total_timeout: Duration::from_secs(60),
                     max_body_bytes: project.limits.max_body_bytes,
                     preserve_identity_headers: true,
+                    upstream_proxy,
                 },
             )
             .await;
@@ -1122,6 +1172,7 @@ mod tests {
                 headers: recorded.clone(),
             }),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
         };
 
         service
@@ -1176,6 +1227,7 @@ mod tests {
             spool_dir: directory.path().join("spool"),
             export_dir: directory.path().join("exports"),
             runtime_dir: directory.path().join("runtime"),
+            plugin_dir: directory.path().join("plugins"),
             ..Config::default()
         };
         config.ensure_layout().unwrap();
@@ -1198,6 +1250,7 @@ mod tests {
             db: db.clone(),
             transport: Arc::new(CannedTransport),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
         };
 
         let result = service
@@ -1454,6 +1507,7 @@ mod tests {
             db,
             transport: Arc::new(GzipTransport),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
         };
         let result = service
             .send(

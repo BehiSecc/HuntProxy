@@ -11,6 +11,7 @@ pub enum ExchangeSource {
     Browser,
     Reply,
     Fuzzer,
+    Plugin,
     Proxy,
     Imported,
 }

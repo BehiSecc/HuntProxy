@@ -31,6 +31,7 @@ pub struct AppState {
     pub fuzzer: Arc<FuzzerService>,
     pub browser: Arc<BrowserService>,
     pub crawler: Arc<CrawlerService>,
+    pub plugins: Arc<crate::plugins::PluginService>,
     pub websocket: crate::websocket::SharedWebSocketService,
     pub events: broadcast::Sender<AppEvent>,
     pub shutdown: CancellationToken,
@@ -90,7 +91,7 @@ pub async fn run_daemon(config: Config) -> DomainResult<()> {
             loop {
                 let idle_for = state.activity.idle_for();
                 if idle_for >= timeout {
-                    if state.fuzzer.has_active_jobs() {
+                    if state.fuzzer.has_active_jobs() || state.plugins.has_active_jobs() {
                         tokio::select! {
                             _ = state.shutdown.cancelled() => break,
                             _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
@@ -248,12 +249,18 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         db: db.clone(),
         transport: transport.clone(),
         placeholder_key: PlaceholderKey::from_bytes(key_bytes.clone()),
+        upstream_proxies: config.upstream_proxies.clone(),
     });
     let fuzzer = Arc::new(FuzzerService::new(
         db.clone(),
         reply.clone(),
         PlaceholderKey::from_bytes(key_bytes),
     ));
+    let plugins = Arc::new(crate::plugins::PluginService::load(
+        config.plugin_dir.clone(),
+        db.clone(),
+        reply.clone(),
+    )?);
     let managed_worker = config.browser_worker_path.clone().or_else(|| {
         crate::browser::prepare_browser_worker_installation(&config.data_dir)
             .ok()
@@ -283,6 +290,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         fuzzer,
         browser,
         crawler,
+        plugins,
         websocket,
         events,
         shutdown: CancellationToken::new(),
@@ -509,6 +517,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
             data_dir: temp.path().to_path_buf(),
+            plugin_dir: temp.path().join("plugins"),
             ..Config::default()
         };
         config.ensure_layout().unwrap();
@@ -527,6 +536,7 @@ mod tests {
         let config = Config {
             data_dir: temp.path().to_path_buf(),
             runtime_dir: temp.path().join("runtime"),
+            plugin_dir: temp.path().join("plugins"),
             ..Config::default()
         };
         config.ensure_layout().unwrap();

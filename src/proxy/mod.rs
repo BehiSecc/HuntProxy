@@ -159,6 +159,10 @@ async fn forward_request(
     let mut applied_rules =
         crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut url).await?;
     let target = TargetRef::from_url(&url)?;
+    let upstream_proxy = state
+        .config
+        .upstream_proxies
+        .proxy_for(&target.host, None)?;
     let capture = url_is_in_scope(&url, &project.scope)?;
     let dial = resolve_validated_dial(&url, &project.scope, Duration::from_secs(60)).await?;
     let method = parts.method.clone();
@@ -247,6 +251,7 @@ async fn forward_request(
                 total_timeout: Duration::from_secs(60),
                 max_body_bytes: project.limits.capture_body_bytes,
                 preserve_identity_headers: true,
+                upstream_proxy,
             },
         )
         .await;
@@ -1017,6 +1022,7 @@ mod tests {
         config.spool_dir = config.data_dir.join("spool");
         config.export_dir = config.data_dir.join("exports");
         config.runtime_dir = config.data_dir.join("runtime");
+        config.plugin_dir = config.data_dir.join("plugins");
         config.ensure_layout().unwrap();
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params =
@@ -1037,6 +1043,7 @@ mod tests {
             db: db.clone(),
             transport: transport.clone(),
             placeholder_key: key.clone(),
+            upstream_proxies: Default::default(),
         });
         let fuzzer = Arc::new(FuzzerService::new(db.clone(), reply.clone(), key));
         let browser = Arc::new(BrowserService::new_with_proxy_and_ca(
@@ -1054,6 +1061,14 @@ mod tests {
             browser.clone(),
             events.clone(),
         ));
+        let plugins = Arc::new(
+            crate::plugins::PluginService::load(
+                config.plugin_dir.clone(),
+                db.clone(),
+                reply.clone(),
+            )
+            .unwrap(),
+        );
         let state = Arc::new(AppState {
             db: db.clone(),
             config,
@@ -1062,6 +1077,7 @@ mod tests {
             fuzzer,
             browser,
             crawler,
+            plugins,
             websocket: Arc::new(crate::websocket::WebSocketService::new()),
             events,
             shutdown: CancellationToken::new(),

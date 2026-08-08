@@ -25,6 +25,7 @@ pub mod history;
 pub mod mcp;
 pub mod page_analyzer;
 pub mod page_title;
+pub mod plugins;
 pub mod policy;
 pub mod proxy;
 pub mod reply;

@@ -4,6 +4,7 @@ use super::{ReplySendContext, ReplyService};
 use crate::domain::*;
 use crate::policy::TargetRef;
 use crate::storage::NewExchange;
+use base64::Engine;
 use rustls::pki_types::ServerName;
 use std::io;
 use std::pin::Pin;
@@ -29,6 +30,8 @@ pub enum RawResponseMode {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct RawHttp1Options {
+    /// Transient per-request proxy override. Credentials are never persisted.
+    pub upstream_proxy: Option<String>,
     /// Split the exact request at this byte offset and pause before writing the remainder.
     pub pause_at_byte: Option<usize>,
     pub pause_ms: Option<u64>,
@@ -36,17 +39,23 @@ pub struct RawHttp1Options {
     pub response_mode: RawResponseMode,
     pub read_timeout_ms: u64,
     pub idle_timeout_ms: u64,
+    /// Internal synchronization point used by the plugin race engine. This is
+    /// never accepted from or exposed through serialized API input.
+    #[serde(skip)]
+    pub release_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 impl Default for RawHttp1Options {
     fn default() -> Self {
         Self {
+            upstream_proxy: None,
             pause_at_byte: None,
             pause_ms: None,
             half_close_write: false,
             response_mode: RawResponseMode::Auto,
             read_timeout_ms: 60_000,
             idle_timeout_ms: 1_000,
+            release_barrier: None,
         }
     }
 }
@@ -167,26 +176,16 @@ impl ReplyService {
             ));
         }
 
-        // Raw Reply is an explicit egress feature. Project scope determines
-        // capture/storage, never which destination the operator may contact.
-        let addresses = tokio::net::lookup_host((target.host.as_str(), target.port))
-            .await
-            .map_err(|error| {
-                DomainError::new(
-                    ErrorCode::Unavailable,
-                    format!("DNS failed for {}: {error}", target.host),
-                )
-            })?
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            return Err(DomainError::new(
-                ErrorCode::Unavailable,
-                "DNS returned no addresses",
-            ));
-        }
-
         let started = Instant::now();
-        let mut stream = connect_any(&addresses, Duration::from_secs(10)).await?;
+        let upstream_proxy = self
+            .upstream_proxies
+            .proxy_for(&target.host, options.upstream_proxy.as_deref())?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_target(&target, upstream_proxy.as_deref()),
+        )
+        .await
+        .map_err(|_| DomainError::new(ErrorCode::Timeout, "upstream connection timed out"))??;
         if target.scheme == "https" {
             stream = connect_tls(stream, &target.host).await?;
         }
@@ -298,6 +297,237 @@ impl ReplyService {
     }
 }
 
+async fn connect_target(
+    target: &TargetRef,
+    upstream_proxy: Option<&str>,
+) -> DomainResult<Pin<Box<dyn RawIo>>> {
+    let Some(proxy_url) = upstream_proxy else {
+        let addresses = resolve_addresses(&target.host, target.port).await?;
+        return connect_any(&addresses, Duration::from_secs(10)).await;
+    };
+    crate::config::validate_upstream_proxy_url(proxy_url)?;
+    let proxy = url::Url::parse(proxy_url)
+        .map_err(|_| DomainError::new(ErrorCode::ConfigInvalid, "invalid upstream proxy URL"))?;
+    let proxy_host = proxy
+        .host_str()
+        .ok_or_else(|| DomainError::new(ErrorCode::ConfigInvalid, "proxy host required"))?;
+    let proxy_port = proxy
+        .port_or_known_default()
+        .ok_or_else(|| DomainError::new(ErrorCode::ConfigInvalid, "proxy port required"))?;
+    let addresses = resolve_addresses(proxy_host, proxy_port).await?;
+    let mut stream = connect_any(&addresses, Duration::from_secs(10)).await?;
+    let username = decode_url_component(proxy.username())?;
+    let password = proxy.password().map(decode_url_component).transpose()?;
+    match proxy.scheme() {
+        "http" => http_connect(&mut stream, target, &username, password.as_deref()).await?,
+        "socks5" | "socks5h" => {
+            socks5_connect(
+                &mut stream,
+                target,
+                proxy.scheme() == "socks5h",
+                &username,
+                password.as_deref(),
+            )
+            .await?
+        }
+        _ => unreachable!("proxy URL was validated"),
+    }
+    Ok(stream)
+}
+
+async fn resolve_addresses(host: &str, port: u16) -> DomainResult<Vec<std::net::SocketAddr>> {
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| {
+            DomainError::new(
+                ErrorCode::Unavailable,
+                format!("DNS failed for {host}: {error}"),
+            )
+        })?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(DomainError::new(
+            ErrorCode::Unavailable,
+            "DNS returned no addresses",
+        ));
+    }
+    Ok(addresses)
+}
+
+fn decode_url_component(value: &str) -> DomainResult<String> {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| DomainError::new(ErrorCode::ConfigInvalid, "proxy credentials must be UTF-8"))
+}
+
+fn connect_authority(target: &TargetRef) -> String {
+    if target.host.contains(':') {
+        format!("[{}]:{}", target.host, target.port)
+    } else {
+        format!("{}:{}", target.host, target.port)
+    }
+}
+
+async fn http_connect(
+    stream: &mut Pin<Box<dyn RawIo>>,
+    target: &TargetRef,
+    username: &str,
+    password: Option<&str>,
+) -> DomainResult<()> {
+    let authority = connect_authority(target);
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if !username.is_empty() || password.is_some() {
+        let credential = format!("{username}:{}", password.unwrap_or_default());
+        request.push_str(&format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64::engine::general_purpose::STANDARD.encode(credential)
+        ));
+    }
+    request.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(io_error)?;
+    stream.flush().await.map_err(io_error)?;
+
+    let mut response = Vec::with_capacity(512);
+    while response.len() < 16 * 1024 && !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut byte))
+            .await
+            .map_err(|_| DomainError::new(ErrorCode::Timeout, "HTTP proxy CONNECT timed out"))?
+            .map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        response.push(byte[0]);
+    }
+    let first_line = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .unwrap_or("");
+    let status = first_line.split_ascii_whitespace().nth(1);
+    if status != Some("200") {
+        return Err(DomainError::new(
+            if status == Some("407") {
+                ErrorCode::ProxyAuthRequired
+            } else {
+                ErrorCode::Unavailable
+            },
+            format!(
+                "HTTP proxy CONNECT failed with status {}",
+                status.unwrap_or("unknown")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn socks5_connect(
+    stream: &mut Pin<Box<dyn RawIo>>,
+    target: &TargetRef,
+    remote_dns: bool,
+    username: &str,
+    password: Option<&str>,
+) -> DomainResult<()> {
+    let authenticated = !username.is_empty() || password.is_some();
+    let greeting: &[u8] = if authenticated {
+        &[5, 1, 2]
+    } else {
+        &[5, 1, 0]
+    };
+    stream.write_all(greeting).await.map_err(io_error)?;
+    let mut choice = [0u8; 2];
+    stream.read_exact(&mut choice).await.map_err(io_error)?;
+    if choice[0] != 5 || choice[1] == 0xff {
+        return Err(DomainError::new(
+            ErrorCode::Unavailable,
+            "SOCKS5 proxy rejected authentication methods",
+        ));
+    }
+    if choice[1] == 2 {
+        let password = password.unwrap_or_default().as_bytes();
+        let username = username.as_bytes();
+        if username.len() > 255 || password.len() > 255 {
+            return Err(DomainError::new(
+                ErrorCode::ConfigInvalid,
+                "SOCKS5 credentials exceed 255 bytes",
+            ));
+        }
+        let mut auth = Vec::with_capacity(username.len() + password.len() + 3);
+        auth.extend_from_slice(&[1, username.len() as u8]);
+        auth.extend_from_slice(username);
+        auth.push(password.len() as u8);
+        auth.extend_from_slice(password);
+        stream.write_all(&auth).await.map_err(io_error)?;
+        let mut result = [0u8; 2];
+        stream.read_exact(&mut result).await.map_err(io_error)?;
+        if result != [1, 0] {
+            return Err(DomainError::new(
+                ErrorCode::ProxyAuthRequired,
+                "SOCKS5 authentication failed",
+            ));
+        }
+    } else if choice[1] != 0 {
+        return Err(DomainError::new(
+            ErrorCode::Unavailable,
+            "SOCKS5 proxy selected an unsupported authentication method",
+        ));
+    }
+
+    let mut connect = vec![5, 1, 0];
+    if remote_dns {
+        let host = target.host.as_bytes();
+        if host.len() > 255 {
+            return Err(DomainError::invalid("target hostname exceeds SOCKS5 limit"));
+        }
+        connect.extend_from_slice(&[3, host.len() as u8]);
+        connect.extend_from_slice(host);
+    } else {
+        let address = resolve_addresses(&target.host, target.port).await?[0].ip();
+        match address {
+            std::net::IpAddr::V4(ip) => {
+                connect.push(1);
+                connect.extend_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                connect.push(4);
+                connect.extend_from_slice(&ip.octets());
+            }
+        }
+    }
+    connect.extend_from_slice(&target.port.to_be_bytes());
+    stream.write_all(&connect).await.map_err(io_error)?;
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await.map_err(io_error)?;
+    if head[0] != 5 || head[1] != 0 {
+        return Err(DomainError::new(
+            ErrorCode::Unavailable,
+            format!("SOCKS5 connect failed with code {}", head[1]),
+        ));
+    }
+    let remaining = match head[3] {
+        1 => 4,
+        4 => 16,
+        3 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.map_err(io_error)?;
+            len[0] as usize
+        }
+        _ => {
+            return Err(DomainError::new(
+                ErrorCode::ProtocolError,
+                "invalid SOCKS5 address type",
+            ))
+        }
+    };
+    let mut ignored = vec![0u8; remaining + 2];
+    stream.read_exact(&mut ignored).await.map_err(io_error)?;
+    Ok(())
+}
+
 async fn connect_any(
     addresses: &[std::net::SocketAddr],
     timeout: Duration,
@@ -364,7 +594,11 @@ async fn write_raw_request(
 
     if let (Some(offset), Some(pause_ms)) = (options.pause_at_byte, options.pause_ms) {
         write_part(stream, &request[..offset]).await?;
-        tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+        if let Some(barrier) = &options.release_barrier {
+            barrier.wait().await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+        }
         write_part(stream, &request[offset..]).await?;
     } else {
         write_part(stream, request).await?;
@@ -979,6 +1213,71 @@ mod tests {
         assert_eq!(response.outcome, RawReadOutcome::Complete);
         assert_eq!(parse_response(&response.bytes).body, b"ok");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_connection_tunnels_through_http_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut connect = Vec::new();
+            while !connect.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                connect.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut payload = [0u8; 4];
+            socket.read_exact(&mut payload).await.unwrap();
+            (connect, payload)
+        });
+        let target = TargetRef::from_url("http://target.test:8080/").unwrap();
+        let mut stream = connect_target(&target, Some(&format!("http://{address}")))
+            .await
+            .unwrap();
+        stream.write_all(b"test").await.unwrap();
+        let (connect, payload) = server.await.unwrap();
+        assert!(String::from_utf8(connect)
+            .unwrap()
+            .starts_with("CONNECT target.test:8080 HTTP/1.1\r\n"));
+        assert_eq!(&payload, b"test");
+    }
+
+    #[tokio::test]
+    async fn raw_connection_uses_socks5h_remote_hostname() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut head = [0u8; 5];
+            socket.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head[..4], &[5, 1, 0, 3]);
+            let mut rest = vec![0u8; head[4] as usize + 2];
+            socket.read_exact(&mut rest).await.unwrap();
+            socket
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            (
+                String::from_utf8(rest[..rest.len() - 2].to_vec()).unwrap(),
+                u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]),
+            )
+        });
+        let target = TargetRef::from_url("http://unresolvable.test:8080/").unwrap();
+        let _stream = connect_target(&target, Some(&format!("socks5h://{address}")))
+            .await
+            .unwrap();
+        let (host, port) = server.await.unwrap();
+        assert_eq!(host, "unresolvable.test");
+        assert_eq!(port, 8080);
     }
 
     #[tokio::test]

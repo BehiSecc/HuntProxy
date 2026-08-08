@@ -291,6 +291,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/projects/{id}/events", get(events))
         .route("/api/v1/doctor", get(doctor))
+        .route("/api/v1/extensions", get(list_extensions))
+        .route("/api/v1/extensions/{plugin_id}", get(describe_extension))
+        .route(
+            "/api/v1/projects/{id}/extension-jobs",
+            post(run_extension).layer(DefaultBodyLimit::max(payload_body_limit)),
+        )
+        .route(
+            "/api/v1/projects/{id}/extension-jobs/{job_id}",
+            get(extension_job),
+        )
+        .route(
+            "/api/v1/projects/{id}/extension-jobs/{job_id}/cancel",
+            post(cancel_extension_job),
+        )
         .route(
             "/api/v1/codec",
             post(codec_transform).layer(DefaultBodyLimit::max(payload_body_limit)),
@@ -393,6 +407,97 @@ async fn version() -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": crate::INTERNAL_PROTOCOL_VERSION,
     }))
+}
+
+async fn list_extensions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "plugin_directory": state.plugins.directory(),
+        "plugins": state.plugins.list(),
+    }))
+}
+
+async fn describe_extension(
+    State(state): State<Arc<AppState>>,
+    Path(plugin_id): Path<String>,
+) -> Response {
+    match state.plugins.describe(&plugin_id) {
+        Ok(plugin) => Json(plugin).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RunExtensionBody {
+    plugin_id: String,
+    action: String,
+    #[serde(alias = "exchange_id")]
+    base_exchange_id: Option<i64>,
+    #[serde(default = "empty_json_object")]
+    input: serde_json::Value,
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+async fn run_extension(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RunExtensionBody>,
+) -> Response {
+    match state
+        .plugins
+        .run(
+            ProjectId(id),
+            &body.plugin_id,
+            &body.action,
+            body.base_exchange_id.map(ExchangeId),
+            body.input,
+        )
+        .await
+    {
+        Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+fn parse_project_job(
+    state: &AppState,
+    project_id: i64,
+    job_id: &str,
+) -> DomainResult<crate::plugins::PluginJobView> {
+    let job_id = job_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| DomainError::invalid("job_id must be a UUID"))?;
+    let job = state.plugins.status(job_id)?;
+    if job.project_id != ProjectId(project_id) {
+        return Err(DomainError::not_found("plugin job"));
+    }
+    Ok(job)
+}
+
+async fn extension_job(
+    State(state): State<Arc<AppState>>,
+    Path((id, job_id)): Path<(i64, String)>,
+) -> Response {
+    match parse_project_job(&state, id, &job_id) {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn cancel_extension_job(
+    State(state): State<Arc<AppState>>,
+    Path((id, job_id)): Path<(i64, String)>,
+) -> Response {
+    let job = match parse_project_job(&state, id, &job_id) {
+        Ok(job) => job,
+        Err(error) => return error_response(error),
+    };
+    match state.plugins.cancel(job.id) {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => error_response(error),
+    }
 }
 
 async fn list_projects(State(state): State<Arc<AppState>>) -> Response {
@@ -1413,6 +1518,7 @@ struct ReplySendBody {
     base_exchange_id: Option<i64>,
     draft: Option<ReplyDraft>,
     protocol: Option<String>,
+    upstream_proxy: Option<String>,
 }
 
 async fn reply_send(
@@ -1449,13 +1555,14 @@ async fn reply_send(
     };
     match state
         .reply
-        .send(
+        .send_with_proxy(
             ProjectId(id),
             body.tab_id.map(ReplyTabId),
             base,
             &draft,
             protocol,
             0,
+            body.upstream_proxy.as_deref(),
         )
         .await
     {
@@ -1967,7 +2074,9 @@ fn error_response(e: DomainError) -> Response {
 fn status_for_error(e: &DomainError) -> StatusCode {
     match e.code() {
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
-        ErrorCode::InvalidArgument | ErrorCode::PlaceholderInvalid => StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidArgument | ErrorCode::PlaceholderInvalid | ErrorCode::ConfigInvalid => {
+            StatusCode::BAD_REQUEST
+        }
         ErrorCode::Unauthorized | ErrorCode::ProxyAuthRequired => StatusCode::UNAUTHORIZED,
         ErrorCode::Forbidden | ErrorCode::ScopeDenied => StatusCode::FORBIDDEN,
         ErrorCode::Conflict | ErrorCode::RevisionConflict => StatusCode::CONFLICT,
@@ -1980,4 +2089,15 @@ fn status_for_error(e: &DomainError) -> StatusCode {
 #[allow(dead_code)]
 fn _event_type_check(e: AppEvent) -> AppEvent {
     e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_supplied_config_values_are_bad_requests() {
+        let error = DomainError::new(ErrorCode::ConfigInvalid, "invalid upstream proxy URL");
+        assert_eq!(status_for_error(&error), StatusCode::BAD_REQUEST);
+    }
 }

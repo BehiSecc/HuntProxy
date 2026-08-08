@@ -36,9 +36,117 @@ pub struct Config {
     pub runtime_dir: PathBuf,
     pub node_path: Option<PathBuf>,
     pub browser_worker_path: Option<PathBuf>,
+    /// Installed HuntProxy extensions. Each immediate child may contain one
+    /// integrity-pinned `plugin.json` package.
+    pub plugin_dir: PathBuf,
     pub auto_start_daemon: bool,
     /// Stop an inactive MCP bridge/daemon and its browsers. Zero disables it.
     pub idle_timeout_seconds: u64,
+    /// Optional default and host-specific upstream proxies for outbound requests.
+    pub upstream_proxies: UpstreamProxyConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamProxyConfig {
+    /// Fallback proxy used when no host rule matches.
+    pub default: Option<String>,
+    /// Exact hosts and `*.example.com` suffix rules. Exact matches win.
+    pub rules: Vec<UpstreamProxyRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamProxyRule {
+    pub host: String,
+    pub proxy: String,
+}
+
+impl UpstreamProxyConfig {
+    pub fn proxy_for(
+        &self,
+        host: &str,
+        request_override: Option<&str>,
+    ) -> DomainResult<Option<String>> {
+        if let Some(proxy) = request_override {
+            validate_upstream_proxy_url(proxy)?;
+            return Ok(Some(proxy.to_string()));
+        }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let exact = self.rules.iter().find(|rule| {
+            !rule.host.starts_with("*.")
+                && rule.host.trim_end_matches('.').eq_ignore_ascii_case(&host)
+        });
+        let wildcard = self
+            .rules
+            .iter()
+            .filter(|rule| rule.host.starts_with("*."))
+            .filter(|rule| host_matches(&host, &rule.host.to_ascii_lowercase()))
+            .max_by_key(|rule| rule.host.len());
+        Ok(exact
+            .or(wildcard)
+            .map(|rule| rule.proxy.clone())
+            .or_else(|| self.default.clone()))
+    }
+
+    fn validate(&self) -> DomainResult<()> {
+        if let Some(proxy) = &self.default {
+            validate_upstream_proxy_url(proxy)?;
+        }
+        for rule in &self.rules {
+            validate_host_pattern(&rule.host)?;
+            validate_upstream_proxy_url(&rule.proxy)?;
+        }
+        Ok(())
+    }
+}
+
+fn host_matches(host: &str, pattern: &str) -> bool {
+    let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if pattern.starts_with("*.") {
+        host.len() > suffix.len()
+            && host.ends_with(suffix)
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+    } else {
+        host.eq_ignore_ascii_case(suffix)
+    }
+}
+
+fn validate_host_pattern(pattern: &str) -> DomainResult<()> {
+    let host = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if host.is_empty() || host.contains('*') || host.contains('/') || host.contains(':') {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "upstream proxy host must be an exact hostname or *.example.com",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_upstream_proxy_url(proxy: &str) -> DomainResult<()> {
+    let parsed = url::Url::parse(proxy)
+        .map_err(|_| DomainError::new(ErrorCode::ConfigInvalid, "invalid upstream proxy URL"))?;
+    if !matches!(parsed.scheme(), "http" | "socks5" | "socks5h") {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "upstream proxy scheme must be http, socks5, or socks5h",
+        ));
+    }
+    if parsed.host_str().is_none() || parsed.port_or_known_default().is_none() {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "upstream proxy URL requires a host and port",
+        ));
+    }
+    if (!parsed.path().is_empty() && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "upstream proxy URL cannot contain a path, query, or fragment",
+        ));
+    }
+    Ok(())
 }
 
 impl Default for Config {
@@ -59,8 +167,10 @@ impl Default for Config {
             runtime_dir: data_dir.join("runtime"),
             node_path: which_path("node"),
             browser_worker_path: None,
+            plugin_dir: data_dir.join("plugins"),
             auto_start_daemon: true,
             idle_timeout_seconds: 60 * 60,
+            upstream_proxies: UpstreamProxyConfig::default(),
         }
     }
 }
@@ -73,6 +183,7 @@ impl Config {
             cfg.spool_dir = cfg.data_dir.join("spool");
             cfg.export_dir = cfg.data_dir.join("exports");
             cfg.runtime_dir = cfg.data_dir.join("runtime");
+            cfg.plugin_dir = cfg.data_dir.join("plugins");
         }
         create_private_dir(&cfg.data_dir)?;
         let path = cfg.data_dir.join(CONFIG_FILE_NAME);
@@ -129,6 +240,12 @@ impl Config {
         if let Some(v) = f.node_path {
             self.node_path = Some(PathBuf::from(v));
         }
+        if let Some(v) = f.plugin_dir {
+            self.plugin_dir = PathBuf::from(v);
+        }
+        if let Some(v) = f.upstream_proxies {
+            self.upstream_proxies = v;
+        }
     }
 
     pub fn validate(&self) -> DomainResult<()> {
@@ -153,6 +270,7 @@ impl Config {
                 "sqlite_synchronous must be NORMAL or FULL",
             ));
         }
+        self.upstream_proxies.validate()?;
         Ok(())
     }
 
@@ -203,6 +321,7 @@ impl Config {
         create_private_dir(&self.export_dir)?;
         create_private_dir(&self.runtime_dir)?;
         create_private_dir(&self.browser_profiles_dir())?;
+        create_private_dir(&self.plugin_dir)?;
         Ok(())
     }
 
@@ -223,6 +342,8 @@ impl Config {
             auto_start_daemon: Some(self.auto_start_daemon),
             idle_timeout_seconds: Some(self.idle_timeout_seconds),
             node_path: self.node_path.as_ref().map(|p| p.display().to_string()),
+            plugin_dir: Some(self.plugin_dir.display().to_string()),
+            upstream_proxies: Some(self.upstream_proxies.clone()),
         };
         let text = toml::to_string_pretty(&file).map_err(|e| {
             DomainError::new(ErrorCode::ConfigInvalid, format!("serialize config: {e}"))
@@ -245,6 +366,8 @@ struct ConfigFile {
     auto_start_daemon: Option<bool>,
     idle_timeout_seconds: Option<u64>,
     node_path: Option<String>,
+    plugin_dir: Option<String>,
+    upstream_proxies: Option<UpstreamProxyConfig>,
 }
 
 pub fn default_data_dir() -> PathBuf {
@@ -343,5 +466,58 @@ mod tests {
         }
         assert!(config.data_dir.join(CONFIG_FILE_NAME).is_file());
         assert_eq!(config.idle_timeout_seconds, 60 * 60);
+    }
+
+    #[test]
+    fn upstream_proxy_selection_prefers_exact_and_longest_wildcard() {
+        let config = UpstreamProxyConfig {
+            default: Some("http://default.test:8080".into()),
+            rules: vec![
+                UpstreamProxyRule {
+                    host: "*.example.com".into(),
+                    proxy: "socks5h://broad.test:1080".into(),
+                },
+                UpstreamProxyRule {
+                    host: "*.api.example.com".into(),
+                    proxy: "http://narrow.test:8080".into(),
+                },
+                UpstreamProxyRule {
+                    host: "one.api.example.com".into(),
+                    proxy: "socks5://exact.test:1080".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            config
+                .proxy_for("one.api.example.com", None)
+                .unwrap()
+                .as_deref(),
+            Some("socks5://exact.test:1080")
+        );
+        assert_eq!(
+            config
+                .proxy_for("two.api.example.com", None)
+                .unwrap()
+                .as_deref(),
+            Some("http://narrow.test:8080")
+        );
+        assert_eq!(
+            config.proxy_for("example.com", None).unwrap().as_deref(),
+            Some("http://default.test:8080")
+        );
+        assert_eq!(
+            config
+                .proxy_for("elsewhere.test", Some("socks5h://override.test:1080"))
+                .unwrap()
+                .as_deref(),
+            Some("socks5h://override.test:1080")
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_validation_rejects_ambiguous_or_unsupported_values() {
+        assert!(validate_upstream_proxy_url("https://proxy.test:443").is_err());
+        assert!(validate_upstream_proxy_url("http://proxy.test:8080/path").is_err());
+        assert!(validate_host_pattern("foo.*.example.com").is_err());
     }
 }

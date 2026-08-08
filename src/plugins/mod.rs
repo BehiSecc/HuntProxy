@@ -1,0 +1,1814 @@
+//! Bounded, host-owned extension runtime.
+//!
+//! Extensions are pure JavaScript orchestration. They can describe semantic
+//! HTTP operations, but they receive no filesystem, process, or socket APIs;
+//! HuntProxy validates and executes every operation and persists its evidence.
+
+use crate::domain::*;
+use crate::policy::url_is_in_scope;
+use crate::reply::{ReplySendContext, ReplyService};
+use base64::Engine;
+use dashmap::DashMap;
+use futures::{stream, StreamExt};
+use rquickjs::{Context, Runtime};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+const PLUGIN_API_VERSION: u32 = 1;
+const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_SCRIPT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
+const MAX_TOTAL_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSE_BODY_FOR_PLUGIN: usize = 256 * 1024;
+const MAX_RAW_REQUEST_CONTEXT: usize = 2 * 1024 * 1024;
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const MAX_TIMEOUT_MS: u64 = 15 * 60_000;
+const DEFAULT_MAX_OPERATIONS: usize = 100;
+const MAX_OPERATIONS: usize = 10_000;
+const DEFAULT_MEMORY_MB: usize = 16;
+const MAX_MEMORY_MB: usize = 64;
+const MAX_ACTIVE_JOBS: usize = 4;
+const MAX_RETAINED_JOBS: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginManifest {
+    pub schema_version: u32,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    #[serde(default)]
+    pub enabled: bool,
+    pub entrypoint: String,
+    /// Hex SHA-256 of the exact entrypoint bytes. This prevents unnoticed
+    /// changes after a package has been reviewed/installed.
+    pub entrypoint_sha256: String,
+    #[serde(default)]
+    pub resources: HashMap<String, PluginResource>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<PluginAction>,
+    #[serde(default)]
+    pub limits: PluginLimits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginResource {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginAction {
+    pub name: String,
+    pub description: String,
+    #[serde(default = "object_schema")]
+    pub input_schema: Value,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+}
+
+fn object_schema() -> Value {
+    json!({"type":"object"})
+}
+
+fn max_requested_exchange_contexts(manifest: &PluginManifest) -> usize {
+    manifest
+        .limits
+        .max_operations
+        .unwrap_or(DEFAULT_MAX_OPERATIONS)
+        .clamp(1, MAX_OPERATIONS)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginLimits {
+    pub timeout_ms: Option<u64>,
+    pub max_operations: Option<usize>,
+    pub max_concurrency: Option<usize>,
+    pub memory_mb: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedPlugin {
+    manifest: PluginManifest,
+    script: Arc<str>,
+    resources: Arc<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginJobState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginJobView {
+    pub id: Uuid,
+    pub project_id: ProjectId,
+    pub plugin_id: String,
+    pub action: String,
+    pub base_exchange_id: Option<ExchangeId>,
+    pub state: PluginJobState,
+    pub operation_count: usize,
+    pub completed_operations: usize,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+}
+
+struct PluginJob {
+    view: parking_lot::RwLock<PluginJobView>,
+    cancel: CancellationToken,
+}
+
+#[derive(Clone)]
+pub struct PluginService {
+    directory: PathBuf,
+    reply: Arc<ReplyService>,
+    db: Arc<crate::storage::Db>,
+    plugins: Arc<HashMap<String, Arc<LoadedPlugin>>>,
+    jobs: Arc<DashMap<Uuid, Arc<PluginJob>>>,
+    active_jobs: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginPlan {
+    #[serde(default)]
+    operations: Vec<PluginOperation>,
+    #[serde(default)]
+    result: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PluginOperation {
+    HttpRequest(PluginHttpRequest),
+    RawHttp1(PluginRawHttp1),
+    RaceGroup(PluginRaceGroup),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginRaceGroup {
+    id: String,
+    technique: RaceTechnique,
+    attempt: u64,
+    requests: Vec<RaceRequest>,
+    #[serde(default)]
+    options: RaceOptions,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RaceRequest {
+    id: String,
+    base_exchange_id: ExchangeId,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RaceTechnique {
+    SequentialControl,
+    Parallel,
+    LastByteSync,
+    H2SinglePacket,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RaceOptions {
+    timeout_ms: Option<u64>,
+    hold_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginRawHttp1 {
+    id: String,
+    target_url: String,
+    request_utf8: Option<String>,
+    request_base64: Option<String>,
+    #[serde(default)]
+    use_project_cookies: bool,
+    #[serde(default)]
+    options: crate::reply::RawHttp1Options,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginHttpRequest {
+    id: String,
+    base_exchange_id: Option<ExchangeId>,
+    method: Option<String>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: Vec<HeaderPatch>,
+    #[serde(default)]
+    header_tombstones: Vec<String>,
+    body_text: Option<String>,
+    body_base64: Option<String>,
+    #[serde(default)]
+    protocol: ProtocolPreference,
+    #[serde(default)]
+    query_params: Vec<PluginParamPatch>,
+    #[serde(default)]
+    cookie_params: Vec<PluginParamPatch>,
+    #[serde(default)]
+    body_params: Vec<PluginParamPatch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginParamPatch {
+    name: String,
+    /// Null removes an existing parameter; a string sets/replaces it.
+    value: Option<String>,
+}
+
+impl PluginService {
+    pub fn load(
+        directory: PathBuf,
+        db: Arc<crate::storage::Db>,
+        reply: Arc<ReplyService>,
+    ) -> DomainResult<Self> {
+        crate::config::create_private_dir(&directory)?;
+        let mut plugins = HashMap::new();
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            DomainError::new(
+                ErrorCode::StorageError,
+                format!("read plugin directory: {error}"),
+            )
+        })?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) if entry.path().is_dir() => entry,
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "skipping unreadable plugin directory entry");
+                    continue;
+                }
+            };
+            match load_plugin(&entry.path()) {
+                Ok(plugin) => {
+                    if plugins
+                        .insert(plugin.manifest.id.clone(), Arc::new(plugin))
+                        .is_some()
+                    {
+                        return Err(DomainError::new(
+                            ErrorCode::ConfigInvalid,
+                            "duplicate plugin id",
+                        ));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(path=%entry.path().display(), %error, "plugin rejected")
+                }
+            }
+        }
+        Ok(Self {
+            directory,
+            reply,
+            db,
+            plugins: Arc::new(plugins),
+            jobs: Arc::new(DashMap::new()),
+            active_jobs: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_JOBS)),
+        })
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn list(&self) -> Vec<PluginManifest> {
+        let mut plugins = self
+            .plugins
+            .values()
+            .map(|plugin| plugin.manifest.clone())
+            .collect::<Vec<_>>();
+        plugins.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        plugins
+    }
+
+    pub fn describe(&self, id: &str) -> DomainResult<PluginManifest> {
+        self.plugins
+            .get(id)
+            .map(|plugin| plugin.manifest.clone())
+            .ok_or_else(|| DomainError::not_found(format!("plugin {id}")))
+    }
+
+    pub async fn run(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        action: &str,
+        base_exchange_id: Option<ExchangeId>,
+        input: Value,
+    ) -> DomainResult<PluginJobView> {
+        let input_bytes = serde_json::to_vec(&input)
+            .map_err(|error| DomainError::invalid(format!("invalid plugin input: {error}")))?;
+        if input_bytes.len() > MAX_INPUT_BYTES {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "plugin input exceeds 2 MiB",
+            ));
+        }
+        let plugin = self
+            .plugins
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| DomainError::not_found(format!("plugin {plugin_id}")))?;
+        if !plugin.manifest.enabled {
+            return Err(DomainError::new(
+                ErrorCode::Forbidden,
+                format!("plugin {plugin_id} is installed but disabled"),
+            ));
+        }
+        let action_manifest = plugin
+            .manifest
+            .actions
+            .iter()
+            .find(|candidate| candidate.name == action)
+            .ok_or_else(|| DomainError::not_found(format!("plugin action {action}")))?;
+        let declared = plugin.manifest.capabilities.iter().collect::<BTreeSet<_>>();
+        if action_manifest
+            .required_capabilities
+            .iter()
+            .any(|capability| !declared.contains(capability))
+        {
+            return Err(DomainError::new(
+                ErrorCode::ConfigInvalid,
+                "plugin action requires an undeclared capability",
+            ));
+        }
+        self.db.get_project(project_id).await?;
+
+        self.prune_finished_jobs();
+        let active_job_permit = self.active_jobs.clone().try_acquire_owned().map_err(|_| {
+            DomainError::new(
+                ErrorCode::ConcurrencyLimited,
+                format!("at most {MAX_ACTIVE_JOBS} extension jobs may run at once"),
+            )
+        })?;
+
+        let id = Uuid::new_v4();
+        let job = Arc::new(PluginJob {
+            view: parking_lot::RwLock::new(PluginJobView {
+                id,
+                project_id,
+                plugin_id: plugin_id.into(),
+                action: action.into(),
+                base_exchange_id,
+                state: PluginJobState::Queued,
+                operation_count: 0,
+                completed_operations: 0,
+                result: None,
+                error: None,
+            }),
+            cancel: CancellationToken::new(),
+        });
+        self.jobs.insert(id, job.clone());
+        let service = self.clone();
+        let action = action.to_string();
+        tokio::spawn(async move {
+            let _active_job_permit = active_job_permit;
+            service.execute_job(job, plugin, action, input).await;
+        });
+        Ok(self.status(id)?)
+    }
+
+    pub fn status(&self, id: Uuid) -> DomainResult<PluginJobView> {
+        self.jobs
+            .get(&id)
+            .map(|job| job.view.read().clone())
+            .ok_or_else(|| DomainError::not_found("plugin job"))
+    }
+
+    pub fn cancel(&self, id: Uuid) -> DomainResult<PluginJobView> {
+        let job = self
+            .jobs
+            .get(&id)
+            .ok_or_else(|| DomainError::not_found("plugin job"))?;
+        job.cancel.cancel();
+        let view = job.view.read().clone();
+        Ok(view)
+    }
+
+    pub fn has_active_jobs(&self) -> bool {
+        self.jobs.iter().any(|job| {
+            matches!(
+                job.view.read().state,
+                PluginJobState::Queued | PluginJobState::Running
+            )
+        })
+    }
+
+    fn prune_finished_jobs(&self) {
+        prune_finished_jobs(&self.jobs);
+    }
+
+    async fn execute_job(
+        &self,
+        job: Arc<PluginJob>,
+        plugin: Arc<LoadedPlugin>,
+        action: String,
+        input: Value,
+    ) {
+        job.view.write().state = PluginJobState::Running;
+        let timeout_ms = plugin
+            .manifest
+            .limits
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1_000, MAX_TIMEOUT_MS);
+        let result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            self.execute_job_inner(job.clone(), plugin, &action, &input),
+        )
+        .await;
+        let mut view = job.view.write();
+        match result {
+            Ok(Ok(result)) => {
+                view.state = PluginJobState::Completed;
+                view.result = Some(result);
+            }
+            Ok(Err(error)) if error.code() == ErrorCode::Cancelled => {
+                view.state = PluginJobState::Cancelled;
+                view.error = Some(error.to_string());
+            }
+            Ok(Err(error)) => {
+                view.state = PluginJobState::Failed;
+                view.error = Some(error.to_string());
+            }
+            Err(_) => {
+                job.cancel.cancel();
+                view.state = PluginJobState::Failed;
+                view.error = Some(format!("plugin job timed out after {timeout_ms} ms"));
+            }
+        }
+    }
+
+    async fn execute_job_inner(
+        &self,
+        job: Arc<PluginJob>,
+        plugin: Arc<LoadedPlugin>,
+        action: &str,
+        input: &Value,
+    ) -> DomainResult<Value> {
+        let (project_id, base_exchange_id) = {
+            let view = job.view.read();
+            (view.project_id, view.base_exchange_id)
+        };
+        let privileged_identity = plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == "identity.use");
+        let raw_request_access = plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == "http.raw");
+        let base_exchange = self
+            .plugin_exchange_context(
+                project_id,
+                base_exchange_id,
+                privileged_identity,
+                raw_request_access,
+            )
+            .await?;
+        let related_exchanges = self
+            .related_exchange_contexts(
+                project_id,
+                input,
+                max_requested_exchange_contexts(&plugin.manifest),
+            )
+            .await?;
+        let context = json!({
+            "api_version": PLUGIN_API_VERSION,
+            "plugin_id": plugin.manifest.id,
+            "plugin_version": plugin.manifest.version,
+            "action": action,
+            "project_id": project_id.get(),
+            "base_exchange": base_exchange,
+            "related_exchanges": related_exchanges,
+            "resources": &*plugin.resources,
+        });
+        let plan_value = run_js_stage(&plugin, "plan", input, &Value::Null, &context).await?;
+        let plan: PluginPlan = serde_json::from_value(plan_value)
+            .map_err(|error| DomainError::invalid(format!("invalid plugin plan: {error}")))?;
+        let max_operations = plugin
+            .manifest
+            .limits
+            .max_operations
+            .unwrap_or(DEFAULT_MAX_OPERATIONS)
+            .clamp(1, MAX_OPERATIONS);
+        let planned_requests = plan
+            .operations
+            .iter()
+            .try_fold(0usize, |count, operation| {
+                count.checked_add(match operation {
+                    PluginOperation::RaceGroup(group) => group.requests.len(),
+                    _ => 1,
+                })
+            })
+            .unwrap_or(usize::MAX);
+        if planned_requests > max_operations {
+            return Err(DomainError::new(
+                ErrorCode::CombinationLimit,
+                format!("plugin planned {planned_requests} requests; limit is {max_operations}",),
+            ));
+        }
+        for operation in &plan.operations {
+            let required = match operation {
+                PluginOperation::HttpRequest(_) => "http.semantic",
+                PluginOperation::RawHttp1(_) => "http.raw",
+                PluginOperation::RaceGroup(_) => "http.race",
+            };
+            if !plugin
+                .manifest
+                .capabilities
+                .iter()
+                .any(|item| item == required)
+            {
+                return Err(DomainError::new(
+                    ErrorCode::Forbidden,
+                    format!("plugin operation requires {required} capability"),
+                ));
+            }
+        }
+        job.view.write().operation_count = planned_requests;
+        let project_id = job.view.read().project_id;
+        let project = self.db.get_project(project_id).await?;
+        let concurrency = plugin
+            .manifest
+            .limits
+            .max_concurrency
+            .unwrap_or(4)
+            .clamp(1, project.limits.max_concurrent_requests.max(1) as usize);
+        let target_host = url::Url::parse(&project.target_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+        let rate = project.limits.requests_per_second.max(0.1);
+        let operations = stream::iter(plan.operations.into_iter().enumerate().map(|(index, operation)| {
+            let service = self.clone();
+            let job = job.clone();
+            let plugin_id = plugin.manifest.id.clone();
+                    let plugin_name = plugin.manifest.name.clone();
+                    let scope = project.scope.clone();
+                    let target_host = target_host.clone();
+                    async move {
+                        let completed_count = match &operation {
+                            PluginOperation::RaceGroup(group) => group.requests.len(),
+                            _ => 1,
+                        };
+                let wait = Duration::from_secs_f64(index as f64 / rate);
+                tokio::select! {
+                    _ = job.cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                let result = service
+                    .execute_operation(project_id, &plugin_id, &plugin_name, operation, &scope, target_host.as_deref(), &job.cancel)
+                    .await;
+                        job.view.write().completed_operations += completed_count;
+                result
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        let observations = operations.into_iter().collect::<DomainResult<Vec<_>>>()?;
+        if job.cancel.is_cancelled() {
+            return Err(DomainError::new(
+                ErrorCode::Cancelled,
+                "plugin job cancelled",
+            ));
+        }
+        let analyzed =
+            run_js_stage(&plugin, "analyze", input, &json!(observations), &context).await?;
+        let analyzed = self
+            .redact_plugin_output(project_id, base_exchange_id, analyzed)
+            .await?;
+        let mut persisted_findings = Vec::new();
+        if let Some(findings) = analyzed.get("findings").and_then(Value::as_array) {
+            if findings.len() > 1000 {
+                return Err(DomainError::new(
+                    ErrorCode::CombinationLimit,
+                    "plugin returned more than 1000 findings",
+                ));
+            }
+            for finding in findings {
+                let title = finding
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DomainError::invalid("plugin finding requires title"))?;
+                let evidence = finding
+                    .get("evidence_exchange_ids")
+                    .and_then(Value::as_array)
+                    .map(|ids| {
+                        ids.iter()
+                            .map(|id| {
+                                id.as_i64().map(ExchangeId).ok_or_else(|| {
+                                    DomainError::invalid(
+                                        "evidence_exchange_ids must contain integers",
+                                    )
+                                })
+                            })
+                            .collect::<DomainResult<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .or_else(|| {
+                        finding
+                            .get("exchange_id")
+                            .and_then(Value::as_i64)
+                            .map(|id| vec![ExchangeId(id)])
+                    })
+                    .ok_or_else(|| {
+                        DomainError::invalid("plugin finding requires evidence_exchange_ids")
+                    })?;
+                let exchange_id = *evidence.first().ok_or_else(|| {
+                    DomainError::invalid("plugin finding requires at least one evidence exchange")
+                })?;
+                for evidence_id in &evidence {
+                    self.db
+                        .get_exchange_detail(
+                            project_id,
+                            *evidence_id,
+                            crate::policy::PresentationOptions::default(),
+                        )
+                        .await?;
+                }
+                let description = if let Some(description) =
+                    finding.get("description").and_then(Value::as_str)
+                {
+                    description.to_string()
+                } else {
+                    let severity = finding
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unspecified");
+                    let confidence = finding
+                        .get("confidence")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unspecified");
+                    let explanation = finding
+                        .get("explanation")
+                        .and_then(Value::as_str)
+                        .unwrap_or("No explanation supplied.");
+                    let remediation = finding
+                        .get("remediation")
+                        .and_then(Value::as_str)
+                        .unwrap_or("No remediation supplied.");
+                    format!("Severity: {severity}\nConfidence: {confidence}\n\n{explanation}\n\nRemediation: {remediation}\n\nEvidence exchanges: {}", evidence.iter().map(|id| id.get().to_string()).collect::<Vec<_>>().join(", "))
+                };
+                persisted_findings.push(
+                    self.db
+                        .create_finding(project_id, exchange_id, title.into(), description)
+                        .await?,
+                );
+            }
+        }
+        let result = json!({"plan_result": plan.result, "analysis": analyzed, "persisted_findings": persisted_findings});
+        let result = self
+            .redact_plugin_output(project_id, base_exchange_id, result)
+            .await?;
+        if serde_json::to_vec(&result)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > MAX_RESULT_BYTES
+        {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "plugin result exceeds 8 MiB",
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn redact_plugin_output(
+        &self,
+        project_id: ProjectId,
+        base_exchange_id: Option<ExchangeId>,
+        mut value: Value,
+    ) -> DomainResult<Value> {
+        let mut secrets = Vec::new();
+        if let Some(exchange_id) = base_exchange_id {
+            for header in self
+                .db
+                .load_raw_headers(project_id, exchange_id, MessageSide::Request)
+                .await?
+            {
+                if crate::policy::is_sensitive_header(&header.name) && !header.value.is_empty() {
+                    if let Ok(text) = String::from_utf8(header.value.clone()) {
+                        secrets.push(text);
+                    }
+                    secrets.push(base64::engine::general_purpose::STANDARD.encode(header.value));
+                }
+            }
+        }
+        redact_value(&mut value, &secrets, None);
+        Ok(value)
+    }
+
+    async fn plugin_exchange_context(
+        &self,
+        project_id: ProjectId,
+        exchange_id: Option<ExchangeId>,
+        privileged_identity: bool,
+        raw_request_access: bool,
+    ) -> DomainResult<Value> {
+        let Some(exchange_id) = exchange_id else {
+            return Ok(Value::Null);
+        };
+        let detail = self
+            .db
+            .get_exchange_detail(
+                project_id,
+                exchange_id,
+                crate::policy::PresentationOptions::default(),
+            )
+            .await?;
+        let query = detail
+            .summary
+            .query
+            .as_ref()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default();
+        let mut context = json!({
+            "exchange_id": exchange_id,
+            "method": detail.summary.method.clone(),
+            "url": format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query),
+            "headers": detail.request_headers.clone(),
+            "request_length": detail.summary.request_length,
+            "request_body_hash": detail.request_body_hash.clone(),
+            "request_preview": detail.request_preview.clone(),
+        });
+        if privileged_identity {
+            let raw_headers = self
+                .db
+                .load_raw_headers(project_id, exchange_id, MessageSide::Request)
+                .await?;
+            let mut body = self
+                .db
+                .load_raw_body(project_id, exchange_id, MessageSide::Request)
+                .await?
+                .unwrap_or_default();
+            let body_truncated = body.len() > MAX_RESPONSE_BODY_FOR_PLUGIN;
+            body.truncate(MAX_RESPONSE_BODY_FOR_PLUGIN);
+            context["identity"] = json!({
+                "request_headers": raw_headers.into_iter().map(|header| json!({
+                    "name": header.name,
+                    "value_base64": base64::engine::general_purpose::STANDARD.encode(header.value),
+                })).collect::<Vec<_>>(),
+                "request_body_base64": base64::engine::general_purpose::STANDARD.encode(body),
+                "request_body_truncated": body_truncated,
+            });
+        }
+        if raw_request_access {
+            let raw_headers = self
+                .db
+                .load_raw_headers(project_id, exchange_id, MessageSide::Request)
+                .await?;
+            let body = self
+                .db
+                .load_raw_body(project_id, exchange_id, MessageSide::Request)
+                .await?
+                .unwrap_or_default();
+            let target = format!(
+                "{}{}",
+                detail.summary.path,
+                detail
+                    .summary
+                    .query
+                    .as_ref()
+                    .map(|query| format!("?{query}"))
+                    .unwrap_or_default()
+            );
+            let mut raw = format!("{} {} HTTP/1.1\r\n", detail.summary.method, target).into_bytes();
+            for header in raw_headers {
+                raw.extend_from_slice(header.name.as_bytes());
+                raw.extend_from_slice(b": ");
+                raw.extend_from_slice(&header.value);
+                raw.extend_from_slice(b"\r\n");
+            }
+            raw.extend_from_slice(b"\r\n");
+            raw.extend_from_slice(&body);
+            if raw.len() <= MAX_RAW_REQUEST_CONTEXT {
+                context["raw_request_base64"] =
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(raw));
+                context["raw_request_reconstructed"] = Value::Bool(true);
+            } else {
+                context["raw_request_omitted"] = Value::Bool(true);
+            }
+        }
+        Ok(context)
+    }
+
+    async fn related_exchange_contexts(
+        &self,
+        project_id: ProjectId,
+        input: &Value,
+        limit: usize,
+    ) -> DomainResult<Vec<Value>> {
+        let ids = input
+            .get("exchange_ids")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if ids.len() > limit {
+            return Err(DomainError::new(
+                ErrorCode::CombinationLimit,
+                format!("exchange_ids exceeds context limit {limit}"),
+            ));
+        }
+        let mut contexts = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = id
+                .as_i64()
+                .map(ExchangeId)
+                .ok_or_else(|| DomainError::invalid("exchange_ids must contain integers"))?;
+            let detail = self
+                .db
+                .get_exchange_detail(
+                    project_id,
+                    id,
+                    crate::policy::PresentationOptions::default(),
+                )
+                .await?;
+            let query = detail
+                .summary
+                .query
+                .as_ref()
+                .map(|query| format!("?{query}"))
+                .unwrap_or_default();
+            contexts.push(json!({
+                "exchange_id": id,
+                "method": detail.summary.method,
+                "url": format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query),
+                "status_code": detail.summary.status_code,
+            }));
+        }
+        Ok(contexts)
+    }
+
+    async fn execute_operation(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        plugin_name: &str,
+        operation: PluginOperation,
+        scope: &ScopePolicy,
+        target_host: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> DomainResult<Value> {
+        match operation {
+            PluginOperation::HttpRequest(request) => {
+                let effective_url = if let Some(url) = request.url.as_deref() {
+                    url.to_string()
+                } else if let Some(base_exchange_id) = request.base_exchange_id {
+                    let detail = self
+                        .db
+                        .get_exchange_detail(
+                            project_id,
+                            base_exchange_id,
+                            crate::policy::PresentationOptions::default(),
+                        )
+                        .await?;
+                    let query = detail
+                        .summary
+                        .query
+                        .as_ref()
+                        .map(|query| format!("?{query}"))
+                        .unwrap_or_default();
+                    format!(
+                        "{}://{}{}{}",
+                        detail.summary.scheme, detail.summary.authority, detail.summary.path, query
+                    )
+                } else {
+                    return Err(DomainError::invalid(
+                        "plugin HTTP operation requires url or base_exchange_id",
+                    ));
+                };
+                enforce_plugin_scope(&effective_url, scope, target_host)?;
+                if request.body_text.is_some() && request.body_base64.is_some() {
+                    return Err(DomainError::invalid(
+                        "plugin request body_text and body_base64 are mutually exclusive",
+                    ));
+                }
+                let mut body_override = request
+                    .body_base64
+                    .as_deref()
+                    .map(|body| base64::engine::general_purpose::STANDARD.decode(body))
+                    .transpose()
+                    .map_err(|error| {
+                        DomainError::invalid(format!("invalid plugin body_base64: {error}"))
+                    })?;
+                let mut url_override = request.url;
+                let mut header_overrides = request.headers;
+                if !request.query_params.is_empty() {
+                    let mut url = url::Url::parse(&effective_url).map_err(|error| {
+                        DomainError::invalid(format!("invalid plugin request URL: {error}"))
+                    })?;
+                    let pairs = url
+                        .query_pairs()
+                        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                        .collect::<Vec<_>>();
+                    url.set_query(None);
+                    let mut serializer = url.query_pairs_mut();
+                    for (name, value) in pairs {
+                        if !request.query_params.iter().any(|patch| patch.name == name) {
+                            serializer.append_pair(&name, &value);
+                        }
+                    }
+                    for patch in &request.query_params {
+                        if let Some(value) = &patch.value {
+                            serializer.append_pair(&patch.name, value);
+                        }
+                    }
+                    drop(serializer);
+                    url_override = Some(url.into());
+                }
+                if !request.cookie_params.is_empty() {
+                    let base = request.base_exchange_id.ok_or_else(|| {
+                        DomainError::invalid("cookie_params requires base_exchange_id")
+                    })?;
+                    let raw = self
+                        .db
+                        .load_raw_headers(project_id, base, MessageSide::Request)
+                        .await?;
+                    let cookie = raw
+                        .iter()
+                        .find(|header| header.name.eq_ignore_ascii_case("cookie"))
+                        .and_then(|header| String::from_utf8(header.value.clone()).ok())
+                        .unwrap_or_default();
+                    let mut cookies = cookie
+                        .split(';')
+                        .filter_map(|item| {
+                            let (name, value) = item.trim().split_once('=')?;
+                            Some((name.trim().to_string(), value.to_string()))
+                        })
+                        .collect::<Vec<_>>();
+                    cookies.retain(|(name, _)| {
+                        !request
+                            .cookie_params
+                            .iter()
+                            .any(|patch| patch.name == *name)
+                    });
+                    cookies.extend(request.cookie_params.iter().filter_map(|patch| {
+                        patch
+                            .value
+                            .as_ref()
+                            .map(|value| (patch.name.clone(), value.clone()))
+                    }));
+                    header_overrides.retain(|header| !header.name.eq_ignore_ascii_case("cookie"));
+                    header_overrides.push(HeaderPatch {
+                        name: "Cookie".into(),
+                        value: cookies
+                            .into_iter()
+                            .map(|(name, value)| format!("{name}={value}"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                            .into_bytes(),
+                    });
+                }
+                if !request.body_params.is_empty() {
+                    let base = request.base_exchange_id.ok_or_else(|| {
+                        DomainError::invalid("body_params requires base_exchange_id")
+                    })?;
+                    let raw_headers = self
+                        .db
+                        .load_raw_headers(project_id, base, MessageSide::Request)
+                        .await?;
+                    let content_type = raw_headers
+                        .iter()
+                        .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+                        .and_then(|header| std::str::from_utf8(&header.value).ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let original = self
+                        .db
+                        .load_raw_body(project_id, base, MessageSide::Request)
+                        .await?
+                        .unwrap_or_default();
+                    if content_type.contains("application/x-www-form-urlencoded") {
+                        let mut pairs = url::form_urlencoded::parse(&original)
+                            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                            .collect::<Vec<_>>();
+                        pairs.retain(|(name, _)| {
+                            !request.body_params.iter().any(|patch| patch.name == *name)
+                        });
+                        pairs.extend(request.body_params.iter().filter_map(|patch| {
+                            patch
+                                .value
+                                .as_ref()
+                                .map(|value| (patch.name.clone(), value.clone()))
+                        }));
+                        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                        serializer.extend_pairs(pairs);
+                        body_override = Some(serializer.finish().into_bytes());
+                    } else if content_type.contains("application/json") {
+                        let mut value: Value = serde_json::from_slice(&original).map_err(|_| {
+                            DomainError::invalid("cannot mutate malformed JSON request body")
+                        })?;
+                        let object = value.as_object_mut().ok_or_else(|| {
+                            DomainError::invalid("body_params only supports top-level JSON objects")
+                        })?;
+                        for patch in &request.body_params {
+                            match &patch.value {
+                                Some(value) => {
+                                    object.insert(patch.name.clone(), Value::String(value.clone()));
+                                }
+                                None => {
+                                    object.remove(&patch.name);
+                                }
+                            }
+                        }
+                        body_override = Some(
+                            serde_json::to_vec(&value)
+                                .map_err(|error| DomainError::invalid(error.to_string()))?,
+                        );
+                    } else {
+                        return Err(DomainError::invalid(
+                            "body_params supports JSON and form-urlencoded saved requests",
+                        ));
+                    }
+                }
+                let context = ReplySendContext {
+                    source: ExchangeSource::Plugin,
+                    lineage: ExchangeLineage::default(),
+                };
+                let draft = ReplyDraft {
+                    method: request.method,
+                    url: url_override,
+                    header_overrides,
+                    header_tombstones: request.header_tombstones,
+                    body_override,
+                    body_text: request.body_text,
+                    ..Default::default()
+                };
+                let response = tokio::select! {
+                    _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                    response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, context) => response?,
+                };
+                let mut response_headers = Vec::new();
+                let mut response_body_base64 = None;
+                let mut response_body_truncated = false;
+                if let Some(exchange_id) = response.exchange_id {
+                    self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name)
+                        .await?;
+                    response_headers = self
+                        .db
+                        .load_raw_headers(project_id, exchange_id, MessageSide::Response)
+                        .await?
+                        .into_iter()
+                        .map(|header| json!({"name": header.name, "value_base64": base64::engine::general_purpose::STANDARD.encode(header.value)}))
+                        .collect();
+                    if let Some(mut body) = self
+                        .db
+                        .load_raw_body(project_id, exchange_id, MessageSide::Response)
+                        .await?
+                    {
+                        if body.len() > MAX_RESPONSE_BODY_FOR_PLUGIN {
+                            body.truncate(MAX_RESPONSE_BODY_FOR_PLUGIN);
+                            response_body_truncated = true;
+                        }
+                        response_body_base64 =
+                            Some(base64::engine::general_purpose::STANDARD.encode(body));
+                    }
+                }
+                Ok(json!({
+                    "id": request.id,
+                    "exchange_id": response.exchange_id,
+                    "status_code": response.status_code,
+                    "duration_ms": response.duration_ms,
+                    "response_length": response.response_length,
+                    "response_body_hash": response.response_body_hash,
+                    "response_preview": response.response_preview,
+                    "response_headers": response_headers,
+                    "response_body_base64": response_body_base64,
+                    "response_body_truncated": response_body_truncated,
+                }))
+            }
+            PluginOperation::RawHttp1(request) => {
+                let has_utf8 = request.request_utf8.is_some();
+                let has_base64 = request.request_base64.is_some();
+                if has_utf8 == has_base64 {
+                    return Err(DomainError::invalid(
+                        "raw_http1 requires exactly one of request_utf8 or request_base64",
+                    ));
+                }
+                enforce_plugin_scope(&request.target_url, scope, target_host)?;
+                let bytes = match (request.request_utf8, request.request_base64) {
+                    (Some(value), None) => value.into_bytes(),
+                    (None, Some(value)) => base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .map_err(|error| {
+                            DomainError::invalid(format!("invalid raw request_base64: {error}"))
+                        })?,
+                    _ => unreachable!(),
+                };
+                let response = tokio::select! {
+                    _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                    response = self.reply.send_raw_http1(project_id, None, &request.target_url, bytes, request.use_project_cookies, request.options) => response?,
+                };
+                if let Some(exchange_id) = response.exchange_id {
+                    self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name)
+                        .await?;
+                }
+                Ok(json!({"id":request.id,"raw":response}))
+            }
+            PluginOperation::RaceGroup(group) => {
+                if group.requests.is_empty() || group.requests.len() > 1000 {
+                    return Err(DomainError::new(
+                        ErrorCode::CombinationLimit,
+                        "race_group requires 1..=1000 requests",
+                    ));
+                }
+                let timeout_ms = group
+                    .options
+                    .timeout_ms
+                    .unwrap_or(60_000)
+                    .clamp(1_000, 120_000);
+                let project_limit = self
+                    .db
+                    .get_project(project_id)
+                    .await?
+                    .limits
+                    .max_concurrent_requests
+                    .max(1) as usize;
+                if matches!(group.technique, RaceTechnique::LastByteSync)
+                    && group.requests.len() > project_limit
+                {
+                    return Err(DomainError::new(
+                        ErrorCode::ConcurrencyLimited,
+                        format!("last_byte_sync requires {} concurrent connections; project limit is {project_limit}", group.requests.len()),
+                    ));
+                }
+                if matches!(group.technique, RaceTechnique::H2SinglePacket) {
+                    return Ok(json!({
+                        "id": group.id,
+                        "technique": "h2_single_packet",
+                        "attempt": group.attempt,
+                        "synchronized": false,
+                        "release_skew_ms": Value::Null,
+                        "responses": [],
+                        "error": {"code":"protocol_incompatible","message":"h2_single_packet requires true HTTP/2 final-frame coalescing and is not available in this runtime"},
+                    }));
+                }
+                let responses = match group.technique {
+                    RaceTechnique::H2SinglePacket => unreachable!(),
+                    RaceTechnique::SequentialControl => {
+                        let mut responses = Vec::with_capacity(group.requests.len());
+                        for request in group.requests {
+                            responses.push(
+                                self.send_race_semantic(
+                                    project_id,
+                                    plugin_id,
+                                    plugin_name,
+                                    request,
+                                    scope,
+                                    target_host,
+                                    cancel,
+                                )
+                                .await,
+                            );
+                        }
+                        responses
+                    }
+                    RaceTechnique::Parallel => {
+                        stream::iter(group.requests.into_iter().map(|request| {
+                            let service = self.clone();
+                            let cancel = cancel.clone();
+                            let scope = scope.clone();
+                            let plugin_id = plugin_id.to_string();
+                            let plugin_name = plugin_name.to_string();
+                            let target_host = target_host.map(str::to_string);
+                            async move {
+                                service
+                                    .send_race_semantic(
+                                        project_id,
+                                        &plugin_id,
+                                        &plugin_name,
+                                        request,
+                                        &scope,
+                                        target_host.as_deref(),
+                                        &cancel,
+                                    )
+                                    .await
+                            }
+                        }))
+                        .buffer_unordered(project_limit)
+                        .collect::<Vec<_>>()
+                        .await
+                    }
+                    RaceTechnique::LastByteSync => {
+                        let barrier = Arc::new(tokio::sync::Barrier::new(group.requests.len()));
+                        let hold_timeout_ms = group
+                            .options
+                            .hold_timeout_ms
+                            .unwrap_or(10_000)
+                            .clamp(100, 30_000);
+                        let futures = group.requests.into_iter().map(|request| {
+                            let service = self.clone();
+                            let barrier = barrier.clone();
+                            let cancel = cancel.clone();
+                            let scope = scope.clone();
+                            let plugin_id = plugin_id.to_string();
+                            let plugin_name = plugin_name.to_string();
+                            let target_host = target_host.map(str::to_string);
+                            async move {
+                                service
+                                    .send_race_last_byte(
+                                        project_id,
+                                        &plugin_id,
+                                        &plugin_name,
+                                        request,
+                                        &scope,
+                                        target_host.as_deref(),
+                                        &cancel,
+                                        barrier,
+                                        hold_timeout_ms,
+                                    )
+                                    .await
+                            }
+                        });
+                        tokio::time::timeout(
+                            Duration::from_millis(timeout_ms),
+                            futures::future::join_all(futures),
+                        )
+                        .await
+                        .map_err(|_| {
+                            DomainError::new(
+                                ErrorCode::Timeout,
+                                "last_byte_sync race group timed out",
+                            )
+                        })?
+                    }
+                };
+                Ok(json!({
+                    "id": group.id,
+                    "technique": match group.technique { RaceTechnique::SequentialControl => "sequential_control", RaceTechnique::Parallel => "parallel", RaceTechnique::LastByteSync => "last_byte_sync", RaceTechnique::H2SinglePacket => "h2_single_packet" },
+                    "attempt": group.attempt,
+                    "synchronized": matches!(group.technique, RaceTechnique::LastByteSync),
+                    "release_skew_ms": Value::Null,
+                    "responses": responses,
+                }))
+            }
+        }
+    }
+
+    async fn send_race_semantic(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        plugin_name: &str,
+        request: RaceRequest,
+        scope: &ScopePolicy,
+        target_host: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Value {
+        let result = async {
+            let detail = self.db.get_exchange_detail(project_id, request.base_exchange_id, crate::policy::PresentationOptions::default()).await?;
+            let query = detail.summary.query.as_ref().map(|query| format!("?{query}")).unwrap_or_default();
+            let url = format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query);
+            enforce_plugin_scope(&url, scope, target_host)?;
+            let draft = ReplyDraft::default();
+            let response = tokio::select! {
+                _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                response = self.reply.send_with_context(project_id, Some(request.base_exchange_id), &draft, ProtocolPreference::Auto, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: Some(request.base_exchange_id), ..Default::default() } }) => response?,
+            };
+            if let Some(exchange_id) = response.exchange_id {
+                self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name).await?;
+            }
+            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_length,"response_body_hash":response.response_body_hash,"duration_ms":response.duration_ms,"error":Value::Null}))
+        }.await;
+        result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
+    }
+
+    async fn send_race_last_byte(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        plugin_name: &str,
+        request: RaceRequest,
+        scope: &ScopePolicy,
+        target_host: Option<&str>,
+        cancel: &CancellationToken,
+        barrier: Arc<tokio::sync::Barrier>,
+        hold_timeout_ms: u64,
+    ) -> Value {
+        let result = async {
+            let detail = self.db.get_exchange_detail(project_id, request.base_exchange_id, crate::policy::PresentationOptions::default()).await?;
+            let query = detail.summary.query.as_ref().map(|query| format!("?{query}")).unwrap_or_default();
+            let target_url = format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query);
+            enforce_plugin_scope(&target_url, scope, target_host)?;
+            let raw_headers = self.db.load_raw_headers(project_id, request.base_exchange_id, MessageSide::Request).await?;
+            let body = self.db.load_raw_body(project_id, request.base_exchange_id, MessageSide::Request).await?.unwrap_or_default();
+            let target = format!("{}{}", detail.summary.path, query);
+            let mut bytes = format!("{} {} HTTP/1.1\r\n", detail.summary.method, target).into_bytes();
+            for header in raw_headers { bytes.extend_from_slice(header.name.as_bytes()); bytes.extend_from_slice(b": "); bytes.extend_from_slice(&header.value); bytes.extend_from_slice(b"\r\n"); }
+            bytes.extend_from_slice(b"\r\n"); bytes.extend_from_slice(&body);
+            if bytes.len() < 2 { return Err(DomainError::invalid("saved request is too short for last_byte_sync")); }
+            let options = crate::reply::RawHttp1Options { pause_at_byte: Some(bytes.len() - 1), pause_ms: Some(hold_timeout_ms), release_barrier: Some(barrier), ..Default::default() };
+            let response = tokio::select! {
+                _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                response = self.reply.send_raw_http1(project_id, None, &target_url, bytes, false, options) => response?,
+            };
+            if let Some(exchange_id) = response.exchange_id { self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name).await?; }
+            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_bytes,"response_body_hash":Value::Null,"duration_ms":Value::Null,"error":Value::Null}))
+        }.await;
+        result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
+    }
+
+    async fn annotate_plugin_exchange(
+        &self,
+        project_id: ProjectId,
+        exchange_id: ExchangeId,
+        plugin_id: &str,
+        plugin_name: &str,
+    ) -> DomainResult<()> {
+        let existing = self.db.get_annotation(project_id, exchange_id).await?;
+        let mut labels = existing
+            .as_ref()
+            .map(|annotation| annotation.labels.clone())
+            .unwrap_or_default();
+        labels.extend([
+            "plugin".into(),
+            plugin_name.into(),
+            format!("plugin:{plugin_id}"),
+        ]);
+        labels.sort_by_key(|label| label.to_ascii_lowercase());
+        labels.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        self.db
+            .upsert_annotation(
+                project_id,
+                exchange_id,
+                AnnotationUpdate {
+                    display_title: existing
+                        .as_ref()
+                        .and_then(|annotation| annotation.display_title.clone()),
+                    note: existing
+                        .as_ref()
+                        .and_then(|annotation| annotation.note.clone())
+                        .or_else(|| Some(format!("Generated by HuntProxy plugin {plugin_id}"))),
+                    labels,
+                    expected_revision: existing.map(|annotation| annotation.revision),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+fn prune_finished_jobs(jobs: &DashMap<Uuid, Arc<PluginJob>>) {
+    let excess = jobs
+        .len()
+        .saturating_sub(MAX_RETAINED_JOBS.saturating_sub(1));
+    if excess == 0 {
+        return;
+    }
+    let removable = jobs
+        .iter()
+        .filter_map(|job| {
+            (!matches!(
+                job.view.read().state,
+                PluginJobState::Queued | PluginJobState::Running
+            ))
+            .then_some(*job.key())
+        })
+        .take(excess)
+        .collect::<Vec<_>>();
+    for id in removable {
+        jobs.remove(&id);
+    }
+}
+
+fn redact_value(value: &mut Value, secrets: &[String], key: Option<&str>) {
+    let sensitive_key = key.is_some_and(|key| {
+        let key = key.to_ascii_lowercase();
+        ["cookie", "authorization", "token", "secret", "password"]
+            .iter()
+            .any(|word| key.contains(word))
+    });
+    match value {
+        Value::String(text) => {
+            if sensitive_key
+                || secrets
+                    .iter()
+                    .any(|secret| !secret.is_empty() && text.contains(secret))
+            {
+                *text = "<redacted>".into();
+            }
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_value(item, secrets, key)),
+        Value::Object(object) => {
+            for (name, value) in object {
+                redact_value(value, secrets, Some(name));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn enforce_plugin_scope(
+    url: &str,
+    scope: &ScopePolicy,
+    target_host: Option<&str>,
+) -> DomainResult<()> {
+    if !url_is_in_scope(url, scope)? {
+        return Err(DomainError::scope_denied(
+            "plugin operation is outside project scope",
+        ));
+    }
+    if scope.host_patterns.is_empty() {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+        if host.as_deref() != target_host {
+            return Err(DomainError::scope_denied(
+                "plugin operations default to the project target host; configure explicit project scope to test other hosts",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_plugin(directory: &Path) -> DomainResult<LoadedPlugin> {
+    let manifest_path = directory.join("plugin.json");
+    let metadata = std::fs::metadata(&manifest_path).map_err(|error| {
+        DomainError::new(ErrorCode::ConfigInvalid, format!("plugin.json: {error}"))
+    })?;
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "plugin manifest too large",
+        ));
+    }
+    let manifest: PluginManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .map_err(|error| DomainError::new(ErrorCode::ConfigInvalid, error.to_string()))?,
+    )
+    .map_err(|error| {
+        DomainError::new(
+            ErrorCode::ConfigInvalid,
+            format!("plugin manifest: {error}"),
+        )
+    })?;
+    validate_manifest(&manifest)?;
+    let relative = Path::new(&manifest.entrypoint);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || relative.extension().and_then(|value| value.to_str()) != Some("js")
+    {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "plugin entrypoint must be a relative .js file",
+        ));
+    }
+    let entrypoint = directory.join(relative);
+    let metadata = std::fs::metadata(&entrypoint).map_err(|error| {
+        DomainError::new(
+            ErrorCode::ConfigInvalid,
+            format!("plugin entrypoint: {error}"),
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_SCRIPT_BYTES {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "plugin entrypoint is not a bounded regular file",
+        ));
+    }
+    let bytes = std::fs::read(&entrypoint)
+        .map_err(|error| DomainError::new(ErrorCode::ConfigInvalid, error.to_string()))?;
+    let digest = hex::encode(Sha256::digest(&bytes));
+    if !digest.eq_ignore_ascii_case(manifest.entrypoint_sha256.trim()) {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "plugin entrypoint integrity check failed",
+        ));
+    }
+    let script = String::from_utf8(bytes).map_err(|_| {
+        DomainError::new(ErrorCode::ConfigInvalid, "plugin entrypoint must be UTF-8")
+    })?;
+    let mut resources: HashMap<String, String> = HashMap::new();
+    let mut total_resource_bytes = 0usize;
+    for (name, resource) in &manifest.resources {
+        if name.is_empty() || name.len() > 64 {
+            return Err(DomainError::new(
+                ErrorCode::ConfigInvalid,
+                "invalid plugin resource name",
+            ));
+        }
+        let relative = Path::new(&resource.path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(DomainError::new(
+                ErrorCode::ConfigInvalid,
+                "plugin resource path must be relative",
+            ));
+        }
+        let path = directory.join(relative);
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            DomainError::new(
+                ErrorCode::ConfigInvalid,
+                format!("plugin resource: {error}"),
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() > MAX_RESOURCE_BYTES {
+            return Err(DomainError::new(
+                ErrorCode::ConfigInvalid,
+                "plugin resource is not a bounded regular file",
+            ));
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|error| DomainError::new(ErrorCode::ConfigInvalid, error.to_string()))?;
+        if let Some(previous) = resources.get(name) {
+            total_resource_bytes = total_resource_bytes.saturating_sub(previous.len());
+        }
+        total_resource_bytes = total_resource_bytes.saturating_add(bytes.len());
+        if total_resource_bytes > MAX_TOTAL_RESOURCE_BYTES
+            || !hex::encode(Sha256::digest(&bytes)).eq_ignore_ascii_case(resource.sha256.trim())
+        {
+            return Err(DomainError::new(
+                ErrorCode::ConfigInvalid,
+                "plugin resource integrity check failed or resource total is too large",
+            ));
+        }
+        resources.insert(
+            name.clone(),
+            String::from_utf8(bytes).map_err(|_| {
+                DomainError::new(ErrorCode::ConfigInvalid, "plugin resources must be UTF-8")
+            })?,
+        );
+    }
+    Ok(LoadedPlugin {
+        manifest,
+        script: script.into(),
+        resources: Arc::new(resources),
+    })
+}
+
+fn validate_manifest(manifest: &PluginManifest) -> DomainResult<()> {
+    if manifest.schema_version != PLUGIN_API_VERSION {
+        return Err(DomainError::new(
+            ErrorCode::ProtocolIncompatible,
+            "unsupported plugin schema_version",
+        ));
+    }
+    let valid_slug = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            })
+    };
+    if !valid_slug(&manifest.id) || manifest.name.trim().is_empty() || manifest.name.len() > 128 {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "invalid plugin id or name",
+        ));
+    }
+    if manifest.version.trim().is_empty() || manifest.actions.is_empty() {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "plugin version and actions are required",
+        ));
+    }
+    let mut actions = BTreeSet::new();
+    for action in &manifest.actions {
+        if !valid_slug(&action.name) || !actions.insert(&action.name) {
+            return Err(DomainError::new(
+                ErrorCode::ConfigInvalid,
+                "invalid or duplicate plugin action",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn run_js_stage(
+    plugin: &LoadedPlugin,
+    stage: &'static str,
+    input: &Value,
+    observations: &Value,
+    context: &Value,
+) -> DomainResult<Value> {
+    let script = plugin.script.clone();
+    let input =
+        serde_json::to_string(input).map_err(|error| DomainError::invalid(error.to_string()))?;
+    let observations = serde_json::to_string(observations)
+        .map_err(|error| DomainError::invalid(error.to_string()))?;
+    let context =
+        serde_json::to_string(context).map_err(|error| DomainError::invalid(error.to_string()))?;
+    let memory = plugin
+        .manifest
+        .limits
+        .memory_mb
+        .unwrap_or(DEFAULT_MEMORY_MB)
+        .clamp(4, MAX_MEMORY_MB)
+        * 1024
+        * 1024;
+    tokio::task::spawn_blocking(move || {
+        run_js_sync(&script, stage, &input, &observations, &context, memory)
+    })
+    .await
+    .map_err(|error| {
+        DomainError::new(ErrorCode::Internal, format!("plugin runtime task: {error}"))
+    })?
+}
+
+fn run_js_sync(
+    script: &str,
+    stage: &str,
+    input: &str,
+    observations: &str,
+    context: &str,
+    memory_limit: usize,
+) -> DomainResult<Value> {
+    let runtime = Runtime::new().map_err(|error| {
+        DomainError::new(ErrorCode::Unavailable, format!("QuickJS runtime: {error}"))
+    })?;
+    runtime.set_memory_limit(memory_limit);
+    runtime.set_max_stack_size(512 * 1024);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_handler = interrupted.clone();
+    runtime.set_interrupt_handler(Some(Box::new(move || {
+        let expired = Instant::now() >= deadline;
+        if expired {
+            interrupted_handler.store(true, Ordering::Relaxed);
+        }
+        expired
+    })));
+    let context_handle = Context::full(&runtime).map_err(|error| {
+        DomainError::new(ErrorCode::Unavailable, format!("QuickJS context: {error}"))
+    })?;
+    let output = context_handle.with(|ctx| -> Result<String, rquickjs::Error> {
+        ctx.eval::<(), _>(script)?;
+        let expression = match stage {
+            "plan" => format!(
+                "JSON.stringify(globalThis.HuntProxyPlugin.plan({input},{context}))"
+            ),
+            "analyze" => format!(
+                "JSON.stringify(globalThis.HuntProxyPlugin.analyze({input},{observations},{context}))"
+            ),
+            _ => unreachable!(),
+        };
+        ctx.eval(expression)
+    });
+    if interrupted.load(Ordering::Relaxed) {
+        return Err(DomainError::new(
+            ErrorCode::Timeout,
+            "plugin JavaScript stage exceeded 2 seconds",
+        ));
+    }
+    let output = output.map_err(|error| {
+        DomainError::new(
+            ErrorCode::ProtocolError,
+            format!("plugin JavaScript {stage}: {error}"),
+        )
+    })?;
+    serde_json::from_str(&output).map_err(|error| {
+        DomainError::new(
+            ErrorCode::ProtocolError,
+            format!("plugin {stage} returned invalid JSON: {error}"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_job(state: PluginJobState) -> Arc<PluginJob> {
+        Arc::new(PluginJob {
+            view: parking_lot::RwLock::new(PluginJobView {
+                id: Uuid::new_v4(),
+                project_id: ProjectId(1),
+                plugin_id: "test".into(),
+                action: "run".into(),
+                base_exchange_id: None,
+                state,
+                operation_count: 0,
+                completed_operations: 0,
+                result: None,
+                error: None,
+            }),
+            cancel: CancellationToken::new(),
+        })
+    }
+
+    #[test]
+    fn javascript_plan_and_analysis_are_bounded_json() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan(input, context) { return {operations: [], result: {value: input.value, api: context.api_version}}; },
+          analyze(input, observations) { return {count: observations.length, value: input.value}; }
+        };"#;
+        let plan = run_js_sync(
+            script,
+            "plan",
+            r#"{"value":7}"#,
+            "null",
+            r#"{"api_version":1}"#,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(plan["result"]["value"], 7);
+        let analysis = run_js_sync(
+            script,
+            "analyze",
+            r#"{"value":7}"#,
+            "[]",
+            "{}",
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(analysis, json!({"count":0,"value":7}));
+    }
+
+    #[test]
+    fn plugin_scope_defaults_to_exact_project_target() {
+        let scope = ScopePolicy::default();
+        assert!(
+            enforce_plugin_scope("https://example.test/a", &scope, Some("example.test")).is_ok()
+        );
+        assert_eq!(
+            enforce_plugin_scope("https://other.test/a", &scope, Some("example.test"))
+                .unwrap_err()
+                .code(),
+            ErrorCode::ScopeDenied
+        );
+    }
+
+    #[test]
+    fn package_loader_checks_integrity_and_loads_bounded_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("sample");
+        std::fs::create_dir_all(plugin.join("resources")).unwrap();
+        let script =
+            b"globalThis.HuntProxyPlugin={plan(){return {operations:[]}},analyze(){return {}}};";
+        std::fs::write(plugin.join("index.js"), script).unwrap();
+        std::fs::write(plugin.join("resources/params.txt"), "alpha\nbeta\n").unwrap();
+        let resource_bytes = b"alpha\nbeta\n";
+        let manifest = json!({
+            "schema_version": 1,
+            "id": "sample-plugin",
+            "name": "Sample Plugin",
+            "version": "1.0.0",
+            "description": "test",
+            "enabled": true,
+            "entrypoint": "index.js",
+            "entrypoint_sha256": hex::encode(Sha256::digest(script)),
+            "resources": {"params.txt": {"path":"resources/params.txt", "sha256":hex::encode(Sha256::digest(resource_bytes))}},
+            "capabilities": [],
+            "actions": [{"name":"inspect_request","description":"test","input_schema":{"type":"object"}}]
+        });
+        std::fs::write(
+            plugin.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_plugin(&plugin).unwrap();
+        assert_eq!(
+            loaded.resources.get("params.txt").map(String::as_str),
+            Some("alpha\nbeta\n")
+        );
+
+        std::fs::write(plugin.join("index.js"), "changed").unwrap();
+        assert_eq!(
+            load_plugin(&plugin).unwrap_err().code(),
+            ErrorCode::ConfigInvalid
+        );
+    }
+
+    #[test]
+    fn completed_job_retention_is_bounded_without_removing_active_jobs() {
+        let jobs = DashMap::new();
+        for _ in 0..MAX_RETAINED_JOBS {
+            let job = test_job(PluginJobState::Completed);
+            jobs.insert(job.view.read().id, job.clone());
+        }
+        let active = test_job(PluginJobState::Running);
+        let active_id = active.view.read().id;
+        jobs.insert(active_id, active);
+
+        prune_finished_jobs(&jobs);
+
+        assert_eq!(jobs.len(), MAX_RETAINED_JOBS - 1);
+        assert!(jobs.contains_key(&active_id));
+    }
+}

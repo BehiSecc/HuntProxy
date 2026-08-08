@@ -1113,6 +1113,7 @@ fn source_str(s: ExchangeSource) -> &'static str {
         ExchangeSource::Browser => "browser",
         ExchangeSource::Reply => "reply",
         ExchangeSource::Fuzzer => "fuzzer",
+        ExchangeSource::Plugin => "plugin",
         ExchangeSource::Proxy => "proxy",
         ExchangeSource::Imported => "imported",
     }
@@ -1122,6 +1123,7 @@ pub(crate) fn parse_source(s: &str) -> ExchangeSource {
         "browser" => ExchangeSource::Browser,
         "reply" => ExchangeSource::Reply,
         "fuzzer" => ExchangeSource::Fuzzer,
+        "plugin" => ExchangeSource::Plugin,
         "imported" => ExchangeSource::Imported,
         _ => ExchangeSource::Proxy,
     }

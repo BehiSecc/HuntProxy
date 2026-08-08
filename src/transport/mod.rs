@@ -58,6 +58,8 @@ pub struct OutboundRequest {
     /// Preserve caller-supplied identity headers. Wreq's protocol profile still
     /// controls TLS/HTTP2 characteristics, while explicit headers win.
     pub preserve_identity_headers: bool,
+    /// Explicit upstream proxy URL selected by the caller. None is direct.
+    pub upstream_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -171,6 +173,7 @@ struct ClientKey {
     protocol: ProtocolMode,
     connect_timeout: Duration,
     total_timeout: Duration,
+    upstream_proxy: Option<String>,
 }
 
 impl ClientKey {
@@ -187,6 +190,7 @@ impl ClientKey {
             protocol: req.protocol,
             connect_timeout: req.connect_timeout,
             total_timeout: req.total_timeout,
+            upstream_proxy: req.upstream_proxy.clone(),
         }
     }
 
@@ -249,8 +253,16 @@ impl WreqTransport {
             .pool_idle_timeout(ttl.max(Duration::from_millis(1)))
             .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .pool_max_size(MAX_CACHED_CLIENTS)
-            .dns_resolver(resolver)
             .emulation(Emulation::Chrome147);
+
+        if let Some(proxy_url) = &req.upstream_proxy {
+            let proxy = wreq::Proxy::all(proxy_url).map_err(|_| {
+                DomainError::new(ErrorCode::ConfigInvalid, "invalid upstream proxy URL")
+            })?;
+            builder = builder.proxy(proxy);
+        } else {
+            builder = builder.dns_resolver(resolver);
+        }
 
         builder = match req.protocol {
             ProtocolMode::Auto => builder,
@@ -481,6 +493,7 @@ mod tests {
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn canonicalization_removes_stale_framing() {
@@ -521,6 +534,7 @@ mod tests {
             total_timeout: Duration::from_secs(5),
             max_body_bytes: 1024,
             preserve_identity_headers: true,
+            upstream_proxy: None,
         }
     }
 
@@ -629,6 +643,7 @@ mod tests {
             total_timeout: Duration::from_secs(2),
             max_body_bytes: 1024,
             preserve_identity_headers: true,
+            upstream_proxy: None,
         };
         let transport = WreqTransport::new();
         assert_eq!(transport.send(&dial, request()).await.unwrap().body, "ok");
@@ -636,6 +651,53 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(connections.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn semantic_request_uses_explicit_http_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nproxied",
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let dial = cache_dial("192.0.2.55:80", 1);
+        let response = WreqTransport::new()
+            .send(
+                &dial,
+                OutboundRequest {
+                    method: Method::GET,
+                    url: "http://cache.test/proxy-check".into(),
+                    headers: vec![],
+                    body: OutboundBody::Empty,
+                    protocol: ProtocolMode::Http1,
+                    connect_timeout: Duration::from_secs(2),
+                    total_timeout: Duration::from_secs(2),
+                    max_body_bytes: 1024,
+                    preserve_identity_headers: true,
+                    upstream_proxy: Some(format!("http://{proxy_addr}")),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, "proxied");
+        let request = String::from_utf8(server.await.unwrap()).unwrap();
+        assert!(request.starts_with("GET http://cache.test/proxy-check HTTP/1.1\r\n"));
     }
 
     #[tokio::test]
@@ -678,6 +740,7 @@ mod tests {
                     total_timeout: Duration::from_secs(2),
                     max_body_bytes: 5,
                     preserve_identity_headers: true,
+                    upstream_proxy: None,
                 },
             )
             .await
@@ -728,6 +791,7 @@ mod tests {
                     total_timeout: Duration::from_secs(10),
                     max_body_bytes: 1024,
                     preserve_identity_headers: true,
+                    upstream_proxy: None,
                 },
             )
             .await
@@ -794,6 +858,7 @@ mod tests {
                     total_timeout: Duration::from_secs(5),
                     max_body_bytes: 1024,
                     preserve_identity_headers: true,
+                    upstream_proxy: None,
                 },
             )
             .await

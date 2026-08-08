@@ -157,6 +157,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 cfg.spool_dir = cfg.data_dir.join("spool");
                 cfg.export_dir = cfg.data_dir.join("exports");
                 cfg.runtime_dir = cfg.data_dir.join("runtime");
+                cfg.plugin_dir = cfg.data_dir.join("plugins");
             }
             cfg.ensure_layout()?;
             cfg.write_default_config()?;

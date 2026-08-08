@@ -18,6 +18,7 @@ async fn test_state() -> (TempDir, std::sync::Arc<bb::app::AppState>, ProjectId)
         spool_dir: directory.path().join("spool"),
         export_dir: directory.path().join("exports"),
         runtime_dir: directory.path().join("runtime"),
+        plugin_dir: directory.path().join("plugins"),
         browser_worker_path: Some(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("browser-worker")

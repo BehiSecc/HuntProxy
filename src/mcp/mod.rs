@@ -316,6 +316,12 @@ fn request_rules_tool_def() -> Value {
 fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List, create, or set optional capture scope. Host patterns may be exact or wildcard suffixes such as *.example.com; excluded_host_patterns always take precedence. Empty host_patterns captures every host except exclusions. Scope only controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","set_scope"]},"project_id":{"type":"integer"},"name":{"type":"string"},"target_url":{"type":"string"},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"]}},
+        {"name":"extension_list","description":"List installed HuntProxy extensions and their enabled state.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
+        {"name":"extension_run","description":"Start an asynchronous extension job. Top-level project_id and base_exchange_id select HuntProxy evidence; input is passed only to the named plugin action. Supplying base_exchange_id lets the extension derive request shapes while cookies and authorization remain host-side.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"HuntProxy project that owns the job and evidence."},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer","description":"Optional saved request inherited host-side without copying secrets into action input."},"input":{"type":"object","description":"Plugin action arguments matching extension_describe.input_schema.","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
+        {"name":"job_status","description":"Read extension job state and progress.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
+        {"name":"job_cancel","description":"Cancel an active extension job.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
+        {"name":"job_results","description":"Read the structured results of a completed extension job.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
         {"name":"capture_sessions","description":"Manage capture sessions","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string"},"session_id":{"type":"integer"}},"required":["project_id","action"]}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
@@ -329,8 +335,8 @@ fn tool_defs() -> Value {
         {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]}},"required":["project_id"]}},
-        {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally split-writing at one byte offset, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
+        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Supply draft.url and optionally method/headers/body; omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"]}},
+        {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"]}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
@@ -668,6 +674,54 @@ fn emit_event(state: &AppState, project_id: ProjectId, kind: &str, payload: Valu
 
 pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResult<Value> {
     match name {
+        "extension_list" => Ok(json!({
+            "plugin_directory": state.plugins.directory(),
+            "plugins": state.plugins.list(),
+        })),
+        "extension_describe" => {
+            let id = args
+                .get("plugin_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DomainError::invalid("plugin_id required"))?;
+            Ok(json!(state.plugins.describe(id)?))
+        }
+        "extension_run" => {
+            let project_id = require_project_id(&args)?;
+            let plugin_id = args
+                .get("plugin_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DomainError::invalid("plugin_id required"))?;
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DomainError::invalid("action required"))?;
+            let base_exchange_id = args
+                .get("base_exchange_id")
+                .or_else(|| args.get("exchange_id"))
+                .and_then(Value::as_i64)
+                .map(ExchangeId);
+            let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
+            Ok(json!(
+                state
+                    .plugins
+                    .run(project_id, plugin_id, action, base_exchange_id, input)
+                    .await?
+            ))
+        }
+        "job_status" | "job_cancel" | "job_results" => {
+            let id = args
+                .get("job_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DomainError::invalid("job_id required"))?
+                .parse::<uuid::Uuid>()
+                .map_err(|_| DomainError::invalid("job_id must be a UUID"))?;
+            let job = if name == "job_cancel" {
+                state.plugins.cancel(id)?
+            } else {
+                state.plugins.status(id)?
+            };
+            Ok(json!(job))
+        }
         "projects" => {
             let action = args
                 .get("action")
@@ -1392,7 +1446,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             };
             let result = state
                 .reply
-                .send(
+                .send_with_proxy(
                     project_id,
                     args.get("tab_id").and_then(|v| v.as_i64()).map(ReplyTabId),
                     args.get("base_exchange_id")
@@ -1401,6 +1455,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     &draft,
                     protocol,
                     0,
+                    args.get("upstream_proxy").and_then(Value::as_str),
                 )
                 .await?;
             if let Some(exchange_id) = result.exchange_id {
@@ -2206,6 +2261,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = Config {
             data_dir: directory.path().to_path_buf(),
+            plugin_dir: directory.path().join("plugins"),
             ..Config::default()
         };
         arm_stop_guard(&config).unwrap();

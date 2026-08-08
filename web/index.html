@@ -366,6 +366,8 @@
             <div><label for="replyBody">Body override</label><textarea id="replyBody"></textarea></div>
           </div>
           <label><input type="checkbox" id="replyClearBody" style="width:auto" /> Clear inherited body</label>
+          <label for="replyUpstreamProxy">Upstream proxy for this send (optional)</label>
+          <input id="replyUpstreamProxy" placeholder="http://127.0.0.1:8080 or socks5h://127.0.0.1:1080" />
           <div class="row">
             <button class="btn" id="saveReply">Save tab</button>
             <button class="btn primary" id="sendReply">Send</button>
@@ -1226,7 +1228,7 @@ test
       if (!state.projectId) return status('replyStatus', 'Select a project', 'err');
       try {
         const tab = await saveReplyTab();
-        const result = await api(`/api/v1/projects/${state.projectId}/reply-send`, { method: 'POST', body: JSON.stringify({ tab_id: tab.id, protocol: $('replyProtocol').value }) });
+        const result = await api(`/api/v1/projects/${state.projectId}/reply-send`, { method: 'POST', body: JSON.stringify({ tab_id: tab.id, protocol: $('replyProtocol').value, upstream_proxy: $('replyUpstreamProxy').value.trim() || null }) });
         $('replyResult').classList.remove('hidden'); $('replyResult').textContent = JSON.stringify(result, null, 2);
         status('replyStatus', result.exchange_id ? `Sent as exchange ${result.exchange_id}` : 'Sent (outside capture scope)', 'ok');
         if (result.exchange_id) loadHistory();
@@ -1248,6 +1250,7 @@ test
             encoding: 'utf8',
             tab_id: state.activeReplyTab?.id || null,
             use_project_cookies: $('rawReplyCookies').checked,
+            upstream_proxy: $('replyUpstreamProxy').value.trim() || null,
             pause_at_byte: optionalInteger('rawReplyPauseAt'),
             pause_ms: optionalInteger('rawReplyPauseMs'),
             half_close_write: $('rawReplyHalfClose').checked,
