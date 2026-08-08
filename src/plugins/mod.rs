@@ -47,6 +47,7 @@ const MAX_WORKFLOW_VALUE_BYTES: usize = 8 * 1024;
 const MAX_WORKFLOW_VALUES_BYTES: usize = 64 * 1024;
 const MAX_RAW_HTTP1_GROUP_MEMBERS: usize = 32;
 const MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_HTTP_REQUEST_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -326,6 +327,8 @@ struct PluginRawHttp2 {
 #[derive(Debug, Clone, Deserialize)]
 struct PluginHttpRequest {
     id: String,
+    #[serde(default)]
+    delay_before_ms: u64,
     base_exchange_id: Option<ExchangeId>,
     method: Option<String>,
     url: Option<String>,
@@ -1388,6 +1391,13 @@ impl PluginService {
     ) -> DomainResult<Value> {
         match operation {
             PluginOperation::HttpRequest(request) => {
+                let delay = plugin_http_request_delay(request.delay_before_ms)?;
+                if !delay.is_zero() {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
                 let operation_id = request.id.clone();
                 let effective_url = if let Some(url) = request.url.as_deref() {
                     url.to_string()
@@ -2837,6 +2847,15 @@ fn plugin_raw_request_bytes(
     Some((raw, true))
 }
 
+fn plugin_http_request_delay(milliseconds: u64) -> DomainResult<Duration> {
+    if milliseconds > MAX_HTTP_REQUEST_DELAY_MS {
+        return Err(DomainError::invalid(format!(
+            "plugin HTTP request delay_before_ms exceeds {MAX_HTTP_REQUEST_DELAY_MS} ms"
+        )));
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
 fn operation_request_count(operation: &PluginOperation) -> usize {
     match operation {
         PluginOperation::RaceGroup(group) => group.requests.len(),
@@ -3747,6 +3766,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(cancelled.code(), ErrorCode::Cancelled);
         assert_eq!(normalize_operation_label("a:b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn semantic_plugin_request_delays_are_bounded() {
+        assert_eq!(plugin_http_request_delay(0).unwrap(), Duration::ZERO);
+        assert_eq!(
+            plugin_http_request_delay(MAX_HTTP_REQUEST_DELAY_MS).unwrap(),
+            Duration::from_millis(MAX_HTTP_REQUEST_DELAY_MS)
+        );
+        assert_eq!(
+            plugin_http_request_delay(MAX_HTTP_REQUEST_DELAY_MS + 1)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
     }
 
     #[test]
