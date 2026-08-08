@@ -151,6 +151,18 @@ struct PluginPlan {
     operations: Vec<PluginOperation>,
     #[serde(default)]
     result: Value,
+    #[serde(default)]
+    execution: PluginExecution,
+    #[serde(default)]
+    stop_on_error: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PluginExecution {
+    #[default]
+    Parallel,
+    Sequential,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -576,6 +588,11 @@ impl PluginService {
         let plan_value = run_js_stage(&plugin, "plan", input, &Value::Null, &context).await?;
         let plan: PluginPlan = serde_json::from_value(plan_value)
             .map_err(|error| DomainError::invalid(format!("invalid plugin plan: {error}")))?;
+        if plan.stop_on_error && plan.execution != PluginExecution::Sequential {
+            return Err(DomainError::invalid(
+                "stop_on_error requires execution=sequential",
+            ));
+        }
         let max_operations = plugin
             .manifest
             .limits
@@ -586,11 +603,7 @@ impl PluginService {
             .operations
             .iter()
             .try_fold(0usize, |count, operation| {
-                count.checked_add(match operation {
-                    PluginOperation::RaceGroup(group) => group.requests.len(),
-                    PluginOperation::RawHttp2(request) => request.streams.len(),
-                    _ => 1,
-                })
+                count.checked_add(operation_request_count(operation))
             })
             .unwrap_or(usize::MAX);
         if planned_requests > max_operations {
@@ -631,35 +644,76 @@ impl PluginService {
             .ok()
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
         let rate = project.limits.requests_per_second.max(0.1);
-        let operations = stream::iter(plan.operations.into_iter().enumerate().map(|(index, operation)| {
-            let service = self.clone();
-            let job = job.clone();
-            let plugin_id = plugin.manifest.id.clone();
-                    let plugin_name = plugin.manifest.name.clone();
-                    let scope = project.scope.clone();
-                    let target_host = target_host.clone();
-                    async move {
-                        let operation_id = operation.id().to_string();
-                        let completed_count = match &operation {
-                            PluginOperation::RaceGroup(group) => group.requests.len(),
-                            PluginOperation::RawHttp2(request) => request.streams.len(),
-                            _ => 1,
-                        };
-                let wait = Duration::from_secs_f64(index as f64 / rate);
-                tokio::select! {
-                    _ = job.cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                    _ = tokio::time::sleep(wait) => {}
+        let operations = if plan.execution == PluginExecution::Sequential {
+            let mut observations = Vec::with_capacity(plan.operations.len());
+            let mut operations = plan.operations.into_iter().peekable();
+            let mut index = 0usize;
+            while let Some(operation) = operations.next() {
+                if index > 0 {
+                    tokio::select! {
+                        _ = job.cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                        _ = tokio::time::sleep(Duration::from_secs_f64(1.0 / rate)) => {}
+                    }
                 }
-                let result = service
-                    .execute_operation(project_id, &plugin_id, &plugin_name, operation, &scope, target_host.as_deref(), &job.cancel)
+                let operation_id = operation.id().to_string();
+                let completed_count = operation_request_count(&operation);
+                let result = self
+                    .execute_operation(
+                        project_id,
+                        &plugin.manifest.id,
+                        &plugin.manifest.name,
+                        operation,
+                        &project.scope,
+                        target_host.as_deref(),
+                        &job.cancel,
+                    )
                     .await;
-                        job.view.write().completed_operations += completed_count;
-                isolate_operation_result(operation_id, result)
+                job.view.write().completed_operations += completed_count;
+                let observation = isolate_operation_result(operation_id, result);
+                let failed = observation
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|value| value.get("error").is_some_and(|error| !error.is_null()));
+                observations.push(observation);
+                if failed && plan.stop_on_error {
+                    for skipped in operations {
+                        observations.push(Ok(json!({
+                            "id": skipped.id(),
+                            "skipped": {"reason":"previous operation failed"},
+                        })));
+                    }
+                    break;
+                }
+                index += 1;
             }
-        }))
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
-        .await;
+            observations
+        } else {
+            stream::iter(plan.operations.into_iter().enumerate().map(|(index, operation)| {
+                let service = self.clone();
+                let job = job.clone();
+                let plugin_id = plugin.manifest.id.clone();
+                let plugin_name = plugin.manifest.name.clone();
+                let scope = project.scope.clone();
+                let target_host = target_host.clone();
+                async move {
+                    let operation_id = operation.id().to_string();
+                    let completed_count = operation_request_count(&operation);
+                    let wait = Duration::from_secs_f64(index as f64 / rate);
+                    tokio::select! {
+                        _ = job.cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    let result = service
+                        .execute_operation(project_id, &plugin_id, &plugin_name, operation, &scope, target_host.as_deref(), &job.cancel)
+                        .await;
+                    job.view.write().completed_operations += completed_count;
+                    isolate_operation_result(operation_id, result)
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+        };
         let observations = operations.into_iter().collect::<DomainResult<Vec<_>>>()?;
         if job.cancel.is_cancelled() {
             return Err(DomainError::new(
@@ -2238,6 +2292,14 @@ fn normalize_operation_label(operation_id: &str) -> String {
     label
 }
 
+fn operation_request_count(operation: &PluginOperation) -> usize {
+    match operation {
+        PluginOperation::RaceGroup(group) => group.requests.len(),
+        PluginOperation::RawHttp2(request) => request.streams.len(),
+        _ => 1,
+    }
+}
+
 fn isolate_operation_result(
     operation_id: String,
     result: DomainResult<Value>,
@@ -2603,6 +2665,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(analysis, json!({"count":0,"value":7}));
+    }
+
+    #[test]
+    fn plugin_plans_can_require_ordered_stop_on_error_execution() {
+        let sequential: PluginPlan = serde_json::from_value(json!({
+            "execution": "sequential",
+            "stop_on_error": true,
+            "operations": [],
+            "result": {}
+        }))
+        .unwrap();
+        assert_eq!(sequential.execution, PluginExecution::Sequential);
+        assert!(sequential.stop_on_error);
+
+        let default: PluginPlan = serde_json::from_value(json!({
+            "operations": [],
+            "result": {}
+        }))
+        .unwrap();
+        assert_eq!(default.execution, PluginExecution::Parallel);
+        assert!(!default.stop_on_error);
     }
 
     #[test]
