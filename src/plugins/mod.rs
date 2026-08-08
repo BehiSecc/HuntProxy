@@ -916,20 +916,30 @@ impl PluginService {
             }
             observations
         } else {
-            stream::iter(plan.operations.into_iter().enumerate().map(|(index, operation)| {
+            let spacing = Duration::from_secs_f64(1.0 / rate);
+            let next_slot = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+            stream::iter(plan.operations.into_iter().map(|operation| {
                 let service = self.clone();
                 let job = job.clone();
                 let plugin_id = plugin.manifest.id.clone();
                 let plugin_name = plugin.manifest.name.clone();
                 let scope = project.scope.clone();
                 let target_host = target_host.clone();
+                let next_slot = next_slot.clone();
                 async move {
                     let operation_id = operation.id().to_string();
                     let completed_count = operation_request_count(&operation);
-                    let wait = Duration::from_secs_f64(index as f64 / rate);
+                    let ready_at = {
+                        let mut next = next_slot.lock().await;
+                        reserve_plugin_request_slot(
+                            &mut next,
+                            tokio::time::Instant::now(),
+                            spacing,
+                        )
+                    };
                     tokio::select! {
                         _ = job.cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                        _ = tokio::time::sleep(wait) => {}
+                        _ = tokio::time::sleep_until(ready_at) => {}
                     }
                     let result = service
                         .execute_operation(project_id, &plugin_id, &plugin_name, operation, &scope, target_host.as_deref(), &job.cancel)
@@ -2856,6 +2866,16 @@ fn plugin_http_request_delay(milliseconds: u64) -> DomainResult<Duration> {
     Ok(Duration::from_millis(milliseconds))
 }
 
+fn reserve_plugin_request_slot(
+    next: &mut tokio::time::Instant,
+    now: tokio::time::Instant,
+    spacing: Duration,
+) -> tokio::time::Instant {
+    let ready_at = (*next).max(now);
+    *next = ready_at + spacing;
+    ready_at
+}
+
 fn operation_request_count(operation: &PluginOperation) -> usize {
     match operation {
         PluginOperation::RaceGroup(group) => group.requests.len(),
@@ -3781,6 +3801,30 @@ mod tests {
                 .code(),
             ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn concurrent_plugin_rate_slots_are_evenly_spaced_without_cumulative_waits() {
+        let start = tokio::time::Instant::now();
+        let spacing = Duration::from_millis(100);
+        let mut next = start;
+
+        assert_eq!(
+            reserve_plugin_request_slot(&mut next, start, spacing),
+            start
+        );
+        assert_eq!(
+            reserve_plugin_request_slot(&mut next, start, spacing),
+            start + spacing
+        );
+        assert_eq!(next, start + spacing * 2);
+
+        let after_idle = start + Duration::from_secs(1);
+        assert_eq!(
+            reserve_plugin_request_slot(&mut next, after_idle, spacing),
+            after_idle
+        );
+        assert_eq!(next, after_idle + spacing);
     }
 
     #[test]
