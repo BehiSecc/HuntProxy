@@ -45,6 +45,7 @@ const MAX_WORKFLOW_STEPS: usize = 64;
 const MAX_WORKFLOW_EXTRACTS_PER_STEP: usize = 16;
 const MAX_WORKFLOW_VALUE_BYTES: usize = 8 * 1024;
 const MAX_WORKFLOW_VALUES_BYTES: usize = 64 * 1024;
+const MAX_RAW_HTTP1_GROUP_MEMBERS: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -180,6 +181,7 @@ enum PluginOperation {
     HttpRequest(PluginHttpRequest),
     HttpWorkflow(PluginHttpWorkflow),
     RawHttp1(PluginRawHttp1),
+    RawHttp1Group(PluginRawHttp1Group),
     RawHttp2(PluginRawHttp2),
     RaceGroup(PluginRaceGroup),
 }
@@ -190,6 +192,7 @@ impl PluginOperation {
             Self::HttpRequest(request) => &request.id,
             Self::HttpWorkflow(workflow) => &workflow.id,
             Self::RawHttp1(request) => &request.id,
+            Self::RawHttp1Group(group) => &group.id,
             Self::RawHttp2(request) => &request.id,
             Self::RaceGroup(group) => &group.id,
         }
@@ -282,6 +285,26 @@ struct RaceOptions {
 struct PluginRawHttp1 {
     id: String,
     target_url: String,
+    request_utf8: Option<String>,
+    request_base64: Option<String>,
+    #[serde(default)]
+    use_project_cookies: bool,
+    #[serde(default)]
+    options: crate::reply::RawHttp1Options,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginRawHttp1Group {
+    id: String,
+    target_url: String,
+    members: Vec<PluginRawHttp1GroupMember>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginRawHttp1GroupMember {
+    id: String,
     request_utf8: Option<String>,
     request_base64: Option<String>,
     #[serde(default)]
@@ -816,6 +839,7 @@ impl PluginService {
                 PluginOperation::HttpRequest(_) => "http.semantic",
                 PluginOperation::HttpWorkflow(_) => "http.semantic",
                 PluginOperation::RawHttp1(_) => "http.raw",
+                PluginOperation::RawHttp1Group(_) => "http.raw",
                 PluginOperation::RawHttp2(_) => "http.raw",
                 PluginOperation::RaceGroup(_) => "http.race",
             };
@@ -1654,6 +1678,121 @@ impl PluginService {
                 };
                 let raw = plugin_raw_observation(&response, transcript)?;
                 Ok(json!({"id":request.id,"raw":raw}))
+            }
+            PluginOperation::RawHttp1Group(group) => {
+                validate_workflow_name(&group.id, "raw_http1_group id")?;
+                if group.members.len() < 2 || group.members.len() > MAX_RAW_HTTP1_GROUP_MEMBERS {
+                    return Err(DomainError::new(
+                        ErrorCode::CombinationLimit,
+                        format!(
+                            "raw_http1_group requires 2..={MAX_RAW_HTTP1_GROUP_MEMBERS} members"
+                        ),
+                    ));
+                }
+                enforce_plugin_scope(&group.target_url, scope, target_host)?;
+                let project_limit = self
+                    .db
+                    .get_project(project_id)
+                    .await?
+                    .limits
+                    .max_concurrent_requests
+                    .max(1) as usize;
+                if group.members.len() > project_limit {
+                    return Err(DomainError::new(
+                        ErrorCode::ConcurrencyLimited,
+                        format!("raw_http1_group requires {} concurrent connections; project limit is {project_limit}", group.members.len()),
+                    ));
+                }
+                let mut ids = BTreeSet::new();
+                let mut prepared = Vec::with_capacity(group.members.len());
+                for (index, member) in group.members.into_iter().enumerate() {
+                    validate_workflow_name(&member.id, "raw_http1_group member id")?;
+                    if !ids.insert(member.id.clone()) {
+                        return Err(DomainError::invalid(format!(
+                            "duplicate raw_http1_group member id: {}",
+                            member.id
+                        )));
+                    }
+                    let has_utf8 = member.request_utf8.is_some();
+                    let has_base64 = member.request_base64.is_some();
+                    if has_utf8 == has_base64 {
+                        return Err(DomainError::invalid(format!(
+                            "raw_http1_group member {} requires exactly one of request_utf8 or request_base64",
+                            member.id
+                        )));
+                    }
+                    let bytes = match (member.request_utf8, member.request_base64) {
+                        (Some(value), None) => value.into_bytes(),
+                        (None, Some(value)) => base64::engine::general_purpose::STANDARD
+                            .decode(value)
+                            .map_err(|error| {
+                                DomainError::invalid(format!(
+                                    "invalid raw_http1_group request_base64 for {}: {error}",
+                                    member.id
+                                ))
+                            })?,
+                        _ => unreachable!(),
+                    };
+                    prepared.push((
+                        index,
+                        member.id,
+                        bytes,
+                        member.use_project_cookies,
+                        member.options,
+                    ));
+                }
+                let member_count = prepared.len();
+                let barrier = Arc::new(tokio::sync::Barrier::new(member_count));
+                let group_id = group.id;
+                let target_url = group.target_url;
+                let results = stream::iter(prepared.into_iter().map(|(index, member_id, bytes, use_project_cookies, mut options)| {
+                    let service = self.clone();
+                    let cancel = cancel.clone();
+                    let barrier = barrier.clone();
+                    let target_url = target_url.clone();
+                    let plugin_id = plugin_id.to_string();
+                    let plugin_name = plugin_name.to_string();
+                    let operation_id = format!("{group_id}:{member_id}");
+                    async move {
+                        options.start_barrier = Some(barrier);
+                        let result = tokio::select! {
+                            _ = cancel.cancelled() => Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                            response = service.reply.send_raw_http1_with_context(
+                                project_id,
+                                &target_url,
+                                bytes,
+                                use_project_cookies,
+                                options,
+                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default() },
+                            ) => response,
+                        };
+                        let observation = match result {
+                            Ok(response) => {
+                                if let Some(exchange_id) = response.exchange_id {
+                                    service.annotate_plugin_exchange(project_id, exchange_id, &plugin_id, &plugin_name, &operation_id).await?;
+                                }
+                                let transcript = match response.exchange_id {
+                                    Some(exchange_id) => service.db.load_raw_body(project_id, exchange_id, MessageSide::Response).await?,
+                                    None => None,
+                                };
+                                json!({"id":member_id,"raw":plugin_raw_observation(&response, transcript)?})
+                            }
+                            Err(error) if error.code() == ErrorCode::Cancelled => return Err(error),
+                            Err(error) => json!({"id":member_id,"error":{"code":error.code().as_str(),"message":error.to_string()}}),
+                        };
+                        Ok::<_, DomainError>((index, observation))
+                    }
+                }))
+                .buffer_unordered(member_count)
+                .collect::<Vec<_>>()
+                .await;
+                let mut members = results.into_iter().collect::<DomainResult<Vec<_>>>()?;
+                members.sort_by_key(|(index, _)| *index);
+                Ok(json!({
+                    "id": group_id,
+                    "dispatch": "parallel_barrier",
+                    "members": members.into_iter().map(|(_, observation)| observation).collect::<Vec<_>>(),
+                }))
             }
             PluginOperation::RawHttp2(request) => {
                 let operation_id = request.id.clone();
@@ -2662,6 +2801,7 @@ fn operation_request_count(operation: &PluginOperation) -> usize {
     match operation {
         PluginOperation::RaceGroup(group) => group.requests.len(),
         PluginOperation::RawHttp2(request) => request.streams.len(),
+        PluginOperation::RawHttp1Group(group) => group.members.len(),
         PluginOperation::HttpWorkflow(workflow) => workflow.steps.len(),
         _ => 1,
     }
@@ -3148,6 +3288,30 @@ fn run_js_sync(
 mod tests {
     use super::*;
 
+    struct UnusedTransport;
+
+    #[async_trait::async_trait]
+    impl crate::transport::SemanticTransport for UnusedTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            _request: crate::transport::OutboundRequest,
+        ) -> DomainResult<crate::transport::OutboundResponse> {
+            Err(DomainError::new(
+                ErrorCode::Internal,
+                "semantic transport is unused by raw HTTP tests",
+            ))
+        }
+
+        fn profile_name(&self) -> &str {
+            "unused"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
     fn test_job(state: PluginJobState) -> Arc<PluginJob> {
         Arc::new(PluginJob {
             view: parking_lot::RwLock::new(PluginJobView {
@@ -3269,6 +3433,141 @@ mod tests {
             panic!("expected workflow")
         };
         assert_eq!(workflow.steps[0].extract[0].name(), "csrf");
+    }
+
+    #[tokio::test]
+    async fn raw_http1_group_barriers_two_connections_and_persists_provenance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let server_arrived = arrived.clone();
+        let server = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                server_arrived.fetch_add(1, Ordering::SeqCst);
+                let observed = server_arrived.clone();
+                handlers.push(tokio::spawn(async move {
+                    let mut request = vec![0; 1024];
+                    let size = socket.read(&mut request).await.unwrap();
+                    let arrivals_when_request_arrived = observed.load(Ordering::SeqCst);
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                    (request[..size].to_vec(), arrivals_when_request_arrived)
+                }));
+            }
+            let mut received = Vec::new();
+            for handler in handlers {
+                received.push(handler.await.unwrap());
+            }
+            received
+        });
+
+        // A file-backed database is required here because the group deliberately
+        // uses multiple pool connections at once; independent SQLite `:memory:`
+        // connections do not share a schema.
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().join("data"))).unwrap();
+        let db = Arc::new(crate::storage::Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "raw group".into(),
+                target_url: format!("http://{address}"),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![7; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let plugin_directory = directory.path().join("plugins-under-test");
+        let service = PluginService::load(plugin_directory, db.clone(), reply).unwrap();
+        let operation: PluginOperation = serde_json::from_value(json!({
+            "type": "raw_http1_group",
+            "id": "pair",
+            "target_url": format!("http://{address}/"),
+            "members": [{
+                "id": "first",
+                "request_utf8": format!("GET /first HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+            }, {
+                "id": "second",
+                "request_utf8": format!("GET /second HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+            }]
+        }))
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            service.execute_operation(
+                project.id,
+                "request-smuggler",
+                "Request Smuggler",
+                operation,
+                &project.scope,
+                Some("127.0.0.1"),
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("raw HTTP/1 group timed out")
+        .unwrap();
+        assert!(
+            result["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|member| member.get("error").is_none()),
+            "raw group member failed: {result}"
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("local raw group server timed out")
+            .unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(received
+            .iter()
+            .all(|(_, arrivals_when_request_arrived)| *arrivals_when_request_arrived == 2));
+        assert!(received
+            .iter()
+            .any(|(request, _)| request.starts_with(b"GET /first ")));
+        assert!(received
+            .iter()
+            .any(|(request, _)| request.starts_with(b"GET /second ")));
+        assert_eq!(result["dispatch"], "parallel_barrier");
+        assert_eq!(result["members"][0]["id"], "first");
+        assert_eq!(result["members"][1]["id"], "second");
+
+        for (index, member) in ["first", "second"].iter().enumerate() {
+            let exchange_id = ExchangeId(
+                result["members"][index]["raw"]["exchange_id"]
+                    .as_i64()
+                    .unwrap(),
+            );
+            let annotation = db
+                .get_annotation(project.id, exchange_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(annotation.labels.iter().any(|label| label == "plugin"));
+            assert!(annotation
+                .labels
+                .iter()
+                .any(|label| label == "plugin:request-smuggler"));
+            assert!(annotation
+                .labels
+                .iter()
+                .any(|label| label == &format!("plugin-op:pair_{member}")));
+        }
     }
 
     #[test]

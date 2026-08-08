@@ -47,6 +47,10 @@ pub struct RawHttp1Options {
     /// never accepted from or exposed through serialized API input.
     #[serde(skip)]
     pub release_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    /// Internal barrier used by bounded raw groups after every connection is
+    /// established but before any request byte is written.
+    #[serde(skip)]
+    pub start_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 impl Default for RawHttp1Options {
@@ -61,6 +65,7 @@ impl Default for RawHttp1Options {
             read_timeout_ms: 60_000,
             idle_timeout_ms: 1_000,
             release_barrier: None,
+            start_barrier: None,
         }
     }
 }
@@ -222,6 +227,7 @@ impl ReplyService {
         if target.scheme == "https" {
             stream = connect_tls(stream, &target.host).await?;
         }
+        wait_for_start_barrier(options.start_barrier.as_ref()).await?;
         let response_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
         let response_to_head = parse_request_method(&request_bytes)
             .is_some_and(|method| method.eq_ignore_ascii_case("HEAD"));
@@ -340,6 +346,20 @@ impl ReplyService {
                 base64::engine::general_purpose::STANDARD.encode(&raw_response)
             }),
         })
+    }
+}
+
+async fn wait_for_start_barrier(
+    barrier: Option<&std::sync::Arc<tokio::sync::Barrier>>,
+) -> DomainResult<()> {
+    let Some(barrier) = barrier else {
+        return Ok(());
+    };
+    tokio::select! {
+        _ = barrier.wait() => Ok(()),
+        _ = tokio::time::sleep(Duration::from_secs(15)) => {
+            Err(DomainError::new(ErrorCode::Timeout, "raw request start barrier timed out"))
+        }
     }
 }
 
