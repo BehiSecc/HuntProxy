@@ -1,8 +1,10 @@
 //! Reply drafts, placeholder resolution, send orchestration.
 
 mod raw;
+mod raw_h2;
 
 pub use raw::*;
+pub use raw_h2::*;
 
 use crate::codec::{decode_content_encodings, MAX_DECODED_BODY_OUTPUT};
 use crate::domain::*;

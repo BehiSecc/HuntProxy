@@ -27,6 +27,10 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 http = "1"
+# Low-level HTTP/2 framing is exposed only through the bounded extension host.
+# The unstable feature makes the crate's frame codec public; HuntProxy still
+# owns every socket, scope check, byte limit, timeout, and persisted exchange.
+http2 = { version = "=0.5.19", features = ["unstable"] }
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "set-header"] }

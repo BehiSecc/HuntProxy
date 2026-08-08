@@ -316,6 +316,7 @@ dependencies = [
  "html-escape",
  "http",
  "http-body-util",
+ "http2",
  "hyper",
  "hyper-util",
  "libc",

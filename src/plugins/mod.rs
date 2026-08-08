@@ -158,6 +158,7 @@ struct PluginPlan {
 enum PluginOperation {
     HttpRequest(PluginHttpRequest),
     RawHttp1(PluginRawHttp1),
+    RawHttp2(PluginRawHttp2),
     RaceGroup(PluginRaceGroup),
 }
 
@@ -166,6 +167,7 @@ impl PluginOperation {
         match self {
             Self::HttpRequest(request) => &request.id,
             Self::RawHttp1(request) => &request.id,
+            Self::RawHttp2(request) => &request.id,
             Self::RaceGroup(group) => &group.id,
         }
     }
@@ -263,6 +265,15 @@ struct PluginRawHttp1 {
     use_project_cookies: bool,
     #[serde(default)]
     options: crate::reply::RawHttp1Options,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginRawHttp2 {
+    id: String,
+    target_url: String,
+    streams: Vec<crate::reply::RawHttp2Stream>,
+    #[serde(default)]
+    options: crate::reply::RawHttp2Options,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -577,6 +588,7 @@ impl PluginService {
             .try_fold(0usize, |count, operation| {
                 count.checked_add(match operation {
                     PluginOperation::RaceGroup(group) => group.requests.len(),
+                    PluginOperation::RawHttp2(request) => request.streams.len(),
                     _ => 1,
                 })
             })
@@ -591,6 +603,7 @@ impl PluginService {
             let required = match operation {
                 PluginOperation::HttpRequest(_) => "http.semantic",
                 PluginOperation::RawHttp1(_) => "http.raw",
+                PluginOperation::RawHttp2(_) => "http.raw",
                 PluginOperation::RaceGroup(_) => "http.race",
             };
             if !plugin
@@ -629,6 +642,7 @@ impl PluginService {
                         let operation_id = operation.id().to_string();
                         let completed_count = match &operation {
                             PluginOperation::RaceGroup(group) => group.requests.len(),
+                            PluginOperation::RawHttp2(request) => request.streams.len(),
                             _ => 1,
                         };
                 let wait = Duration::from_secs_f64(index as f64 / rate);
@@ -1217,6 +1231,85 @@ impl PluginService {
                 let raw = plugin_raw_observation(&response, transcript)?;
                 Ok(json!({"id":request.id,"raw":raw}))
             }
+            PluginOperation::RawHttp2(request) => {
+                let operation_id = request.id.clone();
+                enforce_plugin_scope(&request.target_url, scope, target_host)?;
+                let response = tokio::select! {
+                    _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                    response = self.reply.send_raw_http2_with_context(
+                        project_id,
+                        &request.target_url,
+                        request.streams,
+                        request.options,
+                        ReplySendContext {
+                            source: ExchangeSource::Plugin,
+                            lineage: ExchangeLineage::default(),
+                        },
+                    ) => response?,
+                };
+                let mut streams = Vec::with_capacity(response.streams.len());
+                for stream in response.streams {
+                    let mut response_headers = Vec::new();
+                    let mut response_body_base64 = None;
+                    let mut response_body_hash = None;
+                    let mut response_body_truncated = false;
+                    if let Some(exchange_id) = stream.exchange_id {
+                        self.annotate_plugin_exchange(
+                            project_id,
+                            exchange_id,
+                            plugin_id,
+                            plugin_name,
+                            &format!("{}:{}", operation_id, stream.id),
+                        )
+                        .await?;
+                        let raw_headers = self
+                            .db
+                            .load_raw_headers(project_id, exchange_id, MessageSide::Response)
+                            .await?;
+                        response_headers = raw_headers
+                            .iter()
+                            .map(|header| json!({"name": header.name, "value_base64": base64::engine::general_purpose::STANDARD.encode(&header.value)}))
+                            .collect();
+                        if let Some(body) = self
+                            .db
+                            .load_raw_body(project_id, exchange_id, MessageSide::Response)
+                            .await?
+                        {
+                            let presented = plugin_response_body(&raw_headers, body);
+                            response_body_hash = presented.body_base64.as_ref().map(|encoded| {
+                                let bytes = base64::engine::general_purpose::STANDARD
+                                    .decode(encoded)
+                                    .unwrap_or_default();
+                                hex::encode(Sha256::digest(bytes))
+                            });
+                            response_body_base64 = presented.body_base64;
+                            response_body_truncated = presented.truncated;
+                        }
+                    }
+                    streams.push(json!({
+                        "id": stream.id,
+                        "stream_id": stream.stream_id,
+                        "exchange_id": stream.exchange_id,
+                        "status_code": stream.status_code,
+                        "response_length": stream.response_length,
+                        "response_body_hash": response_body_hash,
+                        "response_headers": response_headers,
+                        "response_body_base64": response_body_base64,
+                        "response_body_truncated": response_body_truncated,
+                        "reset": stream.reset,
+                        "complete": stream.complete,
+                        "truncated": stream.truncated,
+                    }));
+                }
+                Ok(json!({
+                    "id": operation_id,
+                    "protocol": response.negotiated_protocol,
+                    "single_write_release": response.single_write_release,
+                    "goaway": response.goaway,
+                    "timed_out": response.timed_out,
+                    "streams": streams,
+                }))
+            }
             PluginOperation::RaceGroup(group) => {
                 if group.requests.is_empty() || group.requests.len() > 1000 {
                     return Err(DomainError::new(
@@ -1256,19 +1349,20 @@ impl PluginService {
                         format!("last_byte_sync requires {} concurrent connections; project limit is {project_limit}", group.requests.len()),
                     ));
                 }
-                if matches!(group.technique, RaceTechnique::H2SinglePacket) {
-                    return Ok(json!({
-                        "id": group.id,
-                        "technique": "h2_single_packet",
-                        "attempt": group.attempt,
-                        "synchronized": false,
-                        "release_skew_ms": Value::Null,
-                        "responses": [],
-                        "error": {"code":"protocol_incompatible","message":"h2_single_packet requires true HTTP/2 final-frame coalescing and is not available in this runtime"},
-                    }));
-                }
                 let responses = match group.technique {
-                    RaceTechnique::H2SinglePacket => unreachable!(),
+                    RaceTechnique::H2SinglePacket => {
+                        return self
+                            .send_race_h2_single_packet(
+                                project_id,
+                                plugin_id,
+                                plugin_name,
+                                group,
+                                scope,
+                                target_host,
+                                cancel,
+                            )
+                            .await;
+                    }
                     RaceTechnique::SequentialControl => {
                         let mut responses = Vec::with_capacity(group.requests.len());
                         for request in group.requests {
@@ -1411,6 +1505,250 @@ impl PluginService {
             Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_length,"response_body_hash":response.response_body_hash,"duration_ms":response.duration_ms,"success":success,"error":Value::Null}))
         }.await;
         result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
+    }
+
+    async fn send_race_h2_single_packet(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        plugin_name: &str,
+        group: PluginRaceGroup,
+        scope: &ScopePolicy,
+        target_host: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> DomainResult<Value> {
+        let group_id = group.id.clone();
+        let attempt = group.attempt;
+        let timeout_ms = group
+            .options
+            .timeout_ms
+            .unwrap_or(60_000)
+            .clamp(1_000, 120_000);
+        let mut target_url = None::<String>;
+        let mut streams = Vec::with_capacity(group.requests.len());
+        let mut predicates = HashMap::new();
+        for request in group.requests {
+            let draft = race_request_draft(&request)?;
+            let materialized = crate::reply::materialize_request(
+                &self.db,
+                project_id,
+                request.base_exchange_id,
+                &draft,
+                self.reply.placeholder_key(),
+            )
+            .await?;
+            enforce_plugin_scope(&materialized.url, scope, target_host)?;
+            let parsed = url::Url::parse(&materialized.url).map_err(|error| {
+                DomainError::invalid(format!("invalid race request URL: {error}"))
+            })?;
+            if parsed.scheme() != "https" {
+                return Ok(json!({
+                    "id": group_id,
+                    "technique": "h2_single_packet",
+                    "attempt": attempt,
+                    "synchronized": false,
+                    "release_skew_ms": Value::Null,
+                    "responses": [],
+                    "error": {"code":"protocol_incompatible","message":"h2_single_packet requires HTTPS with ALPN h2"},
+                }));
+            }
+            let origin = format!(
+                "{}://{}:{}",
+                parsed.scheme(),
+                parsed.host_str().unwrap_or_default(),
+                parsed.port_or_known_default().unwrap_or(443)
+            );
+            if let Some(existing) = &target_url {
+                let existing = url::Url::parse(existing).map_err(|error| {
+                    DomainError::invalid(format!("invalid race target URL: {error}"))
+                })?;
+                let existing_origin = format!(
+                    "{}://{}:{}",
+                    existing.scheme(),
+                    existing.host_str().unwrap_or_default(),
+                    existing.port_or_known_default().unwrap_or(443)
+                );
+                if existing_origin != origin {
+                    return Err(DomainError::invalid(
+                        "h2_single_packet requests must share one HTTPS origin",
+                    ));
+                }
+            } else {
+                target_url = Some(materialized.url.clone());
+            }
+            let body = materialized.body.unwrap_or_default();
+            if body.is_empty() {
+                return Ok(json!({
+                    "id": group_id,
+                    "technique": "h2_single_packet",
+                    "attempt": attempt,
+                    "synchronized": false,
+                    "release_skew_ms": Value::Null,
+                    "responses": [],
+                    "error": {"code":"protocol_incompatible","message":"h2_single_packet requires a non-empty request body on every request"},
+                }));
+            }
+            let authority = match (parsed.host_str(), parsed.port()) {
+                (Some(host), Some(port)) if host.contains(':') => format!("[{host}]:{port}"),
+                (Some(host), Some(port)) => format!("{host}:{port}"),
+                (Some(host), None) => host.to_string(),
+                _ => return Err(DomainError::invalid("race request URL requires a host")),
+            };
+            let mut path = parsed.path().to_string();
+            if let Some(query) = parsed.query() {
+                path.push('?');
+                path.push_str(query);
+            }
+            let mut headers = vec![
+                crate::reply::RawHttp2Header {
+                    name: ":method".into(),
+                    value: materialized.method.clone(),
+                },
+                crate::reply::RawHttp2Header {
+                    name: ":scheme".into(),
+                    value: parsed.scheme().into(),
+                },
+                crate::reply::RawHttp2Header {
+                    name: ":authority".into(),
+                    value: authority,
+                },
+                crate::reply::RawHttp2Header {
+                    name: ":path".into(),
+                    value: path,
+                },
+            ];
+            let mut ordinary = materialized.headers;
+            if request.use_project_cookies {
+                let profile = self
+                    .db
+                    .get_cookie_profile_for_url(project_id, &materialized.url)
+                    .await?
+                    .ok_or_else(|| {
+                        DomainError::not_found("no managed cookies configured for race target")
+                    })?;
+                let cookie = profile
+                    .cookie_header_for_url(&materialized.url)?
+                    .ok_or_else(|| {
+                        DomainError::not_found("no managed cookies apply to race target")
+                    })?;
+                ordinary.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+                ordinary.push(("cookie".into(), cookie.into_bytes()));
+            }
+            let has_content_length = ordinary
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+            for (name, value) in ordinary {
+                if [
+                    "host",
+                    "connection",
+                    "proxy-connection",
+                    "keep-alive",
+                    "upgrade",
+                    "transfer-encoding",
+                ]
+                .iter()
+                .any(|removed| name.eq_ignore_ascii_case(removed))
+                {
+                    continue;
+                }
+                let value = String::from_utf8(value).map_err(|_| {
+                    DomainError::invalid("h2_single_packet requires UTF-8 header values")
+                })?;
+                headers.push(crate::reply::RawHttp2Header {
+                    name: name.to_ascii_lowercase(),
+                    value,
+                });
+            }
+            if !has_content_length {
+                headers.push(crate::reply::RawHttp2Header {
+                    name: "content-length".into(),
+                    value: body.len().to_string(),
+                });
+            }
+            predicates.insert(request.id.clone(), request.success);
+            streams.push(crate::reply::RawHttp2Stream {
+                id: request.id,
+                stream_id: None,
+                headers,
+                body_text: None,
+                body_base64: Some(base64::engine::general_purpose::STANDARD.encode(body)),
+            });
+        }
+        let target_url = target_url.ok_or_else(|| DomainError::invalid("empty H2 race group"))?;
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+            result = self.reply.send_raw_http2_with_context(
+                project_id,
+                &target_url,
+                streams,
+                crate::reply::RawHttp2Options {
+                    timeout_ms: Some(timeout_ms),
+                    final_data_together: true,
+                    ..Default::default()
+                },
+                ReplySendContext {
+                    source: ExchangeSource::Plugin,
+                    lineage: ExchangeLineage::default(),
+                },
+            ) => result,
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if error.code() == ErrorCode::ProtocolIncompatible => {
+                return Ok(json!({
+                    "id": group_id,
+                    "technique": "h2_single_packet",
+                    "attempt": attempt,
+                    "synchronized": false,
+                    "release_skew_ms": Value::Null,
+                    "responses": [],
+                    "error": {"code":"protocol_incompatible","message":error.to_string()},
+                }));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut responses = Vec::with_capacity(result.streams.len());
+        for response in result.streams {
+            if let Some(exchange_id) = response.exchange_id {
+                self.annotate_plugin_exchange(
+                    project_id,
+                    exchange_id,
+                    plugin_id,
+                    plugin_name,
+                    &response.id,
+                )
+                .await?;
+            }
+            let success = self
+                .evaluate_race_exchange(
+                    project_id,
+                    response.exchange_id,
+                    predicates.get(&response.id).and_then(Option::as_ref),
+                )
+                .await
+                .unwrap_or(Value::Null);
+            responses.push(json!({
+                "id": response.id,
+                "exchange_id": response.exchange_id,
+                "status_code": response.status_code,
+                "response_length": response.response_length,
+                "success": success,
+                "complete": response.complete,
+                "truncated": response.truncated,
+                "reset": response.reset,
+                "error": Value::Null,
+            }));
+        }
+        Ok(json!({
+            "id": group_id,
+            "technique": "h2_single_packet",
+            "attempt": attempt,
+            "synchronized": result.single_write_release,
+            "release_skew_ms": if result.single_write_release { Value::from(0) } else { Value::Null },
+            "responses": responses,
+            "error": if result.timed_out { json!({"code":"timeout","message":"HTTP/2 race response timed out"}) } else { Value::Null },
+            "goaway": result.goaway,
+        }))
     }
 
     async fn send_race_last_byte(
@@ -2405,6 +2743,34 @@ mod tests {
         let value = plugin_raw_observation(&response, Some(b"ok".to_vec())).unwrap();
         assert_eq!(value["response_transcript_base64"], "b2s=");
         assert_eq!(value["response_transcript_truncated"], false);
+    }
+
+    #[test]
+    fn raw_http2_plan_preserves_ordered_malformed_fields() {
+        let plan: PluginPlan = serde_json::from_value(json!({
+            "operations": [{
+                "type": "raw_http2",
+                "id": "h2-probe",
+                "target_url": "https://example.test/",
+                "streams": [{
+                    "id": "stream-one",
+                    "headers": [
+                        {"name":":method","value":"POST"},
+                        {"name":"x-smuggle","value":"a\r\nb: c"},
+                        {"name":":path","value":"/first"},
+                        {"name":":path","value":"/second"}
+                    ],
+                    "body_text": "x"
+                }],
+                "options": {"final_data_together": false}
+            }]
+        }))
+        .unwrap();
+        let PluginOperation::RawHttp2(operation) = &plan.operations[0] else {
+            panic!("expected raw HTTP/2 operation")
+        };
+        assert_eq!(operation.streams[0].headers[1].value, "a\r\nb: c");
+        assert_eq!(operation.streams[0].headers[3].value, "/second");
     }
 
     #[test]

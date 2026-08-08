@@ -113,7 +113,7 @@ pub struct RawResponseSummary {
     pub length: usize,
 }
 
-trait RawIo: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(super) trait RawIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> RawIo for T {}
 
 /// Result returned by the raw Reply endpoint and MCP tool.
@@ -325,7 +325,7 @@ impl ReplyService {
     }
 }
 
-async fn connect_target(
+pub(super) async fn connect_target(
     target: &TargetRef,
     upstream_proxy: Option<&str>,
 ) -> DomainResult<Pin<Box<dyn RawIo>>> {
