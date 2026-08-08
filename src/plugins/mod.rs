@@ -1130,24 +1130,22 @@ impl PluginService {
                         &operation_id,
                     )
                     .await?;
-                    response_headers = self
+                    let raw_response_headers = self
                         .db
                         .load_raw_headers(project_id, exchange_id, MessageSide::Response)
-                        .await?
-                        .into_iter()
-                        .map(|header| json!({"name": header.name, "value_base64": base64::engine::general_purpose::STANDARD.encode(header.value)}))
+                        .await?;
+                    response_headers = raw_response_headers
+                        .iter()
+                        .map(|header| json!({"name": header.name, "value_base64": base64::engine::general_purpose::STANDARD.encode(&header.value)}))
                         .collect();
-                    if let Some(mut body) = self
+                    if let Some(body) = self
                         .db
                         .load_raw_body(project_id, exchange_id, MessageSide::Response)
                         .await?
                     {
-                        if body.len() > MAX_RESPONSE_BODY_FOR_PLUGIN {
-                            body.truncate(MAX_RESPONSE_BODY_FOR_PLUGIN);
-                            response_body_truncated = true;
-                        }
-                        response_body_base64 =
-                            Some(base64::engine::general_purpose::STANDARD.encode(body));
+                        let presented = plugin_response_body(&raw_response_headers, body);
+                        response_body_base64 = presented.body_base64;
+                        response_body_truncated = presented.truncated;
                     }
                 }
                 Ok(json!({
@@ -1551,6 +1549,45 @@ impl PluginService {
             )
             .await?;
         Ok(())
+    }
+}
+
+struct PluginResponseBody {
+    body_base64: Option<String>,
+    truncated: bool,
+}
+
+/// Plugin analyzers compare semantic responses. Supplying compressed wire bytes
+/// makes otherwise identical dynamic pages look unrelated, so decode bounded
+/// bodies here. Oversized or unsupported encodings deliberately fall back to
+/// Reply's already-decoded preview instead of exposing binary data as text.
+fn plugin_response_body(headers: &[HeaderEntry], mut body: Vec<u8>) -> PluginResponseBody {
+    let encodings = headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+        .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
+        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .collect::<Vec<_>>();
+    if !encodings.is_empty() {
+        match crate::codec::decode_content_encodings(
+            &body,
+            &encodings.join(", "),
+            MAX_RESPONSE_BODY_FOR_PLUGIN,
+        ) {
+            Ok(decoded) => body = decoded,
+            Err(_) => {
+                return PluginResponseBody {
+                    body_base64: None,
+                    truncated: true,
+                };
+            }
+        }
+    }
+    let truncated = body.len() > MAX_RESPONSE_BODY_FOR_PLUGIN;
+    body.truncate(MAX_RESPONSE_BODY_FOR_PLUGIN);
+    PluginResponseBody {
+        body_base64: Some(base64::engine::general_purpose::STANDARD.encode(body)),
+        truncated,
     }
 }
 
@@ -2283,6 +2320,39 @@ mod tests {
         .unwrap_err();
         assert_eq!(cancelled.code(), ErrorCode::Cancelled);
         assert_eq!(normalize_operation_label("a:b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn semantic_plugin_bodies_are_decoded_before_analysis() {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"stable account body").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let headers = vec![HeaderEntry {
+            name: "Content-Encoding".into(),
+            value: b"gzip".to_vec(),
+            ordinal: 0,
+        }];
+        let presented = plugin_response_body(&headers, compressed);
+        assert!(!presented.truncated);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(presented.body_base64.unwrap())
+                .unwrap(),
+            b"stable account body"
+        );
+
+        let unsupported = plugin_response_body(
+            &[HeaderEntry {
+                name: "Content-Encoding".into(),
+                value: b"compress".to_vec(),
+                ordinal: 0,
+            }],
+            b"binary".to_vec(),
+        );
+        assert!(unsupported.body_base64.is_none());
+        assert!(unsupported.truncated);
     }
 
     #[test]
