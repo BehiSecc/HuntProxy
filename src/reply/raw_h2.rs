@@ -200,7 +200,9 @@ impl ReplyService {
                     let end_stream = headers.is_end_stream();
                     let (pseudo, fields) = headers.into_parts();
                     let response = received.entry(stream_id).or_default();
-                    response.status = pseudo.status.map(|status| status.as_u16());
+                    if let Some(status) = pseudo.status {
+                        response.status = Some(status.as_u16());
+                    }
                     let mut ordinal = response.headers.len() as u32;
                     for name in fields.keys() {
                         for value in fields.get_all(name) {
