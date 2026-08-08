@@ -35,6 +35,10 @@ pub struct RawHttp1Options {
     /// Split the exact request at this byte offset and pause before writing the remainder.
     pub pause_at_byte: Option<usize>,
     pub pause_ms: Option<u64>,
+    /// While the request is paused, read until one response completes (or the
+    /// pause expires) before sending the remainder on the same connection.
+    /// This is explicit because it changes split-write timing semantics.
+    pub await_response_before_continue: bool,
     pub half_close_write: bool,
     pub response_mode: RawResponseMode,
     pub read_timeout_ms: u64,
@@ -51,6 +55,7 @@ impl Default for RawHttp1Options {
             upstream_proxy: None,
             pause_at_byte: None,
             pause_ms: None,
+            await_response_before_continue: false,
             half_close_write: false,
             response_mode: RawResponseMode::Auto,
             read_timeout_ms: 60_000,
@@ -81,6 +86,16 @@ impl RawHttp1Options {
                     "pause_at_byte and pause_ms must be provided together",
                 ));
             }
+        }
+        if self.await_response_before_continue && self.pause_at_byte.is_none() {
+            return Err(DomainError::invalid(
+                "await_response_before_continue requires split-write pause options",
+            ));
+        }
+        if self.await_response_before_continue && self.release_barrier.is_some() {
+            return Err(DomainError::invalid(
+                "response-gated continuation cannot use a race release barrier",
+            ));
         }
         if self.read_timeout_ms == 0 || self.read_timeout_ms > MAX_READ_TIMEOUT_MS {
             return Err(DomainError::invalid(
@@ -209,12 +224,17 @@ impl ReplyService {
         if target.scheme == "https" {
             stream = connect_tls(stream, &target.host).await?;
         }
-        write_raw_request(&mut stream, &request_bytes, &options).await?;
-
         let response_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
         let response_to_head = parse_request_method(&request_bytes)
             .is_some_and(|method| method.eq_ignore_ascii_case("HEAD"));
-        let read = read_raw_response(&mut stream, response_cap, &options, response_to_head).await?;
+        let read = write_and_read_raw_request(
+            &mut stream,
+            &request_bytes,
+            response_cap,
+            &options,
+            response_to_head,
+        )
+        .await?;
         let raw_response = read.bytes;
         let truncated =
             read.outcome == RawReadOutcome::Limit || read.outcome == RawReadOutcome::Timeout;
@@ -610,28 +630,75 @@ async fn write_raw_request(
     request: &[u8],
     options: &RawHttp1Options,
 ) -> DomainResult<()> {
-    async fn write_part(stream: &mut Pin<Box<dyn RawIo>>, bytes: &[u8]) -> DomainResult<()> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            stream.write_all(bytes).await?;
-            stream.flush().await
-        })
-        .await
-        .map_err(|_| DomainError::new(ErrorCode::Timeout, "raw request write timed out"))?
-        .map_err(io_error)
-    }
-
     if let (Some(offset), Some(pause_ms)) = (options.pause_at_byte, options.pause_ms) {
-        write_part(stream, &request[..offset]).await?;
+        write_raw_part(stream, &request[..offset]).await?;
         if let Some(barrier) = &options.release_barrier {
             barrier.wait().await;
         } else {
             tokio::time::sleep(Duration::from_millis(pause_ms)).await;
         }
-        write_part(stream, &request[offset..]).await?;
+        write_raw_part(stream, &request[offset..]).await?;
     } else {
-        write_part(stream, request).await?;
+        write_raw_part(stream, request).await?;
     }
-    if options.half_close_write {
+    finish_raw_write(stream, options.half_close_write).await
+}
+
+async fn write_and_read_raw_request(
+    stream: &mut Pin<Box<dyn RawIo>>,
+    request: &[u8],
+    response_cap: u64,
+    options: &RawHttp1Options,
+    response_to_head: bool,
+) -> DomainResult<RawReadResult> {
+    let early = if options.await_response_before_continue {
+        let offset = options
+            .pause_at_byte
+            .expect("response-gated continuation validated split offset");
+        write_raw_part(stream, &request[..offset]).await?;
+        let early = read_during_split_pause(
+            stream,
+            response_cap,
+            options.pause_ms.expect("validated pause duration"),
+            response_to_head,
+        )
+        .await?;
+        if let Err(error) = write_raw_part(stream, &request[offset..]).await {
+            if early.bytes.is_empty() {
+                return Err(error);
+            }
+        }
+        finish_raw_write(stream, options.half_close_write).await?;
+        Some(early.bytes)
+    } else {
+        write_raw_request(stream, request, options).await?;
+        None
+    };
+    read_raw_response_from(
+        stream,
+        response_cap,
+        options,
+        response_to_head,
+        early.unwrap_or_default(),
+    )
+    .await
+}
+
+async fn write_raw_part(stream: &mut Pin<Box<dyn RawIo>>, bytes: &[u8]) -> DomainResult<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        stream.write_all(bytes).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| DomainError::new(ErrorCode::Timeout, "raw request write timed out"))?
+    .map_err(io_error)
+}
+
+async fn finish_raw_write(
+    stream: &mut Pin<Box<dyn RawIo>>,
+    half_close_write: bool,
+) -> DomainResult<()> {
+    if half_close_write {
         tokio::time::timeout(Duration::from_secs(10), stream.shutdown())
             .await
             .map_err(|_| DomainError::new(ErrorCode::Timeout, "raw write shutdown timed out"))?
@@ -645,15 +712,27 @@ struct RawReadResult {
     outcome: RawReadOutcome,
 }
 
+#[cfg(test)]
 async fn read_raw_response(
     stream: &mut Pin<Box<dyn RawIo>>,
     cap: u64,
     options: &RawHttp1Options,
     response_to_head: bool,
 ) -> DomainResult<RawReadResult> {
+    read_raw_response_from(stream, cap, options, response_to_head, Vec::new()).await
+}
+
+async fn read_raw_response_from(
+    stream: &mut Pin<Box<dyn RawIo>>,
+    cap: u64,
+    options: &RawHttp1Options,
+    response_to_head: bool,
+    initial: Vec<u8>,
+) -> DomainResult<RawReadResult> {
     let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(options.read_timeout_ms);
-    let mut bytes = Vec::with_capacity(cap.min(64 * 1024));
+    let mut bytes = initial;
+    bytes.reserve(cap.min(64 * 1024).saturating_sub(bytes.len()));
     let mut chunk = [0u8; 16 * 1024];
     loop {
         if options.response_mode == RawResponseMode::Auto
@@ -720,6 +799,56 @@ async fn read_raw_response(
                     ErrorCode::Timeout,
                     "raw response timed out",
                 ))
+            }
+        }
+    }
+}
+
+async fn read_during_split_pause(
+    stream: &mut Pin<Box<dyn RawIo>>,
+    cap: u64,
+    pause_ms: u64,
+    response_to_head: bool,
+) -> DomainResult<RawReadResult> {
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(pause_ms);
+    let mut bytes = Vec::with_capacity(cap.min(64 * 1024));
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if response_is_complete(&bytes, response_to_head) {
+            return Ok(RawReadResult {
+                bytes,
+                outcome: RawReadOutcome::Complete,
+            });
+        }
+        if bytes.len() >= cap {
+            return Ok(RawReadResult {
+                bytes,
+                outcome: RawReadOutcome::Limit,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(RawReadResult {
+                bytes,
+                outcome: RawReadOutcome::Timeout,
+            });
+        }
+        let read_len = chunk.len().min(cap - bytes.len());
+        match tokio::time::timeout(remaining, stream.read(&mut chunk[..read_len])).await {
+            Ok(Ok(0)) => {
+                return Ok(RawReadResult {
+                    bytes,
+                    outcome: RawReadOutcome::Closed,
+                })
+            }
+            Ok(Ok(read)) => bytes.extend_from_slice(&chunk[..read]),
+            Ok(Err(error)) => return Err(io_error(error)),
+            Err(_) => {
+                return Ok(RawReadResult {
+                    bytes,
+                    outcome: RawReadOutcome::Timeout,
+                })
             }
         }
     }
@@ -1150,6 +1279,12 @@ mod tests {
         }
         .validate(request_len)
         .is_err());
+        assert!(RawHttp1Options {
+            await_response_before_continue: true,
+            ..Default::default()
+        }
+        .validate(request_len)
+        .is_err());
     }
 
     #[test]
@@ -1339,6 +1474,52 @@ mod tests {
         assert_eq!(&first, b"abc");
         assert_eq!(&second, b"def");
         assert!(elapsed >= Duration::from_millis(45));
+    }
+
+    #[tokio::test]
+    async fn split_write_can_read_a_response_before_continuing_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut first = [0_u8; 3];
+            socket.read_exact(&mut first).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let mut second = [0_u8; 3];
+            socket.read_exact(&mut second).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            (first, second)
+        });
+        let mut stream = connect_any(&[address], Duration::from_secs(1))
+            .await
+            .unwrap();
+        let options = RawHttp1Options {
+            pause_at_byte: Some(3),
+            pause_ms: Some(500),
+            await_response_before_continue: true,
+            response_mode: RawResponseMode::UntilIdle,
+            read_timeout_ms: 1_000,
+            idle_timeout_ms: 100,
+            ..Default::default()
+        };
+        let result = write_and_read_raw_request(&mut stream, b"abcdef", 4096, &options, false)
+            .await
+            .unwrap();
+        let summaries = parse_response_summaries_for(&result.bytes, false);
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|response| response.status_code)
+                .collect::<Vec<_>>(),
+            vec![Some(302), Some(201)]
+        );
+        assert_eq!(server.await.unwrap(), (*b"abc", *b"def"));
     }
 
     #[tokio::test]
