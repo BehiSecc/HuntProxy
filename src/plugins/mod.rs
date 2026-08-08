@@ -43,6 +43,7 @@ const MAX_ACTIVE_JOBS: usize = 4;
 const MAX_RETAINED_JOBS: usize = 256;
 const MAX_WORKFLOW_STEPS: usize = 64;
 const MAX_WORKFLOW_EXTRACTS_PER_STEP: usize = 16;
+const MAX_RACE_EXTRACTS_PER_PLAN: usize = 256;
 const MAX_WORKFLOW_VALUE_BYTES: usize = 8 * 1024;
 const MAX_WORKFLOW_VALUES_BYTES: usize = 64 * 1024;
 const MAX_RAW_HTTP1_GROUP_MEMBERS: usize = 32;
@@ -228,6 +229,8 @@ struct RaceRequest {
     #[serde(default)]
     use_project_cookies: bool,
     success: Option<RaceSuccessPredicate>,
+    #[serde(default)]
+    extract: Vec<PluginWorkflowExtract>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -814,6 +817,7 @@ impl PluginService {
         let plan_value = run_js_stage(&plugin, "plan", input, &Value::Null, &context).await?;
         let plan: PluginPlan = serde_json::from_value(plan_value)
             .map_err(|error| DomainError::invalid(format!("invalid plugin plan: {error}")))?;
+        validate_race_data_flow(&plan)?;
         if plan.stop_on_error && plan.execution != PluginExecution::Sequential {
             return Err(DomainError::invalid(
                 "stop_on_error requires execution=sequential",
@@ -875,8 +879,10 @@ impl PluginService {
         let operations = if plan.execution == PluginExecution::Sequential {
             let mut observations = Vec::with_capacity(plan.operations.len());
             let mut operations = plan.operations.into_iter().peekable();
+            let mut race_values = HashMap::<String, String>::new();
+            let mut race_value_bytes = 0usize;
             let mut index = 0usize;
-            while let Some(operation) = operations.next() {
+            while let Some(mut operation) = operations.next() {
                 if index > 0 {
                     tokio::select! {
                         _ = job.cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
@@ -885,24 +891,43 @@ impl PluginService {
                 }
                 let operation_id = operation.id().to_string();
                 let completed_count = operation_request_count(&operation);
-                let result = self
-                    .execute_operation(
-                        project_id,
-                        &plugin.manifest.id,
-                        &plugin.manifest.name,
-                        operation,
-                        &project.scope,
-                        target_host.as_deref(),
-                        &job.cancel,
-                    )
-                    .await;
+                let extraction_plan = race_extraction_plan(&operation);
+                let result = match substitute_race_operation(&mut operation, &race_values) {
+                    Ok(()) => {
+                        self.execute_operation(
+                            project_id,
+                            &plugin.manifest.id,
+                            &plugin.manifest.name,
+                            operation,
+                            &project.scope,
+                            target_host.as_deref(),
+                            &job.cancel,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
                 job.view.write().completed_operations += completed_count;
-                let observation = isolate_operation_result(operation_id, result);
+                let mut observation = isolate_operation_result(operation_id, result)?;
+                if !extraction_plan.is_empty() {
+                    if let Err(error) = apply_race_extractions(
+                        &mut observation,
+                        &extraction_plan,
+                        &mut race_values,
+                        &mut race_value_bytes,
+                    ) {
+                        observation["error"] = json!({
+                            "code": error.code().as_str(),
+                            "message": error.to_string(),
+                        });
+                    }
+                }
+                let race_secrets = race_values.values().cloned().collect::<Vec<_>>();
+                redact_value(&mut observation, &race_secrets, None);
                 let failed = observation
-                    .as_ref()
-                    .ok()
-                    .is_some_and(|value| value.get("error").is_some_and(|error| !error.is_null()));
-                observations.push(observation);
+                    .get("error")
+                    .is_some_and(|error| !error.is_null());
+                observations.push(Ok(observation));
                 if failed && plan.stop_on_error {
                     for skipped in operations {
                         observations.push(Ok(json!({
@@ -2072,6 +2097,7 @@ impl PluginService {
         cancel: &CancellationToken,
     ) -> Value {
         let result = async {
+            let requires_extraction = !request.extract.is_empty();
             let draft = race_request_draft(&request)?;
             let materialized = crate::reply::materialize_request(
                 &self.db,
@@ -2100,9 +2126,43 @@ impl PluginService {
             let success = self
                 .evaluate_race_exchange(project_id, response.exchange_id, request.success.as_ref())
                 .await?;
-            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_length,"response_body_hash":response.response_body_hash,"duration_ms":response.duration_ms,"success":success,"error":Value::Null}))
+            let mut observation = json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_length,"response_body_hash":response.response_body_hash,"duration_ms":response.duration_ms,"success":success,"error":Value::Null});
+            if requires_extraction {
+                observation["_extract"] = self
+                    .race_extraction_material(project_id, response.exchange_id)
+                    .await?;
+            }
+            Ok::<_, DomainError>(observation)
         }.await;
         result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
+    }
+
+    async fn race_extraction_material(
+        &self,
+        project_id: ProjectId,
+        exchange_id: Option<ExchangeId>,
+    ) -> DomainResult<Value> {
+        let exchange_id = exchange_id.ok_or_else(|| {
+            DomainError::new(ErrorCode::StorageError, "race response was not persisted")
+        })?;
+        let headers = self
+            .db
+            .load_raw_headers(project_id, exchange_id, MessageSide::Response)
+            .await?;
+        let response_headers = headers
+            .iter()
+            .map(|header| json!({"name":header.name,"value_base64":base64::engine::general_purpose::STANDARD.encode(&header.value)}))
+            .collect::<Vec<_>>();
+        let body = self
+            .db
+            .load_raw_body(project_id, exchange_id, MessageSide::Response)
+            .await?
+            .map(|body| plugin_response_body(&headers, body));
+        Ok(json!({
+            "response_headers": response_headers,
+            "response_body_base64": body.as_ref().and_then(|body| body.body_base64.clone()),
+            "response_body_truncated": body.is_some_and(|body| body.truncated),
+        }))
     }
 
     async fn send_race_h2_single_packet(
@@ -2873,6 +2933,193 @@ fn operation_request_count(operation: &PluginOperation) -> usize {
         PluginOperation::HttpWorkflow(workflow) => workflow.steps.len(),
         _ => 1,
     }
+}
+
+type RaceExtractionPlan = Vec<(String, Vec<PluginWorkflowExtract>)>;
+
+fn race_request_has_placeholder(request: &RaceRequest) -> bool {
+    const PREFIX: &str = "{{extract:";
+    request
+        .url
+        .as_deref()
+        .is_some_and(|value| value.contains(PREFIX))
+        || request
+            .body_text
+            .as_deref()
+            .is_some_and(|value| value.contains(PREFIX))
+        || request
+            .body_base64
+            .as_deref()
+            .is_some_and(|value| value.contains(PREFIX))
+        || request.headers.iter().any(|header| {
+            std::str::from_utf8(&header.value)
+                .ok()
+                .is_some_and(|value| value.contains(PREFIX))
+        })
+}
+
+fn validate_race_data_flow(plan: &PluginPlan) -> DomainResult<()> {
+    let mut has_data_flow = false;
+    let mut extract_names = BTreeSet::new();
+    let mut total_extracts = 0usize;
+    for operation in &plan.operations {
+        let PluginOperation::RaceGroup(group) = operation else {
+            continue;
+        };
+        let extract_count = group
+            .requests
+            .iter()
+            .map(|request| request.extract.len())
+            .sum::<usize>();
+        total_extracts = total_extracts.saturating_add(extract_count);
+        if total_extracts > MAX_RACE_EXTRACTS_PER_PLAN {
+            return Err(DomainError::new(
+                ErrorCode::CombinationLimit,
+                format!("race plan exceeds {MAX_RACE_EXTRACTS_PER_PLAN} extracts"),
+            ));
+        }
+        if extract_count > MAX_WORKFLOW_EXTRACTS_PER_STEP {
+            return Err(DomainError::new(
+                ErrorCode::CombinationLimit,
+                format!(
+                    "race group {} exceeds {MAX_WORKFLOW_EXTRACTS_PER_STEP} extracts",
+                    group.id
+                ),
+            ));
+        }
+        if extract_count > 0 && !matches!(group.technique, RaceTechnique::SequentialControl) {
+            return Err(DomainError::invalid(
+                "race response extraction is allowed only on sequential setup groups",
+            ));
+        }
+        for request in &group.requests {
+            has_data_flow |= race_request_has_placeholder(request) || !request.extract.is_empty();
+            for extract in &request.extract {
+                validate_workflow_name(extract.name(), "race extract name")?;
+                if !extract_names.insert(extract.name().to_string()) {
+                    return Err(DomainError::invalid(format!(
+                        "duplicate race extract name in plan: {}",
+                        extract.name()
+                    )));
+                }
+                extract.validate()?;
+            }
+        }
+    }
+    if has_data_flow && plan.execution != PluginExecution::Sequential {
+        return Err(DomainError::invalid(
+            "race extraction and {{extract:name}} placeholders require execution=sequential",
+        ));
+    }
+    if has_data_flow && !plan.stop_on_error {
+        return Err(DomainError::invalid(
+            "race extraction and {{extract:name}} placeholders require stop_on_error=true",
+        ));
+    }
+    Ok(())
+}
+
+fn race_extraction_plan(operation: &PluginOperation) -> RaceExtractionPlan {
+    let PluginOperation::RaceGroup(group) = operation else {
+        return Vec::new();
+    };
+    group
+        .requests
+        .iter()
+        .filter(|request| !request.extract.is_empty())
+        .map(|request| (request.id.clone(), request.extract.clone()))
+        .collect()
+}
+
+fn substitute_race_operation(
+    operation: &mut PluginOperation,
+    values: &HashMap<String, String>,
+) -> DomainResult<()> {
+    let PluginOperation::RaceGroup(group) = operation else {
+        return Ok(());
+    };
+    for request in &mut group.requests {
+        if let Some(url) = &mut request.url {
+            *url = substitute_workflow_template(url, values)?;
+        }
+        if let Some(body) = &mut request.body_text {
+            *body = substitute_workflow_template(body, values)?;
+        }
+        if request
+            .body_base64
+            .as_deref()
+            .is_some_and(|body| body.contains("{{extract:"))
+        {
+            return Err(DomainError::invalid(
+                "race extract placeholders are not supported in body_base64; use body_text or typed header/URL values",
+            ));
+        }
+        for header in &mut request.headers {
+            if !header
+                .value
+                .windows(10)
+                .any(|window| window == b"{{extract:")
+            {
+                continue;
+            }
+            let value = std::str::from_utf8(&header.value)
+                .map_err(|_| DomainError::invalid("templated race headers must contain UTF-8"))?;
+            header.value = substitute_workflow_template(value, values)?.into_bytes();
+        }
+    }
+    Ok(())
+}
+
+fn apply_race_extractions(
+    observation: &mut Value,
+    plan: &RaceExtractionPlan,
+    values: &mut HashMap<String, String>,
+    total_value_bytes: &mut usize,
+) -> DomainResult<()> {
+    let mut material = HashMap::<String, Value>::new();
+    if let Some(responses) = observation
+        .get_mut("responses")
+        .and_then(Value::as_array_mut)
+    {
+        for response in responses {
+            let Some(object) = response.as_object_mut() else {
+                continue;
+            };
+            let id = object.get("id").and_then(Value::as_str).map(str::to_string);
+            let private = object.remove("_extract").unwrap_or(Value::Null);
+            if let Some(id) = id {
+                material.insert(id, private);
+            }
+        }
+    }
+    let mut extracted = BTreeSet::new();
+    for (request_id, rules) in plan {
+        let response = material.get(request_id).unwrap_or(&Value::Null);
+        for rule in rules {
+            if let Some(value) = rule.extract(response)? {
+                if value.len() > MAX_WORKFLOW_VALUE_BYTES {
+                    return Err(DomainError::new(
+                        ErrorCode::BodyTooLarge,
+                        format!(
+                            "race extract {} exceeds {MAX_WORKFLOW_VALUE_BYTES} bytes",
+                            rule.name()
+                        ),
+                    ));
+                }
+                *total_value_bytes = total_value_bytes.saturating_add(value.len());
+                if *total_value_bytes > MAX_WORKFLOW_VALUES_BYTES {
+                    return Err(DomainError::new(
+                        ErrorCode::BodyTooLarge,
+                        format!("race extracted values exceed {MAX_WORKFLOW_VALUES_BYTES} bytes"),
+                    ));
+                }
+                values.insert(rule.name().to_string(), value);
+                extracted.insert(rule.name().to_string());
+            }
+        }
+    }
+    observation["extracted"] = json!(extracted);
+    Ok(())
 }
 
 fn validate_workflow_name(value: &str, field: &str) -> DomainResult<()> {
@@ -3684,6 +3931,151 @@ mod tests {
         assert_eq!(request.headers[0].value, b"a%2Bb%2Fc");
         assert_eq!(request.body_params[0].value.as_deref(), Some("a%2Bb%2Fc"));
         assert!(substitute_workflow_template("{{extract:missing}}", &values).is_err());
+    }
+
+    #[test]
+    fn race_setup_extracts_are_sequential_bounded_and_private() {
+        let plan_value = json!({
+            "execution": "sequential",
+            "stop_on_error": true,
+            "operations": [{
+                "id": "setup-0",
+                "type": "race_group",
+                "technique": "sequential_control",
+                "attempt": 0,
+                "requests": [{
+                    "id": "setup-shape-0",
+                    "url": "https://example.test/setup",
+                    "extract": [{"from":"json","name":"csrf.0","pointer":"/csrf","encoding":"url"}]
+                }]
+            }, {
+                "id": "race-0",
+                "type": "race_group",
+                "technique": "last_byte_sync",
+                "attempt": 0,
+                "requests": [{
+                    "id": "race-shape-0-copy-0",
+                    "url": "https://example.test/submit?csrf={{extract:csrf.0}}",
+                    "headers": [{"name":"X-CSRF","value":"{{extract:csrf.0}}"}],
+                    "body_text": "csrf={{extract:csrf.0}}"
+                }]
+            }]
+        });
+        let plan: PluginPlan = serde_json::from_value(plan_value).unwrap();
+        validate_race_data_flow(&plan).unwrap();
+        let extraction_plan = race_extraction_plan(&plan.operations[0]);
+        let mut observation = json!({
+            "id": "setup-0",
+            "responses": [{
+                "id": "setup-shape-0",
+                "_extract": {
+                    "response_headers": [],
+                    "response_body_base64": base64::engine::general_purpose::STANDARD.encode(br#"{"csrf":"secret+/token"}"#)
+                }
+            }]
+        });
+        let mut values = HashMap::new();
+        let mut total = 0;
+        apply_race_extractions(&mut observation, &extraction_plan, &mut values, &mut total)
+            .unwrap();
+        assert_eq!(observation["extracted"], json!(["csrf.0"]));
+        assert!(!observation.to_string().contains("secret"));
+        assert!(!observation.to_string().contains("_extract"));
+        let mut race = plan.operations[1].clone();
+        substitute_race_operation(&mut race, &values).unwrap();
+        let PluginOperation::RaceGroup(group) = race else {
+            panic!("expected race group")
+        };
+        assert!(group.requests[0]
+            .url
+            .as_deref()
+            .unwrap()
+            .ends_with("csrf=secret%2B%2Ftoken"));
+        assert_eq!(group.requests[0].headers[0].value, b"secret%2B%2Ftoken");
+        assert_eq!(
+            group.requests[0].body_text.as_deref(),
+            Some("csrf=secret%2B%2Ftoken")
+        );
+        let mut transport_error = json!({
+            "error": {"code":"protocol_error","message":"request https://example.test/submit?csrf=secret%2B%2Ftoken failed"}
+        });
+        let secrets = values.values().cloned().collect::<Vec<_>>();
+        redact_value(&mut transport_error, &secrets, None);
+        assert!(!transport_error.to_string().contains("secret%2B%2Ftoken"));
+        assert_eq!(transport_error["error"]["message"], "<redacted>");
+    }
+
+    #[test]
+    fn race_extract_flow_rejects_unsafe_ordering_overwrite_and_missing_values() {
+        let operation = json!({
+            "id": "setup",
+            "type": "race_group",
+            "technique": "sequential_control",
+            "attempt": 0,
+            "requests": [{
+                "id": "one",
+                "url": "https://example.test/",
+                "extract": [{"from":"body_regex","name":"token","pattern":"token=(\\w+)","group":1}]
+            }]
+        });
+        for (execution, stop_on_error, expected) in [
+            ("parallel", true, "execution=sequential"),
+            ("sequential", false, "stop_on_error=true"),
+        ] {
+            let plan: PluginPlan = serde_json::from_value(json!({
+                "execution": execution,
+                "stop_on_error": stop_on_error,
+                "operations": [operation.clone()]
+            }))
+            .unwrap();
+            assert!(validate_race_data_flow(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
+        let duplicate: PluginPlan = serde_json::from_value(json!({
+            "execution": "sequential",
+            "stop_on_error": true,
+            "operations": [operation.clone(), operation]
+        }))
+        .unwrap();
+        assert!(validate_race_data_flow(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate race extract name"));
+
+        let mut missing = json!({
+            "responses": [{"id":"one","_extract":{"response_headers":[]}}]
+        });
+        let extraction = race_extraction_plan(&duplicate.operations[0]);
+        let error = apply_race_extractions(&mut missing, &extraction, &mut HashMap::new(), &mut 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("response has no body"));
+        assert!(!missing.to_string().contains("_extract"));
+
+        let operations = (0..=MAX_RACE_EXTRACTS_PER_PLAN)
+            .map(|index| json!({
+                "id": format!("setup-{index}"),
+                "type": "race_group",
+                "technique": "sequential_control",
+                "attempt": index,
+                "requests": [{
+                    "id": format!("request-{index}"),
+                    "url": "https://example.test/",
+                    "extract": [{"from":"header","name":format!("token.{index}"),"header":"X-Token"}]
+                }]
+            }))
+            .collect::<Vec<_>>();
+        let oversized: PluginPlan = serde_json::from_value(json!({
+            "execution": "sequential",
+            "stop_on_error": true,
+            "operations": operations,
+        }))
+        .unwrap();
+        assert_eq!(
+            validate_race_data_flow(&oversized).unwrap_err().code(),
+            ErrorCode::CombinationLimit
+        );
     }
 
     #[test]
