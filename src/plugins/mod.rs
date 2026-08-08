@@ -46,6 +46,7 @@ const MAX_WORKFLOW_EXTRACTS_PER_STEP: usize = 16;
 const MAX_WORKFLOW_VALUE_BYTES: usize = 8 * 1024;
 const MAX_WORKFLOW_VALUES_BYTES: usize = 64 * 1024;
 const MAX_RAW_HTTP1_GROUP_MEMBERS: usize = 32;
+const MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -1695,17 +1696,26 @@ impl PluginService {
                     ));
                 }
                 enforce_plugin_scope(&group.target_url, scope, target_host)?;
-                let project_limit = self
-                    .db
-                    .get_project(project_id)
-                    .await?
-                    .limits
-                    .max_concurrent_requests
-                    .max(1) as usize;
+                let project = self.db.get_project(project_id).await?;
+                let project_limit = project.limits.max_concurrent_requests.max(1) as usize;
                 if group.members.len() > project_limit {
                     return Err(DomainError::new(
                         ErrorCode::ConcurrencyLimited,
                         format!("raw_http1_group requires {} concurrent connections; project limit is {project_limit}", group.members.len()),
+                    ));
+                }
+                let aggregate_response_cap = project
+                    .limits
+                    .max_body_bytes
+                    .saturating_add(64 * 1024)
+                    .saturating_mul(group.members.len() as u64);
+                if aggregate_response_cap > MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES {
+                    return Err(DomainError::new(
+                        ErrorCode::BodyTooLarge,
+                        format!(
+                            "raw_http1_group aggregate response allowance exceeds {} MiB; reduce members or the project body limit",
+                            MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES / (1024 * 1024)
+                        ),
                     ));
                 }
                 let mut ids = BTreeSet::new();
