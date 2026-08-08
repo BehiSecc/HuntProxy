@@ -195,6 +195,8 @@ struct RaceRequest {
     body_base64: Option<String>,
     #[serde(default)]
     protocol: ProtocolPreference,
+    #[serde(default)]
+    use_project_cookies: bool,
     success: Option<RaceSuccessPredicate>,
 }
 
@@ -1441,7 +1443,7 @@ impl PluginService {
                     project_id,
                     &target_url,
                     bytes,
-                    false,
+                    request.use_project_cookies,
                     options,
                     ReplySendContext {
                         source: ExchangeSource::Plugin,
@@ -2364,6 +2366,7 @@ mod tests {
             "headers": [{"name":"Content-Type","value":"application/json"}],
             "body_text": "{\"coupon\":\"TEST\"}",
             "protocol": "h1",
+            "use_project_cookies": true,
             "success": {
                 "status_codes": [200],
                 "json": [{"pointer":"/applied","equals":true}]
@@ -2374,6 +2377,7 @@ mod tests {
         assert_eq!(draft.method.as_deref(), Some("POST"));
         assert_eq!(draft.body_text.as_deref(), Some("{\"coupon\":\"TEST\"}"));
         assert!(request.base_exchange_id.is_none());
+        assert!(request.use_project_cookies);
 
         let inherited: RaceRequest = serde_json::from_value(json!({
             "id": "shape-0",
