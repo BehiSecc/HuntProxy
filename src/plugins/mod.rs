@@ -184,7 +184,56 @@ struct PluginRaceGroup {
 #[derive(Debug, Clone, Deserialize)]
 struct RaceRequest {
     id: String,
-    base_exchange_id: ExchangeId,
+    base_exchange_id: Option<ExchangeId>,
+    method: Option<String>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: Vec<HeaderPatch>,
+    #[serde(default)]
+    header_tombstones: Vec<String>,
+    body_text: Option<String>,
+    body_base64: Option<String>,
+    #[serde(default)]
+    protocol: ProtocolPreference,
+    success: Option<RaceSuccessPredicate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RaceSuccessPredicate {
+    #[serde(default)]
+    status_codes: Vec<u16>,
+    #[serde(default)]
+    headers: Vec<RaceHeaderPredicate>,
+    body_contains: Option<String>,
+    body_regex: Option<String>,
+    #[serde(default)]
+    json: Vec<RaceJsonPredicate>,
+    redirect_location: Option<RaceTextPredicate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RaceHeaderPredicate {
+    name: String,
+    #[serde(flatten)]
+    value: RaceTextPredicate,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RaceTextPredicate {
+    equals: Option<String>,
+    contains: Option<String>,
+    regex: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RaceJsonPredicate {
+    pointer: String,
+    equals: Option<Value>,
+    exists: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1166,6 +1215,18 @@ impl PluginService {
                         "race_group requires 1..=1000 requests",
                     ));
                 }
+                let mut request_ids = BTreeSet::new();
+                for request in &group.requests {
+                    if request.id.trim().is_empty() || !request_ids.insert(request.id.clone()) {
+                        return Err(DomainError::invalid(
+                            "race_group request ids must be non-empty and unique",
+                        ));
+                    }
+                    race_request_draft(request)?;
+                    if let Some(predicate) = &request.success {
+                        validate_race_success_predicate(predicate)?;
+                    }
+                }
                 let timeout_ms = group
                     .options
                     .timeout_ms
@@ -1310,14 +1371,20 @@ impl PluginService {
         cancel: &CancellationToken,
     ) -> Value {
         let result = async {
-            let detail = self.db.get_exchange_detail(project_id, request.base_exchange_id, crate::policy::PresentationOptions::default()).await?;
-            let query = detail.summary.query.as_ref().map(|query| format!("?{query}")).unwrap_or_default();
-            let url = format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query);
+            let draft = race_request_draft(&request)?;
+            let materialized = crate::reply::materialize_request(
+                &self.db,
+                project_id,
+                request.base_exchange_id,
+                &draft,
+                self.reply.placeholder_key(),
+            )
+            .await?;
+            let url = materialized.url;
             enforce_plugin_scope(&url, scope, target_host)?;
-            let draft = ReplyDraft::default();
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                response = self.reply.send_with_context(project_id, Some(request.base_exchange_id), &draft, ProtocolPreference::Auto, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: Some(request.base_exchange_id), ..Default::default() } }) => response?,
+                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() } }) => response?,
             };
             if let Some(exchange_id) = response.exchange_id {
                 self.annotate_plugin_exchange(
@@ -1329,7 +1396,10 @@ impl PluginService {
                 )
                 .await?;
             }
-            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_length,"response_body_hash":response.response_body_hash,"duration_ms":response.duration_ms,"error":Value::Null}))
+            let success = self
+                .evaluate_race_exchange(project_id, response.exchange_id, request.success.as_ref())
+                .await?;
+            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_length,"response_body_hash":response.response_body_hash,"duration_ms":response.duration_ms,"success":success,"error":Value::Null}))
         }.await;
         result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
     }
@@ -1347,16 +1417,24 @@ impl PluginService {
         hold_timeout_ms: u64,
     ) -> Value {
         let result = async {
-            let detail = self.db.get_exchange_detail(project_id, request.base_exchange_id, crate::policy::PresentationOptions::default()).await?;
-            let query = detail.summary.query.as_ref().map(|query| format!("?{query}")).unwrap_or_default();
-            let target_url = format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query);
+            if matches!(request.protocol, ProtocolPreference::H2) {
+                return Err(DomainError::new(
+                    ErrorCode::ProtocolIncompatible,
+                    "last_byte_sync is exact HTTP/1 only",
+                ));
+            }
+            let draft = race_request_draft(&request)?;
+            let materialized = crate::reply::materialize_request(
+                &self.db,
+                project_id,
+                request.base_exchange_id,
+                &draft,
+                self.reply.placeholder_key(),
+            )
+            .await?;
+            let target_url = materialized.url.clone();
             enforce_plugin_scope(&target_url, scope, target_host)?;
-            let raw_headers = self.db.load_raw_headers(project_id, request.base_exchange_id, MessageSide::Request).await?;
-            let body = self.db.load_raw_body(project_id, request.base_exchange_id, MessageSide::Request).await?.unwrap_or_default();
-            let target = format!("{}{}", detail.summary.path, query);
-            let mut bytes = format!("{} {} HTTP/1.1\r\n", detail.summary.method, target).into_bytes();
-            for header in raw_headers { bytes.extend_from_slice(header.name.as_bytes()); bytes.extend_from_slice(b": "); bytes.extend_from_slice(&header.value); bytes.extend_from_slice(b"\r\n"); }
-            bytes.extend_from_slice(b"\r\n"); bytes.extend_from_slice(&body);
+            let bytes = materialized_http1_bytes(&materialized)?;
             if bytes.len() < 2 { return Err(DomainError::invalid("saved request is too short for last_byte_sync")); }
             let options = crate::reply::RawHttp1Options { pause_at_byte: Some(bytes.len() - 1), pause_ms: Some(hold_timeout_ms), release_barrier: Some(barrier), ..Default::default() };
             let response = tokio::select! {
@@ -1370,7 +1448,7 @@ impl PluginService {
                     ReplySendContext {
                         source: ExchangeSource::Plugin,
                         lineage: ExchangeLineage {
-                            parent_exchange_id: Some(request.base_exchange_id),
+                            parent_exchange_id: request.base_exchange_id,
                             ..Default::default()
                         },
                     },
@@ -1386,9 +1464,52 @@ impl PluginService {
                 )
                 .await?;
             }
-            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_bytes,"response_body_hash":Value::Null,"duration_ms":Value::Null,"error":Value::Null}))
+            let success = self
+                .evaluate_race_exchange(project_id, response.exchange_id, request.success.as_ref())
+                .await?;
+            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_bytes,"response_body_hash":Value::Null,"duration_ms":Value::Null,"success":success,"error":Value::Null}))
         }.await;
         result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
+    }
+
+    async fn evaluate_race_exchange(
+        &self,
+        project_id: ProjectId,
+        exchange_id: Option<ExchangeId>,
+        predicate: Option<&RaceSuccessPredicate>,
+    ) -> DomainResult<Value> {
+        let Some(predicate) = predicate else {
+            return Ok(Value::Null);
+        };
+        let exchange_id = exchange_id.ok_or_else(|| {
+            DomainError::new(ErrorCode::StorageError, "race response was not persisted")
+        })?;
+        let detail = self
+            .db
+            .get_exchange_detail(
+                project_id,
+                exchange_id,
+                crate::policy::PresentationOptions::default(),
+            )
+            .await?;
+        let headers = self
+            .db
+            .load_raw_headers(project_id, exchange_id, MessageSide::Response)
+            .await?;
+        let mut body = self
+            .db
+            .load_raw_body(project_id, exchange_id, MessageSide::Response)
+            .await?
+            .unwrap_or_default();
+        let body_truncated = body.len() > MAX_RESPONSE_BODY_FOR_PLUGIN;
+        body.truncate(MAX_RESPONSE_BODY_FOR_PLUGIN);
+        evaluate_race_success(
+            detail.summary.status_code,
+            &headers,
+            &body,
+            body_truncated,
+            predicate,
+        )
     }
 
     async fn annotate_plugin_exchange(
@@ -1431,6 +1552,238 @@ impl PluginService {
             .await?;
         Ok(())
     }
+}
+
+fn race_request_draft(request: &RaceRequest) -> DomainResult<ReplyDraft> {
+    if request.base_exchange_id.is_none() && request.url.is_none() {
+        return Err(DomainError::invalid(
+            "race request requires base_exchange_id or an inline url",
+        ));
+    }
+    if request.body_text.is_some() && request.body_base64.is_some() {
+        return Err(DomainError::invalid(
+            "race request accepts only one of body_text or body_base64",
+        ));
+    }
+    let body_override = request
+        .body_base64
+        .as_deref()
+        .map(|body| {
+            base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .map_err(|error| DomainError::invalid(format!("invalid race body_base64: {error}")))
+        })
+        .transpose()?;
+    Ok(ReplyDraft {
+        method: request.method.clone(),
+        url: request.url.clone(),
+        header_overrides: request.headers.clone(),
+        header_tombstones: request.header_tombstones.clone(),
+        body_override,
+        body_text: request.body_text.clone(),
+        ..Default::default()
+    })
+}
+
+fn materialized_http1_bytes(request: &crate::reply::MaterializedRequest) -> DomainResult<Vec<u8>> {
+    let url = url::Url::parse(&request.url)
+        .map_err(|error| DomainError::invalid(format!("invalid race request url: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(DomainError::invalid("race request url must be HTTP(S)"));
+    }
+    let authority = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_string(),
+    };
+    let mut target = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    }
+    .to_string();
+    if let Some(query) = url.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    let body = request.body.as_deref().unwrap_or_default();
+    let mut bytes = format!("{} {} HTTP/1.1\r\n", request.method, target).into_bytes();
+    if !request
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        bytes.extend_from_slice(format!("Host: {authority}\r\n").as_bytes());
+    }
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        if name.contains(['\r', '\n']) || value.contains(&b'\r') || value.contains(&b'\n') {
+            return Err(DomainError::invalid(
+                "race request contains an invalid header",
+            ));
+        }
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(b": ");
+        bytes.extend_from_slice(value);
+        bytes.extend_from_slice(b"\r\n");
+    }
+    if !body.is_empty() {
+        bytes.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    bytes.extend_from_slice(b"Connection: close\r\n\r\n");
+    bytes.extend_from_slice(body);
+    Ok(bytes)
+}
+
+fn text_predicate_matches(value: &str, predicate: &RaceTextPredicate) -> DomainResult<bool> {
+    if predicate.equals.is_none() && predicate.contains.is_none() && predicate.regex.is_none() {
+        return Err(DomainError::invalid(
+            "text predicate requires equals, contains, or regex",
+        ));
+    }
+    if predicate
+        .equals
+        .as_deref()
+        .is_some_and(|expected| value != expected)
+    {
+        return Ok(false);
+    }
+    if predicate
+        .contains
+        .as_deref()
+        .is_some_and(|expected| !value.contains(expected))
+    {
+        return Ok(false);
+    }
+    if let Some(pattern) = &predicate.regex {
+        let regex = regex::Regex::new(pattern)
+            .map_err(|error| DomainError::invalid(format!("invalid success regex: {error}")))?;
+        if !regex.is_match(value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_race_success_predicate(predicate: &RaceSuccessPredicate) -> DomainResult<()> {
+    if predicate.status_codes.is_empty()
+        && predicate.headers.is_empty()
+        && predicate.body_contains.is_none()
+        && predicate.body_regex.is_none()
+        && predicate.json.is_empty()
+        && predicate.redirect_location.is_none()
+    {
+        return Err(DomainError::invalid("success predicate cannot be empty"));
+    }
+    for header in &predicate.headers {
+        if header.name.trim().is_empty() {
+            return Err(DomainError::invalid("header predicate name is required"));
+        }
+        text_predicate_matches("", &header.value)?;
+    }
+    if let Some(pattern) = &predicate.body_regex {
+        regex::Regex::new(pattern)
+            .map_err(|error| DomainError::invalid(format!("invalid body_regex: {error}")))?;
+    }
+    for json in &predicate.json {
+        if !json.pointer.is_empty() && !json.pointer.starts_with('/') {
+            return Err(DomainError::invalid(
+                "JSON predicate pointer must be empty or start with /",
+            ));
+        }
+    }
+    if let Some(redirect) = &predicate.redirect_location {
+        text_predicate_matches("", redirect)?;
+    }
+    Ok(())
+}
+
+fn evaluate_race_success(
+    status_code: Option<u16>,
+    headers: &[HeaderEntry],
+    body: &[u8],
+    body_truncated: bool,
+    predicate: &RaceSuccessPredicate,
+) -> DomainResult<Value> {
+    let mut checks = Vec::new();
+    let mut matched = true;
+    validate_race_success_predicate(predicate)?;
+    if !predicate.status_codes.is_empty() {
+        let check = status_code.is_some_and(|status| predicate.status_codes.contains(&status));
+        matched &= check;
+        checks.push(json!({"type":"status","matched":check}));
+    }
+    for expected in &predicate.headers {
+        let values = headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case(&expected.name))
+            .map(|header| String::from_utf8_lossy(&header.value).into_owned())
+            .collect::<Vec<_>>();
+        let mut check = false;
+        for value in &values {
+            check |= text_predicate_matches(value, &expected.value)?;
+        }
+        matched &= check;
+        checks.push(json!({"type":"header","name":expected.name,"matched":check}));
+    }
+    let body_text = String::from_utf8_lossy(body);
+    if let Some(expected) = &predicate.body_contains {
+        let check = body_text.contains(expected);
+        matched &= check;
+        checks.push(json!({"type":"body_contains","matched":check}));
+    }
+    if let Some(pattern) = &predicate.body_regex {
+        let regex = regex::Regex::new(pattern)
+            .map_err(|error| DomainError::invalid(format!("invalid body_regex: {error}")))?;
+        let check = regex.is_match(&body_text);
+        matched &= check;
+        checks.push(json!({"type":"body_regex","matched":check}));
+    }
+    if !predicate.json.is_empty() {
+        let parsed: Option<Value> = serde_json::from_slice(body).ok();
+        for expected in &predicate.json {
+            let value = parsed
+                .as_ref()
+                .and_then(|json| json.pointer(&expected.pointer));
+            let mut check = expected
+                .exists
+                .map_or(value.is_some(), |exists| exists == value.is_some());
+            if let Some(equals) = &expected.equals {
+                check &= value == Some(equals);
+            }
+            matched &= check;
+            checks.push(json!({"type":"json","pointer":expected.pointer,"matched":check}));
+        }
+    }
+    if let Some(expected) = &predicate.redirect_location {
+        let location = headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("location"))
+            .map(|header| String::from_utf8_lossy(&header.value).into_owned());
+        let check = if status_code.is_some_and(|status| (300..400).contains(&status)) {
+            match location.as_deref() {
+                Some(value) => text_predicate_matches(value, expected)?,
+                None => false,
+            }
+        } else {
+            false
+        };
+        matched &= check;
+        checks.push(json!({"type":"redirect_location","matched":check}));
+    }
+    let body_dependent = predicate.body_contains.is_some()
+        || predicate.body_regex.is_some()
+        || !predicate.json.is_empty();
+    Ok(json!({
+        "matched": matched,
+        "checks": checks,
+        "body_truncated": body_truncated,
+        "indeterminate": body_truncated && body_dependent && !matched,
+    }))
 }
 
 fn prune_finished_jobs(jobs: &DashMap<Uuid, Arc<PluginJob>>) {
@@ -1930,5 +2283,98 @@ mod tests {
         .unwrap_err();
         assert_eq!(cancelled.code(), ErrorCode::Cancelled);
         assert_eq!(normalize_operation_label("a:b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn race_requests_accept_unsent_templates_and_overrides() {
+        let request: RaceRequest = serde_json::from_value(json!({
+            "id": "coupon-0",
+            "method": "POST",
+            "url": "https://example.test/cart/coupon",
+            "headers": [{"name":"Content-Type","value":"application/json"}],
+            "body_text": "{\"coupon\":\"TEST\"}",
+            "protocol": "h1",
+            "success": {
+                "status_codes": [200],
+                "json": [{"pointer":"/applied","equals":true}]
+            }
+        }))
+        .unwrap();
+        let draft = race_request_draft(&request).unwrap();
+        assert_eq!(draft.method.as_deref(), Some("POST"));
+        assert_eq!(draft.body_text.as_deref(), Some("{\"coupon\":\"TEST\"}"));
+        assert!(request.base_exchange_id.is_none());
+
+        let inherited: RaceRequest = serde_json::from_value(json!({
+            "id": "shape-0",
+            "base_exchange_id": 42,
+            "url": "https://example.test/alternate",
+            "header_tombstones": ["If-Match"]
+        }))
+        .unwrap();
+        assert_eq!(inherited.base_exchange_id, Some(ExchangeId(42)));
+        assert_eq!(
+            race_request_draft(&inherited).unwrap().header_tombstones,
+            vec!["If-Match"]
+        );
+    }
+
+    #[test]
+    fn semantic_success_predicates_cover_status_headers_body_json_and_redirects() {
+        let headers = vec![
+            HeaderEntry {
+                name: "X-State".into(),
+                value: b"applied-twice".to_vec(),
+                ordinal: 0,
+            },
+            HeaderEntry {
+                name: "Location".into(),
+                value: b"/orders/123".to_vec(),
+                ordinal: 1,
+            },
+        ];
+        let predicate: RaceSuccessPredicate = serde_json::from_value(json!({
+            "status_codes": [302],
+            "headers": [{"name":"X-State","contains":"twice"}],
+            "body_contains": "confirmed",
+            "body_regex": "order_[0-9]+",
+            "json": [{"pointer":"/confirmed","equals":true}],
+            "redirect_location": {"regex":"^/orders/[0-9]+$"}
+        }))
+        .unwrap();
+        let result = evaluate_race_success(
+            Some(302),
+            &headers,
+            br#"{"confirmed":true,"message":"confirmed order_123"}"#,
+            false,
+            &predicate,
+        )
+        .unwrap();
+        assert_eq!(result["matched"], true);
+        assert_eq!(result["indeterminate"], false);
+
+        let mismatch: RaceSuccessPredicate =
+            serde_json::from_value(json!({"body_contains":"missing"})).unwrap();
+        let result = evaluate_race_success(Some(200), &[], b"partial", true, &mismatch).unwrap();
+        assert_eq!(result["matched"], false);
+        assert_eq!(result["indeterminate"], true);
+    }
+
+    #[test]
+    fn inline_last_byte_requests_are_normalized_to_exact_http1() {
+        let request = crate::reply::MaterializedRequest {
+            method: "POST".into(),
+            url: "https://example.test:8443/apply?mode=one".into(),
+            headers: vec![
+                ("Content-Type".into(), b"text/plain".to_vec()),
+                ("Content-Length".into(), b"999".to_vec()),
+            ],
+            body: Some(b"go".to_vec()),
+        };
+        let bytes = materialized_http1_bytes(&request).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("POST /apply?mode=one HTTP/1.1\r\nHost: example.test:8443\r\n"));
+        assert_eq!(text.matches("Content-Length:").count(), 1);
+        assert!(text.ends_with("Connection: close\r\n\r\ngo"));
     }
 }
