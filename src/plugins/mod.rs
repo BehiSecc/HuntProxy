@@ -1104,6 +1104,11 @@ impl PluginService {
             "request_body_hash": detail.request_body_hash.clone(),
             "request_preview": detail.request_preview.clone(),
         });
+        if privileged_identity && detail.protocol.ends_with(" raw") {
+            return Err(DomainError::invalid(
+                "identity-aware extensions require a semantic base exchange, not a raw-wire transcript",
+            ));
+        }
         if privileged_identity {
             let raw_headers = self
                 .db
@@ -1145,21 +1150,21 @@ impl PluginService {
                     .map(|query| format!("?{query}"))
                     .unwrap_or_default()
             );
-            let mut raw = format!("{} {} HTTP/1.1\r\n", detail.summary.method, target).into_bytes();
-            for header in raw_headers {
-                raw.extend_from_slice(header.name.as_bytes());
-                raw.extend_from_slice(b": ");
-                raw.extend_from_slice(&header.value);
-                raw.extend_from_slice(b"\r\n");
-            }
-            raw.extend_from_slice(b"\r\n");
-            raw.extend_from_slice(&body);
-            if raw.len() <= MAX_RAW_REQUEST_CONTEXT {
-                context["raw_request_base64"] =
-                    Value::String(base64::engine::general_purpose::STANDARD.encode(raw));
-                context["raw_request_reconstructed"] = Value::Bool(true);
-            } else {
-                context["raw_request_omitted"] = Value::Bool(true);
+            match plugin_raw_request_bytes(
+                &detail.protocol,
+                &detail.summary.method,
+                &target,
+                &raw_headers,
+                &body,
+            ) {
+                Some((raw, reconstructed)) if raw.len() <= MAX_RAW_REQUEST_CONTEXT => {
+                    context["raw_request_base64"] =
+                        Value::String(base64::engine::general_purpose::STANDARD.encode(raw));
+                    context["raw_request_reconstructed"] = Value::Bool(reconstructed);
+                }
+                _ => {
+                    context["raw_request_omitted"] = Value::Bool(true);
+                }
             }
         }
         Ok(context)
@@ -2797,6 +2802,31 @@ fn normalize_operation_label(operation_id: &str) -> String {
     label
 }
 
+fn plugin_raw_request_bytes(
+    protocol: &str,
+    method: &str,
+    target: &str,
+    headers: &[HeaderEntry],
+    body: &[u8],
+) -> Option<(Vec<u8>, bool)> {
+    if protocol == "HTTP/1.1 raw" {
+        return Some((body.to_vec(), false));
+    }
+    if protocol.ends_with(" raw") {
+        return None;
+    }
+    let mut raw = format!("{method} {target} HTTP/1.1\r\n").into_bytes();
+    for header in headers {
+        raw.extend_from_slice(header.name.as_bytes());
+        raw.extend_from_slice(b": ");
+        raw.extend_from_slice(&header.value);
+        raw.extend_from_slice(b"\r\n");
+    }
+    raw.extend_from_slice(b"\r\n");
+    raw.extend_from_slice(body);
+    Some((raw, true))
+}
+
 fn operation_request_count(operation: &PluginOperation) -> usize {
     match operation {
         PluginOperation::RaceGroup(group) => group.requests.len(),
@@ -3756,6 +3786,34 @@ mod tests {
         let value = plugin_raw_observation(&response, Some(b"ok".to_vec())).unwrap();
         assert_eq!(value["response_transcript_base64"], "b2s=");
         assert_eq!(value["response_transcript_truncated"], false);
+    }
+
+    #[test]
+    fn raw_plugin_context_preserves_http1_wire_bytes_without_double_wrapping() {
+        let exact = b"GET /raw HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let (raw, reconstructed) =
+            plugin_raw_request_bytes("HTTP/1.1 raw", "GET", "/raw", &[], exact).unwrap();
+        assert_eq!(raw, exact);
+        assert!(!reconstructed);
+        assert!(plugin_raw_request_bytes("HTTP/2 raw", "GET", "/", &[], exact).is_none());
+
+        let (semantic, reconstructed) = plugin_raw_request_bytes(
+            "HTTP/1.1",
+            "POST",
+            "/submit",
+            &[HeaderEntry {
+                name: "Content-Type".into(),
+                value: b"text/plain".to_vec(),
+                ordinal: 0,
+            }],
+            b"ok",
+        )
+        .unwrap();
+        assert!(reconstructed);
+        assert_eq!(
+            semantic,
+            b"POST /submit HTTP/1.1\r\nContent-Type: text/plain\r\n\r\nok"
+        );
     }
 
     #[test]

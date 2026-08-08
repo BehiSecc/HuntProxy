@@ -213,6 +213,16 @@ pub async fn materialize_request(
             .method
             .as_deref()
             .is_some_and(|requested| !requested.eq_ignore_ascii_case(&detail.summary.method));
+        if detail.protocol.ends_with(" raw")
+            && draft.inheritance == ReplyInheritance::FullRequest
+            && !has_explicit_body
+            && !draft.body_cleared
+            && !method_changed
+        {
+            return Err(DomainError::invalid(
+                "raw-wire exchanges cannot inherit a semantic request body; explicitly set or clear the body",
+            ));
+        }
         if draft.method.is_none() {
             method = detail.summary.method;
         }
@@ -1492,6 +1502,79 @@ mod tests {
         assert!(!changed_to_get.headers.iter().any(|(name, _)| {
             name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("content-length")
         }));
+    }
+
+    #[tokio::test]
+    async fn semantic_replay_never_inherits_a_raw_wire_transcript_as_the_body() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "raw replay guard".into(),
+                target_url: "https://example.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let base = db
+            .insert_exchange(NewExchange {
+                project_id: project.id,
+                source: ExchangeSource::Reply,
+                protocol: "HTTP/1.1 raw".into(),
+                method: "GET".into(),
+                scheme: "https".into(),
+                authority: "example.test".into(),
+                host: "example.test".into(),
+                port: 443,
+                path: "/".into(),
+                query: None,
+                status_code: Some(200),
+                mime: None,
+                completion: CompletionState::Complete,
+                capture_quality: CaptureQuality::WirePreserved,
+                header_representation: HeaderRepresentation::WirePreserved,
+                body_representation: BodyRepresentation::WireEncoded,
+                cache_provenance: CacheProvenance::None,
+                transport_provenance: Some(TransportProvenance::GenericUnprofiled),
+                transport_profile: Some("raw_http1_transcript_v2".into()),
+                request_headers: vec![],
+                response_headers: vec![],
+                request_body: Some(
+                    b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n".to_vec(),
+                ),
+                response_body: None,
+                duration_ms: Some(1),
+                lineage: ExchangeLineage::default(),
+                page_title: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+
+        let error = materialize_request(
+            &db,
+            project.id,
+            Some(base),
+            &ReplyDraft::default(),
+            &PlaceholderKey::from_bytes(vec![1; 32]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("raw-wire"));
+
+        let cleared = materialize_request(
+            &db,
+            project.id,
+            Some(base),
+            &ReplyDraft {
+                body_cleared: true,
+                ..Default::default()
+            },
+            &PlaceholderKey::from_bytes(vec![1; 32]),
+        )
+        .await
+        .unwrap();
+        assert!(cleared.body.is_none());
     }
 
     #[tokio::test]
