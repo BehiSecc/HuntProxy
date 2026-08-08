@@ -1206,7 +1206,16 @@ impl PluginService {
                     )
                     .await?;
                 }
-                Ok(json!({"id":request.id,"raw":response}))
+                let transcript = match response.exchange_id {
+                    Some(exchange_id) => {
+                        self.db
+                            .load_raw_body(project_id, exchange_id, MessageSide::Response)
+                            .await?
+                    }
+                    None => None,
+                };
+                let raw = plugin_raw_observation(&response, transcript)?;
+                Ok(json!({"id":request.id,"raw":raw}))
             }
             PluginOperation::RaceGroup(group) => {
                 if group.requests.is_empty() || group.requests.len() > 1000 {
@@ -1591,6 +1600,31 @@ fn plugin_response_body(headers: &[HeaderEntry], mut body: Vec<u8>) -> PluginRes
         body_base64: Some(base64::engine::general_purpose::STANDARD.encode(body)),
         truncated,
     }
+}
+
+fn plugin_raw_observation(
+    response: &crate::reply::RawReplyResult,
+    transcript: Option<Vec<u8>>,
+) -> DomainResult<Value> {
+    let mut value = serde_json::to_value(response).map_err(|error| {
+        DomainError::new(
+            ErrorCode::Internal,
+            format!("serialize raw plugin observation: {error}"),
+        )
+    })?;
+    if let (Some(transcript), Some(object)) = (transcript, value.as_object_mut()) {
+        let truncated = transcript.len() > MAX_RESPONSE_BODY_FOR_PLUGIN;
+        let slice = &transcript[..transcript.len().min(MAX_RESPONSE_BODY_FOR_PLUGIN)];
+        object.insert(
+            "response_transcript_base64".into(),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(slice)),
+        );
+        object.insert(
+            "response_transcript_truncated".into(),
+            Value::Bool(truncated),
+        );
+    }
+    Ok(value)
 }
 
 fn race_request_draft(request: &RaceRequest) -> DomainResult<ReplyDraft> {
@@ -2355,6 +2389,22 @@ mod tests {
         );
         assert!(unsupported.body_base64.is_none());
         assert!(unsupported.truncated);
+    }
+
+    #[test]
+    fn raw_plugin_observations_include_a_bounded_response_transcript() {
+        let response = crate::reply::RawReplyResult {
+            exchange_id: Some(ExchangeId(9)),
+            status_code: Some(200),
+            response_bytes: 2,
+            truncated: false,
+            read_outcome: crate::reply::RawReadOutcome::Complete,
+            responses: vec![],
+            response_base64: None,
+        };
+        let value = plugin_raw_observation(&response, Some(b"ok".to_vec())).unwrap();
+        assert_eq!(value["response_transcript_base64"], "b2s=");
+        assert_eq!(value["response_transcript_truncated"], false);
     }
 
     #[test]
