@@ -37,6 +37,8 @@ const DEFAULT_MAX_OPERATIONS: usize = 100;
 const MAX_OPERATIONS: usize = 10_000;
 const DEFAULT_MEMORY_MB: usize = 16;
 const MAX_MEMORY_MB: usize = 64;
+const DEFAULT_JS_STAGE_TIMEOUT_MS: u64 = 2_000;
+const MAX_JS_STAGE_TIMEOUT_MS: u64 = 15_000;
 const MAX_ACTIVE_JOBS: usize = 4;
 const MAX_RETAINED_JOBS: usize = 256;
 
@@ -94,6 +96,9 @@ fn max_requested_exchange_contexts(manifest: &PluginManifest) -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginLimits {
     pub timeout_ms: Option<u64>,
+    /// CPU wall-clock budget for each synchronous QuickJS plan/analyze stage.
+    /// Network execution remains governed by `timeout_ms`.
+    pub js_stage_timeout_ms: Option<u64>,
     pub max_operations: Option<usize>,
     pub max_concurrency: Option<usize>,
     pub memory_mb: Option<usize>,
@@ -2545,8 +2550,22 @@ async fn run_js_stage(
         .clamp(4, MAX_MEMORY_MB)
         * 1024
         * 1024;
+    let js_stage_timeout_ms = plugin
+        .manifest
+        .limits
+        .js_stage_timeout_ms
+        .unwrap_or(DEFAULT_JS_STAGE_TIMEOUT_MS)
+        .clamp(250, MAX_JS_STAGE_TIMEOUT_MS);
     tokio::task::spawn_blocking(move || {
-        run_js_sync(&script, stage, &input, &observations, &context, memory)
+        run_js_sync(
+            &script,
+            stage,
+            &input,
+            &observations,
+            &context,
+            memory,
+            Duration::from_millis(js_stage_timeout_ms),
+        )
     })
     .await
     .map_err(|error| {
@@ -2561,13 +2580,14 @@ fn run_js_sync(
     observations: &str,
     context: &str,
     memory_limit: usize,
+    stage_timeout: Duration,
 ) -> DomainResult<Value> {
     let runtime = Runtime::new().map_err(|error| {
         DomainError::new(ErrorCode::Unavailable, format!("QuickJS runtime: {error}"))
     })?;
     runtime.set_memory_limit(memory_limit);
     runtime.set_max_stack_size(512 * 1024);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + stage_timeout;
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_handler = interrupted.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
@@ -2596,7 +2616,10 @@ fn run_js_sync(
     if interrupted.load(Ordering::Relaxed) {
         return Err(DomainError::new(
             ErrorCode::Timeout,
-            "plugin JavaScript stage exceeded 2 seconds",
+            format!(
+                "plugin JavaScript stage exceeded {} ms",
+                stage_timeout.as_millis()
+            ),
         ));
     }
     let output = output.map_err(|error| {
@@ -2648,6 +2671,7 @@ mod tests {
             "null",
             r#"{"api_version":1}"#,
             4 * 1024 * 1024,
+            Duration::from_secs(2),
         )
         .unwrap();
         assert_eq!(plan["result"]["value"], 7);
@@ -2658,9 +2682,29 @@ mod tests {
             "[]",
             "{}",
             4 * 1024 * 1024,
+            Duration::from_secs(2),
         )
         .unwrap();
         assert_eq!(analysis, json!({"count":0,"value":7}));
+    }
+
+    #[test]
+    fn javascript_stage_timeout_is_explicit_and_bounded() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { while (true) {} }, analyze() { return {}; }
+        };"#;
+        let error = run_js_sync(
+            script,
+            "plan",
+            "{}",
+            "null",
+            "{}",
+            4 * 1024 * 1024,
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        assert!(error.to_string().contains("10 ms"));
     }
 
     #[test]
