@@ -132,7 +132,9 @@ HuntProxy owns all extension network I/O, scope checks, concurrency, rate
 limits, cancellation, history, and findings. Generated requests appear in
 History with `plugin`, the extension name, and `plugin:<id>` labels. Packages
 are SHA-256 integrity-pinned; this first version does not yet include a
-publisher-signature trust store. The low-level HTTP/1 path supports exact bytes
+publisher-signature trust store. Bounded semantic workflows can extract a
+value from one response and use it in the next request without exposing the
+value in job output. The low-level HTTP/1 path supports exact bytes
 and synchronized final-byte release. Extensions can also send ordered raw
 HTTP/2 fields—including duplicate pseudo-headers and CRLF values—and release
 the final DATA frames for a race group in one write. Unsupported protocol

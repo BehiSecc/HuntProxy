@@ -41,6 +41,10 @@ const DEFAULT_JS_STAGE_TIMEOUT_MS: u64 = 2_000;
 const MAX_JS_STAGE_TIMEOUT_MS: u64 = 15_000;
 const MAX_ACTIVE_JOBS: usize = 4;
 const MAX_RETAINED_JOBS: usize = 256;
+const MAX_WORKFLOW_STEPS: usize = 64;
+const MAX_WORKFLOW_EXTRACTS_PER_STEP: usize = 16;
+const MAX_WORKFLOW_VALUE_BYTES: usize = 8 * 1024;
+const MAX_WORKFLOW_VALUES_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -174,6 +178,7 @@ enum PluginExecution {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PluginOperation {
     HttpRequest(PluginHttpRequest),
+    HttpWorkflow(PluginHttpWorkflow),
     RawHttp1(PluginRawHttp1),
     RawHttp2(PluginRawHttp2),
     RaceGroup(PluginRaceGroup),
@@ -183,6 +188,7 @@ impl PluginOperation {
     fn id(&self) -> &str {
         match self {
             Self::HttpRequest(request) => &request.id,
+            Self::HttpWorkflow(workflow) => &workflow.id,
             Self::RawHttp1(request) => &request.id,
             Self::RawHttp2(request) => &request.id,
             Self::RaceGroup(group) => &group.id,
@@ -313,6 +319,194 @@ struct PluginHttpRequest {
     cookie_params: Vec<PluginParamPatch>,
     #[serde(default)]
     body_params: Vec<PluginParamPatch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginHttpWorkflow {
+    id: String,
+    steps: Vec<PluginHttpWorkflowStep>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginHttpWorkflowStep {
+    id: String,
+    request: PluginHttpRequest,
+    #[serde(default)]
+    extract: Vec<PluginWorkflowExtract>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+enum PluginWorkflowExtract {
+    BodyRegex {
+        name: String,
+        pattern: String,
+        #[serde(default = "default_capture_group")]
+        group: usize,
+        #[serde(default)]
+        encoding: PluginWorkflowEncoding,
+        #[serde(default = "default_true")]
+        required: bool,
+    },
+    Header {
+        name: String,
+        header: String,
+        #[serde(default)]
+        encoding: PluginWorkflowEncoding,
+        #[serde(default = "default_true")]
+        required: bool,
+    },
+    Json {
+        name: String,
+        pointer: String,
+        #[serde(default)]
+        encoding: PluginWorkflowEncoding,
+        #[serde(default = "default_true")]
+        required: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginWorkflowEncoding {
+    #[default]
+    Raw,
+    Url,
+    Json,
+    Base64,
+}
+
+impl PluginWorkflowExtract {
+    fn name(&self) -> &str {
+        match self {
+            Self::BodyRegex { name, .. } | Self::Header { name, .. } | Self::Json { name, .. } => {
+                name
+            }
+        }
+    }
+
+    fn encoding(&self) -> PluginWorkflowEncoding {
+        match self {
+            Self::BodyRegex { encoding, .. }
+            | Self::Header { encoding, .. }
+            | Self::Json { encoding, .. } => *encoding,
+        }
+    }
+
+    fn required(&self) -> bool {
+        match self {
+            Self::BodyRegex { required, .. }
+            | Self::Header { required, .. }
+            | Self::Json { required, .. } => *required,
+        }
+    }
+
+    fn validate(&self) -> DomainResult<()> {
+        match self {
+            Self::BodyRegex { pattern, group, .. } => {
+                if pattern.len() > 2048 {
+                    return Err(DomainError::new(
+                        ErrorCode::CombinationLimit,
+                        "http_workflow body regex exceeds 2048 bytes",
+                    ));
+                }
+                let regex = regex::Regex::new(pattern).map_err(|error| {
+                    DomainError::invalid(format!("invalid http_workflow body regex: {error}"))
+                })?;
+                if *group >= regex.captures_len() {
+                    return Err(DomainError::invalid(format!(
+                        "http_workflow body regex has no capture group {group}"
+                    )));
+                }
+            }
+            Self::Header { header, .. } => {
+                if header.trim().is_empty() || header.contains(['\r', '\n']) {
+                    return Err(DomainError::invalid(
+                        "http_workflow extract header must be a valid header name",
+                    ));
+                }
+            }
+            Self::Json { pointer, .. } => {
+                if !pointer.is_empty() && !pointer.starts_with('/') {
+                    return Err(DomainError::invalid(
+                        "http_workflow JSON pointer must be empty or start with /",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract(&self, observation: &Value) -> DomainResult<Option<String>> {
+        let raw = match self {
+            Self::BodyRegex { pattern, group, .. } => {
+                let body = workflow_response_body(observation)?;
+                let body = std::str::from_utf8(&body).map_err(|_| {
+                    DomainError::invalid("http_workflow body regex requires a UTF-8 response body")
+                })?;
+                let regex = regex::Regex::new(pattern).map_err(|error| {
+                    DomainError::invalid(format!("invalid http_workflow body regex: {error}"))
+                })?;
+                regex
+                    .captures(body)
+                    .and_then(|captures| captures.get(*group))
+                    .map(|matched| matched.as_str().as_bytes().to_vec())
+            }
+            Self::Header { header, .. } => observation
+                .get("response_headers")
+                .and_then(Value::as_array)
+                .and_then(|headers| {
+                    headers.iter().find(|candidate| {
+                        candidate
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.eq_ignore_ascii_case(header))
+                    })
+                })
+                .and_then(|header| header.get("value_base64"))
+                .and_then(Value::as_str)
+                .map(|value| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .map_err(|error| {
+                            DomainError::invalid(format!(
+                                "invalid stored response header encoding: {error}"
+                            ))
+                        })
+                })
+                .transpose()?,
+            Self::Json { pointer, .. } => {
+                let body = workflow_response_body(observation)?;
+                let document: Value = serde_json::from_slice(&body).map_err(|error| {
+                    DomainError::invalid(format!(
+                        "http_workflow could not parse response JSON: {error}"
+                    ))
+                })?;
+                document.pointer(pointer).map(|value| match value {
+                    Value::String(value) => value.as_bytes().to_vec(),
+                    other => other.to_string().into_bytes(),
+                })
+            }
+        };
+        match raw {
+            Some(raw) => Ok(Some(encode_workflow_value(&raw, self.encoding())?)),
+            None if self.required() => Err(DomainError::invalid(format!(
+                "required http_workflow extract {} was not found",
+                self.name()
+            ))),
+            None => Ok(None),
+        }
+    }
+}
+
+fn default_capture_group() -> usize {
+    1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -620,6 +814,7 @@ impl PluginService {
         for operation in &plan.operations {
             let required = match operation {
                 PluginOperation::HttpRequest(_) => "http.semantic",
+                PluginOperation::HttpWorkflow(_) => "http.semantic",
                 PluginOperation::RawHttp1(_) => "http.raw",
                 PluginOperation::RawHttp2(_) => "http.raw",
                 PluginOperation::RaceGroup(_) => "http.race",
@@ -993,6 +1188,164 @@ impl PluginService {
         Ok(contexts)
     }
 
+    async fn execute_http_workflow(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        plugin_name: &str,
+        workflow: PluginHttpWorkflow,
+        scope: &ScopePolicy,
+        target_host: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> DomainResult<Value> {
+        validate_workflow_name(&workflow.id, "id")?;
+        if workflow.steps.is_empty() || workflow.steps.len() > MAX_WORKFLOW_STEPS {
+            return Err(DomainError::new(
+                ErrorCode::CombinationLimit,
+                format!("http_workflow requires 1..={MAX_WORKFLOW_STEPS} steps"),
+            ));
+        }
+        let project = self.db.get_project(project_id).await?;
+        let rate = project.limits.requests_per_second.max(0.1);
+        let mut step_ids = BTreeSet::new();
+        let mut extract_names = BTreeSet::new();
+        for step in &workflow.steps {
+            validate_workflow_name(&step.id, "step id")?;
+            if !step_ids.insert(step.id.clone()) {
+                return Err(DomainError::invalid(format!(
+                    "duplicate http_workflow step id: {}",
+                    step.id
+                )));
+            }
+            if step.extract.len() > MAX_WORKFLOW_EXTRACTS_PER_STEP {
+                return Err(DomainError::new(
+                    ErrorCode::CombinationLimit,
+                    format!(
+                        "http_workflow step {} exceeds {MAX_WORKFLOW_EXTRACTS_PER_STEP} extracts",
+                        step.id
+                    ),
+                ));
+            }
+            for extract in &step.extract {
+                let name = extract.name();
+                validate_workflow_name(name, "extract name")?;
+                if !extract_names.insert(name.to_string()) {
+                    return Err(DomainError::invalid(format!(
+                        "duplicate http_workflow extract name: {name}"
+                    )));
+                }
+                extract.validate()?;
+            }
+        }
+
+        let workflow_id = workflow.id;
+        let mut values = HashMap::<String, String>::new();
+        let mut total_value_bytes = 0usize;
+        let mut observations = Vec::with_capacity(workflow.steps.len());
+        for (index, step) in workflow.steps.into_iter().enumerate() {
+            if index > 0 {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                    _ = tokio::time::sleep(Duration::from_secs_f64(1.0 / rate)) => {}
+                }
+            }
+            let step_id = step.id;
+            let operation_id = format!("{workflow_id}:{step_id}");
+            let mut request = step.request;
+            request.id = operation_id.clone();
+            if let Err(error) = substitute_workflow_request(&mut request, &values) {
+                return Ok(workflow_error_observation(
+                    workflow_id,
+                    observations,
+                    &step_id,
+                    error,
+                ));
+            }
+            let result = Box::pin(self.execute_operation(
+                project_id,
+                plugin_id,
+                plugin_name,
+                PluginOperation::HttpRequest(request),
+                scope,
+                target_host,
+                cancel,
+            ))
+            .await;
+            let mut observation = match result {
+                Ok(observation) => observation,
+                Err(error) if error.code() == ErrorCode::Cancelled => return Err(error),
+                Err(error) => {
+                    return Ok(workflow_error_observation(
+                        workflow_id,
+                        observations,
+                        &step_id,
+                        error,
+                    ));
+                }
+            };
+            observation["id"] = Value::String(step_id.clone());
+            observation["operation_id"] = Value::String(operation_id);
+
+            for extract in &step.extract {
+                let extracted = match extract.extract(&observation) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        observations.push(observation);
+                        return Ok(workflow_error_observation(
+                            workflow_id,
+                            observations,
+                            &step_id,
+                            error,
+                        ));
+                    }
+                };
+                if let Some(value) = extracted {
+                    if value.len() > MAX_WORKFLOW_VALUE_BYTES {
+                        observations.push(observation);
+                        return Ok(workflow_error_observation(
+                            workflow_id,
+                            observations,
+                            &step_id,
+                            DomainError::new(
+                                ErrorCode::BodyTooLarge,
+                                format!(
+                                    "http_workflow extract {} exceeds {MAX_WORKFLOW_VALUE_BYTES} bytes",
+                                    extract.name()
+                                ),
+                            ),
+                        ));
+                    }
+                    total_value_bytes = total_value_bytes.saturating_add(value.len());
+                    if total_value_bytes > MAX_WORKFLOW_VALUES_BYTES {
+                        observations.push(observation);
+                        return Ok(workflow_error_observation(
+                            workflow_id,
+                            observations,
+                            &step_id,
+                            DomainError::new(
+                                ErrorCode::BodyTooLarge,
+                                format!(
+                                    "http_workflow extracted values exceed {MAX_WORKFLOW_VALUES_BYTES} bytes"
+                                ),
+                            ),
+                        ));
+                    }
+                    values.insert(extract.name().to_string(), value);
+                }
+            }
+            observations.push(observation);
+        }
+
+        let terminal = observations.last().cloned().unwrap_or(Value::Null);
+        Ok(json!({
+            "id": workflow_id,
+            "steps": observations,
+            "terminal": terminal,
+            "extracted": values.keys().cloned().collect::<BTreeSet<_>>(),
+            "error": null,
+        }))
+    }
+
     async fn execute_operation(
         &self,
         project_id: ProjectId,
@@ -1235,6 +1588,18 @@ impl PluginService {
                     "response_body_base64": response_body_base64,
                     "response_body_truncated": response_body_truncated,
                 }))
+            }
+            PluginOperation::HttpWorkflow(workflow) => {
+                self.execute_http_workflow(
+                    project_id,
+                    plugin_id,
+                    plugin_name,
+                    workflow,
+                    scope,
+                    target_host,
+                    cancel,
+                )
+                .await
             }
             PluginOperation::RawHttp1(request) => {
                 let operation_id = request.id.clone();
@@ -2297,8 +2662,151 @@ fn operation_request_count(operation: &PluginOperation) -> usize {
     match operation {
         PluginOperation::RaceGroup(group) => group.requests.len(),
         PluginOperation::RawHttp2(request) => request.streams.len(),
+        PluginOperation::HttpWorkflow(workflow) => workflow.steps.len(),
         _ => 1,
     }
+}
+
+fn validate_workflow_name(value: &str, field: &str) -> DomainResult<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(DomainError::invalid(format!(
+            "http_workflow {field} must be 1..=64 ASCII letters, digits, '.', '-' or '_'"
+        )));
+    }
+    Ok(())
+}
+
+fn workflow_response_body(observation: &Value) -> DomainResult<Vec<u8>> {
+    let encoded = observation
+        .get("response_body_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DomainError::invalid("http_workflow response has no body to extract"))?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| DomainError::invalid(format!("invalid stored response body: {error}")))
+}
+
+fn encode_workflow_value(value: &[u8], encoding: PluginWorkflowEncoding) -> DomainResult<String> {
+    match encoding {
+        PluginWorkflowEncoding::Raw => String::from_utf8(value.to_vec()).map_err(|_| {
+            DomainError::invalid("raw http_workflow extracts must contain valid UTF-8")
+        }),
+        PluginWorkflowEncoding::Url => Ok(percent_encoding::percent_encode(
+            value,
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+        .to_string()),
+        PluginWorkflowEncoding::Json => {
+            let value = std::str::from_utf8(value).map_err(|_| {
+                DomainError::invalid("JSON-encoded http_workflow extracts must contain UTF-8")
+            })?;
+            let quoted = serde_json::to_string(value)
+                .map_err(|error| DomainError::invalid(error.to_string()))?;
+            Ok(quoted[1..quoted.len() - 1].to_string())
+        }
+        PluginWorkflowEncoding::Base64 => {
+            Ok(base64::engine::general_purpose::STANDARD.encode(value))
+        }
+    }
+}
+
+fn substitute_workflow_template(
+    template: &str,
+    values: &HashMap<String, String>,
+) -> DomainResult<String> {
+    const PREFIX: &str = "{{extract:";
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find(PREFIX) {
+        output.push_str(&rest[..start]);
+        let after_prefix = &rest[start + PREFIX.len()..];
+        let end = after_prefix.find("}}").ok_or_else(|| {
+            DomainError::invalid("unterminated http_workflow extract placeholder")
+        })?;
+        let name = &after_prefix[..end];
+        validate_workflow_name(name, "placeholder name")?;
+        let value = values.get(name).ok_or_else(|| {
+            DomainError::invalid(format!(
+                "http_workflow extract {name} is not available before this step"
+            ))
+        })?;
+        output.push_str(value);
+        rest = &after_prefix[end + 2..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn substitute_workflow_request(
+    request: &mut PluginHttpRequest,
+    values: &HashMap<String, String>,
+) -> DomainResult<()> {
+    if let Some(method) = &mut request.method {
+        *method = substitute_workflow_template(method, values)?;
+    }
+    if let Some(url) = &mut request.url {
+        *url = substitute_workflow_template(url, values)?;
+    }
+    if let Some(body) = &mut request.body_text {
+        *body = substitute_workflow_template(body, values)?;
+    }
+    if request
+        .body_base64
+        .as_deref()
+        .is_some_and(|body| body.contains("{{extract:"))
+    {
+        return Err(DomainError::invalid(
+            "http_workflow placeholders are not supported in body_base64; use body_text or typed parameters",
+        ));
+    }
+    for header in &mut request.headers {
+        if !header
+            .value
+            .windows(10)
+            .any(|window| window == b"{{extract:")
+        {
+            continue;
+        }
+        let value = std::str::from_utf8(&header.value).map_err(|_| {
+            DomainError::invalid("templated http_workflow headers must contain UTF-8")
+        })?;
+        header.value = substitute_workflow_template(value, values)?.into_bytes();
+    }
+    for patch in request
+        .query_params
+        .iter_mut()
+        .chain(request.cookie_params.iter_mut())
+        .chain(request.body_params.iter_mut())
+    {
+        if let Some(value) = &mut patch.value {
+            *value = substitute_workflow_template(value, values)?;
+        }
+    }
+    Ok(())
+}
+
+fn workflow_error_observation(
+    workflow_id: String,
+    steps: Vec<Value>,
+    step_id: &str,
+    error: DomainError,
+) -> Value {
+    let terminal = steps.last().cloned().unwrap_or(Value::Null);
+    json!({
+        "id": workflow_id,
+        "steps": steps,
+        "terminal": terminal,
+        "error": {
+            "code": error.code().as_str(),
+            "message": error.to_string(),
+            "step_id": step_id,
+        }
+    })
 }
 
 fn isolate_operation_result(
@@ -2726,6 +3234,89 @@ mod tests {
         .unwrap();
         assert_eq!(default.execution, PluginExecution::Parallel);
         assert!(!default.stop_on_error);
+    }
+
+    #[test]
+    fn http_workflow_plan_is_bounded_and_counts_each_request() {
+        let plan: PluginPlan = serde_json::from_value(json!({
+            "operations": [{
+                "type": "http_workflow",
+                "id": "fresh-csrf",
+                "steps": [{
+                    "id": "acquire",
+                    "request": {
+                        "id": "ignored-by-host",
+                        "url": "https://example.test/form"
+                    },
+                    "extract": [{
+                        "from": "body_regex",
+                        "name": "csrf",
+                        "pattern": "name=\\\"csrf\\\" value=\\\"([^\\\"]+)\\\""
+                    }]
+                }, {
+                    "id": "submit",
+                    "request": {
+                        "id": "ignored-by-host",
+                        "base_exchange_id": 42,
+                        "body_params": [{"name":"csrf","value":"{{extract:csrf}}"}]
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(operation_request_count(&plan.operations[0]), 2);
+        let PluginOperation::HttpWorkflow(workflow) = &plan.operations[0] else {
+            panic!("expected workflow")
+        };
+        assert_eq!(workflow.steps[0].extract[0].name(), "csrf");
+    }
+
+    #[test]
+    fn http_workflow_extracts_and_substitutes_without_returning_values() {
+        let observation = json!({
+            "response_headers": [{
+                "name": "X-Request-Token",
+                "value_base64": base64::engine::general_purpose::STANDARD.encode(b"head token")
+            }],
+            "response_body_base64": base64::engine::general_purpose::STANDARD.encode(
+                br#"{"csrf":"a+b/c","html":"token-123"}"#
+            )
+        });
+        let json_extract = PluginWorkflowExtract::Json {
+            name: "csrf".into(),
+            pointer: "/csrf".into(),
+            encoding: PluginWorkflowEncoding::Url,
+            required: true,
+        };
+        let header_extract = PluginWorkflowExtract::Header {
+            name: "header".into(),
+            header: "x-request-token".into(),
+            encoding: PluginWorkflowEncoding::Base64,
+            required: true,
+        };
+        assert_eq!(
+            json_extract.extract(&observation).unwrap(),
+            Some("a%2Bb%2Fc".into())
+        );
+        assert_eq!(
+            header_extract.extract(&observation).unwrap(),
+            Some("aGVhZCB0b2tlbg==".into())
+        );
+
+        let mut values = HashMap::new();
+        values.insert("csrf".into(), "a%2Bb%2Fc".into());
+        let mut request: PluginHttpRequest = serde_json::from_value(json!({
+            "id": "submit",
+            "url": "https://example.test/submit?csrf={{extract:csrf}}",
+            "headers": [{"name":"X-CSRF","value":"{{extract:csrf}}"}],
+            "body_params": [{"name":"csrf","value":"{{extract:csrf}}"}]
+        }))
+        .unwrap();
+        substitute_workflow_request(&mut request, &values).unwrap();
+        assert!(request.url.as_deref().unwrap().ends_with("csrf=a%2Bb%2Fc"));
+        assert_eq!(request.headers[0].value, b"a%2Bb%2Fc");
+        assert_eq!(request.body_params[0].value.as_deref(), Some("a%2Bb%2Fc"));
+        assert!(substitute_workflow_template("{{extract:missing}}", &values).is_err());
     }
 
     #[test]
