@@ -894,6 +894,7 @@ async fn run_job(
     );
     let mut running = FuturesUnordered::new();
     let mut exhausted = false;
+    let mut fatal_error = None;
 
     loop {
         while !exhausted && !cancel.is_cancelled() && running.len() < max_concurrency {
@@ -918,17 +919,31 @@ async fn run_job(
             break;
         }
         match running.next().await {
-            Some(Ok(result)) => result?,
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(error))) => {
+                cancel.cancel();
+                exhausted = true;
+                if fatal_error.is_none() {
+                    fatal_error = Some(error);
+                }
+            }
             Some(Err(error)) => {
-                return Err(DomainError::new(
-                    ErrorCode::Internal,
-                    format!("fuzz case task failed: {error}"),
-                ));
+                cancel.cancel();
+                exhausted = true;
+                if fatal_error.is_none() {
+                    fatal_error = Some(DomainError::new(
+                        ErrorCode::Internal,
+                        format!("fuzz case task failed: {error}"),
+                    ));
+                }
             }
             None => break,
         }
     }
 
+    if let Some(error) = fatal_error {
+        return Err(error);
+    }
     if cancel.is_cancelled() {
         return db
             .set_fuzz_job_state(project_id, job_id, FuzzJobState::Interrupted, None)
@@ -1115,6 +1130,7 @@ async fn execute_case(
             let exchange_id = db
                 .find_fuzz_case_exchange(project_id, job_id, persisted.id)
                 .await?;
+            let fatal = error.code() == ErrorCode::DiskQuotaExceeded;
             db.finish_fuzz_case(
                 project_id,
                 job_id,
@@ -1127,7 +1143,12 @@ async fn execute_case(
                 Some(error.to_string()),
                 None,
             )
-            .await
+            .await?;
+            if fatal {
+                Err(error)
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -1313,10 +1334,17 @@ fn validate_template(template: &FuzzTemplate) -> DomainResult<()> {
         _ => point_count,
     };
     if template.wordlists.len() != expected_wordlists {
-        return Err(DomainError::invalid(format!(
-            "strategy {:?} requires {expected_wordlists} wordlist(s)",
-            template.strategy
-        )));
+        let guidance = if template.strategy == FuzzStrategy::Sniper {
+            format!(
+                "sniper requires either 1 shared wordlist or exactly {point_count} per-point wordlists"
+            )
+        } else {
+            format!(
+                "strategy {:?} requires exactly {expected_wordlists} wordlist(s)",
+                template.strategy
+            )
+        };
+        return Err(DomainError::invalid(guidance));
     }
     if template.wordlists.iter().any(Vec::is_empty) {
         return Err(DomainError::invalid("wordlists must not be empty"));
@@ -1336,6 +1364,10 @@ mod tests {
     struct FailingTransport;
 
     struct MixedTransport {
+        calls: AtomicUsize,
+    }
+
+    struct SizedTransport {
         calls: AtomicUsize,
     }
 
@@ -1408,6 +1440,35 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl SemanticTransport for SizedTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            _request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                body: Bytes::from(vec![b'x'; 4096]),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test_sized".into(),
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test_sized"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
     #[test]
     fn strategy_counts_are_correct() {
         assert_eq!(estimate_combinations(FuzzStrategy::Sniper, 2, &[3, 4]), 7);
@@ -1436,6 +1497,25 @@ mod tests {
         assert_eq!(cases.len(), 3);
         assert_eq!(cases[0].values, vec![Some("a".into()), None]);
         assert_eq!(cases[2].values, vec![None, Some("1".into())]);
+    }
+
+    #[test]
+    fn sniper_wordlist_error_explains_shared_and_per_point_shapes() {
+        let template: FuzzTemplate = serde_json::from_value(serde_json::json!({
+            "draft": {"url": "https://example.test/?a=§a§&b=§b§"},
+            "insertion_points": [
+                {"name": "a", "location": "url"},
+                {"name": "b", "location": "url"}
+            ],
+            "wordlists": [["one"], ["two"], ["three"]],
+            "strategy": "sniper"
+        }))
+        .unwrap();
+
+        let error = validate_template(&template).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("either 1 shared wordlist or exactly 2 per-point wordlists"));
     }
 
     #[test]
@@ -1754,6 +1834,94 @@ mod tests {
         assert_eq!(detail.summary.source, ExchangeSource::Fuzzer);
         assert_eq!(detail.lineage.fuzz_job_id, Some(job.id));
         assert_eq!(detail.lineage.fuzz_case_id, Some(cases[0].id));
+    }
+
+    #[tokio::test]
+    async fn disk_quota_failure_stops_dispatch_after_bounded_in_flight_cases() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().to_path_buf())).unwrap();
+        let db = Arc::new(Db::open(&config).await.unwrap());
+        let mut project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz quota".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        project.limits.max_disk_bytes = 1;
+        project = db
+            .update_project_scope(
+                project.id,
+                project.scope.clone(),
+                Some(project.limits.clone()),
+            )
+            .await
+            .unwrap();
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/?q=§value§".into()),
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "value".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![(0..20).map(|value| value.to_string()).collect()],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+        };
+        let job = db
+            .create_fuzz_job(
+                project.id,
+                None,
+                template.strategy,
+                serde_json::to_string(&template).unwrap(),
+                20,
+                "{}".into(),
+            )
+            .await
+            .unwrap();
+        let transport = Arc::new(SizedTransport {
+            calls: AtomicUsize::new(0),
+        });
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: transport.clone(),
+            placeholder_key: PlaceholderKey::from_bytes(vec![11; 32]),
+            upstream_proxies: Default::default(),
+        });
+
+        let error = run_job(
+            db.clone(),
+            reply,
+            project.id,
+            job.id,
+            template,
+            3,
+            test_limiter(3, 1_000.0),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            ErrorCode::DiskQuotaExceeded,
+            "unexpected terminal error: {error}"
+        );
+        assert!(transport.calls.load(Ordering::SeqCst) <= 3);
+        let (cases, _) = db
+            .list_fuzz_cases(project.id, job.id, 100, None)
+            .await
+            .unwrap();
+        assert!(cases.len() <= 3);
+        assert!(cases
+            .iter()
+            .all(|case| case.state != FuzzCaseState::Running));
     }
 
     #[tokio::test]

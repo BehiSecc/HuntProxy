@@ -453,7 +453,7 @@ test
             <div class="table-wrap"><table><thead><tr><th>ID</th><th>State</th><th>Progress</th><th>Failed</th><th>Action</th></tr></thead><tbody id="fuzzJobs"></tbody></table></div>
             <div class="row"><h3 style="margin:0">Selected job results</h3><div><button class="btn fit" id="showFuzzGroups">Groups</button> <button class="btn fit" id="showFuzzCases">All cases</button></div></div>
             <div id="fuzzGroupsPanel" class="table-wrap"><table><thead><tr><th>Count</th><th>Status</th><th>MIME</th><th>Size</th><th>Timing</th></tr></thead><tbody id="fuzzGroups"></tbody></table></div>
-            <div id="fuzzCasesPanel" class="table-wrap hidden"><table><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Exchange</th><th>Action</th></tr></thead><tbody id="fuzzCases"></tbody></table></div>
+            <div id="fuzzCasesPanel" class="hidden"><div class="table-wrap"><table><thead><tr><th>#</th><th>Payload</th><th>Status</th><th>Length</th><th>Exchange</th><th>Action</th></tr></thead><tbody id="fuzzCases"></tbody></table></div><button class="btn fit hidden" id="loadMoreFuzzCases" style="margin-top:.55rem">Load more</button></div>
             <pre class="mono hidden" id="fuzzDiff"></pre>
           </div>
         </div>
@@ -539,6 +539,8 @@ test
       websocketConnection: null,
       events: null,
       fuzzTimer: null,
+      fuzzCases: [],
+      fuzzCasesCursor: null,
       historyItems: [],
       historyCursor: null,
       historyTotal: 0,
@@ -553,7 +555,13 @@ test
       const text = await response.text();
       let data = null;
       try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
-      if (!response.ok) throw new Error(data?.message || data?.code || response.statusText);
+      if (!response.ok) {
+        const error = new Error(data?.message || data?.code || response.statusText);
+        error.code = data?.code;
+        error.details = data?.details;
+        error.status = response.status;
+        throw error;
+      }
       return data;
     }
 
@@ -1325,10 +1333,19 @@ test
       $('fuzzRegexFields').classList.toggle('hidden', source !== 'regex_bypass');
     };
     function parsePoints() {
-      return $('fuzzPoints').value.split('\n').map(line => {
-        const [name, location] = line.split('|').map(s => s.trim());
-        return name && location ? { name, location } : null;
-      }).filter(Boolean);
+      const points = [];
+      for (const [index, raw] of $('fuzzPoints').value.split('\n').entries()) {
+        const line = raw.trim();
+        if (!line) continue;
+        const separator = line.indexOf('|');
+        if (separator < 1 || separator !== line.lastIndexOf('|')) throw new Error(`Insertion point line ${index + 1} must use name|location`);
+        const name = line.slice(0, separator).trim();
+        const location = line.slice(separator + 1).trim();
+        if (!name || !location) throw new Error(`Insertion point line ${index + 1} must include both name and location`);
+        points.push({ name, location });
+      }
+      if (!points.length) throw new Error('Add at least one insertion point');
+      return points;
     }
     $('startFuzz').onclick = async () => {
       if (!state.projectId || !state.activeReplyTab) return status('fuzzStatus', 'Save or select a Reply tab first', 'err');
@@ -1339,7 +1356,13 @@ test
           draft: replyDraftFromForm(), insertion_points: parsePoints(), ...fuzzPayloadInput(),
           transforms: $('fuzzTransforms').value.split(',').map(s => s.trim()).filter(Boolean), strategy: $('fuzzStrategy').value,
         };
-        const job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, { method: 'POST', body: JSON.stringify({ template, confirm: true }) });
+        let job;
+        try {
+          job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, { method: 'POST', body: JSON.stringify({ template, confirm: false }) });
+        } catch (error) {
+          if (error.code !== 'combination_limit' || !confirm(`${error.message}. Start this large job?`)) throw error;
+          job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, { method: 'POST', body: JSON.stringify({ template, confirm: true }) });
+        }
         state.selectedFuzzJob = job.id; status('fuzzStatus', `Job ${job.id} started`, 'ok'); await loadFuzzJobs();
       } catch (e) { status('fuzzStatus', e.message, 'err'); }
     };
@@ -1376,17 +1399,21 @@ test
         showFuzzResultsPanel('groups');
       } catch (e) { status('fuzzStatus', e.message, 'err'); }
     }
-    async function loadFuzzCases(jobId, groupId = null) {
+    async function loadFuzzCases(jobId, groupId = null, append = false) {
       state.selectedFuzzJob = Number(jobId);
       state.selectedFuzzGroup = groupId;
       try {
         const groupQuery = groupId ? `&group_id=${encodeURIComponent(groupId)}` : '';
-        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/cases?limit=250${groupQuery}`);
-        $('fuzzCases').innerHTML = (result.cases || []).map(c => {
+        const cursorQuery = append && state.fuzzCasesCursor != null ? `&before_case_index=${state.fuzzCasesCursor}` : '';
+        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/cases?limit=250${groupQuery}${cursorQuery}`);
+        state.fuzzCases = append ? state.fuzzCases.concat(result.cases || []) : (result.cases || []);
+        state.fuzzCasesCursor = result.next_before_case_index ?? null;
+        $('fuzzCases').innerHTML = state.fuzzCases.map(c => {
           const payload = c.payload_summary || JSON.stringify(c.payloads || []);
-          const compare = c.exchange_id ? `<button class="btn fit" data-fuzz-compare="${c.id}">Compare</button>` : escapeHtml(c.error || '—');
-          return `<tr><td>${c.case_index}</td><td title="${escapeHtml(payload)}">${escapeHtml(payload.slice(0, 60))}</td><td>${c.status_code ?? c.state ?? '—'}</td><td>${c.response_length ?? '—'}</td><td>${c.exchange_id ?? '—'}</td><td>${compare}</td></tr>`;
+          const actions = c.exchange_id ? `<button class="btn fit" data-fuzz-open="${c.exchange_id}">Open response</button> <button class="btn fit" data-fuzz-compare="${c.id}">Compare</button>` : escapeHtml(c.error || '—');
+          return `<tr><td>${c.case_index}</td><td title="${escapeHtml(payload)}">${escapeHtml(payload.slice(0, 60))}</td><td>${c.status_code ?? c.state ?? '—'}</td><td>${c.response_length ?? '—'}</td><td>${c.exchange_id ?? '—'}</td><td>${actions}</td></tr>`;
         }).join('');
+        $('loadMoreFuzzCases').classList.toggle('hidden', state.fuzzCasesCursor == null);
         showFuzzResultsPanel('cases');
       } catch (e) { status('fuzzStatus', e.message, 'err'); }
     }
@@ -1404,6 +1431,8 @@ test
       if (row) loadFuzzCases(state.selectedFuzzJob, row.dataset.fuzzGroup);
     };
     $('fuzzCases').onclick = async e => {
+      const open = e.target.closest('[data-fuzz-open]');
+      if (open) { activateView('history'); await selectExchange(Number(open.dataset.fuzzOpen)); return; }
       const compare = e.target.closest('[data-fuzz-compare]');
       if (!compare) return;
       try {
@@ -1412,6 +1441,7 @@ test
         $('fuzzDiff').classList.remove('hidden');
       } catch (err) { status('fuzzStatus', err.message, 'err'); }
     };
+    $('loadMoreFuzzCases').onclick = () => state.selectedFuzzJob && loadFuzzCases(state.selectedFuzzJob, state.selectedFuzzGroup, true);
     $('showFuzzGroups').onclick = () => state.selectedFuzzJob && loadFuzzGroups(state.selectedFuzzJob);
     $('showFuzzCases').onclick = () => state.selectedFuzzJob && loadFuzzCases(state.selectedFuzzJob);
     $('refreshFuzz').onclick = loadFuzzJobs;
