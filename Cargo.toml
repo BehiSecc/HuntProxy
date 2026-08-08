@@ -39,7 +39,7 @@ wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["e
 
 # TLS / CA
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 webpki-roots = "0.26"
