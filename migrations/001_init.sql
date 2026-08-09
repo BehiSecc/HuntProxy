@@ -1,4 +1,4 @@
--- bb schema v1
+-- HuntProxy schema v1
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE projects (

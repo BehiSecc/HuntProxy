@@ -1059,24 +1059,38 @@ async fn history(
         _ => None,
     };
 
-    let count_filter = filter.clone();
+    // `request:~text` may decode and scan every candidate request body. An
+    // exact total would execute that same expensive filter a second time.
+    let total_exact = filter
+        .as_ref()
+        .is_none_or(|filter| !crate::history::uses_request_body_search(filter));
+    let count_filter = total_exact.then(|| filter.clone()).flatten();
     match state
         .db
         .list_history_filtered(ProjectId(id), filter, limit, before_started, before_id)
         .await
     {
         Ok((items, next)) => {
-            let total = match state
-                .db
-                .count_history_filtered(ProjectId(id), count_filter)
-                .await
-            {
-                Ok(total) => total,
-                Err(error) => return error_response(error),
+            let total = if total_exact {
+                match state
+                    .db
+                    .count_history_filtered(ProjectId(id), count_filter)
+                    .await
+                {
+                    Ok(total) => Some(total),
+                    Err(error) => return error_response(error),
+                }
+            } else {
+                None
             };
             let cursor = next.map(|(s, i)| format!("{s}:{i}"));
-            Json(serde_json::json!({"items": items, "next_cursor": cursor, "total": total}))
-                .into_response()
+            Json(serde_json::json!({
+                "items": items,
+                "next_cursor": cursor,
+                "total": total,
+                "total_exact": total_exact
+            }))
+            .into_response()
         }
         Err(e) => error_response(e),
     }

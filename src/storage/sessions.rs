@@ -298,3 +298,27 @@ pub fn extract_proxy_token(header_value: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn basic(value: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, value.as_bytes())
+        )
+    }
+
+    #[test]
+    fn proxy_basic_auth_uses_huntproxy_and_accepts_legacy_username() {
+        assert_eq!(
+            extract_proxy_token(&basic("huntproxy:token")),
+            Some("token".into())
+        );
+        assert_eq!(
+            extract_proxy_token(&basic("bb:legacy")),
+            Some("legacy".into())
+        );
+    }
+}

@@ -1,5 +1,5 @@
 [package]
-name = "bb"
+name = "HuntProxy"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
@@ -9,6 +9,10 @@ repository = "https://github.com/BehiSecc/HuntProxy"
 homepage = "https://github.com/BehiSecc/HuntProxy"
 publish = false
 default-run = "HuntProxy"
+
+[lib]
+name = "huntproxy"
+path = "src/lib.rs"
 
 [[bin]]
 name = "HuntProxy"

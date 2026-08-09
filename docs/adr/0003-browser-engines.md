@@ -19,7 +19,7 @@ browser startup, state migration, and public controls unnecessarily complex.
 - Portable checkpoints retain cookies plus local/session storage. A legacy
   checkpoint is imported when a project has no initialized Chromium profile.
 - Checkpoint values stay in daemon memory only; SQLite stores version/status/hash.
-- Chromium authenticates to HuntProxy's proxy with Basic user `bb` and the
+- Chromium authenticates to HuntProxy's proxy with Basic user `huntproxy` and the
   capture token as its password.
 - Browser start requires no engine policy, fallback reason, or migration action.
 

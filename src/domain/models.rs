@@ -65,6 +65,10 @@ pub struct ProjectLimits {
     pub fuzz_confirm_threshold: u64,
 }
 
+/// Default per-project logical capture allowance: exactly 2 GiB
+/// (2 × 1024³ bytes), not 2 decimal GB.
+pub const DEFAULT_PROJECT_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 impl Default for ProjectLimits {
     fn default() -> Self {
         Self {
@@ -73,10 +77,21 @@ impl Default for ProjectLimits {
             max_concurrent_browsers: 2,
             max_body_bytes: 25 * 1024 * 1024,
             max_fuzz_cases: 100_000,
-            max_disk_bytes: 2 * 1024 * 1024 * 1024,
+            max_disk_bytes: DEFAULT_PROJECT_DISK_BYTES,
             capture_body_bytes: 10 * 1024 * 1024,
             fuzz_confirm_threshold: 5_000,
         }
+    }
+}
+
+#[cfg(test)]
+mod project_limit_tests {
+    use super::*;
+
+    #[test]
+    fn default_capture_quota_is_exactly_two_gibibytes() {
+        assert_eq!(DEFAULT_PROJECT_DISK_BYTES, 2_147_483_648);
+        assert_eq!(ProjectLimits::default().max_disk_bytes, 2_147_483_648);
     }
 }
 
@@ -126,7 +141,7 @@ pub struct CaptureSession {
 }
 
 /// Fixed Basic-auth username for Chromium/external clients.
-pub const PROXY_BASIC_USER: &str = "bb";
+pub const PROXY_BASIC_USER: &str = "huntproxy";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Annotation {

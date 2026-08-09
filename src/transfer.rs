@@ -408,7 +408,8 @@ fn resolve_draft_placeholders(
             continue;
         };
         let Some(inner) = value
-            .strip_prefix("{{bb:v1:")
+            .strip_prefix("{{huntproxy:v1:")
+            .or_else(|| value.strip_prefix("{{bb:v1:"))
             .and_then(|value| value.strip_suffix("}}"))
         else {
             continue;

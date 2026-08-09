@@ -9,7 +9,7 @@
 | Projects + scope policy + ValidatedDial | Done |
 | SQLite WAL storage, migrations, body storage | Done |
 | Redaction / noisy headers (spec set) | Done + unit tests |
-| Capture sessions (Bearer + Basic `bb:token`) | Done |
+| Capture sessions (Bearer + Basic `huntproxy:token`; legacy `bb:token` accepted) | Done |
 | Explicit proxy (HTTP forward + CONNECT tunnel) | Done (semantic path) |
 | History filters (AST + text → SQL binds) | Done |
 | Reply drafts + inheritance + send | Done |

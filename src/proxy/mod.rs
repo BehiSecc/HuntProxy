@@ -910,7 +910,7 @@ fn proxy_error_response(error: DomainError) -> Response<ProxyBody> {
     if error.code() == ErrorCode::ProxyAuthRequired {
         return Response::builder()
             .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .header("Proxy-Authenticate", "Basic realm=\"bb\"")
+            .header("Proxy-Authenticate", "Basic realm=\"HuntProxy\"")
             .header("Proxy-Authenticate", "Bearer")
             .body(full_body(Bytes::from("Proxy authentication required")))
             .expect("static proxy auth response");
@@ -1295,7 +1295,7 @@ mod tests {
             .iter()
             .map(|value| value.to_str().unwrap().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(challenges, vec!["Basic realm=\"bb\"", "Bearer"]);
+        assert_eq!(challenges, vec!["Basic realm=\"HuntProxy\"", "Bearer"]);
     }
 
     #[test]

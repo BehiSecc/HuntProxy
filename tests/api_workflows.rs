@@ -1,17 +1,17 @@
 use axum::body::Body;
-use bb::app::bootstrap_state;
-use bb::config::Config;
-use bb::domain::*;
-use bb::storage::NewExchange;
 use http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use huntproxy::app::bootstrap_state;
+use huntproxy::config::Config;
+use huntproxy::domain::*;
+use huntproxy::storage::NewExchange;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn test_state() -> (TempDir, std::sync::Arc<bb::app::AppState>, ProjectId) {
+async fn test_state() -> (TempDir, std::sync::Arc<huntproxy::app::AppState>, ProjectId) {
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
         data_dir: directory.path().to_path_buf(),
@@ -79,7 +79,7 @@ async fn json_response(response: axum::response::Response) -> serde_json::Value 
 #[tokio::test]
 async fn api_body_limits_are_route_specific() {
     let (_directory, state, project_id) = test_state().await;
-    let app = bb::api::router(state);
+    let app = huntproxy::api::router(state);
     let large_text = "x".repeat(140 * 1024);
     let rename = serde_json::json!({ "name": large_text }).to_string();
     let rejected = app
@@ -110,7 +110,7 @@ async fn api_body_limits_are_route_specific() {
 #[tokio::test]
 async fn dynamic_api_responses_are_never_browser_cached() {
     let (_directory, state, _project_id) = test_state().await;
-    let response = bb::api::router(state)
+    let response = huntproxy::api::router(state)
         .oneshot(
             Request::get("/api/v1/projects")
                 .body(Body::empty())
@@ -138,7 +138,7 @@ async fn history_filter_and_annotation_work_through_http_api() {
         .insert_exchange(exchange(project_id, "POST", "/post"))
         .await
         .unwrap();
-    let app = bb::api::router(state);
+    let app = huntproxy::api::router(state);
 
     let filtered = app
         .clone()
@@ -156,7 +156,25 @@ async fn history_filter_and_annotation_work_through_http_api() {
     let filtered = json_response(filtered).await;
     assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["total"], 1);
+    assert_eq!(filtered["total_exact"], true);
     assert_eq!(filtered["items"][0]["method"], "GET");
+
+    let body_search = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/history?q=request%3A~missing",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_search.status(), StatusCode::OK);
+    let body_search = json_response(body_search).await;
+    assert!(body_search["total"].is_null());
+    assert_eq!(body_search["total_exact"], false);
 
     let first_page = app
         .clone()
@@ -239,7 +257,7 @@ async fn history_filter_and_annotation_work_through_http_api() {
 #[tokio::test]
 async fn embedded_ui_exposes_the_complete_workbench() {
     let (_directory, state, _project_id) = test_state().await;
-    let response = bb::api::router(state)
+    let response = huntproxy::api::router(state)
         .oneshot(Request::get("/").body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -272,7 +290,7 @@ async fn embedded_ui_exposes_the_complete_workbench() {
 #[tokio::test]
 async fn reply_send_rejects_flat_request_fields_instead_of_sending_defaults() {
     let (_directory, state, project_id) = test_state().await;
-    let response = bb::api::router(state)
+    let response = huntproxy::api::router(state)
         .oneshot(
             Request::post(format!("/api/v1/projects/{}/reply-send", project_id.get()))
                 .header(http::header::CONTENT_TYPE, "application/json")
@@ -301,7 +319,7 @@ async fn fuzzer_number_generator_runs_through_http_api() {
         .mount(&server)
         .await;
     let (_directory, state, project_id) = test_state().await;
-    let app = bb::api::router(state.clone());
+    let app = huntproxy::api::router(state.clone());
     let response = app
         .oneshot(
             Request::post(format!("/api/v1/projects/{}/fuzz-jobs", project_id.get()))
@@ -354,7 +372,7 @@ async fn fuzzer_number_generator_runs_through_http_api() {
     ids.sort();
     assert_eq!(ids, ["1", "10", "4", "7"]);
 
-    let groups = bb::api::router(state)
+    let groups = huntproxy::api::router(state)
         .oneshot(
             Request::get(format!(
                 "/api/v1/projects/{}/fuzz-jobs/{}/groups",
@@ -385,7 +403,7 @@ async fn page_analyzer_extracts_saved_response_findings_through_http_api() {
     );
     let exchange_id = state.db.insert_exchange(captured).await.unwrap();
 
-    let response = bb::api::router(state)
+    let response = huntproxy::api::router(state)
         .oneshot(
             Request::get(format!(
                 "/api/v1/projects/{}/exchanges/{}/analyze",
@@ -435,7 +453,7 @@ async fn get_words_includes_javascript_related_to_the_requested_site_by_default(
         .record_javascript_files(
             project_id,
             "https://example.com/partner-dashboard",
-            vec![bb::storage::JavascriptProvenanceInput {
+            vec![huntproxy::storage::JavascriptProvenanceInput {
                 url: "https://assets.cdn.test/static/app.js".into(),
                 source_page_url: None,
             }],
@@ -445,7 +463,7 @@ async fn get_words_includes_javascript_related_to_the_requested_site_by_default(
         .await
         .unwrap();
 
-    let app = bb::api::router(state);
+    let app = huntproxy::api::router(state);
     let included = app
         .clone()
         .oneshot(
@@ -623,7 +641,7 @@ async fn background_crawler_fetches_one_level_and_obeys_scope_exclusions() {
 #[tokio::test]
 async fn optional_capture_scope_can_be_updated_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
-    let app = bb::api::router(state);
+    let app = huntproxy::api::router(state);
     let response = app
         .oneshot(
             Request::post(format!("/api/v1/projects/{}/scope", project_id.get()))
@@ -659,7 +677,7 @@ async fn optional_capture_scope_can_be_updated_through_http_api() {
 #[tokio::test]
 async fn managed_cookies_are_configured_without_exposing_values() {
     let (_directory, state, project_id) = test_state().await;
-    let app = bb::api::router(state.clone());
+    let app = huntproxy::api::router(state.clone());
     let set = app
         .clone()
         .oneshot(
@@ -788,7 +806,7 @@ async fn response_body_api_decodes_gzip_and_preserves_raw_access() {
     }];
     captured.response_body = Some(compressed.clone());
     let exchange_id = state.db.insert_exchange(captured).await.unwrap();
-    let app = bb::api::router(state);
+    let app = huntproxy::api::router(state);
 
     let decoded = app
         .clone()
@@ -858,7 +876,7 @@ async fn sitemap_and_findings_work_through_http_api() {
     third.host = "cdn.example.com".into();
     third.authority = "cdn.example.com".into();
     state.db.insert_exchange(third).await.unwrap();
-    let app = bb::api::router(state);
+    let app = huntproxy::api::router(state);
 
     let sitemap = app
         .clone()
@@ -987,7 +1005,7 @@ async fn copy_as_includes_secrets_by_default_and_can_explicitly_redact_them() {
     ];
     captured.request_body = Some(br#"{"ok":true}"#.to_vec());
     let exchange_id = state.db.insert_exchange(captured).await.unwrap();
-    let app = bb::api::router(state);
+    let app = huntproxy::api::router(state);
 
     let included = app
         .clone()
@@ -1065,7 +1083,7 @@ async fn raw_reply_preserves_framing_and_collects_response_sequences() {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     });
-    let app = bb::api::router(state.clone());
+    let app = huntproxy::api::router(state.clone());
     let sent = app
         .clone()
         .oneshot(
@@ -1134,7 +1152,7 @@ async fn raw_reply_preserves_framing_and_collects_response_sequences() {
         .windows(b"HTTP/1.1 201 ".len())
         .any(|window| window == b"HTTP/1.1 201 "));
 
-    let mcp_presented = bb::mcp::call_tool(
+    let mcp_presented = huntproxy::mcp::call_tool(
         state.clone(),
         "exchange_body",
         serde_json::json!({
@@ -1148,7 +1166,7 @@ async fn raw_reply_preserves_framing_and_collects_response_sequences() {
     assert_eq!(mcp_presented["preview"], "one");
     assert_eq!(mcp_presented["total"], 3);
 
-    let mcp_raw = bb::mcp::call_tool(
+    let mcp_raw = huntproxy::mcp::call_tool(
         state,
         "exchange_body",
         serde_json::json!({

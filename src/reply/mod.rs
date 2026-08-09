@@ -23,7 +23,10 @@ use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Presentation placeholder: `{{bb:v1:<b64-mac>:<project>:<exchange>:<side>:<header>:<rev>}}`
+const PLACEHOLDER_PREFIX: &str = "{{huntproxy:v1:";
+const LEGACY_PLACEHOLDER_PREFIX: &str = "{{bb:v1:";
+
+/// Presentation placeholder: `{{huntproxy:v1:<b64-mac>:<project>:<exchange>:<side>:<header>:<rev>}}`
 #[derive(Clone)]
 pub struct PlaceholderKey {
     key: Vec<u8>,
@@ -75,7 +78,7 @@ impl PlaceholderKey {
         );
         let sig = self.mac(&payload);
         format!(
-            "{{{{bb:v1:{sig}:{proj}:{ex}:{side}:{hdr}:{rev}}}}}",
+            "{{{{huntproxy:v1:{sig}:{proj}:{ex}:{side}:{hdr}:{rev}}}}}",
             sig = sig,
             proj = project_id.get(),
             ex = exchange_id.get(),
@@ -87,7 +90,8 @@ impl PlaceholderKey {
 
     pub fn verify_and_parse(&self, token: &str) -> DomainResult<PlaceholderRef> {
         let inner = token
-            .strip_prefix("{{bb:v1:")
+            .strip_prefix(PLACEHOLDER_PREFIX)
+            .or_else(|| token.strip_prefix(LEGACY_PLACEHOLDER_PREFIX))
             .and_then(|s| s.strip_suffix("}}"))
             .ok_or_else(|| DomainError::new(ErrorCode::PlaceholderInvalid, "bad placeholder"))?;
         let parts: Vec<&str> = inner.split(':').collect();
@@ -269,7 +273,7 @@ pub async fn materialize_request(
     for o in &draft.header_overrides {
         // If value looks like a placeholder, resolve to original secret
         let val = if let Ok(s) = std::str::from_utf8(&o.value) {
-            if s.starts_with("{{bb:v1:") {
+            if s.starts_with(PLACEHOLDER_PREFIX) || s.starts_with(LEGACY_PLACEHOLDER_PREFIX) {
                 let pref = key.verify_and_parse(s)?;
                 if pref.project_id != project_id {
                     return Err(DomainError::new(
@@ -552,6 +556,9 @@ pub struct MaterializedRequest {
 pub struct ReplySendContext {
     pub source: ExchangeSource,
     pub lineage: ExchangeLineage,
+    /// Internal-only escape hatch for host-validated relay transports such as
+    /// IpRotate. Public Reply callers never set this.
+    pub capture_out_of_scope: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -598,6 +605,7 @@ impl ReplySendContext {
                 reply_tab_id: tab_id,
                 ..Default::default()
             },
+            capture_out_of_scope: false,
         }
     }
 
@@ -610,6 +618,7 @@ impl ReplySendContext {
                 fuzz_case_id: Some(case_id),
                 ..Default::default()
             },
+            capture_out_of_scope: false,
         }
     }
 }
@@ -749,7 +758,8 @@ impl ReplyService {
         );
 
         // Scope controls persistence only; it never blocks egress.
-        let should_capture = url_is_in_scope(&mat.url, &project.scope)?;
+        let should_capture =
+            context.capture_out_of_scope || url_is_in_scope(&mat.url, &project.scope)?;
         let dial =
             resolve_validated_dial(&mat.url, &project.scope, Duration::from_secs(60)).await?;
 
@@ -1060,6 +1070,25 @@ mod tests {
     use crate::transport::OutboundResponse;
 
     struct CannedTransport;
+
+    #[test]
+    fn placeholders_use_huntproxy_prefix_and_accept_legacy_prefix() {
+        let key = PlaceholderKey::from_bytes(vec![7; 32]);
+        let current = key.mint(ProjectId(11), ExchangeId(22), "request", "Cookie", 3);
+        assert!(current.starts_with(PLACEHOLDER_PREFIX));
+
+        let parsed = key.verify_and_parse(&current).unwrap();
+        assert_eq!(parsed.project_id, ProjectId(11));
+        assert_eq!(parsed.exchange_id, ExchangeId(22));
+        assert_eq!(parsed.side, "request");
+        assert_eq!(parsed.header, "cookie");
+        assert_eq!(parsed.rev, 3);
+
+        let legacy = current.replacen(PLACEHOLDER_PREFIX, LEGACY_PLACEHOLDER_PREFIX, 1);
+        let parsed_legacy = key.verify_and_parse(&legacy).unwrap();
+        assert_eq!(parsed_legacy.project_id, ProjectId(11));
+        assert_eq!(parsed_legacy.exchange_id, ExchangeId(22));
+    }
 
     #[async_trait::async_trait]
     impl SemanticTransport for CannedTransport {

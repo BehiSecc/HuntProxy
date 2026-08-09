@@ -56,8 +56,8 @@ function trackJavascriptFiles(session, existing = new Map()) {
 
 function loadPlaywright() {
   const candidates = [];
-  if (process.env.BB_PLAYWRIGHT_CORE_PATH) {
-    candidates.push(process.env.BB_PLAYWRIGHT_CORE_PATH);
+  if (process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH || process.env.BB_PLAYWRIGHT_CORE_PATH) {
+    candidates.push(process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH || process.env.BB_PLAYWRIGHT_CORE_PATH);
   }
   const workerDir = path.dirname(fileURLToPath(import.meta.url));
   candidates.push(
@@ -108,6 +108,7 @@ function rpcError(code, message) {
 
 function existingChromiumExecutable() {
   const candidates = [
+    process.env.HUNTPROXY_CHROME_EXECUTABLE,
     process.env.BB_CHROME_EXECUTABLE,
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
     "/usr/bin/google-chrome-stable",
@@ -159,7 +160,7 @@ async function launchChromium(proxy, caCertPath, profileDir = null) {
   if (!executablePath) {
     throw rpcError(
       -32003,
-      "Chromium executable not found; install Chromium or set BB_CHROME_EXECUTABLE",
+      "Chromium executable not found; install Chromium or set HUNTPROXY_CHROME_EXECUTABLE",
     );
   }
   const options = chromiumLaunchOptions(proxy, caCertPath);

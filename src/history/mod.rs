@@ -72,6 +72,19 @@ pub fn validate_filter(node: &FilterNode) -> DomainResult<()> {
     validate_filter_depth(node, 0, &mut 0)
 }
 
+/// Full request search includes decoded body bytes and is intentionally
+/// treated as expensive by API callers (for example, they skip an exact
+/// second-pass count). Keep this structural check next to the filter model so
+/// every adapter can make the same decision without inspecting generated SQL.
+pub fn uses_request_body_search(node: &FilterNode) -> bool {
+    match node {
+        FilterNode::And { and } => and.iter().any(uses_request_body_search),
+        FilterNode::Or { or } => or.iter().any(uses_request_body_search),
+        FilterNode::Not { not } => uses_request_body_search(not),
+        FilterNode::Term { field, .. } => field == "request",
+    }
+}
+
 fn validate_filter_depth(node: &FilterNode, depth: usize, terms: &mut usize) -> DomainResult<()> {
     if depth > MAX_DEPTH {
         return Err(DomainError::invalid("filter nesting too deep"));
@@ -733,6 +746,16 @@ mod tests {
         assert!(sql.contains("method="));
         assert!(binds.iter().any(|value| value == ":smtg"));
         assert!(binds.iter().any(|value| value == "PUT"));
+        assert!(uses_request_body_search(&filter));
+    }
+
+    #[test]
+    fn only_request_terms_are_classified_as_full_body_searches() {
+        let ordinary = parse_text_query("host:example.com method:POST").unwrap();
+        assert!(!uses_request_body_search(&ordinary));
+
+        let nested = parse_text_query("NOT (status:404 OR request:~needle)").unwrap();
+        assert!(uses_request_body_search(&nested));
     }
 
     #[test]

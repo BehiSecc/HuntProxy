@@ -1,8 +1,8 @@
 //! Bounded, host-owned extension runtime.
 //!
-//! Extensions are pure JavaScript orchestration. They can describe semantic
-//! HTTP operations, but they receive no filesystem, process, or socket APIs;
-//! HuntProxy validates and executes every operation and persists its evidence.
+//! Extensions are pure JavaScript orchestration. They can describe bounded
+//! HTTP and explicitly declared cloud operations, but receive no filesystem,
+//! process, socket, or secret APIs; HuntProxy validates and executes them.
 
 use crate::domain::*;
 use crate::policy::url_is_in_scope;
@@ -10,15 +10,17 @@ use crate::reply::{ReplySendContext, ReplyService};
 use base64::Engine;
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
-use rquickjs::{Context, Runtime};
+use rquickjs::{CatchResultExt, Context, Runtime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -183,6 +185,7 @@ enum PluginExecution {
 enum PluginOperation {
     HttpRequest(PluginHttpRequest),
     HttpWorkflow(PluginHttpWorkflow),
+    AwsApiGateway(PluginAwsApiGateway),
     RawHttp1(PluginRawHttp1),
     RawHttp1Group(PluginRawHttp1Group),
     RawHttp2(PluginRawHttp2),
@@ -194,10 +197,43 @@ impl PluginOperation {
         match self {
             Self::HttpRequest(request) => &request.id,
             Self::HttpWorkflow(workflow) => &workflow.id,
+            Self::AwsApiGateway(operation) => operation.id(),
             Self::RawHttp1(request) => &request.id,
             Self::RawHttp1Group(group) => &group.id,
             Self::RawHttp2(request) => &request.id,
             Self::RaceGroup(group) => &group.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum PluginAwsApiGateway {
+    Provision {
+        id: String,
+        region: String,
+        target_url: String,
+        stage_name: String,
+    },
+    Delete {
+        id: String,
+        region: String,
+        rest_api_id: String,
+    },
+    Request {
+        id: String,
+        gateway_endpoint: String,
+        base_exchange_id: ExchangeId,
+        target_scope: String,
+        #[serde(default)]
+        include_auth: bool,
+    },
+}
+
+impl PluginAwsApiGateway {
+    fn id(&self) -> &str {
+        match self {
+            Self::Provision { id, .. } | Self::Delete { id, .. } | Self::Request { id, .. } => id,
         }
     }
 }
@@ -694,7 +730,7 @@ impl PluginService {
             let _active_job_permit = active_job_permit;
             service.execute_job(job, plugin, action, input).await;
         });
-        Ok(self.status(id)?)
+        self.status(id)
     }
 
     pub fn status(&self, id: Uuid) -> DomainResult<PluginJobView> {
@@ -846,6 +882,7 @@ impl PluginService {
             let required = match operation {
                 PluginOperation::HttpRequest(_) => "http.semantic",
                 PluginOperation::HttpWorkflow(_) => "http.semantic",
+                PluginOperation::AwsApiGateway(_) => "aws.api_gateway",
                 PluginOperation::RawHttp1(_) => "http.raw",
                 PluginOperation::RawHttp1Group(_) => "http.raw",
                 PluginOperation::RawHttp2(_) => "http.raw",
@@ -1411,6 +1448,150 @@ impl PluginService {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_aws_api_gateway(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        plugin_name: &str,
+        operation: PluginAwsApiGateway,
+        scope: &ScopePolicy,
+        target_host: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> DomainResult<Value> {
+        let operation = match operation {
+            PluginAwsApiGateway::Request {
+                id,
+                gateway_endpoint,
+                base_exchange_id,
+                target_scope,
+                include_auth,
+            } => {
+                let detail = self
+                    .db
+                    .get_exchange_detail(
+                        project_id,
+                        base_exchange_id,
+                        crate::policy::PresentationOptions::default(),
+                    )
+                    .await?;
+                let query = detail
+                    .summary
+                    .query
+                    .as_ref()
+                    .map(|query| format!("?{query}"))
+                    .unwrap_or_default();
+                let original_url = format!(
+                    "{}://{}{}{}",
+                    detail.summary.scheme, detail.summary.authority, detail.summary.path, query
+                );
+                enforce_plugin_scope(&original_url, scope, target_host)?;
+                enforce_target_scope(&original_url, &target_scope)?;
+                let gateway_endpoint = validate_gateway_endpoint(&gateway_endpoint)?;
+                let wire_url = format!(
+                    "{}{}{}",
+                    gateway_endpoint.trim_end_matches('/'),
+                    detail.summary.path,
+                    query
+                );
+                let header_tombstones = if include_auth {
+                    Vec::new()
+                } else {
+                    vec![
+                        "Cookie".into(),
+                        "Authorization".into(),
+                        "Proxy-Authorization".into(),
+                    ]
+                };
+                let draft = ReplyDraft {
+                    method: Some(detail.summary.method),
+                    url: Some(wire_url),
+                    header_tombstones,
+                    ..Default::default()
+                };
+                let response = tokio::select! {
+                    _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                    response = self.reply.send_with_context(
+                        project_id,
+                        Some(base_exchange_id),
+                        &draft,
+                        ProtocolPreference::Auto,
+                        0,
+                        ReplySendContext {
+                            source: ExchangeSource::Plugin,
+                            lineage: ExchangeLineage { parent_exchange_id: Some(base_exchange_id), ..Default::default() },
+                            capture_out_of_scope: true,
+                        },
+                    ) => response?,
+                };
+                let exchange_id = response.exchange_id.ok_or_else(|| {
+                    DomainError::new(
+                        ErrorCode::StorageError,
+                        "IpRotate response was not saved after host scope validation",
+                    )
+                })?;
+                self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name, &id)
+                    .await?;
+                return Ok(json!({
+                    "id": id,
+                    "exchange_id": exchange_id,
+                    "status_code": response.status_code,
+                    "response_length": response.response_length,
+                    "response_body_hash": response.response_body_hash,
+                    "response_preview": response.response_preview,
+                }));
+            }
+            operation => operation,
+        };
+
+        let credentials_path = self.directory.join(plugin_id).join("aws-credentials.toml");
+        let credentials = load_aws_credentials(&credentials_path)?;
+        let (id, region) = match &operation {
+            PluginAwsApiGateway::Provision { id, region, .. }
+            | PluginAwsApiGateway::Delete { id, region, .. } => (id.clone(), region.clone()),
+            PluginAwsApiGateway::Request { .. } => unreachable!(),
+        };
+        validate_aws_region(&region)?;
+        let helper = self
+            .plugins
+            .get(plugin_id)
+            .and_then(|plugin| plugin.resources.get("aws-control"))
+            .ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::ConfigInvalid,
+                    "IpRotate package is missing its verified aws-control resource",
+                )
+            })?;
+        let payload = match operation {
+            PluginAwsApiGateway::Provision {
+                target_url,
+                stage_name,
+                ..
+            } => {
+                enforce_plugin_scope(&target_url, scope, target_host)?;
+                validate_gateway_target(&target_url)?;
+                validate_gateway_stage(&stage_name)?;
+                json!({
+                    "action": "provision",
+                    "region": region,
+                    "target_url": target_url,
+                    "stage_name": stage_name,
+                })
+            }
+            PluginAwsApiGateway::Delete { rest_api_id, .. } => {
+                validate_rest_api_id(&rest_api_id)?;
+                json!({
+                    "action": "delete",
+                    "region": region,
+                    "rest_api_id": rest_api_id,
+                })
+            }
+            PluginAwsApiGateway::Request { .. } => unreachable!(),
+        };
+        let result = run_aws_control_helper(helper, payload, credentials, cancel).await?;
+        Ok(json!({"id": id, "aws_gateway": result}))
+    }
+
     async fn execute_operation(
         &self,
         project_id: ProjectId,
@@ -1604,6 +1785,7 @@ impl PluginService {
                 let context = ReplySendContext {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
+                    capture_out_of_scope: false,
                 };
                 let draft = ReplyDraft {
                     method: request.method,
@@ -1661,6 +1843,18 @@ impl PluginService {
                     "response_body_truncated": response_body_truncated,
                 }))
             }
+            PluginOperation::AwsApiGateway(operation) => {
+                self.execute_aws_api_gateway(
+                    project_id,
+                    plugin_id,
+                    plugin_name,
+                    operation,
+                    scope,
+                    target_host,
+                    cancel,
+                )
+                .await
+            }
             PluginOperation::HttpWorkflow(workflow) => {
                 self.execute_http_workflow(
                     project_id,
@@ -1703,6 +1897,7 @@ impl PluginService {
                         ReplySendContext {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
+                            capture_out_of_scope: false,
                         },
                     ) => response?,
                 };
@@ -1820,7 +2015,7 @@ impl PluginService {
                                 bytes,
                                 use_project_cookies,
                                 options,
-                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default() },
+                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default(), capture_out_of_scope: false },
                             ) => response,
                         };
                         let observation = match result {
@@ -1864,6 +2059,7 @@ impl PluginService {
                         ReplySendContext {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
+                            capture_out_of_scope: false,
                         },
                     ) => response?,
                 };
@@ -2108,7 +2304,7 @@ impl PluginService {
             enforce_plugin_scope(&url, scope, target_host)?;
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() } }) => response?,
+                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() }, capture_out_of_scope: false }) => response?,
             };
             if let Some(exchange_id) = response.exchange_id {
                 self.annotate_plugin_exchange(
@@ -2329,6 +2525,7 @@ impl PluginService {
                 ReplySendContext {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
+                    capture_out_of_scope: false,
                 },
             ) => result,
         };
@@ -2438,6 +2635,7 @@ impl PluginService {
                             parent_exchange_id: request.base_exchange_id,
                             ..Default::default()
                         },
+                        capture_out_of_scope: false,
                     },
                 ) => response?,
             };
@@ -2539,6 +2737,289 @@ impl PluginService {
             .await?;
         Ok(())
     }
+}
+
+const AWS_CREDENTIAL_FILE_MAX_BYTES: u64 = 8 * 1024;
+const AWS_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AwsCredentialFile {
+    access_key_id: String,
+    secret_access_key: String,
+    #[serde(default)]
+    session_token: Option<String>,
+}
+
+fn load_aws_credentials(path: &Path) -> DomainResult<AwsCredentialFile> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        DomainError::new(
+            ErrorCode::ConfigInvalid,
+            format!(
+                "IpRotate credential file {} is unavailable: {error}; copy aws-credentials.toml.example to aws-credentials.toml",
+                path.display()
+            ),
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "IpRotate credential path must be a regular non-symlink file",
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > AWS_CREDENTIAL_FILE_MAX_BYTES {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            format!(
+                "IpRotate credential file must contain 1..={AWS_CREDENTIAL_FILE_MAX_BYTES} bytes"
+            ),
+        ));
+    }
+    let mut bytes = std::fs::read(path)
+        .map_err(|error| DomainError::new(ErrorCode::ConfigInvalid, error.to_string()))?;
+    let parsed = match std::str::from_utf8(&bytes) {
+        Ok(text) => toml::from_str::<AwsCredentialFile>(text).map_err(|error| {
+            DomainError::new(
+                ErrorCode::ConfigInvalid,
+                format!("invalid IpRotate credential file: {error}"),
+            )
+        }),
+        Err(_) => Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "IpRotate credential file must be UTF-8 TOML",
+        )),
+    };
+    bytes.fill(0);
+    let mut parsed = parsed?;
+    parsed.access_key_id = parsed.access_key_id.trim().to_string();
+    parsed.secret_access_key = parsed.secret_access_key.trim().to_string();
+    parsed.session_token = parsed
+        .session_token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if parsed.access_key_id.is_empty()
+        || parsed.access_key_id.len() > 256
+        || parsed.secret_access_key.is_empty()
+        || parsed.secret_access_key.len() > 512
+        || parsed
+            .session_token
+            .as_ref()
+            .is_some_and(|value| value.len() > 4_096)
+    {
+        return Err(DomainError::new(
+            ErrorCode::ConfigInvalid,
+            "IpRotate credentials are empty or exceed their bounds",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_aws_region(region: &str) -> DomainResult<()> {
+    if !(3..=32).contains(&region.len())
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !region.contains('-')
+    {
+        return Err(DomainError::invalid("invalid AWS region"));
+    }
+    Ok(())
+}
+
+fn validate_gateway_stage(stage: &str) -> DomainResult<()> {
+    if stage.is_empty()
+        || stage.len() > 64
+        || !stage
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(DomainError::invalid("invalid API Gateway stage name"));
+    }
+    Ok(())
+}
+
+fn validate_rest_api_id(rest_api_id: &str) -> DomainResult<()> {
+    if !(5..=32).contains(&rest_api_id.len())
+        || !rest_api_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Err(DomainError::invalid("invalid API Gateway REST API id"));
+    }
+    Ok(())
+}
+
+fn validate_gateway_target(target_url: &str) -> DomainResult<()> {
+    let parsed = url::Url::parse(target_url)
+        .map_err(|error| DomainError::invalid(format!("invalid target_url: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(DomainError::invalid(
+            "target_url must be an HTTP(S) origin without credentials, path, query, or fragment",
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_target_scope(target_url: &str, target_scope: &str) -> DomainResult<()> {
+    let parsed = url::Url::parse(target_url)
+        .map_err(|error| DomainError::invalid(format!("invalid target URL: {error}")))?;
+    let host = parsed
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .ok_or_else(|| DomainError::invalid("target URL requires a hostname"))?;
+    let pattern = target_scope
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let matches = if let Some(suffix) = pattern.strip_prefix("*.") {
+        !suffix.is_empty() && host.len() > suffix.len() && host.ends_with(&format!(".{suffix}"))
+    } else {
+        !pattern.is_empty() && host == pattern
+    };
+    if !matches {
+        return Err(DomainError::scope_denied(
+            "IpRotate saved request is outside target_scope",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_endpoint(value: &str) -> DomainResult<String> {
+    let parsed = url::Url::parse(value)
+        .map_err(|error| DomainError::invalid(format!("invalid gateway endpoint: {error}")))?;
+    let host = parsed
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| DomainError::invalid("gateway endpoint requires a hostname"))?;
+    let parts = host.split('.').collect::<Vec<_>>();
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port_or_known_default() != Some(443)
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() == "/"
+        || parts.len() != 5
+        || parts[1] != "execute-api"
+        || parts[3] != "amazonaws"
+        || parts[4] != "com"
+    {
+        return Err(DomainError::invalid(
+            "gateway endpoint must be a regional HTTPS execute-api URL with a stage path",
+        ));
+    }
+    validate_rest_api_id(parts[0])?;
+    validate_aws_region(parts[2])?;
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+async fn run_aws_control_helper(
+    helper: &str,
+    payload: Value,
+    credentials: AwsCredentialFile,
+    cancel: &CancellationToken,
+) -> DomainResult<Value> {
+    let payload = serde_json::to_vec(&payload)
+        .map_err(|error| DomainError::invalid(format!("invalid AWS operation: {error}")))?;
+    let mut command = tokio::process::Command::new("python3");
+    command
+        .arg("-c")
+        .arg(helper)
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+        )
+        .env("PYTHONUNBUFFERED", "1")
+        .env("AWS_ACCESS_KEY_ID", &credentials.access_key_id)
+        .env("AWS_SECRET_ACCESS_KEY", &credentials.secret_access_key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(session_token) = credentials.session_token.as_deref() {
+        command.env("AWS_SESSION_TOKEN", session_token);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        DomainError::new(
+            ErrorCode::Unavailable,
+            format!("IpRotate requires Python 3 with boto3 available to HuntProxy: {error}"),
+        )
+    })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        DomainError::new(ErrorCode::Unavailable, "IpRotate helper stdin unavailable")
+    })?;
+    stdin.write_all(&payload).await.map_err(|error| {
+        DomainError::new(
+            ErrorCode::Unavailable,
+            format!("could not start IpRotate AWS operation: {error}"),
+        )
+    })?;
+    drop(stdin);
+
+    let output = tokio::select! {
+        _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+        result = tokio::time::timeout(AWS_OPERATION_TIMEOUT, child.wait_with_output()) => match result {
+            Err(_) => return Err(DomainError::new(ErrorCode::Timeout, format!("AWS API Gateway operation timed out after {} seconds", AWS_OPERATION_TIMEOUT.as_secs()))),
+            Ok(Err(error)) => return Err(DomainError::new(ErrorCode::Unavailable, format!("IpRotate AWS helper failed: {error}"))),
+            Ok(Ok(output)) => output,
+        }
+    };
+    let redact = |bytes: &[u8]| {
+        let mut text = String::from_utf8_lossy(bytes)
+            .chars()
+            .take(2_048)
+            .collect::<String>();
+        for secret in [
+            Some(credentials.access_key_id.as_str()),
+            Some(credentials.secret_access_key.as_str()),
+            credentials.session_token.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !secret.is_empty() {
+                text = text.replace(secret, "[redacted]");
+            }
+        }
+        text
+    };
+    if !output.status.success() {
+        let message = redact(&output.stderr);
+        return Err(DomainError::new(
+            ErrorCode::Unavailable,
+            format!(
+                "AWS API Gateway operation failed: {}",
+                if message.trim().is_empty() {
+                    format!("helper exited with {}", output.status)
+                } else {
+                    message.trim().to_string()
+                }
+            ),
+        ));
+    }
+    if output.stdout.len() > 64 * 1024 {
+        return Err(DomainError::new(
+            ErrorCode::BodyTooLarge,
+            "IpRotate AWS helper output exceeded 64 KiB",
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        DomainError::new(
+            ErrorCode::ProtocolError,
+            format!(
+                "IpRotate AWS helper returned invalid JSON: {error}; stderr: {}",
+                redact(&output.stderr)
+            ),
+        )
+    })
 }
 
 struct PluginResponseBody {
@@ -2928,6 +3409,7 @@ fn operation_request_count(operation: &PluginOperation) -> usize {
         PluginOperation::RawHttp2(request) => request.streams.len(),
         PluginOperation::RawHttp1Group(group) => group.members.len(),
         PluginOperation::HttpWorkflow(workflow) => workflow.steps.len(),
+        PluginOperation::AwsApiGateway(_) => 1,
         _ => 1,
     }
 }
@@ -3663,8 +4145,10 @@ fn run_js_sync(
     let context_handle = Context::full(&runtime).map_err(|error| {
         DomainError::new(ErrorCode::Unavailable, format!("QuickJS context: {error}"))
     })?;
-    let output = context_handle.with(|ctx| -> Result<String, rquickjs::Error> {
-        ctx.eval::<(), _>(script)?;
+    let output = context_handle.with(|ctx| -> Result<String, String> {
+        ctx.eval::<(), _>(script)
+            .catch(&ctx)
+            .map_err(|error| bounded_javascript_error(error.to_string()))?;
         let expression = match stage {
             "plan" => format!(
                 "JSON.stringify(globalThis.HuntProxyPlugin.plan({input},{context}))"
@@ -3675,6 +4159,8 @@ fn run_js_sync(
             _ => unreachable!(),
         };
         ctx.eval(expression)
+            .catch(&ctx)
+            .map_err(|error| bounded_javascript_error(error.to_string()))
     });
     if interrupted.load(Ordering::Relaxed) {
         return Err(DomainError::new(
@@ -3697,6 +4183,15 @@ fn run_js_sync(
             format!("plugin {stage} returned invalid JSON: {error}"),
         )
     })
+}
+
+fn bounded_javascript_error(mut message: String) -> String {
+    const MAX_ERROR_CHARS: usize = 2_048;
+    if let Some((index, _)) = message.char_indices().nth(MAX_ERROR_CHARS) {
+        message.truncate(index);
+        message.push('…');
+    }
+    message
 }
 
 #[cfg(test)]
@@ -3792,6 +4287,129 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Timeout);
         assert!(error.to_string().contains("10 ms"));
+    }
+
+    #[test]
+    fn javascript_stage_preserves_bounded_plugin_error_detail() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { throw new Error('confirm_intrusive is required'); },
+          analyze() { return {}; }
+        };"#;
+        let error = run_js_sync(
+            script,
+            "plan",
+            "{}",
+            "null",
+            "{}",
+            4 * 1024 * 1024,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::ProtocolError);
+        assert!(error.to_string().contains("confirm_intrusive is required"));
+        assert!(!error.to_string().contains("Exception generated by QuickJS"));
+    }
+
+    #[test]
+    fn ip_rotate_credentials_are_bounded_and_host_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("aws-credentials.toml");
+        std::fs::write(
+            &path,
+            "access_key_id = \"test-access\"\nsecret_access_key = \"test-secret\"\nsession_token = \"test-session\"\n",
+        )
+        .unwrap();
+        let loaded = load_aws_credentials(&path).unwrap();
+        assert_eq!(loaded.access_key_id, "test-access");
+        assert_eq!(loaded.secret_access_key, "test-secret");
+        assert_eq!(loaded.session_token.as_deref(), Some("test-session"));
+
+        std::fs::write(&path, "access_key_id = \"\"\nsecret_access_key = \"\"\n").unwrap();
+        let error = match load_aws_credentials(&path) {
+            Ok(_) => panic!("empty credentials must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::ConfigInvalid);
+        assert!(!error.to_string().contains("test-secret"));
+    }
+
+    #[test]
+    fn ip_rotate_host_operation_is_strict_and_bounded() {
+        let operation: PluginOperation = serde_json::from_value(json!({
+            "type": "aws_api_gateway",
+            "action": "provision",
+            "id": "provision-0",
+            "region": "us-east-1",
+            "target_url": "https://api.example.test",
+            "stage_name": "huntproxy"
+        }))
+        .unwrap();
+        assert_eq!(operation.id(), "provision-0");
+        assert_eq!(operation_request_count(&operation), 1);
+        let request: PluginOperation = serde_json::from_value(json!({
+            "type": "aws_api_gateway",
+            "action": "request",
+            "id": "rotate-0",
+            "gateway_endpoint": "https://abcde12345.execute-api.us-east-1.amazonaws.com/huntproxy",
+            "base_exchange_id": 42,
+            "target_scope": "*.example.test"
+        }))
+        .unwrap();
+        assert_eq!(request.id(), "rotate-0");
+        assert!(serde_json::from_value::<PluginOperation>(json!({
+            "type": "aws_api_gateway",
+            "action": "provision",
+            "id": "provision-0",
+            "region": "us-east-1",
+            "target_url": "https://api.example.test",
+            "stage_name": "huntproxy",
+            "credentials": "must-not-be-accepted"
+        }))
+        .is_err());
+        assert!(validate_gateway_target("https://api.example.test").is_ok());
+        assert!(validate_gateway_target("https://api.example.test/base").is_err());
+        assert!(validate_gateway_target("https://user:pass@example.test").is_err());
+        assert!(validate_gateway_endpoint(
+            "https://abcde12345.execute-api.us-east-1.amazonaws.com/huntproxy"
+        )
+        .is_ok());
+        assert!(validate_gateway_endpoint("https://example.test/huntproxy").is_err());
+        assert!(enforce_target_scope("https://api.example.test/path", "*.example.test").is_ok());
+        assert!(enforce_target_scope("https://example.test/path", "*.example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn ip_rotate_helper_is_bounded_and_redacts_credentials() {
+        let credentials = AwsCredentialFile {
+            access_key_id: "test-access".into(),
+            secret_access_key: "test-secret".into(),
+            session_token: Some("test-session".into()),
+        };
+        let result = run_aws_control_helper(
+            "import json,sys; value=json.load(sys.stdin); print(json.dumps({'region': value['region']}))",
+            json!({"region":"us-east-1"}),
+            credentials,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["region"], "us-east-1");
+
+        let credentials = AwsCredentialFile {
+            access_key_id: "test-access".into(),
+            secret_access_key: "test-secret".into(),
+            session_token: None,
+        };
+        let error = run_aws_control_helper(
+            "import os,sys; print(os.environ['AWS_SECRET_ACCESS_KEY'], file=sys.stderr); raise SystemExit(1)",
+            json!({}),
+            credentials,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().contains("test-secret"));
+        assert!(error.to_string().contains("[redacted]"));
     }
 
     #[test]

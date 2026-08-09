@@ -12,7 +12,8 @@ pub const DAEMON_SOCKET_NAME: &str = "daemon.sock";
 pub const DAEMON_LOCK_NAME: &str = "daemon.lock";
 pub const BOOTSTRAP_LOCK_NAME: &str = "bootstrap.lock";
 pub const CONFIG_FILE_NAME: &str = "config.toml";
-pub const DB_FILE_NAME: &str = "bb.db";
+pub const DB_FILE_NAME: &str = "huntproxy.db";
+const LEGACY_DB_FILE_NAME: &str = "bb.db";
 pub const CA_CERT_NAME: &str = "ca.crt";
 pub const CA_KEY_NAME: &str = "ca.key";
 pub const PLACEHOLDER_KEY_NAME: &str = "placeholder.key";
@@ -275,7 +276,13 @@ impl Config {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        self.data_dir.join(DB_FILE_NAME)
+        let current = self.data_dir.join(DB_FILE_NAME);
+        let legacy = self.data_dir.join(LEGACY_DB_FILE_NAME);
+        if !current.exists() && legacy.exists() {
+            legacy
+        } else {
+            current
+        }
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -466,6 +473,21 @@ mod tests {
         }
         assert!(config.data_dir.join(CONFIG_FILE_NAME).is_file());
         assert_eq!(config.idle_timeout_seconds, 60 * 60);
+    }
+
+    #[test]
+    fn new_databases_use_huntproxy_name_and_existing_legacy_databases_still_open() {
+        let parent = tempfile::tempdir().unwrap();
+        let data_dir = parent.path().join("data");
+        let config = Config::load(Some(data_dir.clone())).unwrap();
+
+        assert_eq!(config.db_path(), data_dir.join("huntproxy.db"));
+
+        std::fs::write(data_dir.join(LEGACY_DB_FILE_NAME), b"legacy").unwrap();
+        assert_eq!(config.db_path(), data_dir.join(LEGACY_DB_FILE_NAME));
+
+        std::fs::write(data_dir.join(DB_FILE_NAME), b"current").unwrap();
+        assert_eq!(config.db_path(), data_dir.join(DB_FILE_NAME));
     }
 
     #[test]

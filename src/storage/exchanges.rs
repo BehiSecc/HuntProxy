@@ -1006,14 +1006,17 @@ fn enforce_project_disk_quota(
         return Err(DomainError::with_details(
             ErrorCode::DiskQuotaExceeded,
             format!(
-                "project disk quota exceeded: projected {projected_usage} bytes exceeds {} bytes",
-                limits.max_disk_bytes
+                "project capture quota exceeded: projected {projected_usage} logical bytes exceeds the {:.2} GiB limit ({} bytes); export evidence or clear older History before capturing more",
+                limits.max_disk_bytes as f64 / (1024_f64 * 1024_f64 * 1024_f64),
+                limits.max_disk_bytes,
             ),
             serde_json::json!({
                 "current_bytes": current_usage,
                 "incoming_bytes": incoming_usage,
                 "projected_bytes": projected_usage,
                 "max_disk_bytes": limits.max_disk_bytes,
+                "quota_basis": "logical_capture_bytes",
+                "action": "export evidence or clear older History before capturing more",
             }),
         ));
     }
@@ -1659,6 +1662,8 @@ mod tests {
         second.response_body = Some(vec![0x44; 64]);
         let error = db.insert_exchange(second).await.unwrap_err();
         assert_eq!(error.code(), ErrorCode::DiskQuotaExceeded);
+        assert!(error.to_string().contains("logical bytes"));
+        assert!(error.to_string().contains("GiB limit"));
         assert_eq!(storage_counts(&db, project.id).await, before_rejection);
     }
 

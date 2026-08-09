@@ -23,6 +23,11 @@ pub struct ProjectUsage {
     pub response_body_bytes: u64,
     pub header_bytes: u64,
     pub approximate_total_bytes: u64,
+    /// The value enforced against max_disk_bytes. It counts logical captured
+    /// bytes, so compression and body deduplication do not weaken the limit.
+    pub quota_used_bytes: u64,
+    pub quota_remaining_bytes: u64,
+    pub quota_basis: &'static str,
     pub database_file_bytes: u64,
     pub max_disk_bytes: u64,
 }
@@ -137,6 +142,11 @@ impl Db {
                 response_body_bytes,
                 header_bytes,
                 approximate_total_bytes,
+                quota_used_bytes: approximate_total_bytes,
+                quota_remaining_bytes: limits
+                    .max_disk_bytes
+                    .saturating_sub(approximate_total_bytes),
+                quota_basis: "logical_capture_bytes",
                 database_file_bytes,
                 max_disk_bytes: limits.max_disk_bytes,
             })
@@ -810,15 +820,16 @@ mod tests {
         db.create_finding(project.id, id, "Finding".into(), "Description".into())
             .await
             .unwrap();
+        let usage = db.project_usage(project.id).await.unwrap();
+        assert_eq!(usage.exchange_count, 1);
+        assert_eq!(usage.quota_used_bytes, usage.approximate_total_bytes);
+        assert_eq!(usage.quota_basis, "logical_capture_bytes");
+        assert_eq!(usage.max_disk_bytes, 2_147_483_648);
         assert_eq!(
-            db.project_usage(project.id).await.unwrap().exchange_count,
-            1
+            usage.quota_remaining_bytes,
+            usage.max_disk_bytes - usage.quota_used_bytes
         );
-        let original_accounted = db
-            .project_usage(project.id)
-            .await
-            .unwrap()
-            .approximate_total_bytes;
+        let original_accounted = usage.approximate_total_bytes;
         db.with_conn(move |conn| {
             conn.execute(
                 "UPDATE project_usage SET accounted_bytes=1 WHERE project_id=?1",

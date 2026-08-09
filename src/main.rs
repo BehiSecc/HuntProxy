@@ -1,9 +1,9 @@
 //! HuntProxy CLI entry points.
 
-use bb::app;
-use bb::config::Config;
-use bb::domain::{CreateProjectRequest, DomainError, DomainResult, ErrorCode};
 use clap::{Parser, Subcommand};
+use huntproxy::app;
+use huntproxy::config::Config;
+use huntproxy::domain::{CreateProjectRequest, DomainError, DomainResult, ErrorCode};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -162,12 +162,12 @@ async fn run(cli: Cli) -> DomainResult<()> {
             cfg.ensure_layout()?;
             cfg.write_default_config()?;
             // Create DB via open
-            let db = bb::storage::Db::open(&cfg).await?;
+            let db = huntproxy::storage::Db::open(&cfg).await?;
             let ver = db.schema_version().await?;
             // Generate CA
             generate_ca(&cfg)?;
             // Placeholder key
-            let _ = bb::reply::PlaceholderKey::load_or_create(&cfg.placeholder_key_path())?;
+            let _ = huntproxy::reply::PlaceholderKey::load_or_create(&cfg.placeholder_key_path())?;
             println!("Initialized {}", cfg.data_dir.display());
             println!("  database: {} (schema v{ver})", cfg.db_path().display());
             println!("  CA cert:  {}", cfg.ca_cert_path().display());
@@ -180,7 +180,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
         }
         Commands::Serve { foreground: _ } => {
             let mut cfg = Config::load(cli.data_dir)?;
-            bb::mcp::clear_stop_guard(&cfg);
+            huntproxy::mcp::clear_stop_guard(&cfg);
             let auto_started = std::env::var_os("HUNTPROXY_DAEMONIZED").is_some();
             configure_daemon_mode(&mut cfg, auto_started);
             let mirror_to_stderr = !auto_started;
@@ -201,14 +201,14 @@ async fn run(cli: Cli) -> DomainResult<()> {
             // MCP: logs to stderr only
             init_logging_stderr("warn");
             let cfg = Config::load(cli.data_dir.clone())?;
-            if bb::mcp::stop_guard_blocks_start(&cfg) {
+            if huntproxy::mcp::stop_guard_blocks_start(&cfg) {
                 return Err(DomainError::new(
                     ErrorCode::DaemonNotRunning,
                     "HuntProxy was explicitly stopped for this MCP client; restart the client to use it again",
                 ));
             }
             ensure_daemon(&cfg).await?;
-            bb::mcp::run_stdio_mcp_client(cfg).await
+            huntproxy::mcp::run_stdio_mcp_client(cfg).await
         }
         Commands::Doctor => {
             init_logging("error");
@@ -314,9 +314,9 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     println!("{value}");
                 }
                 ProjectCmd::Reconcile { id } => {
-                    let db = bb::storage::Db::open(&cfg).await?;
+                    let db = huntproxy::storage::Db::open(&cfg).await?;
                     let project_ids = match id {
-                        Some(id) => vec![bb::domain::ProjectId(id)],
+                        Some(id) => vec![huntproxy::domain::ProjectId(id)],
                         None => db
                             .list_projects()
                             .await?
@@ -341,16 +341,16 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     include_secrets,
                     include_chromium_profile,
                 } => {
-                    let db = bb::storage::Db::open(&cfg).await?;
+                    let db = huntproxy::storage::Db::open(&cfg).await?;
                     db.export_bundle(
                         &cfg,
-                        bb::domain::ProjectId(id),
+                        huntproxy::domain::ProjectId(id),
                         output.clone(),
-                        bb::transfer::BundleExportOptions {
+                        huntproxy::transfer::BundleExportOptions {
                             secrets: if include_secrets {
-                                bb::transfer::SecretMode::Full
+                                huntproxy::transfer::SecretMode::Full
                             } else {
-                                bb::transfer::SecretMode::Sanitized
+                                huntproxy::transfer::SecretMode::Sanitized
                             },
                             include_chromium_profile,
                         },
@@ -359,7 +359,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     println!("Exported project {id} to {}", output.display());
                 }
                 ProjectCmd::Import { input } => {
-                    let db = bb::storage::Db::open(&cfg).await?;
+                    let db = huntproxy::storage::Db::open(&cfg).await?;
                     let project = if input
                         .extension()
                         .is_some_and(|extension| extension == "json")
@@ -367,8 +367,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
                         let encoded = std::fs::read(&input).map_err(|error| {
                             DomainError::new(ErrorCode::StorageError, error.to_string())
                         })?;
-                        let archive: bb::storage::ProjectArchive = serde_json::from_slice(&encoded)
-                            .map_err(|error| {
+                        let archive: huntproxy::storage::ProjectArchive =
+                            serde_json::from_slice(&encoded).map_err(|error| {
                                 DomainError::invalid(format!("invalid v1 project archive: {error}"))
                             })?;
                         db.import_project(archive).await?
@@ -404,7 +404,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Backup { destination } => {
             init_logging("error");
             let cfg = Config::load(cli.data_dir)?;
-            let db = bb::storage::Db::open(&cfg).await?;
+            let db = huntproxy::storage::Db::open(&cfg).await?;
             let path = db.backup_to(destination).await?;
             println!("Backup written to {}", path.display());
             Ok(())
@@ -412,7 +412,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Har { cmd } => {
             init_logging("error");
             let cfg = Config::load(cli.data_dir)?;
-            let db = bb::storage::Db::open(&cfg).await?;
+            let db = huntproxy::storage::Db::open(&cfg).await?;
             match cmd {
                 HarCmd::Export {
                     project_id,
@@ -420,10 +420,10 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     include_secrets,
                 } => {
                     let har = db
-                        .export_har(bb::domain::ProjectId(project_id), include_secrets)
+                        .export_har(huntproxy::domain::ProjectId(project_id), include_secrets)
                         .await?;
                     if let Some(parent) = output.parent() {
-                        bb::config::create_private_dir(parent)?;
+                        huntproxy::config::create_private_dir(parent)?;
                     }
                     let file = std::fs::OpenOptions::new()
                         .create(true)
@@ -440,7 +440,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 }
                 HarCmd::Import { project_id, input } => {
                     let result = db
-                        .import_har_file(bb::domain::ProjectId(project_id), &input)
+                        .import_har_file(huntproxy::domain::ProjectId(project_id), &input)
                         .await?;
                     println!("Imported {} HAR entries", result.imported_entries);
                 }
@@ -453,7 +453,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 BrowserCmd::Install { with_deps } => {
                     let cfg = Config::load(cli.data_dir)?;
                     println!("Installing browser-worker dependencies…");
-                    let worker = bb::browser::prepare_browser_worker_installation(&cfg.data_dir)?;
+                    let worker =
+                        huntproxy::browser::prepare_browser_worker_installation(&cfg.data_dir)?;
                     let status = std::process::Command::new("npm")
                         .args(["ci"])
                         .current_dir(&worker)
@@ -550,7 +551,7 @@ impl std::io::Write for DaemonLogWriter {
             return Ok(bytes.len());
         };
         if let Some(parent) = self.path.parent() {
-            let _ = bb::config::create_private_dir(parent);
+            let _ = huntproxy::config::create_private_dir(parent);
         }
         let current = std::fs::metadata(&self.path)
             .map(|metadata| metadata.len())
@@ -620,8 +621,11 @@ fn generate_ca(cfg: &Config) -> DomainResult<()> {
     let cert = params
         .self_signed(&key)
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    bb::config::write_private_file(cfg.ca_cert_path().as_path(), cert.pem().as_bytes())?;
-    bb::config::write_private_file(cfg.ca_key_path().as_path(), key.serialize_pem().as_bytes())?;
+    huntproxy::config::write_private_file(cfg.ca_cert_path().as_path(), cert.pem().as_bytes())?;
+    huntproxy::config::write_private_file(
+        cfg.ca_key_path().as_path(),
+        key.serialize_pem().as_bytes(),
+    )?;
     Ok(())
 }
 

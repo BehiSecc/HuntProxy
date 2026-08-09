@@ -197,13 +197,13 @@ impl WorkerProcess {
             command.current_dir(parent);
         }
         if let Some(path) = playwright_core_path {
-            command.env("BB_PLAYWRIGHT_CORE_PATH", path);
+            command.env("HUNTPROXY_PLAYWRIGHT_CORE_PATH", path);
             if path.join(".local-browsers").is_dir() {
                 command.env("PLAYWRIGHT_BROWSERS_PATH", "0");
             }
         }
         if let Some(path) = chromium_path {
-            command.env("BB_CHROME_EXECUTABLE", path);
+            command.env("HUNTPROXY_CHROME_EXECUTABLE", path);
         }
         #[cfg(unix)]
         {
@@ -403,9 +403,12 @@ pub struct BrowserService {
 impl BrowserService {
     pub fn new(db: Arc<Db>, node_path: Option<PathBuf>, worker_path: Option<PathBuf>) -> Self {
         let profiles_root = default_profiles_root(&db);
-        let proxy_server = std::env::var("BB_BROWSER_PROXY_SERVER")
+        let proxy_server = std::env::var("HUNTPROXY_BROWSER_PROXY_SERVER")
+            .or_else(|_| std::env::var("BB_BROWSER_PROXY_SERVER"))
             .unwrap_or_else(|_| DEFAULT_BROWSER_PROXY.to_string());
-        let ca_cert_path = std::env::var_os("BB_BROWSER_CA_CERT").map(PathBuf::from);
+        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT")
+            .or_else(|| std::env::var_os("BB_BROWSER_CA_CERT"))
+            .map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
             node_path,
@@ -424,7 +427,9 @@ impl BrowserService {
         proxy_server: String,
     ) -> Self {
         let profiles_root = default_profiles_root(&db);
-        let ca_cert_path = std::env::var_os("BB_BROWSER_CA_CERT").map(PathBuf::from);
+        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT")
+            .or_else(|| std::env::var_os("BB_BROWSER_CA_CERT"))
+            .map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
             node_path,
@@ -481,7 +486,10 @@ impl BrowserService {
         let install_hint = if !node_available {
             Some("Install Node.js, then run: HuntProxy browser install".into())
         } else if !worker_script_available {
-            Some("Browser worker missing; reinstall HuntProxy or set BB_BROWSER_WORKER_PATH".into())
+            Some(
+                "Browser worker missing; reinstall HuntProxy or set HUNTPROXY_BROWSER_WORKER_PATH"
+                    .into(),
+            )
         } else if self.playwright_core_path.is_none() {
             let directory = self
                 .worker_path
@@ -1847,6 +1855,7 @@ fn existing_path(configured: Option<PathBuf>, executable_name: &str) -> Option<P
 
 fn chromium_executable(playwright_core_path: Option<&Path>) -> Option<PathBuf> {
     [
+        "HUNTPROXY_CHROME_EXECUTABLE",
         "BB_CHROME_EXECUTABLE",
         "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
     ]
@@ -1955,7 +1964,9 @@ fn resolve_worker_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(path) = explicit {
         candidates.push(path);
     }
-    if let Some(path) = std::env::var_os("BB_BROWSER_WORKER_PATH") {
+    if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH")
+        .or_else(|| std::env::var_os("BB_BROWSER_WORKER_PATH"))
+    {
         candidates.push(PathBuf::from(path));
     }
     if let Ok(executable) = std::env::current_exe() {
@@ -2016,7 +2027,8 @@ fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
 }
 
 fn find_playwright_from_environment() -> Option<PathBuf> {
-    std::env::var_os("BB_PLAYWRIGHT_CORE_PATH")
+    std::env::var_os("HUNTPROXY_PLAYWRIGHT_CORE_PATH")
+        .or_else(|| std::env::var_os("BB_PLAYWRIGHT_CORE_PATH"))
         .map(PathBuf::from)
         .filter(|path| path.exists())
 }
