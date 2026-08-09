@@ -159,12 +159,21 @@ async fn forward_request(
     let mut applied_rules =
         crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut url).await?;
     let target = TargetRef::from_url(&url)?;
+    let rotation = state
+        .db
+        .next_ip_rotation_route(session.project_id, &url)
+        .await?;
+    let wire_url = match &rotation {
+        Some(route) => route.wire_url(&url)?,
+        None => url.clone(),
+    };
+    let wire_target = TargetRef::from_url(&wire_url)?;
     let upstream_proxy = state
         .config
         .upstream_proxies
-        .proxy_for(&target.host, None)?;
+        .proxy_for(&wire_target.host, None)?;
     let capture = url_is_in_scope(&url, &project.scope)?;
-    let dial = resolve_validated_dial(&url, &project.scope, Duration::from_secs(60)).await?;
+    let dial = resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?;
     let method = parts.method.clone();
     let protocol = if parts.version == http::Version::HTTP_2 {
         ProtocolMode::Http2
@@ -214,6 +223,10 @@ async fn forward_request(
         )
         .await?,
     );
+    let mut wire_headers = headers.clone();
+    if rotation.is_some() {
+        wire_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
+    }
     if rewrite_body {
         if let Some((spool, length)) = request_spool.as_mut() {
             tokio::fs::write(spool.path(), &body)
@@ -243,8 +256,8 @@ async fn forward_request(
             &dial,
             OutboundRequest {
                 method: method.clone(),
-                url: url.clone(),
-                headers: headers.clone(),
+                url: wire_url,
+                headers: wire_headers,
                 body: request_body,
                 protocol,
                 connect_timeout: Duration::from_secs(10),
@@ -256,7 +269,7 @@ async fn forward_request(
         )
         .await;
 
-    let outbound = match outbound {
+    let mut outbound = match outbound {
         Ok(outbound) => outbound,
         Err(error) => {
             if capture {
@@ -270,12 +283,16 @@ async fn forward_request(
                     start.elapsed(),
                     &error,
                     &applied_rules,
+                    rotation.as_ref(),
                 )
                 .await;
             }
             return Err(error);
         }
     };
+    if let Some(route) = &rotation {
+        outbound.transport_profile = route.transport_profile(&outbound.transport_profile);
+    }
     streaming_response(
         state,
         session,
@@ -363,6 +380,7 @@ async fn record_failed_exchange(
     duration: Duration,
     error: &DomainError,
     applied_rules: &[crate::request_rules::AppliedRequestRule],
+    rotation: Option<&crate::storage::IpRotationRoute>,
 ) {
     let completion = completion_for_error(error);
     let request_path = request_spool
@@ -390,7 +408,10 @@ async fn record_failed_exchange(
                 body_representation: BodyRepresentation::SemanticEncoded,
                 cache_provenance: CacheProvenance::None,
                 transport_provenance: Some(state.transport.provenance()),
-                transport_profile: Some(state.transport.profile_name().into()),
+                transport_profile: Some(match rotation {
+                    Some(route) => route.transport_profile(state.transport.profile_name()),
+                    None => state.transport.profile_name().into(),
+                }),
                 request_headers: header_entries(headers),
                 response_headers: Vec::new(),
                 request_body: None,
@@ -1142,6 +1163,111 @@ mod tests {
             request_url(&parts, Some("https")).unwrap(),
             "https://example.com/a?b=1"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_rotates_enabled_origin_and_preserves_original_history() {
+        use crate::storage::IpRotationGateway;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (state, project, session) = proxy_test_fixture(&directory).await;
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        state
+            .db
+            .activate_ip_rotation(
+                project.id,
+                "https://example.com".into(),
+                "huntproxy".into(),
+                vec![IpRotationGateway {
+                    region: "us-east-1".into(),
+                    rest_api_id: "test-gateway".into(),
+                    endpoint: format!("http://{gateway_addr}/huntproxy"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let observed = tokio::spawn(async move {
+            let (mut socket, _) = gateway.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrotated",
+                )
+                .await
+                .unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET https://example.com/rotated?q=1 HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                    session.token_once.as_deref().unwrap()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("rotated"));
+
+        let wire_request = observed.await.unwrap();
+        assert!(wire_request.starts_with("GET /huntproxy/rotated?q=1 HTTP/1.1\r\n"));
+        assert!(wire_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case(&format!("host: {gateway_addr}"))));
+        assert!(!wire_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("host: example.com")));
+
+        let detail = wait_for_exchange(&state, project.id).await;
+        assert_eq!(detail.summary.scheme, "https");
+        assert_eq!(detail.summary.host, "example.com");
+        assert_eq!(detail.summary.path, "/rotated");
+        assert_eq!(detail.summary.query.as_deref(), Some("q=1"));
+        let exchange_id = detail.summary.exchange_id;
+        let transport_profile = state
+            .db
+            .with_conn(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT transport_profile FROM exchanges WHERE project_id=?1 AND exchange_id=?2",
+                        rusqlite::params![project.id.get(), exchange_id.get()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+            })
+            .await
+            .unwrap();
+        assert!(transport_profile.unwrap().contains("+ip_rotate:us-east-1"));
+
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
     }
 
     #[tokio::test]

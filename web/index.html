@@ -194,6 +194,21 @@
         <p class="small muted">Sanitized exports omit authentication state. Full exports contain credentials and browser state; keep them private.</p>
       </details>
 
+      <details id="ipRotationPanel" style="margin-top:.75rem">
+        <summary>IP rotation</summary>
+        <p class="small muted">Route this exact origin through regional AWS API Gateways until disabled. Credentials are read from the IpRotate plugin's <code>aws-credentials.toml</code>; raw HTTP remains direct.</p>
+        <label for="ipRotationTarget">Target origin</label>
+        <input id="ipRotationTarget" placeholder="https://api.example.com" />
+        <label for="ipRotationRegions">AWS regions</label>
+        <input id="ipRotationRegions" value="us-east-1, us-west-2, eu-west-1, ap-southeast-1" />
+        <div class="row" style="margin-top:.4rem">
+          <button class="btn primary" id="enableIpRotation">Enable</button>
+          <button class="btn" id="refreshIpRotation">Refresh</button>
+        </div>
+        <div class="status" id="ipRotationStatus"></div>
+        <div class="stack" id="ipRotationProfiles"></div>
+      </details>
+
       <h3>Session cookies</h3>
       <label for="cookieTarget">Target URL</label>
       <input id="cookieTarget" placeholder="https://app.example.com" />
@@ -547,6 +562,7 @@ test
       historyCursor: null,
       historyTotal: 0,
       historyTotalExact: true,
+      ipRotationBusy: false,
       bodies: { request: null, response: null },
     };
 
@@ -634,7 +650,7 @@ test
       $('analyzePage').disabled = true;
       $('pageAnalysis').classList.add('hidden');
       connectEvents();
-      if (!state.projectId) return;
+      if (!state.projectId) { renderIpRotationProfiles([]); status('ipRotationStatus', 'Select a project.'); return; }
       try {
         const project = await api(`/api/v1/projects/${state.projectId}`);
         $('scopeHosts').value = (project.scope?.host_patterns || []).join(', ');
@@ -642,10 +658,11 @@ test
         $('renameProjectName').value = project.name || '';
         $('browserUrl').value = project.target_url || '';
         $('cookieTarget').value = project.target_url || '';
+        try { $('ipRotationTarget').value = new URL(project.target_url).origin; } catch (_) { $('ipRotationTarget').value = ''; }
       } catch (_) {}
       $('cookieValue').value = '';
       $('cookieFile').value = '';
-      await Promise.allSettled([loadHistory(), loadSitemap(), loadRules(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadWebSockets(), loadBrowserStatus(), loadCookies(), loadProjectUsage()]);
+      await Promise.allSettled([loadHistory(), loadSitemap(), loadRules(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadWebSockets(), loadBrowserStatus(), loadCookies(), loadProjectUsage(), loadIpRotationStatus()]);
     }
 
     $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
@@ -679,6 +696,79 @@ test
       $('projectUsage').textContent = `${usage.exchange_count} exchanges · logical capture ${humanBytes(usage.quota_used_bytes ?? usage.approximate_total_bytes)} / ${humanBytes(usage.max_disk_bytes)} (${percent.toFixed(1)}%) · responses ${humanBytes(usage.response_body_bytes)} · requests ${humanBytes(usage.request_body_bytes)} · headers ${humanBytes(usage.header_bytes)} · physical database ${humanBytes(usage.database_file_bytes)}`;
       $('projectUsage').style.color = percent >= 90 ? 'var(--warning)' : '';
     }
+
+    function setIpRotationBusy(busy) {
+      state.ipRotationBusy = busy;
+      $('enableIpRotation').disabled = busy;
+      $('refreshIpRotation').disabled = busy;
+      document.querySelectorAll('[data-disable-ip-rotation]').forEach(button => { button.disabled = busy; });
+    }
+
+    function renderIpRotationProfiles(profiles) {
+      $('ipRotationProfiles').innerHTML = profiles.map(profile => `<div class="card" style="padding:.65rem;margin-top:.45rem">
+        <div><strong>${escapeHtml(profile.target_origin)}</strong></div>
+        <div class="small muted">${profile.enabled ? 'enabled' : 'routing disabled · cleanup pending'} · ${profile.gateways.length} region${profile.gateways.length === 1 ? '' : 's'}</div>
+        <div class="small muted">${escapeHtml(profile.gateways.map(gateway => gateway.region).join(', '))}</div>
+        <button class="btn danger" style="margin-top:.4rem" data-disable-ip-rotation="${escapeHtml(profile.target_origin)}">${profile.enabled ? 'Disable' : 'Retry cleanup'}</button>
+      </div>`).join('');
+      document.querySelectorAll('[data-disable-ip-rotation]').forEach(button => {
+        button.onclick = () => runIpRotation('disable', { target_url: button.dataset.disableIpRotation });
+        button.disabled = state.ipRotationBusy;
+      });
+    }
+
+    async function loadIpRotationStatus(updateMessage = true) {
+      if (!state.projectId) {
+        renderIpRotationProfiles([]);
+        return;
+      }
+      try {
+        const result = await api(`/api/v1/projects/${state.projectId}/ip-rotation`);
+        const profiles = result.profiles || [];
+        renderIpRotationProfiles(profiles);
+        if (updateMessage) status('ipRotationStatus', profiles.length ? `${profiles.length} configured target${profiles.length === 1 ? '' : 's'}` : 'Rotation is off.');
+      } catch (error) {
+        if (updateMessage) status('ipRotationStatus', error.message, 'err');
+      }
+    }
+
+    async function waitForExtensionJob(projectId, jobId) {
+      while (true) {
+        const job = await api(`/api/v1/projects/${projectId}/extension-jobs/${jobId}`);
+        if (['completed', 'failed', 'cancelled'].includes(job.state)) return job;
+        await new Promise(resolve => setTimeout(resolve, 600));
+      }
+    }
+
+    async function runIpRotation(action, input) {
+      if (!state.projectId || state.ipRotationBusy) return;
+      const projectId = state.projectId;
+      setIpRotationBusy(true);
+      status('ipRotationStatus', action === 'enable' ? 'Provisioning gateways…' : 'Disabling routing and cleaning up gateways…');
+      try {
+        const queued = await api(`/api/v1/projects/${projectId}/extension-jobs`, {
+          method: 'POST',
+          body: JSON.stringify({ plugin_id: 'ip-rotate', action, input }),
+        });
+        const job = await waitForExtensionJob(projectId, queued.id);
+        if (job.state !== 'completed') throw new Error(job.error?.message || `IpRotate job ${job.state}`);
+        const operationError = job.result?.analysis?.result?.error;
+        if (operationError) throw new Error(operationError.message || operationError.code || 'IpRotate operation failed');
+        const cleanupErrors = job.result?.analysis?.result?.ip_rotation?.cleanup_errors || [];
+        status('ipRotationStatus', cleanupErrors.length ? `Routing stopped; ${cleanupErrors.length} gateway cleanup error(s) remain` : (action === 'enable' ? 'IP rotation enabled.' : 'IP rotation disabled.'), cleanupErrors.length ? 'err' : 'ok');
+      } catch (error) {
+        status('ipRotationStatus', error.message, 'err');
+      } finally {
+        setIpRotationBusy(false);
+        if (state.projectId === projectId) await loadIpRotationStatus(false);
+      }
+    }
+
+    $('enableIpRotation').onclick = () => {
+      const regions = $('ipRotationRegions').value.split(',').map(value => value.trim()).filter(Boolean);
+      runIpRotation('enable', { target_url: $('ipRotationTarget').value.trim(), regions });
+    };
+    $('refreshIpRotation').onclick = loadIpRotationStatus;
     $('renameProject').onclick = async () => {
       if (!state.projectId) return;
       try {

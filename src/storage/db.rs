@@ -7,6 +7,7 @@ use deadpool_sqlite::{Config as PoolConfig, Pool, Runtime};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -15,6 +16,7 @@ pub struct Db {
     pub path: std::path::PathBuf,
     pub busy_timeout_ms: u64,
     pub synchronous: String,
+    pub(crate) ip_rotation_cursors: Arc<dashmap::DashMap<i64, AtomicU64>>,
 }
 
 impl Db {
@@ -51,6 +53,7 @@ impl Db {
             path,
             busy_timeout_ms: busy,
             synchronous: sync,
+            ip_rotation_cursors: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -76,6 +79,7 @@ impl Db {
             path: Path::new(":memory:").to_path_buf(),
             busy_timeout_ms: 5000,
             synchronous: "NORMAL".into(),
+            ip_rotation_cursors: Arc::new(dashmap::DashMap::new()),
         })
     }
 

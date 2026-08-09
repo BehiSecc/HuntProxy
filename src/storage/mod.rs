@@ -9,6 +9,7 @@ mod db;
 mod exchanges;
 mod findings;
 mod fuzz_store;
+mod ip_rotation;
 mod lifecycle;
 mod migrations;
 mod projects;
@@ -37,6 +38,8 @@ pub use cookies::*;
 pub use findings::*;
 #[allow(unused_imports)]
 pub use fuzz_store::*;
+#[allow(unused_imports)]
+pub use ip_rotation::*;
 #[allow(unused_imports)]
 pub use reply_store::*;
 #[allow(unused_imports)]

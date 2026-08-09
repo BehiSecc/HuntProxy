@@ -305,6 +305,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/projects/{id}/extension-jobs/{job_id}/cancel",
             post(cancel_extension_job),
         )
+        .route("/api/v1/projects/{id}/ip-rotation", get(ip_rotation_status))
         .route(
             "/api/v1/codec",
             post(codec_transform).layer(DefaultBodyLimit::max(payload_body_limit)),
@@ -502,6 +503,13 @@ async fn extension_job(
     }
 }
 
+async fn ip_rotation_status(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+    match state.db.list_ip_rotation_profiles(ProjectId(id)).await {
+        Ok(profiles) => Json(serde_json::json!({ "profiles": profiles })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
 async fn cancel_extension_job(
     State(state): State<Arc<AppState>>,
     Path((id, job_id)): Path<(i64, String)>,
@@ -576,6 +584,15 @@ async fn delete_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
         {
             return error_response(DomainError::conflict(
                 "cancel active fuzz jobs before deleting the project",
+            ));
+        }
+        Err(error) => return error_response(error),
+        _ => {}
+    }
+    match state.db.list_ip_rotation_profiles(project_id).await {
+        Ok(profiles) if !profiles.is_empty() => {
+            return error_response(DomainError::conflict(
+                "disable IP rotation and finish gateway cleanup before deleting the project",
             ));
         }
         Err(error) => return error_response(error),

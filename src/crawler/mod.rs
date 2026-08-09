@@ -190,7 +190,6 @@ impl CrawlerService {
                         browser_action_id: detail.lineage.browser_action_id,
                         ..Default::default()
                     },
-                    capture_out_of_scope: false,
                 };
                 match self
                     .reply

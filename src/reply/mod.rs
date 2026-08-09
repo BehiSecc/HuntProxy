@@ -556,9 +556,6 @@ pub struct MaterializedRequest {
 pub struct ReplySendContext {
     pub source: ExchangeSource,
     pub lineage: ExchangeLineage,
-    /// Internal-only escape hatch for host-validated relay transports such as
-    /// IpRotate. Public Reply callers never set this.
-    pub capture_out_of_scope: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -605,7 +602,6 @@ impl ReplySendContext {
                 reply_tab_id: tab_id,
                 ..Default::default()
             },
-            capture_out_of_scope: false,
         }
     }
 
@@ -618,7 +614,6 @@ impl ReplySendContext {
                 fuzz_case_id: Some(case_id),
                 ..Default::default()
             },
-            capture_out_of_scope: false,
         }
     }
 }
@@ -758,18 +753,23 @@ impl ReplyService {
         );
 
         // Scope controls persistence only; it never blocks egress.
-        let should_capture =
-            context.capture_out_of_scope || url_is_in_scope(&mat.url, &project.scope)?;
+        let should_capture = url_is_in_scope(&mat.url, &project.scope)?;
+        let target = TargetRef::from_url(&mat.url)?;
+        let rotation = self.db.next_ip_rotation_route(project_id, &mat.url).await?;
+        let wire_url = match &rotation {
+            Some(route) => route.wire_url(&mat.url)?,
+            None => mat.url.clone(),
+        };
+        let wire_target = TargetRef::from_url(&wire_url)?;
         let dial =
-            resolve_validated_dial(&mat.url, &project.scope, Duration::from_secs(60)).await?;
+            resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?;
 
         let method = mat.method.parse::<http::Method>().map_err(|error| {
             DomainError::invalid(format!("invalid HTTP method {}: {error}", mat.method))
         })?;
-        let target = TargetRef::from_url(&mat.url)?;
         let upstream_proxy = self
             .upstream_proxies
-            .proxy_for(&target.host, upstream_proxy_override)?;
+            .proxy_for(&wire_target.host, upstream_proxy_override)?;
         let req_headers: Vec<HeaderEntry> = mat
             .headers
             .iter()
@@ -780,6 +780,10 @@ impl ReplyService {
                 ordinal: i as u32,
             })
             .collect();
+        let mut wire_headers = mat.headers.clone();
+        if rotation.is_some() {
+            wire_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
+        }
         let started = std::time::Instant::now();
         let out = self
             .transport
@@ -787,8 +791,8 @@ impl ReplyService {
                 &dial,
                 OutboundRequest {
                     method,
-                    url: mat.url.clone(),
-                    headers: mat.headers.clone(),
+                    url: wire_url,
+                    headers: wire_headers,
                     body: mat
                         .body
                         .clone()
@@ -808,7 +812,7 @@ impl ReplyService {
                 },
             )
             .await;
-        let out = match out {
+        let mut out = match out {
             Ok(out) => out,
             Err(error) => {
                 let completion = match error.code() {
@@ -838,7 +842,12 @@ impl ReplyService {
                             body_representation: BodyRepresentation::SemanticEncoded,
                             cache_provenance: CacheProvenance::None,
                             transport_provenance: Some(self.transport.provenance()),
-                            transport_profile: Some(self.transport.profile_name().into()),
+                            transport_profile: Some(match &rotation {
+                                Some(route) => {
+                                    route.transport_profile(self.transport.profile_name())
+                                }
+                                None => self.transport.profile_name().into(),
+                            }),
                             request_headers: req_headers.clone(),
                             response_headers: Vec::new(),
                             request_body: mat.body.clone(),
@@ -872,6 +881,9 @@ impl ReplyService {
                 return Err(error);
             }
         };
+        if let Some(route) = &rotation {
+            out.transport_profile = route.transport_profile(&out.transport_profile);
+        }
         let resp_headers: Vec<HeaderEntry> = out
             .headers
             .iter()
@@ -1066,7 +1078,7 @@ fn response_content_encoding(headers: &[HeaderEntry]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::storage::NewExchange;
+    use crate::storage::{IpRotationGateway, NewExchange};
     use crate::transport::OutboundResponse;
 
     struct CannedTransport;
@@ -1159,6 +1171,7 @@ mod tests {
 
     struct RecordingTransport {
         headers: Arc<std::sync::Mutex<Vec<RecordedHeaders>>>,
+        urls: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -1168,6 +1181,7 @@ mod tests {
             _dial: &ValidatedDial,
             request: OutboundRequest,
         ) -> DomainResult<OutboundResponse> {
+            self.urls.lock().unwrap().push(request.url.clone());
             self.headers.lock().unwrap().push(request.headers);
             Ok(OutboundResponse {
                 status: http::StatusCode::OK,
@@ -1209,10 +1223,12 @@ mod tests {
         .await
         .unwrap();
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_urls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let service = ReplyService {
             db,
             transport: Arc::new(RecordingTransport {
                 headers: recorded.clone(),
+                urls: recorded_urls,
             }),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
@@ -1260,6 +1276,107 @@ mod tests {
         assert!(requests[1]
             .iter()
             .any(|(name, value)| name == "Cookie" && value == b"sid=explicit"));
+    }
+
+    #[tokio::test]
+    async fn semantic_reply_uses_enabled_rotation_and_preserves_original_history() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "rotation".into(),
+                target_url: "https://api.example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        db.activate_ip_rotation(
+            project.id,
+            "https://api.example.test".into(),
+            "huntproxy".into(),
+            vec![IpRotationGateway {
+                region: "us-east-1".into(),
+                rest_api_id: "abcde12345".into(),
+                endpoint: "http://127.0.0.1:9/huntproxy".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let recorded_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_urls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = ReplyService {
+            db: db.clone(),
+            transport: Arc::new(RecordingTransport {
+                headers: recorded_headers.clone(),
+                urls: recorded_urls.clone(),
+            }),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
+        };
+        let result = service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("https://api.example.test/items?page=2".into()),
+                    header_overrides: vec![HeaderPatch {
+                        name: "Host".into(),
+                        value: b"api.example.test".to_vec(),
+                    }],
+                    ..Default::default()
+                },
+                ProtocolPreference::H1,
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recorded_urls.lock().unwrap().as_slice(),
+            ["http://127.0.0.1:9/huntproxy/items?page=2"]
+        );
+        assert!(!recorded_headers.lock().unwrap()[0]
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("host")));
+        let detail = db
+            .get_exchange_detail(
+                project.id,
+                result.exchange_id.unwrap(),
+                PresentationOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.summary.host, "api.example.test");
+        assert_eq!(detail.summary.path, "/items");
+        let exchange_id = result.exchange_id.unwrap();
+        let transport_profile = db
+            .with_conn(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT transport_profile FROM exchanges WHERE project_id=?1 AND exchange_id=?2",
+                        rusqlite::params![project.id.get(), exchange_id.get()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            transport_profile.as_deref(),
+            Some("test+ip_rotate:us-east-1")
+        );
+        let captured_headers = db
+            .load_raw_headers(
+                project.id,
+                result.exchange_id.unwrap(),
+                MessageSide::Request,
+            )
+            .await
+            .unwrap();
+        assert!(captured_headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("host") && header.value == b"api.example.test"
+        }));
     }
 
     #[tokio::test]

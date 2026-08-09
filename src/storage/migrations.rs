@@ -49,6 +49,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "012_chromium_only_browser",
         include_str!("../../migrations/012_chromium_only_browser.sql"),
     ),
+    (
+        "013_ip_rotation",
+        include_str!("../../migrations/013_ip_rotation.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {

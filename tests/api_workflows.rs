@@ -126,6 +126,73 @@ async fn dynamic_api_responses_are_never_browser_cached() {
 }
 
 #[tokio::test]
+async fn ip_rotation_status_is_visible_and_blocks_project_deletion_until_cleanup() {
+    let (_directory, state, project_id) = test_state().await;
+    let app = huntproxy::api::router(state.clone());
+    let empty = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}/ip-rotation", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(
+        json_response(empty).await["profiles"],
+        serde_json::json!([])
+    );
+
+    state
+        .db
+        .activate_ip_rotation(
+            project_id,
+            "https://example.com".into(),
+            "huntproxy".into(),
+            vec![huntproxy::storage::IpRotationGateway {
+                region: "us-east-1".into(),
+                rest_api_id: "test-api".into(),
+                endpoint: "https://test.execute-api.us-east-1.amazonaws.com/huntproxy".into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}/ip-rotation", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status = json_response(status).await;
+    assert_eq!(
+        status["profiles"][0]["target_origin"],
+        "https://example.com"
+    );
+    assert_eq!(status["profiles"][0]["enabled"], true);
+    assert_eq!(status["profiles"][0]["gateways"][0]["region"], "us-east-1");
+
+    let delete = app
+        .oneshot(
+            Request::delete(format!("/api/v1/projects/{}", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::CONFLICT);
+    assert!(json_response(delete).await["message"]
+        .as_str()
+        .unwrap()
+        .contains("disable IP rotation"));
+}
+
+#[tokio::test]
 async fn history_filter_and_annotation_work_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let get_id = state

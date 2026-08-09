@@ -146,7 +146,10 @@ technique.
 
 IpRotate uses Python 3 with `boto3`. Copy its
 `aws-credentials.toml.example` to `aws-credentials.toml` inside the installed
-`ip-rotate` directory before provisioning gateways.
+`ip-rotate` directory before enabling it. While enabled, Proxy, Browser, Reply,
+Fuzzer, crawler, and semantic plugin requests for the configured exact origin
+rotate through the regional gateways; Raw Reply and raw plugin traffic remain
+direct. Disable stops routing first and then removes the managed gateways.
 
 The UI restores an active Chromium browser after a page refresh and shows its
 current URL and title. Browser startup and navigation errors remain visible to

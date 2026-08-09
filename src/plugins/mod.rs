@@ -209,31 +209,25 @@ impl PluginOperation {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum PluginAwsApiGateway {
-    Provision {
+    Enable {
         id: String,
-        region: String,
         target_url: String,
+        regions: Vec<String>,
         stage_name: String,
     },
-    Delete {
+    Disable {
         id: String,
-        region: String,
-        rest_api_id: String,
+        target_url: String,
     },
-    Request {
+    Status {
         id: String,
-        gateway_endpoint: String,
-        base_exchange_id: ExchangeId,
-        target_scope: String,
-        #[serde(default)]
-        include_auth: bool,
     },
 }
 
 impl PluginAwsApiGateway {
     fn id(&self) -> &str {
         match self {
-            Self::Provision { id, .. } | Self::Delete { id, .. } | Self::Request { id, .. } => id,
+            Self::Enable { id, .. } | Self::Disable { id, .. } | Self::Status { id } => id,
         }
     }
 }
@@ -1453,143 +1447,144 @@ impl PluginService {
         &self,
         project_id: ProjectId,
         plugin_id: &str,
-        plugin_name: &str,
+        _plugin_name: &str,
         operation: PluginAwsApiGateway,
         scope: &ScopePolicy,
         target_host: Option<&str>,
         cancel: &CancellationToken,
     ) -> DomainResult<Value> {
-        let operation = match operation {
-            PluginAwsApiGateway::Request {
+        if let PluginAwsApiGateway::Status { id } = operation {
+            return Ok(json!({
+                "id": id,
+                "ip_rotation": {
+                    "action": "status",
+                    "profiles": self.db.list_ip_rotation_profiles(project_id).await?,
+                }
+            }));
+        }
+        match operation {
+            PluginAwsApiGateway::Enable {
                 id,
-                gateway_endpoint,
-                base_exchange_id,
-                target_scope,
-                include_auth,
+                target_url,
+                regions,
+                stage_name,
             } => {
-                let detail = self
+                validate_gateway_target(&target_url)?;
+                let target_url = crate::storage::canonical_rotation_origin(&target_url)?;
+                enforce_plugin_scope(&target_url, scope, target_host)?;
+                validate_gateway_stage(&stage_name)?;
+                validate_regions(&regions)?;
+                let helper = self
+                    .plugins
+                    .get(plugin_id)
+                    .and_then(|plugin| plugin.resources.get("aws-control"))
+                    .ok_or_else(|| {
+                        DomainError::new(
+                            ErrorCode::ConfigInvalid,
+                            "IpRotate package is missing its verified aws-control resource",
+                        )
+                    })?;
+                let credentials_path = self.directory.join(plugin_id).join("aws-credentials.toml");
+                let credentials = load_aws_credentials(&credentials_path)?;
+                if self
                     .db
-                    .get_exchange_detail(
+                    .list_ip_rotation_profiles(project_id)
+                    .await?
+                    .iter()
+                    .any(|profile| profile.target_origin == target_url)
+                {
+                    return Err(DomainError::new(
+                        ErrorCode::Conflict,
+                        "IP rotation is already configured for this target; disable it before enabling a replacement",
+                    ));
+                }
+                let gateways = provision_rotation_gateways(
+                    helper,
+                    &credentials,
+                    &target_url,
+                    &stage_name,
+                    &regions,
+                    cancel,
+                )
+                .await?;
+                let profile = match self
+                    .db
+                    .activate_ip_rotation(
                         project_id,
-                        base_exchange_id,
-                        crate::policy::PresentationOptions::default(),
+                        target_url.clone(),
+                        stage_name,
+                        gateways.clone(),
                     )
+                    .await
+                {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        cleanup_rotation_gateways(helper, &credentials, &gateways).await;
+                        return Err(error);
+                    }
+                };
+                Ok(json!({
+                    "id": id,
+                    "ip_rotation": {
+                        "action": "enabled",
+                        "profile": profile,
+                    }
+                }))
+            }
+            PluginAwsApiGateway::Disable { id, target_url } => {
+                let profile = self
+                    .db
+                    .deactivate_ip_rotation(project_id, target_url)
                     .await?;
-                let query = detail
-                    .summary
-                    .query
-                    .as_ref()
-                    .map(|query| format!("?{query}"))
-                    .unwrap_or_default();
-                let original_url = format!(
-                    "{}://{}{}{}",
-                    detail.summary.scheme, detail.summary.authority, detail.summary.path, query
-                );
-                enforce_plugin_scope(&original_url, scope, target_host)?;
-                enforce_target_scope(&original_url, &target_scope)?;
-                let gateway_endpoint = validate_gateway_endpoint(&gateway_endpoint)?;
-                let wire_url = format!(
-                    "{}{}{}",
-                    gateway_endpoint.trim_end_matches('/'),
-                    detail.summary.path,
-                    query
-                );
-                let header_tombstones = if include_auth {
-                    Vec::new()
-                } else {
-                    vec![
-                        "Cookie".into(),
-                        "Authorization".into(),
-                        "Proxy-Authorization".into(),
-                    ]
-                };
-                let draft = ReplyDraft {
-                    method: Some(detail.summary.method),
-                    url: Some(wire_url),
-                    header_tombstones,
-                    ..Default::default()
-                };
-                let response = tokio::select! {
-                    _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                    response = self.reply.send_with_context(
-                        project_id,
-                        Some(base_exchange_id),
-                        &draft,
-                        ProtocolPreference::Auto,
-                        0,
-                        ReplySendContext {
-                            source: ExchangeSource::Plugin,
-                            lineage: ExchangeLineage { parent_exchange_id: Some(base_exchange_id), ..Default::default() },
-                            capture_out_of_scope: true,
-                        },
-                    ) => response?,
-                };
-                let exchange_id = response.exchange_id.ok_or_else(|| {
+                let helper = self
+                    .plugins
+                    .get(plugin_id)
+                    .and_then(|plugin| plugin.resources.get("aws-control"))
+                    .ok_or_else(|| {
+                        DomainError::new(
+                            ErrorCode::ConfigInvalid,
+                            "IP rotation was disabled; gateway cleanup is pending because the package is missing its verified aws-control resource",
+                        )
+                    })?;
+                let credentials_path = self.directory.join(plugin_id).join("aws-credentials.toml");
+                let credentials = load_aws_credentials(&credentials_path).map_err(|error| {
                     DomainError::new(
-                        ErrorCode::StorageError,
-                        "IpRotate response was not saved after host scope validation",
+                        error.code(),
+                        format!("IP rotation was disabled; gateway cleanup is pending: {error}"),
                     )
                 })?;
-                self.annotate_plugin_exchange(project_id, exchange_id, plugin_id, plugin_name, &id)
-                    .await?;
-                return Ok(json!({
-                    "id": id,
-                    "exchange_id": exchange_id,
-                    "status_code": response.status_code,
-                    "response_length": response.response_length,
-                    "response_body_hash": response.response_body_hash,
-                    "response_preview": response.response_preview,
-                }));
-            }
-            operation => operation,
-        };
-
-        let credentials_path = self.directory.join(plugin_id).join("aws-credentials.toml");
-        let credentials = load_aws_credentials(&credentials_path)?;
-        let (id, region) = match &operation {
-            PluginAwsApiGateway::Provision { id, region, .. }
-            | PluginAwsApiGateway::Delete { id, region, .. } => (id.clone(), region.clone()),
-            PluginAwsApiGateway::Request { .. } => unreachable!(),
-        };
-        validate_aws_region(&region)?;
-        let helper = self
-            .plugins
-            .get(plugin_id)
-            .and_then(|plugin| plugin.resources.get("aws-control"))
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::ConfigInvalid,
-                    "IpRotate package is missing its verified aws-control resource",
+                let cleanup = delete_rotation_gateways(
+                    &self.db,
+                    project_id,
+                    helper,
+                    &credentials,
+                    &profile,
+                    cancel,
                 )
-            })?;
-        let payload = match operation {
-            PluginAwsApiGateway::Provision {
-                target_url,
-                stage_name,
-                ..
-            } => {
-                enforce_plugin_scope(&target_url, scope, target_host)?;
-                validate_gateway_target(&target_url)?;
-                validate_gateway_stage(&stage_name)?;
-                json!({
-                    "action": "provision",
-                    "region": region,
-                    "target_url": target_url,
-                    "stage_name": stage_name,
-                })
+                .await;
+                if cleanup.cancelled {
+                    return Err(DomainError::new(
+                        ErrorCode::Cancelled,
+                        "IP rotation was disabled; gateway cleanup was cancelled and can be retried with disable",
+                    ));
+                }
+                let removed = self
+                    .db
+                    .remove_empty_ip_rotation_profile(project_id, profile.id)
+                    .await?;
+                Ok(json!({
+                    "id": id,
+                    "ip_rotation": {
+                        "action": "disabled",
+                        "target_origin": profile.target_origin,
+                        "deleted_regions": cleanup.deleted_regions,
+                        "cleanup_errors": cleanup.errors,
+                        "profile_removed": removed,
+                    }
+                }))
             }
-            PluginAwsApiGateway::Delete { rest_api_id, .. } => {
-                validate_rest_api_id(&rest_api_id)?;
-                json!({
-                    "action": "delete",
-                    "region": region,
-                    "rest_api_id": rest_api_id,
-                })
-            }
-            PluginAwsApiGateway::Request { .. } => unreachable!(),
-        };
-        let result = run_aws_control_helper(helper, payload, credentials, cancel).await?;
-        Ok(json!({"id": id, "aws_gateway": result}))
+            PluginAwsApiGateway::Status { .. } => unreachable!(),
+        }
     }
 
     async fn execute_operation(
@@ -1785,7 +1780,6 @@ impl PluginService {
                 let context = ReplySendContext {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
-                    capture_out_of_scope: false,
                 };
                 let draft = ReplyDraft {
                     method: request.method,
@@ -1897,7 +1891,6 @@ impl PluginService {
                         ReplySendContext {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
-                            capture_out_of_scope: false,
                         },
                     ) => response?,
                 };
@@ -2015,7 +2008,7 @@ impl PluginService {
                                 bytes,
                                 use_project_cookies,
                                 options,
-                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default(), capture_out_of_scope: false },
+                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default() },
                             ) => response,
                         };
                         let observation = match result {
@@ -2059,7 +2052,6 @@ impl PluginService {
                         ReplySendContext {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
-                            capture_out_of_scope: false,
                         },
                     ) => response?,
                 };
@@ -2304,7 +2296,7 @@ impl PluginService {
             enforce_plugin_scope(&url, scope, target_host)?;
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() }, capture_out_of_scope: false }) => response?,
+                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() } }) => response?,
             };
             if let Some(exchange_id) = response.exchange_id {
                 self.annotate_plugin_exchange(
@@ -2525,7 +2517,6 @@ impl PluginService {
                 ReplySendContext {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
-                    capture_out_of_scope: false,
                 },
             ) => result,
         };
@@ -2635,7 +2626,6 @@ impl PluginService {
                             parent_exchange_id: request.base_exchange_id,
                             ..Default::default()
                         },
-                        capture_out_of_scope: false,
                     },
                 ) => response?,
             };
@@ -2742,7 +2732,7 @@ impl PluginService {
 const AWS_CREDENTIAL_FILE_MAX_BYTES: u64 = 8 * 1024;
 const AWS_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AwsCredentialFile {
     access_key_id: String,
@@ -2826,6 +2816,20 @@ fn validate_aws_region(region: &str) -> DomainResult<()> {
     Ok(())
 }
 
+fn validate_regions(regions: &[String]) -> DomainResult<()> {
+    if regions.is_empty() || regions.len() > 30 {
+        return Err(DomainError::invalid("regions requires 1..=30 values"));
+    }
+    let mut unique = BTreeSet::new();
+    for region in regions {
+        validate_aws_region(region)?;
+        if !unique.insert(region) {
+            return Err(DomainError::invalid("regions must be unique"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_gateway_stage(stage: &str) -> DomainResult<()> {
     if stage.is_empty()
         || stage.len() > 64
@@ -2867,30 +2871,6 @@ fn validate_gateway_target(target_url: &str) -> DomainResult<()> {
     Ok(())
 }
 
-fn enforce_target_scope(target_url: &str, target_scope: &str) -> DomainResult<()> {
-    let parsed = url::Url::parse(target_url)
-        .map_err(|error| DomainError::invalid(format!("invalid target URL: {error}")))?;
-    let host = parsed
-        .host_str()
-        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
-        .ok_or_else(|| DomainError::invalid("target URL requires a hostname"))?;
-    let pattern = target_scope
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    let matches = if let Some(suffix) = pattern.strip_prefix("*.") {
-        !suffix.is_empty() && host.len() > suffix.len() && host.ends_with(&format!(".{suffix}"))
-    } else {
-        !pattern.is_empty() && host == pattern
-    };
-    if !matches {
-        return Err(DomainError::scope_denied(
-            "IpRotate saved request is outside target_scope",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_gateway_endpoint(value: &str) -> DomainResult<String> {
     let parsed = url::Url::parse(value)
         .map_err(|error| DomainError::invalid(format!("invalid gateway endpoint: {error}")))?;
@@ -2920,10 +2900,179 @@ fn validate_gateway_endpoint(value: &str) -> DomainResult<String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
+async fn provision_rotation_gateways(
+    helper: &str,
+    credentials: &AwsCredentialFile,
+    target_url: &str,
+    stage_name: &str,
+    regions: &[String],
+    cancel: &CancellationToken,
+) -> DomainResult<Vec<crate::storage::IpRotationGateway>> {
+    let results = stream::iter(regions.iter().cloned())
+        .map(|region| async move {
+            let result = run_aws_control_helper(
+                helper,
+                json!({
+                    "action": "provision",
+                    "region": region,
+                    "target_url": target_url,
+                    "stage_name": stage_name,
+                }),
+                credentials,
+                cancel,
+            )
+            .await;
+            (region, result)
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut gateways = Vec::new();
+    let mut first_error = None;
+    for (region, result) in results {
+        match result.and_then(|value| parse_provisioned_gateway(&region, value)) {
+            Ok(gateway) => gateways.push(gateway),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = first_error {
+        cleanup_rotation_gateways(helper, credentials, &gateways).await;
+        return Err(error);
+    }
+    gateways.sort_by(|left, right| left.region.cmp(&right.region));
+    Ok(gateways)
+}
+
+fn parse_provisioned_gateway(
+    expected_region: &str,
+    value: Value,
+) -> DomainResult<crate::storage::IpRotationGateway> {
+    if value.get("action").and_then(Value::as_str) != Some("provisioned")
+        || value.get("region").and_then(Value::as_str) != Some(expected_region)
+    {
+        return Err(DomainError::new(
+            ErrorCode::ProtocolError,
+            "IpRotate AWS helper returned an unexpected provision result",
+        ));
+    }
+    let rest_api_id = value
+        .get("rest_api_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DomainError::new(ErrorCode::ProtocolError, "AWS omitted REST API id"))?;
+    validate_rest_api_id(rest_api_id)?;
+    let endpoint = value
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DomainError::new(ErrorCode::ProtocolError, "AWS omitted gateway endpoint")
+        })?;
+    Ok(crate::storage::IpRotationGateway {
+        region: expected_region.into(),
+        rest_api_id: rest_api_id.into(),
+        endpoint: validate_gateway_endpoint(endpoint)?,
+    })
+}
+
+async fn cleanup_rotation_gateways(
+    helper: &str,
+    credentials: &AwsCredentialFile,
+    gateways: &[crate::storage::IpRotationGateway],
+) {
+    let cleanup_cancel = CancellationToken::new();
+    let _ = stream::iter(gateways.iter().cloned())
+        .map(|gateway| {
+            let cleanup_cancel = cleanup_cancel.clone();
+            async move {
+                run_aws_control_helper(
+                    helper,
+                    json!({
+                        "action": "delete",
+                        "region": gateway.region,
+                        "rest_api_id": gateway.rest_api_id,
+                    }),
+                    credentials,
+                    &cleanup_cancel,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+}
+
+struct RotationCleanupResult {
+    deleted_regions: Vec<String>,
+    errors: Vec<Value>,
+    cancelled: bool,
+}
+
+async fn delete_rotation_gateways(
+    db: &crate::storage::Db,
+    project_id: ProjectId,
+    helper: &str,
+    credentials: &AwsCredentialFile,
+    profile: &crate::storage::IpRotationProfile,
+    cancel: &CancellationToken,
+) -> RotationCleanupResult {
+    let results = stream::iter(profile.gateways.iter().cloned())
+        .map(|gateway| async move {
+            let result = run_aws_control_helper(
+                helper,
+                json!({
+                    "action": "delete",
+                    "region": gateway.region,
+                    "rest_api_id": gateway.rest_api_id,
+                }),
+                credentials,
+                cancel,
+            )
+            .await;
+            (gateway, result)
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+    let mut deleted_regions = Vec::new();
+    let mut errors = Vec::new();
+    let mut cancelled = false;
+    for (gateway, result) in results {
+        match result {
+            Ok(_) => match db
+                .remove_ip_rotation_gateway(project_id, profile.id, gateway.region.clone())
+                .await
+            {
+                Ok(()) => deleted_regions.push(gateway.region),
+                Err(error) => errors.push(json!({
+                    "region": gateway.region,
+                    "code": error.code(),
+                    "message": error.to_string(),
+                })),
+            },
+            Err(error) => {
+                cancelled |= error.code() == ErrorCode::Cancelled;
+                errors.push(json!({
+                    "region": gateway.region,
+                    "code": error.code(),
+                    "message": error.to_string(),
+                }));
+            }
+        }
+    }
+    deleted_regions.sort();
+    RotationCleanupResult {
+        deleted_regions,
+        errors,
+        cancelled,
+    }
+}
+
 async fn run_aws_control_helper(
     helper: &str,
     payload: Value,
-    credentials: AwsCredentialFile,
+    credentials: &AwsCredentialFile,
     cancel: &CancellationToken,
 ) -> DomainResult<Value> {
     let payload = serde_json::to_vec(&payload)
@@ -3409,6 +3558,9 @@ fn operation_request_count(operation: &PluginOperation) -> usize {
         PluginOperation::RawHttp2(request) => request.streams.len(),
         PluginOperation::RawHttp1Group(group) => group.members.len(),
         PluginOperation::HttpWorkflow(workflow) => workflow.steps.len(),
+        PluginOperation::AwsApiGateway(PluginAwsApiGateway::Enable { regions, .. }) => {
+            regions.len()
+        }
         PluginOperation::AwsApiGateway(_) => 1,
         _ => 1,
     }
@@ -4337,31 +4489,28 @@ mod tests {
     fn ip_rotate_host_operation_is_strict_and_bounded() {
         let operation: PluginOperation = serde_json::from_value(json!({
             "type": "aws_api_gateway",
-            "action": "provision",
-            "id": "provision-0",
-            "region": "us-east-1",
+            "action": "enable",
+            "id": "ip-rotation-enable",
             "target_url": "https://api.example.test",
+            "regions": ["us-east-1", "eu-west-1"],
             "stage_name": "huntproxy"
         }))
         .unwrap();
-        assert_eq!(operation.id(), "provision-0");
-        assert_eq!(operation_request_count(&operation), 1);
-        let request: PluginOperation = serde_json::from_value(json!({
+        assert_eq!(operation.id(), "ip-rotation-enable");
+        assert_eq!(operation_request_count(&operation), 2);
+        let status: PluginOperation = serde_json::from_value(json!({
             "type": "aws_api_gateway",
-            "action": "request",
-            "id": "rotate-0",
-            "gateway_endpoint": "https://abcde12345.execute-api.us-east-1.amazonaws.com/huntproxy",
-            "base_exchange_id": 42,
-            "target_scope": "*.example.test"
+            "action": "status",
+            "id": "ip-rotation-status"
         }))
         .unwrap();
-        assert_eq!(request.id(), "rotate-0");
+        assert_eq!(status.id(), "ip-rotation-status");
         assert!(serde_json::from_value::<PluginOperation>(json!({
             "type": "aws_api_gateway",
-            "action": "provision",
-            "id": "provision-0",
-            "region": "us-east-1",
+            "action": "enable",
+            "id": "ip-rotation-enable",
             "target_url": "https://api.example.test",
+            "regions": ["us-east-1"],
             "stage_name": "huntproxy",
             "credentials": "must-not-be-accepted"
         }))
@@ -4374,8 +4523,8 @@ mod tests {
         )
         .is_ok());
         assert!(validate_gateway_endpoint("https://example.test/huntproxy").is_err());
-        assert!(enforce_target_scope("https://api.example.test/path", "*.example.test").is_ok());
-        assert!(enforce_target_scope("https://example.test/path", "*.example.test").is_err());
+        assert!(validate_regions(&["us-east-1".into(), "eu-west-1".into()]).is_ok());
+        assert!(validate_regions(&["us-east-1".into(), "us-east-1".into()]).is_err());
     }
 
     #[tokio::test]
@@ -4388,7 +4537,7 @@ mod tests {
         let result = run_aws_control_helper(
             "import json,sys; value=json.load(sys.stdin); print(json.dumps({'region': value['region']}))",
             json!({"region":"us-east-1"}),
-            credentials,
+            &credentials,
             &CancellationToken::new(),
         )
         .await
@@ -4403,13 +4552,72 @@ mod tests {
         let error = run_aws_control_helper(
             "import os,sys; print(os.environ['AWS_SECRET_ACCESS_KEY'], file=sys.stderr); raise SystemExit(1)",
             json!({}),
-            credentials,
+            &credentials,
             &CancellationToken::new(),
         )
         .await
         .unwrap_err();
         assert!(!error.to_string().contains("test-secret"));
         assert!(error.to_string().contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn ip_rotate_disable_stops_routing_before_cleanup_configuration_is_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().join("data"))).unwrap();
+        let db = Arc::new(crate::storage::Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "rotation disable".into(),
+                target_url: "https://api.example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        db.activate_ip_rotation(
+            project.id,
+            "https://api.example.test".into(),
+            "huntproxy".into(),
+            vec![crate::storage::IpRotationGateway {
+                region: "us-east-1".into(),
+                rest_api_id: "abcde12345".into(),
+                endpoint: "https://abcde12345.execute-api.us-east-1.amazonaws.com/huntproxy".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![7; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let service =
+            PluginService::load(directory.path().join("plugins"), db.clone(), reply).unwrap();
+        let error = service
+            .execute_aws_api_gateway(
+                project.id,
+                "ip-rotate",
+                "IpRotate",
+                PluginAwsApiGateway::Disable {
+                    id: "disable".into(),
+                    target_url: "https://api.example.test".into(),
+                },
+                &project.scope,
+                Some("api.example.test"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("was disabled"));
+        assert!(db
+            .next_ip_rotation_route(project.id, "https://api.example.test/path")
+            .await
+            .unwrap()
+            .is_none());
+        let profiles = db.list_ip_rotation_profiles(project.id).await.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert!(!profiles[0].enabled);
     }
 
     #[test]
