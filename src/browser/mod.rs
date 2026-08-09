@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 const WORKER_PROTOCOL_VERSION: u64 = 1;
 const WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
+const BROWSER_CDP_PORT: u16 = 9222;
 const MAX_PERSISTENT_PROFILE_BYTES: usize = 25 * 1024 * 1024;
 const EMBEDDED_WORKER: &str = include_str!("../../browser-worker/index.js");
 const EMBEDDED_WORKER_PACKAGE: &str = include_str!("../../browser-worker/package.json");
@@ -43,6 +44,26 @@ pub struct BrowserJavascriptFile {
     pub status_code: Option<u16>,
     #[serde(default)]
     pub source_page_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserCdpInfo {
+    pub port: u16,
+    pub endpoint: String,
+    pub devtools_url: String,
+    pub hosted_devtools_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrowserCdpStatus {
+    pub project_id: ProjectId,
+    pub active: bool,
+    pub agent_control: bool,
+    pub session_id: Option<BrowserSessionId>,
+    pub endpoint: Option<String>,
+    pub devtools_url: Option<String>,
+    pub hosted_devtools_url: Option<String>,
+    pub ssh_forward_command: Option<String>,
 }
 
 /// Secret-bearing values live only in daemon memory. SQLite stores version/hash/status metadata.
@@ -144,6 +165,7 @@ struct RuntimeSession {
     project_id: ProjectId,
     capture_session_id: CaptureSessionId,
     persistent: bool,
+    cdp: Option<BrowserCdpInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -756,6 +778,7 @@ impl BrowserService {
                 project_id,
                 capture_session_id: capture.id,
                 persistent,
+                cdp: None,
             },
         );
         if let Err(error) = self
@@ -906,6 +929,134 @@ impl BrowserService {
         Ok(sessions)
     }
 
+    pub async fn cdp_status(&self, project_id: ProjectId) -> DomainResult<BrowserCdpStatus> {
+        self.db.get_project(project_id).await?;
+        let active = self
+            .runtime_sessions
+            .lock()
+            .await
+            .iter()
+            .find_map(|(session_id, runtime)| {
+                (runtime.project_id == project_id)
+                    .then(|| runtime.cdp.clone().map(|cdp| (*session_id, cdp)))
+                    .flatten()
+            });
+        Ok(cdp_status_view(project_id, active))
+    }
+
+    pub async fn enable_cdp(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+    ) -> DomainResult<BrowserCdpStatus> {
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
+        let runtime = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .cloned()
+            .ok_or_else(|| {
+                DomainError::new(ErrorCode::Unavailable, "browser session is not active")
+            })?;
+        if runtime.project_id != project_id {
+            return Err(DomainError::not_found("browser session"));
+        }
+        if !runtime.persistent {
+            return Err(DomainError::invalid(
+                "CDP handoff requires a persistent project browser",
+            ));
+        }
+        if let Some(cdp) = runtime.cdp {
+            return Ok(cdp_status_view(project_id, Some((session_id.get(), cdp))));
+        }
+        if let Some((active_session, _)) = self
+            .runtime_sessions
+            .lock()
+            .await
+            .iter()
+            .find(|(_, active)| active.cdp.is_some())
+        {
+            return Err(DomainError::new(
+                ErrorCode::ConcurrencyLimited,
+                format!(
+                    "CDP port {BROWSER_CDP_PORT} is already handed off by browser session {active_session}"
+                ),
+            ));
+        }
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, BROWSER_CDP_PORT)).map_err(
+            |error| {
+                DomainError::new(
+                    ErrorCode::Unavailable,
+                    format!("CDP port {BROWSER_CDP_PORT} is unavailable on 127.0.0.1: {error}"),
+                )
+            },
+        )?;
+        let result = self
+            .call_worker(
+                "session.cdp_enable",
+                json!({
+                    "session_id": session_id.get(),
+                    "cdp_port": BROWSER_CDP_PORT,
+                }),
+            )
+            .await?;
+        let cdp = parse_cdp_info(result.get("cdp"))?;
+        if let Some(runtime) = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get_mut(&session_id.get())
+        {
+            runtime.cdp = Some(cdp.clone());
+        }
+        self.save_cookie_checkpoint(project_id, session_id, &result)
+            .await?;
+        Ok(cdp_status_view(project_id, Some((session_id.get(), cdp))))
+    }
+
+    pub async fn disable_cdp(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+    ) -> DomainResult<BrowserCdpStatus> {
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
+        let runtime = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .cloned()
+            .ok_or_else(|| {
+                DomainError::new(ErrorCode::Unavailable, "browser session is not active")
+            })?;
+        if runtime.project_id != project_id {
+            return Err(DomainError::not_found("browser session"));
+        }
+        if runtime.cdp.is_none() {
+            return Ok(cdp_status_view(project_id, None));
+        }
+        let result = self
+            .call_worker(
+                "session.cdp_disable",
+                json!({ "session_id": session_id.get() }),
+            )
+            .await?;
+        if let Some(runtime) = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get_mut(&session_id.get())
+        {
+            runtime.cdp = None;
+        }
+        self.save_cookie_checkpoint(project_id, session_id, &result)
+            .await?;
+        Ok(cdp_status_view(project_id, None))
+    }
+
     async fn session_is_persistent(&self, session_id: BrowserSessionId) -> bool {
         self.runtime_sessions
             .lock()
@@ -942,7 +1093,7 @@ impl BrowserService {
             .lock()
             .await
             .get(&session_id.get())
-            .is_some_and(|runtime| runtime.project_id == project_id);
+            .is_some_and(|runtime| runtime.project_id == project_id && runtime.cdp.is_none());
         if !active {
             return Ok(false);
         }
@@ -1020,6 +1171,12 @@ impl BrowserService {
                 "browser runtime is not attached; start a new browser session",
             ));
         };
+        if runtime.cdp.is_some() {
+            return Err(DomainError::new(
+                ErrorCode::Conflict,
+                "browser control is handed off through CDP; disable the CDP handoff before running agent browser actions",
+            ));
+        }
 
         session.state = BrowserSessionState::Busy;
         self.db.update_browser_session(&session).await?;
@@ -1841,6 +1998,66 @@ fn profile_cookie_identities(profile: &StoredCookieProfile) -> DomainResult<Vec<
         .collect())
 }
 
+fn parse_cdp_info(value: Option<&Value>) -> DomainResult<BrowserCdpInfo> {
+    let info: BrowserCdpInfo = serde_json::from_value(value.cloned().ok_or_else(|| {
+        DomainError::new(
+            ErrorCode::ProtocolError,
+            "browser worker omitted CDP details",
+        )
+    })?)
+    .map_err(|error| {
+        DomainError::new(
+            ErrorCode::ProtocolError,
+            format!("browser worker returned invalid CDP details: {error}"),
+        )
+    })?;
+    if info.port != BROWSER_CDP_PORT
+        || info.endpoint != format!("http://127.0.0.1:{BROWSER_CDP_PORT}")
+        || info.devtools_url.len() > 4_096
+        || info.hosted_devtools_url.len() > 4_096
+        || !info.devtools_url.starts_with(&format!(
+            "http://127.0.0.1:{BROWSER_CDP_PORT}/devtools/inspector.html?ws=127.0.0.1:{BROWSER_CDP_PORT}/devtools/page/"
+        ))
+        || !info
+            .hosted_devtools_url
+            .starts_with("https://chrome-devtools-frontend.appspot.com/")
+    {
+        return Err(DomainError::new(
+            ErrorCode::ProtocolError,
+            "browser worker returned unexpected CDP details",
+        ));
+    }
+    Ok(info)
+}
+
+fn cdp_status_view(
+    project_id: ProjectId,
+    active: Option<(i64, BrowserCdpInfo)>,
+) -> BrowserCdpStatus {
+    match active {
+        Some((session_id, cdp)) => BrowserCdpStatus {
+            project_id,
+            active: true,
+            agent_control: false,
+            session_id: Some(BrowserSessionId(session_id)),
+            endpoint: Some(cdp.endpoint),
+            devtools_url: Some(cdp.devtools_url),
+            hosted_devtools_url: Some(cdp.hosted_devtools_url),
+            ssh_forward_command: Some("ssh -N -L 9222:127.0.0.1:9222 user@vps".into()),
+        },
+        None => BrowserCdpStatus {
+            project_id,
+            active: false,
+            agent_control: true,
+            session_id: None,
+            endpoint: None,
+            devtools_url: None,
+            hosted_devtools_url: None,
+            ssh_forward_command: None,
+        },
+    }
+}
+
 fn existing_path(configured: Option<PathBuf>, executable_name: &str) -> Option<PathBuf> {
     configured
         .filter(|path| path.exists())
@@ -2130,6 +2347,36 @@ mod tests {
         checkpoint.version = 99;
         checkpoint.hash = "old".into();
         assert_eq!(first, checkpoint_hash(&checkpoint).unwrap());
+    }
+
+    #[test]
+    fn cdp_details_are_bounded_and_status_makes_control_ownership_explicit() {
+        let info = parse_cdp_info(Some(&json!({
+            "port": 9222,
+            "endpoint": "http://127.0.0.1:9222",
+            "devtools_url": "http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/1",
+            "hosted_devtools_url": "https://chrome-devtools-frontend.appspot.com/serve_rev/@abc/inspector.html?ws=127.0.0.1:9222/devtools/page/1"
+        })))
+        .unwrap();
+        let handed_off = cdp_status_view(ProjectId(7), Some((9, info)));
+        assert!(handed_off.active);
+        assert!(!handed_off.agent_control);
+        assert_eq!(handed_off.session_id, Some(BrowserSessionId(9)));
+        assert!(handed_off
+            .ssh_forward_command
+            .unwrap()
+            .contains("9222:127.0.0.1:9222"));
+
+        let available = cdp_status_view(ProjectId(7), None);
+        assert!(!available.active);
+        assert!(available.agent_control);
+        assert!(parse_cdp_info(Some(&json!({
+            "port": 9223,
+            "endpoint": "http://127.0.0.1:9223",
+            "devtools_url": "https://example.test/",
+            "hosted_devtools_url": "https://example.test/"
+        })))
+        .is_err());
     }
 
     #[test]

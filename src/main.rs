@@ -131,11 +131,27 @@ enum HistoryCmd {
 
 #[derive(Subcommand, Debug)]
 enum BrowserCmd {
+    /// Install Playwright and Chromium artifacts.
     Install {
         /// Also ask Playwright to install Linux browser system dependencies.
         #[arg(long)]
         with_deps: bool,
     },
+    /// Hand a managed browser to Chrome DevTools or return it to the agent.
+    Cdp {
+        #[command(subcommand)]
+        cmd: BrowserCdpCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BrowserCdpCmd {
+    /// Expose this active browser on loopback port 9222.
+    Enable { project_id: i64, session_id: i64 },
+    /// Show the project's current handoff state and DevTools URL.
+    Status { project_id: i64 },
+    /// Close CDP port 9222 and return browser control to agents.
+    Disable { project_id: i64, session_id: i64 },
 }
 
 #[tokio::main]
@@ -487,6 +503,37 @@ async fn run(cli: Cli) -> DomainResult<()> {
                         ));
                     }
                     println!("Browser runtime installed in {}", worker.display());
+                    Ok(())
+                }
+                BrowserCmd::Cdp { cmd } => {
+                    let cfg = Config::load(cli.data_dir)?;
+                    ensure_daemon(&cfg).await?;
+                    let (project_id, body) = match cmd {
+                        BrowserCdpCmd::Enable {
+                            project_id,
+                            session_id,
+                        } => (
+                            project_id,
+                            serde_json::json!({ "op": "enable", "session_id": session_id }),
+                        ),
+                        BrowserCdpCmd::Status { project_id } => {
+                            (project_id, serde_json::json!({ "op": "status" }))
+                        }
+                        BrowserCdpCmd::Disable {
+                            project_id,
+                            session_id,
+                        } => (
+                            project_id,
+                            serde_json::json!({ "op": "disable", "session_id": session_id }),
+                        ),
+                    };
+                    let value = daemon_post(
+                        &cfg,
+                        &format!("/api/v1/projects/{project_id}/browser-cdp"),
+                        &body.to_string(),
+                    )
+                    .await?;
+                    println!("{value}");
                     Ok(())
                 }
             }

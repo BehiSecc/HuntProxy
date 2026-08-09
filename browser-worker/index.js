@@ -137,25 +137,33 @@ function chromiumProxy(proxy) {
   };
 }
 
-function chromiumLaunchOptions(proxy, caCertPath) {
+function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
+  const args = [
+    "--disable-quic",
+    "--disk-cache-size=52428800",
+    "--media-cache-size=10485760",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--proxy-bypass-list=<-loopback>",
+  ];
+  if (cdpPort != null) {
+    args.push(
+      "--remote-debugging-address=127.0.0.1",
+      `--remote-debugging-port=${cdpPort}`,
+      `--remote-allow-origins=http://127.0.0.1:${cdpPort},https://chrome-devtools-frontend.appspot.com`,
+    );
+  }
   return {
     executablePath: existingChromiumExecutable(),
     headless: true,
     proxy: chromiumProxy(proxy),
     ignoreHTTPSErrors: Boolean(caCertPath),
     serviceWorkers: "allow",
-    args: [
-      "--disable-quic",
-      "--disk-cache-size=52428800",
-      "--media-cache-size=10485760",
-      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-      "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-      "--proxy-bypass-list=<-loopback>",
-    ],
+    args,
   };
 }
 
-async function launchChromium(proxy, caCertPath, profileDir = null) {
+async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = null) {
   const executablePath = existingChromiumExecutable();
   if (!executablePath) {
     throw rpcError(
@@ -163,7 +171,7 @@ async function launchChromium(proxy, caCertPath, profileDir = null) {
       "Chromium executable not found; install Chromium or set HUNTPROXY_CHROME_EXECUTABLE",
     );
   }
-  const options = chromiumLaunchOptions(proxy, caCertPath);
+  const options = chromiumLaunchOptions(proxy, caCertPath, cdpPort);
   options.serviceWorkers = profileDir ? "allow" : "block";
   if (profileDir) {
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
@@ -186,6 +194,102 @@ async function launchChromium(proxy, caCertPath, profileDir = null) {
   });
   const page = await context.newPage();
   return { browser, context, page, persistent: false, profileDir: null };
+}
+
+function validateCdpPort(value) {
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
+    throw rpcError(-32602, "cdp_port must be an integer between 1024 and 65535");
+  }
+  return port;
+}
+
+async function discoverCdp(page, port) {
+  const cdp = await page.context().newCDPSession(page);
+  const targetInfo = await cdp.send("Target.getTargetInfo");
+  await cdp.detach();
+  const deadline = Date.now() + 5_000;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+        signal: AbortSignal.timeout(1_000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const targets = await response.json();
+      const target = targets.find((candidate) => candidate.id === targetInfo.targetInfo.targetId);
+      if (target?.webSocketDebuggerUrl) {
+        const websocket = new URL(target.webSocketDebuggerUrl);
+        let hostedDevtoolsUrl = String(target.devtoolsFrontendUrl || "");
+        if (!hostedDevtoolsUrl.startsWith("https://chrome-devtools-frontend.appspot.com/")) {
+          const versionResponse = await fetch(`http://127.0.0.1:${port}/json/version`, {
+            signal: AbortSignal.timeout(1_000),
+          });
+          const version = await versionResponse.json();
+          const revision = String(version["WebKit-Version"] || "").match(/\(@([^)]+)\)/)?.[1];
+          if (!revision) throw new Error("Chromium omitted its DevTools revision");
+          hostedDevtoolsUrl = `https://chrome-devtools-frontend.appspot.com/serve_rev/@${revision}/inspector.html?ws=${websocket.host}${websocket.pathname}`;
+        }
+        return {
+          port,
+          endpoint: `http://127.0.0.1:${port}`,
+          devtools_url: `http://127.0.0.1:${port}/devtools/inspector.html?ws=${websocket.host}${websocket.pathname}`,
+          hosted_devtools_url: hostedDevtoolsUrl,
+        };
+      }
+      lastError = new Error("debug target was not published");
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw rpcError(-32000, `Chromium CDP endpoint did not become ready: ${lastError?.message || "unknown error"}`);
+}
+
+async function launchSessionRuntime(session, cdpPort, currentUrl) {
+  const runtime = await launchChromium(
+    session.proxy || null,
+    session.caCertPath || null,
+    session.profileDir || null,
+    cdpPort,
+  );
+  try {
+    if (currentUrl && currentUrl !== "about:blank") {
+      await runtime.page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    }
+    const cdp = cdpPort == null ? null : await discoverCdp(runtime.page, cdpPort);
+    return { runtime, cdp };
+  } catch (error) {
+    await closeRuntime(runtime);
+    throw error;
+  }
+}
+
+async function relaunchSession(session, cdpPort) {
+  if (!session.persistent || !session.profileDir) {
+    throw rpcError(-32602, "CDP handoff requires a persistent project browser");
+  }
+  const currentUrl = session.page?.url() || "about:blank";
+  await closeRuntime(session);
+  let launched;
+  try {
+    launched = await launchSessionRuntime(session, cdpPort, currentUrl);
+  } catch (error) {
+    try {
+      const restored = await launchSessionRuntime(session, null, currentUrl);
+      Object.assign(session, restored.runtime, { cdp: null });
+      trackJavascriptFiles(session);
+    } catch (restoreError) {
+      throw rpcError(
+        -32000,
+        `CDP handoff failed and the normal browser could not be restored: ${restoreError?.message || restoreError}`,
+      );
+    }
+    throw error;
+  }
+  Object.assign(session, launched.runtime, { cdp: launched.cdp });
+  trackJavascriptFiles(session);
+  return launched.cdp;
 }
 
 async function restoreProjectState(session, state) {
@@ -436,7 +540,7 @@ async function handle(req) {
         return respond(id, {
           protocol: PROTOCOL,
           engines: ["chromium"],
-          capabilities: ["actions", "checkpoints"],
+          capabilities: ["actions", "checkpoints", "cdp_handoff"],
         });
       case "session.start": {
         const sessionId = Number(params.session_id);
@@ -461,6 +565,7 @@ async function handle(req) {
           persistent: Boolean(params.persistent),
           profileDir,
           preferProfileState: Boolean(params.prefer_profile_state),
+          cdp: null,
         };
         trackJavascriptFiles(session);
         sessions.set(sessionId, session);
@@ -552,6 +657,27 @@ async function handle(req) {
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
         return respond(id, { files: [...(session.javascriptFiles?.values() || [])] });
+      }
+      case "session.cdp_enable": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        if (session.cdp) {
+          return respond(id, { cdp: session.cdp, checkpoint: await extractCheckpoint(session) });
+        }
+        const cdp = await relaunchSession(session, validateCdpPort(params.cdp_port));
+        const checkpoint = await extractCheckpoint(session);
+        logMeta("session.cdp_enable", { session_id: sessionId, port: cdp.port });
+        return respond(id, { cdp, checkpoint });
+      }
+      case "session.cdp_disable": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        if (session.cdp) await relaunchSession(session, null);
+        const checkpoint = await extractCheckpoint(session);
+        logMeta("session.cdp_disable", { session_id: sessionId });
+        return respond(id, { cdp: null, checkpoint });
       }
       case "session.authenticated_fetch": {
         const sessionId = Number(params.session_id);

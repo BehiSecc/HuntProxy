@@ -34,6 +34,20 @@ HuntProxy serve
 `--data-dir` is optional. The default is `~/.huntproxy`, which HuntProxy
 creates automatically.
 
+## Docker
+
+The image runs HuntProxy and Chromium as a non-root user:
+
+```bash
+docker build -t huntproxy .
+docker volume create huntproxy-data
+docker run --name huntproxy --network host --shm-size=1g -v huntproxy-data:/data huntproxy
+```
+
+Open http://127.0.0.1:17890. Host networking keeps the UI, proxy, and optional
+CDP port on the host's loopback interface. For MCP, use
+`docker exec -i huntproxy HuntProxy mcp`.
+
 ## MCP
 
 Generic JSON configuration:
@@ -87,6 +101,20 @@ auto-started daemon exits and its browser processes close. A daemon started
 explicitly with `HuntProxy serve` stays running until stopped.
 Set `idle_timeout_seconds` in `~/.huntproxy/config.toml` to change this timeout;
 use `0` to disable it.
+
+To hand an active persistent browser to a person, call the MCP `browser_cdp`
+tool with `op: "enable"`, or run:
+
+```bash
+HuntProxy browser cdp enable <project-id> <session-id>
+```
+
+Open the returned `devtools_url` in a browser on the VPS. From another machine,
+first run `ssh -N -L 9222:127.0.0.1:9222 user@vps`, then open that same URL.
+The result also includes a `hosted_devtools_url` from Chrome's hosted frontend;
+the local URL is more reliable when browsers restrict local-network WebSockets.
+Agent browser actions pause during the handoff. Return control with
+`browser_cdp` `op: "disable"` or `HuntProxy browser cdp disable <project-id> <session-id>`.
 
 Outbound requests are direct by default. To use an HTTP or SOCKS5 upstream
 proxy globally or for selected hosts, add this to `~/.huntproxy/config.toml`

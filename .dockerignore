@@ -1,0 +1,13 @@
+.git
+.github
+.codegraph
+.env
+.env.*
+target
+spikes
+*.key
+*.pem
+*.db
+*.db-shm
+*.db-wal
+*.log

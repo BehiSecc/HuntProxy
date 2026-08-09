@@ -193,6 +193,42 @@ async fn ip_rotation_status_is_visible_and_blocks_project_deletion_until_cleanup
 }
 
 #[tokio::test]
+async fn browser_cdp_api_reports_control_state_and_validates_session_requirements() {
+    let (_directory, state, project_id) = test_state().await;
+    let app = huntproxy::api::router(state);
+    let status = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/projects/{}/browser-cdp", project_id.get()))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"op":"status"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status = json_response(status).await;
+    assert_eq!(status["active"], false);
+    assert_eq!(status["agent_control"], true);
+    assert_eq!(status["session_id"], serde_json::Value::Null);
+
+    let missing_session = app
+        .oneshot(
+            Request::post(format!("/api/v1/projects/{}/browser-cdp", project_id.get()))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"op":"enable"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+    assert!(json_response(missing_session).await["message"]
+        .as_str()
+        .unwrap()
+        .contains("session_id"));
+}
+
+#[tokio::test]
 async fn history_filter_and_annotation_work_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let get_id = state

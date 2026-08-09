@@ -289,6 +289,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/projects/{id}/browser-sessions/{bid}/stop",
             post(stop_browser),
         )
+        .route(
+            "/api/v1/projects/{id}/browser-cdp",
+            post(browser_cdp).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
         .route("/api/v1/projects/{id}/events", get(events))
         .route("/api/v1/doctor", get(doctor))
         .route("/api/v1/extensions", get(list_extensions))
@@ -1999,6 +2003,48 @@ async fn stop_browser(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserCdpRequest {
+    op: String,
+    session_id: Option<i64>,
+}
+
+async fn browser_cdp(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<BrowserCdpRequest>,
+) -> Response {
+    let project_id = ProjectId(id);
+    let result = match body.op.as_str() {
+        "status" => state.browser.cdp_status(project_id).await,
+        "enable" | "disable" => {
+            let session_id = match body.session_id {
+                Some(session_id) => BrowserSessionId(session_id),
+                None => {
+                    return error_response(DomainError::invalid(
+                        "session_id is required for CDP enable and disable",
+                    ))
+                }
+            };
+            if body.op == "enable" {
+                state.browser.enable_cdp(project_id, session_id).await
+            } else {
+                state.browser.disable_cdp(project_id, session_id).await
+            }
+        }
+        _ => {
+            return error_response(DomainError::invalid(
+                "CDP op must be enable, status, or disable",
+            ))
+        }
+    };
+    match result {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => error_response(error),
     }
 }
 
