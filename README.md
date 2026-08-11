@@ -159,6 +159,16 @@ extension_list
   -> job_status(job_id) / job_results(job_id) / job_cancel(job_id)
 ```
 
+`extension_list` is intentionally compact; action schemas and limits live only
+in `extension_describe`. `job_status` returns progress, the current phase, and
+`recommended_poll_interval_ms` while a job is active without serializing its
+result. `job_results` defaults to a bounded summary and supports
+`view=findings|full`, `offset`, and `limit` for stable finding pages. Semantic
+plugin requests may set `credential_mode` to `with_project_credentials`
+(default) or `without_project_credentials`; the latter removes inherited,
+managed-cookie, and request-rule credentials while retaining credentials the
+probe explicitly supplies.
+
 HuntProxy owns all extension network I/O, scope checks, concurrency, rate
 limits, cancellation, history, and findings. Generated requests appear in
 History with `plugin`, the extension name, and `plugin:<id>` labels. Packages

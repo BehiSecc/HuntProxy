@@ -736,7 +736,7 @@ test
       while (true) {
         const job = await api(`/api/v1/projects/${projectId}/extension-jobs/${jobId}`);
         if (['completed', 'failed', 'cancelled'].includes(job.state)) return job;
-        await new Promise(resolve => setTimeout(resolve, 600));
+        await new Promise(resolve => setTimeout(resolve, job.recommended_poll_interval_ms || 600));
       }
     }
 
@@ -752,9 +752,10 @@ test
         });
         const job = await waitForExtensionJob(projectId, queued.id);
         if (job.state !== 'completed') throw new Error(job.error?.message || `IpRotate job ${job.state}`);
-        const operationError = job.result?.analysis?.result?.error;
+        const results = await api(`/api/v1/projects/${projectId}/extension-jobs/${job.id}/results?view=full&limit=1`);
+        const operationError = results.result?.analysis?.result?.error;
         if (operationError) throw new Error(operationError.message || operationError.code || 'IpRotate operation failed');
-        const cleanupErrors = job.result?.analysis?.result?.ip_rotation?.cleanup_errors || [];
+        const cleanupErrors = results.result?.analysis?.result?.ip_rotation?.cleanup_errors || [];
         status('ipRotationStatus', cleanupErrors.length ? `Routing stopped; ${cleanupErrors.length} gateway cleanup error(s) remain` : (action === 'enable' ? 'IP rotation enabled.' : 'IP rotation disabled.'), cleanupErrors.length ? 'err' : 'ok');
       } catch (error) {
         status('ipRotationStatus', error.message, 'err');

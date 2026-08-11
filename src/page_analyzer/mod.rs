@@ -10,6 +10,7 @@ use crate::domain::{DomainResult, ExchangeId, MessageSide, ProjectId};
 use crate::storage::Db;
 
 const MAX_CANDIDATE_LEN: usize = 2_048;
+const MAX_PASSIVE_DISCOVERY_BODY: usize = 1024 * 1024;
 
 static ABSOLUTE_URL: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?i)(?:https?|wss?)://[^\s"'<>\\]{4,2048}"#).expect("absolute-url regex")
@@ -28,6 +29,22 @@ static DIRECT_PATH: Lazy<Regex> = Lazy::new(|| {
 
 static EMAIL: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.-]+\.[a-z]{2,24}").expect("email regex"));
+
+static SCRIPT_SRC: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<script\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'=<>`]+))"#)
+        .expect("script-src regex")
+});
+static LINK_HREF: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<link\b[^>]*?\bhref\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'=<>`]+))"#)
+        .expect("link-href regex")
+});
+static BASE_HREF: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<base\b[^>]*?\bhref\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'=<>`]+))"#)
+        .expect("base-href regex")
+});
+static PASSIVE_EXTENSION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\.(?:js|mjs|css|json)$").expect("passive extension regex")
+});
 
 static STATIC_ASSET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -114,6 +131,107 @@ pub struct ExchangePageAnalysis {
     pub content_encoding: Option<String>,
     #[serde(flatten)]
     pub analysis: PageAnalysis,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PassiveTargetDiscovery {
+    pub source_url: String,
+    pub targets: Vec<String>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+fn attribute_value<'a>(captures: &'a regex::Captures<'a>) -> Option<&'a str> {
+    (1..=3).find_map(|index| captures.get(index).map(|value| value.as_str()))
+}
+
+fn same_origin(left: &url::Url, right: &url::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn passive_targets(source_url: &str, content: &[u8], limit: usize) -> PassiveTargetDiscovery {
+    let text = String::from_utf8_lossy(content);
+    let source = url::Url::parse(source_url).ok();
+    let mut base = source.clone();
+    if let (Some(source), Some(captures)) = (source.as_ref(), BASE_HREF.captures(&text)) {
+        if let Some(value) = attribute_value(&captures) {
+            if let Ok(candidate) = source.join(value) {
+                if same_origin(source, &candidate) {
+                    base = Some(candidate);
+                }
+            }
+        }
+    }
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    if let (Some(source), Some(base)) = (source.as_ref(), base.as_ref()) {
+        for captures in SCRIPT_SRC.captures_iter(&text).chain(LINK_HREF.captures_iter(&text)) {
+            let Some(value) = attribute_value(&captures) else { continue };
+            let Ok(mut target) = base.join(value) else { continue };
+            if !matches!(target.scheme(), "http" | "https")
+                || !same_origin(source, &target)
+                || !target.username().is_empty()
+                || target.password().is_some()
+            {
+                continue;
+            }
+            target.set_fragment(None);
+            if target.as_str().len() > MAX_CANDIDATE_LEN
+                || !PASSIVE_EXTENSION.is_match(target.path())
+                || target.query_pairs().any(|(name, value)| {
+                    !matches!(name.to_ascii_lowercase().as_str(), "callback" | "cb" | "v" | "ver" | "version" | "lang" | "locale" | "theme" | "format" | "module")
+                        || value.len() > 128
+                        || !value.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '~' | '-'))
+                })
+            {
+                continue;
+            }
+            let canonical = target.to_string();
+            if seen.insert(canonical.clone()) {
+                targets.push(canonical);
+            }
+        }
+    }
+    let total = targets.len();
+    targets.truncate(limit.min(64));
+    PassiveTargetDiscovery { source_url: source_url.to_string(), truncated: total > targets.len(), total, targets }
+}
+
+/// Resolve and sanitize passive same-origin resources referenced by the saved
+/// base response. Only script and link targets with safe static extensions are
+/// returned; emails and flat application routes are deliberately excluded.
+pub async fn discover_passive_targets(
+    db: &Db,
+    project_id: ProjectId,
+    exchange_id: ExchangeId,
+    limit: usize,
+) -> DomainResult<PassiveTargetDiscovery> {
+    let detail = db
+        .get_exchange_detail(project_id, exchange_id, crate::policy::PresentationOptions::default())
+        .await?;
+    let mut body = db
+        .load_raw_body(project_id, exchange_id, MessageSide::Response)
+        .await?
+        .unwrap_or_default();
+    if detail.protocol == "HTTP/1.1 raw" {
+        body = crate::reply::presented_raw_response_body(&body);
+    }
+    let headers = db.load_raw_headers(project_id, exchange_id, MessageSide::Response).await?;
+    let encodings = headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+        .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
+        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .collect::<Vec<_>>();
+    if !encodings.is_empty() {
+        body = crate::codec::decode_content_encodings(&body, &encodings.join(", "), MAX_PASSIVE_DISCOVERY_BODY)?;
+    }
+    body.truncate(MAX_PASSIVE_DISCOVERY_BODY);
+    let query = detail.summary.query.as_deref().filter(|query| !query.is_empty()).map(|query| format!("?{query}")).unwrap_or_default();
+    let source_url = format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query);
+    Ok(passive_targets(&source_url, &body, limit))
 }
 
 /// Analyze the full stored response body, decoding HTTP content encodings first.
@@ -543,5 +661,34 @@ mod tests {
             result.urls,
             ["https://cdn.example.test/contracts/Program Terms.pdf"]
         );
+    }
+
+    #[test]
+    fn passive_target_discovery_is_same_origin_bounded_and_secret_safe() {
+        let result = passive_targets(
+            "https://example.test/app/index.html",
+            br#"
+              <base href="/assets/">
+              <script src="../resources/js/geolocate.js"></script>
+              <script src="https://example.test/app.js#fragment"></script>
+              <script src="https://other.test/foreign.js"></script>
+              <script src="signed.js?token=secret"></script>
+              <script src="cloud.js?X-Amz-Credential=credential&amp;X-Amz-Signature=signature"></script>
+              <link rel="stylesheet" href="theme.css">
+              <a href="/logout">logout</a>
+            "#,
+            2,
+        );
+        assert_eq!(result.total, 3);
+        assert_eq!(result.targets.len(), 2);
+        assert!(result.truncated);
+        assert!(result.targets.contains(&"https://example.test/resources/js/geolocate.js".to_string()));
+        assert!(result.targets.contains(&"https://example.test/app.js".to_string()));
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("credential"));
+        assert!(!serialized.contains("signature"));
+        assert!(!serialized.contains("other.test"));
+        assert!(!serialized.contains("logout"));
     }
 }

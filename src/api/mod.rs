@@ -306,6 +306,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(extension_job),
         )
         .route(
+            "/api/v1/projects/{id}/extension-jobs/{job_id}/results",
+            get(extension_job_results),
+        )
+        .route(
             "/api/v1/projects/{id}/extension-jobs/{job_id}/cancel",
             post(cancel_extension_job),
         )
@@ -434,6 +438,7 @@ async fn list_extensions(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(serde_json::json!({
         "plugin_directory": state.plugins.directory(),
         "plugins": state.plugins.list(),
+        "load_issues": state.plugins.load_issues(),
     }))
 }
 
@@ -503,6 +508,49 @@ async fn extension_job(
 ) -> Response {
     match parse_project_job(&state, id, &job_id) {
         Ok(job) => Json(job).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtensionJobResultsQuery {
+    view: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+async fn extension_job_results(
+    State(state): State<Arc<AppState>>,
+    Path((id, job_id)): Path<(i64, String)>,
+    Query(query): Query<ExtensionJobResultsQuery>,
+) -> Response {
+    let job_id = match job_id.parse::<uuid::Uuid>() {
+        Ok(job_id) => job_id,
+        Err(_) => return error_response(DomainError::invalid("job_id must be a UUID")),
+    };
+    let status = match state.plugins.status(job_id) {
+        Ok(status) if status.project_id == ProjectId(id) => status,
+        Ok(_) => return error_response(DomainError::not_found("plugin job")),
+        Err(error) => return error_response(error),
+    };
+    let _ = status;
+    let view = match query.view.as_deref().unwrap_or("summary") {
+        "summary" => crate::plugins::PluginResultView::Summary,
+        "findings" => crate::plugins::PluginResultView::Findings,
+        "full" => crate::plugins::PluginResultView::Full,
+        _ => {
+            return error_response(DomainError::invalid(
+                "view must be summary, findings, or full",
+            ))
+        }
+    };
+    match state.plugins.results(
+        job_id,
+        view,
+        query.offset.unwrap_or(0),
+        query.limit.unwrap_or(25),
+    ) {
+        Ok(result) => Json(result).into_response(),
         Err(error) => error_response(error),
     }
 }

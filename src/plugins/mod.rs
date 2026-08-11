@@ -121,6 +121,22 @@ struct LoadedPlugin {
     resources: Arc<HashMap<String, String>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginSummary {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub enabled: bool,
+    pub actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginLoadIssue {
+    pub package: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginJobState {
@@ -131,6 +147,26 @@ pub enum PluginJobState {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginJobPhase {
+    Queued,
+    Planning,
+    Executing,
+    Analyzing,
+    Persisting,
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginResultView {
+    #[default]
+    Summary,
+    Findings,
+    Full,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginJobView {
     pub id: Uuid,
@@ -139,15 +175,74 @@ pub struct PluginJobView {
     pub action: String,
     pub base_exchange_id: Option<ExchangeId>,
     pub state: PluginJobState,
+    pub phase: PluginJobPhase,
     pub operation_count: usize,
     pub completed_operations: usize,
-    pub result: Option<Value>,
+    /// Adaptive hint for agents and UIs. Omitted for terminal jobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_poll_interval_ms: Option<u64>,
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PluginJobRecord {
+    id: Uuid,
+    project_id: ProjectId,
+    plugin_id: String,
+    action: String,
+    base_exchange_id: Option<ExchangeId>,
+    state: PluginJobState,
+    phase: PluginJobPhase,
+    operation_count: usize,
+    completed_operations: usize,
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+impl PluginJobRecord {
+    fn status(&self) -> PluginJobView {
+        PluginJobView {
+            id: self.id,
+            project_id: self.project_id,
+            plugin_id: self.plugin_id.clone(),
+            action: self.action.clone(),
+            base_exchange_id: self.base_exchange_id,
+            state: self.state,
+            phase: self.phase,
+            operation_count: self.operation_count,
+            completed_operations: self.completed_operations,
+            recommended_poll_interval_ms: recommended_poll_interval_ms(self),
+            error: self.error.clone(),
+        }
+    }
+}
+
 struct PluginJob {
-    view: parking_lot::RwLock<PluginJobView>,
+    view: parking_lot::RwLock<PluginJobRecord>,
     cancel: CancellationToken,
+}
+
+fn recommended_poll_interval_ms(job: &PluginJobRecord) -> Option<u64> {
+    if matches!(
+        job.state,
+        PluginJobState::Completed | PluginJobState::Failed | PluginJobState::Cancelled
+    ) {
+        return None;
+    }
+    match job.phase {
+        PluginJobPhase::Queued | PluginJobPhase::Planning | PluginJobPhase::Analyzing => Some(500),
+        PluginJobPhase::Persisting => Some(250),
+        PluginJobPhase::Finished => None,
+        PluginJobPhase::Executing => {
+            let remaining = job.operation_count.saturating_sub(job.completed_operations);
+            Some(match remaining {
+                0..=10 => 500,
+                11..=100 => 1_000,
+                101..=500 => 2_000,
+                _ => 5_000,
+            })
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -156,6 +251,7 @@ pub struct PluginService {
     reply: Arc<ReplyService>,
     db: Arc<crate::storage::Db>,
     plugins: Arc<HashMap<String, Arc<LoadedPlugin>>>,
+    load_issues: Arc<Vec<PluginLoadIssue>>,
     jobs: Arc<DashMap<Uuid, Arc<PluginJob>>>,
     active_jobs: Arc<tokio::sync::Semaphore>,
 }
@@ -379,6 +475,16 @@ struct PluginHttpRequest {
     cookie_params: Vec<PluginParamPatch>,
     #[serde(default)]
     body_params: Vec<PluginParamPatch>,
+    #[serde(default)]
+    credential_mode: PluginCredentialMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PluginCredentialMode {
+    #[default]
+    WithProjectCredentials,
+    WithoutProjectCredentials,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -584,6 +690,7 @@ impl PluginService {
     ) -> DomainResult<Self> {
         crate::config::create_private_dir(&directory)?;
         let mut plugins = HashMap::new();
+        let mut load_issues = Vec::new();
         let entries = std::fs::read_dir(&directory).map_err(|error| {
             DomainError::new(
                 ErrorCode::StorageError,
@@ -601,26 +708,32 @@ impl PluginService {
             };
             match load_plugin(&entry.path()) {
                 Ok(plugin) => {
-                    if plugins
-                        .insert(plugin.manifest.id.clone(), Arc::new(plugin))
-                        .is_some()
-                    {
-                        return Err(DomainError::new(
-                            ErrorCode::ConfigInvalid,
-                            "duplicate plugin id",
-                        ));
+                    let plugin_id = plugin.manifest.id.clone();
+                    if plugins.contains_key(&plugin_id) {
+                        load_issues.push(PluginLoadIssue {
+                            package: entry.file_name().to_string_lossy().into_owned(),
+                            message: format!("duplicate plugin id {plugin_id}"),
+                        });
+                    } else {
+                        plugins.insert(plugin_id, Arc::new(plugin));
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(path=%entry.path().display(), %error, "plugin rejected")
+                    tracing::warn!(path=%entry.path().display(), %error, "plugin rejected");
+                    load_issues.push(PluginLoadIssue {
+                        package: entry.file_name().to_string_lossy().into_owned(),
+                        message: error.to_string(),
+                    });
                 }
             }
         }
+        load_issues.sort_by(|left, right| left.package.cmp(&right.package));
         Ok(Self {
             directory,
             reply,
             db,
             plugins: Arc::new(plugins),
+            load_issues: Arc::new(load_issues),
             jobs: Arc::new(DashMap::new()),
             active_jobs: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_JOBS)),
         })
@@ -630,14 +743,30 @@ impl PluginService {
         &self.directory
     }
 
-    pub fn list(&self) -> Vec<PluginManifest> {
+    pub fn list(&self) -> Vec<PluginSummary> {
         let mut plugins = self
             .plugins
             .values()
-            .map(|plugin| plugin.manifest.clone())
+            .map(|plugin| PluginSummary {
+                id: plugin.manifest.id.clone(),
+                name: plugin.manifest.name.clone(),
+                version: plugin.manifest.version.clone(),
+                description: bounded_chars(&plugin.manifest.description, 240),
+                enabled: plugin.manifest.enabled,
+                actions: plugin
+                    .manifest
+                    .actions
+                    .iter()
+                    .map(|action| action.name.clone())
+                    .collect(),
+            })
             .collect::<Vec<_>>();
         plugins.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
         plugins
+    }
+
+    pub fn load_issues(&self) -> &[PluginLoadIssue] {
+        &self.load_issues
     }
 
     pub fn describe(&self, id: &str) -> DomainResult<PluginManifest> {
@@ -703,13 +832,14 @@ impl PluginService {
 
         let id = Uuid::new_v4();
         let job = Arc::new(PluginJob {
-            view: parking_lot::RwLock::new(PluginJobView {
+            view: parking_lot::RwLock::new(PluginJobRecord {
                 id,
                 project_id,
                 plugin_id: plugin_id.into(),
                 action: action.into(),
                 base_exchange_id,
                 state: PluginJobState::Queued,
+                phase: PluginJobPhase::Queued,
                 operation_count: 0,
                 completed_operations: 0,
                 result: None,
@@ -730,7 +860,7 @@ impl PluginService {
     pub fn status(&self, id: Uuid) -> DomainResult<PluginJobView> {
         self.jobs
             .get(&id)
-            .map(|job| job.view.read().clone())
+            .map(|job| job.view.read().status())
             .ok_or_else(|| DomainError::not_found("plugin job"))
     }
 
@@ -740,8 +870,88 @@ impl PluginService {
             .get(&id)
             .ok_or_else(|| DomainError::not_found("plugin job"))?;
         job.cancel.cancel();
-        let view = job.view.read().clone();
-        Ok(view)
+        let status = job.view.read().status();
+        Ok(status)
+    }
+
+    pub fn results(
+        &self,
+        id: Uuid,
+        result_view: PluginResultView,
+        offset: usize,
+        limit: usize,
+    ) -> DomainResult<Value> {
+        let job = self
+            .jobs
+            .get(&id)
+            .ok_or_else(|| DomainError::not_found("plugin job"))?;
+        let record = job.view.read();
+        let status = record.status();
+        let Some(stored) = record.result.as_ref() else {
+            return Ok(json!({
+                "job": status,
+                "result_available": false,
+            }));
+        };
+        let findings = stored
+            .pointer("/analysis/findings")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let total_findings = findings.len();
+        let persisted_findings_total = stored
+            .get("persisted_findings")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let offset = offset.min(total_findings);
+        let limit = limit.clamp(1, 100);
+        let end = offset.saturating_add(limit).min(total_findings);
+        let next_offset = (end < total_findings).then_some(end);
+        let mut page = findings[offset..end].to_vec();
+        for finding in &mut page {
+            remove_remediation_fields(finding);
+        }
+        let pagination = json!({
+            "offset": offset,
+            "limit": limit,
+            "returned": page.len(),
+            "total": total_findings,
+            "next_offset": next_offset,
+        });
+        match result_view {
+            PluginResultView::Summary => Ok(json!({
+                "job": status,
+                "result_available": true,
+                "summary": summarize_plugin_result(stored),
+                "findings": { "total": total_findings },
+            })),
+            PluginResultView::Findings => Ok(json!({
+                "job": status,
+                "result_available": true,
+                "pagination": pagination,
+                "findings": page,
+            })),
+            PluginResultView::Full => {
+                let mut result = stored.clone();
+                remove_remediation_fields(&mut result);
+                if let Some(items) = result
+                    .pointer_mut("/analysis/findings")
+                    .and_then(Value::as_array_mut)
+                {
+                    *items = page;
+                }
+                if let Some(object) = result.as_object_mut() {
+                    object.remove("persisted_findings");
+                }
+                Ok(json!({
+                    "job": status,
+                    "result_available": true,
+                    "pagination": pagination,
+                    "persisted_findings_total": persisted_findings_total,
+                    "result": result,
+                }))
+            }
+        }
     }
 
     pub fn has_active_jobs(&self) -> bool {
@@ -764,7 +974,11 @@ impl PluginService {
         action: String,
         input: Value,
     ) {
-        job.view.write().state = PluginJobState::Running;
+        {
+            let mut view = job.view.write();
+            view.state = PluginJobState::Running;
+            view.phase = PluginJobPhase::Planning;
+        }
         let timeout_ms = plugin
             .manifest
             .limits
@@ -780,19 +994,23 @@ impl PluginService {
         match result {
             Ok(Ok(result)) => {
                 view.state = PluginJobState::Completed;
+                view.phase = PluginJobPhase::Finished;
                 view.result = Some(result);
             }
             Ok(Err(error)) if error.code() == ErrorCode::Cancelled => {
                 view.state = PluginJobState::Cancelled;
+                view.phase = PluginJobPhase::Finished;
                 view.error = Some(error.to_string());
             }
             Ok(Err(error)) => {
                 view.state = PluginJobState::Failed;
+                view.phase = PluginJobPhase::Finished;
                 view.error = Some(error.to_string());
             }
             Err(_) => {
                 job.cancel.cancel();
                 view.state = PluginJobState::Failed;
+                view.phase = PluginJobPhase::Finished;
                 view.error = Some(format!("plugin job timed out after {timeout_ms} ms"));
             }
         }
@@ -819,12 +1037,19 @@ impl PluginService {
             .capabilities
             .iter()
             .any(|capability| capability == "http.raw");
+        let page_discovery_access = plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == "page.discover")
+            && input.get("target_url").is_none();
         let base_exchange = self
             .plugin_exchange_context(
                 project_id,
                 base_exchange_id,
                 privileged_identity,
                 raw_request_access,
+                page_discovery_access,
             )
             .await?;
         let related_exchanges = self
@@ -895,6 +1120,7 @@ impl PluginService {
             }
         }
         job.view.write().operation_count = planned_requests;
+        job.view.write().phase = PluginJobPhase::Executing;
         let project_id = job.view.read().project_id;
         let project = self.db.get_project(project_id).await?;
         let concurrency = plugin
@@ -1012,11 +1238,14 @@ impl PluginService {
                 "plugin job cancelled",
             ));
         }
+        job.view.write().phase = PluginJobPhase::Analyzing;
         let analyzed =
             run_js_stage(&plugin, "analyze", input, &json!(observations), &context).await?;
-        let analyzed = self
+        let mut analyzed = self
             .redact_plugin_output(project_id, base_exchange_id, analyzed)
             .await?;
+        remove_remediation_fields(&mut analyzed);
+        job.view.write().phase = PluginJobPhase::Persisting;
         let mut persisted_findings = Vec::new();
         if let Some(findings) = analyzed.get("findings").and_then(Value::as_array) {
             if findings.len() > 1000 {
@@ -1083,11 +1312,7 @@ impl PluginService {
                         .get("explanation")
                         .and_then(Value::as_str)
                         .unwrap_or("No explanation supplied.");
-                    let remediation = finding
-                        .get("remediation")
-                        .and_then(Value::as_str)
-                        .unwrap_or("No remediation supplied.");
-                    format!("Severity: {severity}\nConfidence: {confidence}\n\n{explanation}\n\nRemediation: {remediation}\n\nEvidence exchanges: {}", evidence.iter().map(|id| id.get().to_string()).collect::<Vec<_>>().join(", "))
+                    format!("Severity: {severity}\nConfidence: {confidence}\n\n{explanation}\n\nEvidence exchanges: {}", evidence.iter().map(|id| id.get().to_string()).collect::<Vec<_>>().join(", "))
                 };
                 persisted_findings.push(
                     self.db
@@ -1144,6 +1369,7 @@ impl PluginService {
         exchange_id: Option<ExchangeId>,
         privileged_identity: bool,
         raw_request_access: bool,
+        page_discovery_access: bool,
     ) -> DomainResult<Value> {
         let Some(exchange_id) = exchange_id else {
             return Ok(Value::Null);
@@ -1171,6 +1397,20 @@ impl PluginService {
             "request_body_hash": detail.request_body_hash.clone(),
             "request_preview": detail.request_preview.clone(),
         });
+        if page_discovery_access {
+            match crate::page_analyzer::discover_passive_targets(&self.db, project_id, exchange_id, 64).await {
+                Ok(analysis) => {
+                    context["page_discovery"] = serde_json::to_value(analysis)
+                        .unwrap_or_else(|_| json!({"available": false}));
+                }
+                Err(error) => {
+                    context["page_discovery"] = json!({
+                        "available": false,
+                        "error": error.to_string(),
+                    });
+                }
+            }
+        }
         if privileged_identity && detail.protocol.ends_with(" raw") {
             return Err(DomainError::invalid(
                 "identity-aware extensions require a semantic base exchange, not a raw-wire transcript",
@@ -1649,6 +1889,7 @@ impl PluginService {
                     })?;
                 let mut url_override = request.url;
                 let mut header_overrides = request.headers;
+                let credential_mode = request.credential_mode;
                 if !request.query_params.is_empty() {
                     let mut url = url::Url::parse(&effective_url).map_err(|error| {
                         DomainError::invalid(format!("invalid plugin request URL: {error}"))
@@ -1788,6 +2029,14 @@ impl PluginService {
                     header_tombstones: request.header_tombstones,
                     body_override,
                     body_text: request.body_text,
+                    credential_mode: match credential_mode {
+                        PluginCredentialMode::WithProjectCredentials => {
+                            ReplyCredentialMode::WithProjectCredentials
+                        }
+                        PluginCredentialMode::WithoutProjectCredentials => {
+                            ReplyCredentialMode::WithoutProjectCredentials
+                        }
+                    },
                     ..Default::default()
                 };
                 let response = tokio::select! {
@@ -2726,6 +2975,94 @@ impl PluginService {
             )
             .await?;
         Ok(())
+    }
+}
+
+fn remove_remediation_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("remediation");
+            for child in object.values_mut() {
+                remove_remediation_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                remove_remediation_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn summarize_plugin_result(result: &Value) -> Value {
+    let follow_up = result.pointer("/analysis/result/follow_up").map(|value| {
+        if serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 64 * 1024) {
+            value.clone()
+        } else {
+            json!({
+                "available": false,
+                "error": "follow_up exceeds the 64 KiB compact-result limit; request view=full"
+            })
+        }
+    });
+    let mut plan_result = compact_json(result.get("plan_result").unwrap_or(&Value::Null), 0);
+    if let Some(object) = plan_result.as_object_mut() {
+        object.remove("coverage");
+    }
+    let mut analysis_result = compact_json(result.pointer("/analysis/result").unwrap_or(&Value::Null), 0);
+    if let Some(object) = analysis_result.as_object_mut() {
+        object.remove("follow_up");
+    }
+    json!({
+        "plan_result": plan_result,
+        "analysis_result": analysis_result,
+        "follow_up": follow_up,
+        "persisted_findings": result
+            .get("persisted_findings")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+    })
+}
+
+fn compact_json(value: &Value, depth: usize) -> Value {
+    const MAX_DEPTH: usize = 3;
+    const MAX_OBJECT_KEYS: usize = 24;
+    const MAX_STRING_CHARS: usize = 240;
+    match value {
+        Value::String(text) => Value::String(bounded_chars(text, MAX_STRING_CHARS)),
+        Value::Array(items) => json!({"count": items.len()}),
+        Value::Object(object) if depth >= MAX_DEPTH => json!({"keys": object.len()}),
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            let total_keys = keys.len();
+            let mut compact = serde_json::Map::new();
+            for key in keys.into_iter().take(MAX_OBJECT_KEYS) {
+                if key == "findings" || key == "remediation" {
+                    continue;
+                }
+                compact.insert(key.clone(), compact_json(&object[key], depth + 1));
+            }
+            if total_keys > MAX_OBJECT_KEYS {
+                compact.insert(
+                    "_truncated_keys".into(),
+                    json!(total_keys - MAX_OBJECT_KEYS),
+                );
+            }
+            Value::Object(compact)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn bounded_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let compact = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
     }
 }
 
@@ -4376,13 +4713,21 @@ mod tests {
 
     fn test_job(state: PluginJobState) -> Arc<PluginJob> {
         Arc::new(PluginJob {
-            view: parking_lot::RwLock::new(PluginJobView {
+            view: parking_lot::RwLock::new(PluginJobRecord {
                 id: Uuid::new_v4(),
                 project_id: ProjectId(1),
                 plugin_id: "test".into(),
                 action: "run".into(),
                 base_exchange_id: None,
                 state,
+                phase: if matches!(
+                    state,
+                    PluginJobState::Completed | PluginJobState::Failed | PluginJobState::Cancelled
+                ) {
+                    PluginJobPhase::Finished
+                } else {
+                    PluginJobPhase::Executing
+                },
                 operation_count: 0,
                 completed_operations: 0,
                 result: None,
@@ -4390,6 +4735,150 @@ mod tests {
             }),
             cancel: CancellationToken::new(),
         })
+    }
+
+    #[test]
+    fn plugin_http_credentials_default_to_project_and_support_explicit_opt_out() {
+        let default_request: PluginHttpRequest = serde_json::from_value(json!({
+            "id": "default",
+            "url": "https://example.test/"
+        }))
+        .unwrap();
+        assert_eq!(
+            default_request.credential_mode,
+            PluginCredentialMode::WithProjectCredentials
+        );
+        let anonymous_request: PluginHttpRequest = serde_json::from_value(json!({
+            "id": "anonymous",
+            "url": "https://example.test/",
+            "credential_mode": "without_project_credentials"
+        }))
+        .unwrap();
+        assert_eq!(
+            anonymous_request.credential_mode,
+            PluginCredentialMode::WithoutProjectCredentials
+        );
+    }
+
+    #[test]
+    fn compact_result_keeps_bounded_follow_up_and_removes_remediation() {
+        let mut result = json!({
+            "plan_result": {"mode": "full", "coverage": {"headers": {"tested": 10}}},
+            "analysis": {
+                "findings": [{"title": "test", "remediation": "do not surface"}],
+                "result": {
+                    "follow_up": {"action": "confirm", "candidate_ids": ["a", "b"]},
+                    "large_diagnostic_array": [1, 2, 3]
+                }
+            },
+            "persisted_findings": [{"id": 1}]
+        });
+        remove_remediation_fields(&mut result);
+        assert!(result.pointer("/analysis/findings/0/remediation").is_none());
+        let summary = summarize_plugin_result(&result);
+        assert_eq!(summary["follow_up"]["candidate_ids"], json!(["a", "b"]));
+        assert!(summary["plan_result"].get("coverage").is_none());
+        assert!(summary["analysis_result"].get("follow_up").is_none());
+        assert_eq!(
+            summary["analysis_result"]["large_diagnostic_array"]["count"],
+            3
+        );
+    }
+
+    #[test]
+    fn polling_hint_adapts_to_remaining_work_and_stops_when_terminal() {
+        let job = test_job(PluginJobState::Running);
+        {
+            let mut view = job.view.write();
+            view.operation_count = 1_000;
+            view.completed_operations = 100;
+        }
+        assert_eq!(
+            job.view.read().status().recommended_poll_interval_ms,
+            Some(5_000)
+        );
+        {
+            let mut view = job.view.write();
+            view.completed_operations = 995;
+        }
+        assert_eq!(
+            job.view.read().status().recommended_poll_interval_ms,
+            Some(500)
+        );
+        {
+            let mut view = job.view.write();
+            view.state = PluginJobState::Completed;
+            view.phase = PluginJobPhase::Finished;
+        }
+        assert_eq!(job.view.read().status().recommended_poll_interval_ms, None);
+    }
+
+    #[tokio::test]
+    async fn job_status_is_result_free_and_result_findings_are_stably_paged() {
+        let db = Arc::new(crate::storage::Db::open_in_memory().await.unwrap());
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let service = PluginService {
+            directory: PathBuf::from("plugins"),
+            reply,
+            db,
+            plugins: Arc::new(HashMap::new()),
+            load_issues: Arc::new(Vec::new()),
+            jobs: Arc::new(DashMap::new()),
+            active_jobs: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let job = test_job(PluginJobState::Completed);
+        let id = job.view.read().id;
+        job.view.write().result = Some(json!({
+            "plan_result": {"mode": "full"},
+            "analysis": {
+                "findings": [
+                    {"title": "one", "remediation": "hidden"},
+                    {"title": "two"},
+                    {"title": "three"}
+                ],
+                "result": {"follow_up": {"action": "confirm", "ids": [1, 2]}}
+            },
+            "persisted_findings": [{"id": 10}, {"id": 11}, {"id": 12}]
+        }));
+        service.jobs.insert(id, job);
+
+        let status = serde_json::to_value(service.status(id).unwrap()).unwrap();
+        assert!(status.get("result").is_none());
+        assert!(status.get("recommended_poll_interval_ms").is_none());
+
+        let summary = service
+            .results(id, PluginResultView::Summary, 0, 25)
+            .unwrap();
+        assert_eq!(summary["findings"]["total"], 3);
+        assert_eq!(summary["summary"]["follow_up"]["ids"], json!([1, 2]));
+
+        let first = service
+            .results(id, PluginResultView::Findings, 0, 2)
+            .unwrap();
+        assert_eq!(first["pagination"]["next_offset"], 2);
+        assert_eq!(first["findings"][0]["title"], "one");
+        assert!(first["findings"][0].get("remediation").is_none());
+        let second = service
+            .results(id, PluginResultView::Findings, 2, 2)
+            .unwrap();
+        assert_eq!(second["findings"][0]["title"], "three");
+        assert!(second["pagination"]["next_offset"].is_null());
+
+        let full = service.results(id, PluginResultView::Full, 0, 1).unwrap();
+        assert_eq!(full["persisted_findings_total"], 3);
+        assert!(full["result"].get("persisted_findings").is_none());
+        assert_eq!(
+            full["result"]["analysis"]["findings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

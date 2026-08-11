@@ -532,6 +532,13 @@ fn is_auth_context_header(name: &str) -> bool {
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
 }
 
+fn is_project_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("proxy-authorization")
+        || crate::policy::SENSITIVE_HEADERS
+            .iter()
+            .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+}
+
 fn origins_differ(left: &str, right: &str) -> bool {
     let Ok(left) = url::Url::parse(left) else {
         return true;
@@ -741,6 +748,22 @@ impl ReplyService {
                 }
             }
         }
+        let explicit_probe_credentials =
+            if draft.credential_mode == ReplyCredentialMode::WithoutProjectCredentials {
+                mat.headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        is_project_credential_header(name)
+                            && draft
+                                .header_overrides
+                                .iter()
+                                .any(|header| header.name.eq_ignore_ascii_case(name))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
         applied_rules.extend(
             crate::request_rules::apply_message_rules(
                 &self.db,
@@ -751,6 +774,17 @@ impl ReplyService {
             )
             .await?,
         );
+
+        // Credential-free plugin probes must stay credential-free after every
+        // host-owned source (base inheritance, managed cookies, and request
+        // rules) has had a chance to modify the request. Explicit probe
+        // overrides remain authoritative so extensions can supply a deliberate
+        // alternate identity without exposing or inheriting project secrets.
+        if draft.credential_mode == ReplyCredentialMode::WithoutProjectCredentials {
+            mat.headers
+                .retain(|(name, _)| !is_project_credential_header(name));
+            mat.headers.extend(explicit_probe_credentials);
+        }
 
         // Scope controls persistence only; it never blocks egress.
         let should_capture = url_is_in_scope(&mat.url, &project.scope)?;
@@ -1222,6 +1256,42 @@ mod tests {
         )
         .await
         .unwrap();
+        db.create_request_rule(
+            project.id,
+            crate::request_rules::RequestRuleInput {
+                name: "managed authorization".into(),
+                enabled: true,
+                position: 0,
+                host_pattern: Some("127.0.0.1".into()),
+                target: crate::request_rules::RequestRuleTarget::Header,
+                operation: crate::request_rules::RequestRuleOperation::Set,
+                header_name: Some("Authorization".into()),
+                match_kind: crate::request_rules::RequestRuleMatchKind::Literal,
+                pattern: String::new(),
+                replacement: Some("Bearer managed".into()),
+                replace_all: true,
+            },
+        )
+        .await
+        .unwrap();
+        db.create_request_rule(
+            project.id,
+            crate::request_rules::RequestRuleInput {
+                name: "managed api key".into(),
+                enabled: true,
+                position: 1,
+                host_pattern: Some("127.0.0.1".into()),
+                target: crate::request_rules::RequestRuleTarget::Header,
+                operation: crate::request_rules::RequestRuleOperation::Set,
+                header_name: Some("X-Api-Key".into()),
+                match_kind: crate::request_rules::RequestRuleMatchKind::Literal,
+                pattern: String::new(),
+                replacement: Some("managed-secret".into()),
+                replace_all: true,
+            },
+        )
+        .await
+        .unwrap();
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded_urls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let service = ReplyService {
@@ -1257,6 +1327,42 @@ mod tests {
                 &ReplyDraft {
                     method: Some("GET".into()),
                     url: Some("http://127.0.0.1/".into()),
+                    credential_mode: ReplyCredentialMode::WithoutProjectCredentials,
+                    ..Default::default()
+                },
+                ProtocolPreference::H1,
+                0,
+            )
+            .await
+            .unwrap();
+        service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("http://127.0.0.1/".into()),
+                    header_overrides: vec![HeaderPatch {
+                        name: "X-Api-Key".into(),
+                        value: b"deliberate-probe-identity".to_vec(),
+                    }],
+                    credential_mode: ReplyCredentialMode::WithoutProjectCredentials,
+                    ..Default::default()
+                },
+                ProtocolPreference::H1,
+                0,
+            )
+            .await
+            .unwrap();
+        service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("http://127.0.0.1/".into()),
                     header_overrides: vec![HeaderPatch {
                         name: "Cookie".into(),
                         value: b"sid=explicit".to_vec(),
@@ -1273,9 +1379,24 @@ mod tests {
         assert!(requests[0]
             .iter()
             .any(|(name, value)| name == "Cookie" && value == b"sid=managed"));
-        assert!(requests[1]
+        assert!(requests[0].iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == b"Bearer managed"
+        }));
+        assert!(requests[3]
             .iter()
             .any(|(name, value)| name == "Cookie" && value == b"sid=explicit"));
+        assert!(!requests[1]
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("cookie")));
+        assert!(!requests[1]
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")));
+        assert!(!requests[1]
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-api-key")));
+        assert!(requests[2].iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-api-key") && value == b"deliberate-probe-identity"
+        }));
     }
 
     #[tokio::test]

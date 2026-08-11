@@ -260,6 +260,17 @@ pub struct ReplyDraft {
     /// Ordered text fields for form-urlencoded and multipart bodies.
     pub body_params: Vec<ReplyBodyParam>,
     pub body_cleared: bool,
+    /// Internal send policy used by bounded extensions. This is deliberately
+    /// not part of the public Reply draft JSON contract.
+    #[serde(skip)]
+    pub credential_mode: ReplyCredentialMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReplyCredentialMode {
+    #[default]
+    WithProjectCredentials,
+    WithoutProjectCredentials,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
