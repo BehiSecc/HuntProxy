@@ -317,10 +317,12 @@ fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List projects, create one, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope"],"description":"list needs no project_id; create needs name and target_url; usage needs project_id; set_scope needs project_id and scope."},"project_id":{"type":"integer","description":"Required for usage and set_scope."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List compact installed-extension summaries and any rejected packages. Use extension_describe for schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
+        {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and requested/effective limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
+        {"name":"extension_preview","description":"Run the real extension planner without creating a job or sending requests. Returns stage-scoped request, candidate, runtime, and mode estimates.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer"},"input":{"type":"object","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
         {"name":"extension_run","description":"Start an asynchronous extension job. Call extension_describe first and place action-specific fields inside input, not at the top level. project_id owns the job/evidence; optional base_exchange_id supplies a saved request while cookies and authorization remain host-side. Planning failures report the plugin's bounded validation message.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"HuntProxy project that owns the job and evidence."},"plugin_id":{"type":"string","description":"Installed id from extension_list."},"action":{"type":"string","description":"Action name from extension_describe."},"base_exchange_id":{"type":"integer","description":"Optional saved request inherited host-side without copying secrets into action input."},"input":{"type":"object","description":"Action arguments matching extension_describe.actions[].input_schema. Do not put these fields at the top level.","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
         {"name":"job_status","description":"Read compact extension job state, phase, progress, and recommended_poll_interval_ms. Honor the returned interval before polling again.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
         {"name":"job_cancel","description":"Cancel an active extension job.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
+        {"name":"job_resume_analysis","description":"Retry only a failed resumable aggregation stage without replaying network probes, then resume normal status polling. The memory-only checkpoint must be retried before restart; timeout is bounded to 120000 ms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"job_id":{"type":"string","format":"uuid"},"js_stage_timeout_ms":{"type":"integer","minimum":250,"maximum":120000}},"required":["project_id","job_id"],"additionalProperties":false}},
         {"name":"job_results","description":"Read completed extension output. summary is compact (default); findings returns a stable page; full returns complete non-finding data plus a paged findings array.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"},"view":{"type":"string","enum":["summary","findings","full"],"default":"summary"},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":100,"default":25}},"required":["job_id"],"additionalProperties":false}},
         {"name":"capture_sessions","description":"List proxy capture credentials, create a one-time credential, revoke one, or renew one. create returns the secret once; copy it immediately. revoke and renew require session_id. This does not start Chromium; use browser_start for browser traffic.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","revoke","renew"]},"session_id":{"type":"integer","description":"Required for revoke and renew."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file. profile_name stores an independently selectable identity for identity-aware extensions instead of changing the active cookie jar.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
@@ -687,6 +689,26 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .ok_or_else(|| DomainError::invalid("plugin_id required"))?;
             Ok(json!(state.plugins.describe(id)?))
         }
+        "extension_preview" => {
+            let project_id = require_project_id(&args)?;
+            let plugin_id = args
+                .get("plugin_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DomainError::invalid("plugin_id required"))?;
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DomainError::invalid("action required"))?;
+            let base_exchange_id = args
+                .get("base_exchange_id")
+                .and_then(Value::as_i64)
+                .map(ExchangeId);
+            let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
+            state
+                .plugins
+                .preview(project_id, plugin_id, action, base_exchange_id, input)
+                .await
+        }
         "extension_run" => {
             let project_id = require_project_id(&args)?;
             let plugin_id = args
@@ -710,13 +732,29 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     .await?
             ))
         }
-        "job_status" | "job_cancel" | "job_results" => {
+        "job_status" | "job_cancel" | "job_results" | "job_resume_analysis" => {
             let id = args
                 .get("job_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("job_id required"))?
                 .parse::<uuid::Uuid>()
                 .map_err(|_| DomainError::invalid("job_id must be a UUID"))?;
+            if name == "job_resume_analysis" {
+                let project_id = require_project_id(&args)?;
+                let status = state.plugins.status(id)?;
+                if status.project_id != project_id {
+                    return Err(DomainError::not_found("plugin job"));
+                }
+                return Ok(json!(
+                    state
+                        .plugins
+                        .resume_analysis(
+                            id,
+                            args.get("js_stage_timeout_ms").and_then(Value::as_u64),
+                        )
+                        .await?
+                ));
+            }
             if name == "job_results" {
                 let view = match args
                     .get("view")

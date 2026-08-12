@@ -10,14 +10,16 @@ use crate::reply::{ReplySendContext, ReplyService};
 use base64::Engine;
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
-use rquickjs::{CatchResultExt, Context, Runtime};
+use rquickjs::{
+    function::This, CatchResultExt, Context, Function, Object, Runtime, Value as JsValue,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -40,7 +42,7 @@ const MAX_OPERATIONS: usize = 10_000;
 const DEFAULT_MEMORY_MB: usize = 16;
 const MAX_MEMORY_MB: usize = 64;
 const DEFAULT_JS_STAGE_TIMEOUT_MS: u64 = 2_000;
-const MAX_JS_STAGE_TIMEOUT_MS: u64 = 15_000;
+const MAX_JS_STAGE_TIMEOUT_MS: u64 = 120_000;
 const MAX_ACTIVE_JOBS: usize = 4;
 const MAX_RETAINED_JOBS: usize = 256;
 const MAX_WORKFLOW_STEPS: usize = 64;
@@ -51,6 +53,9 @@ const MAX_WORKFLOW_VALUES_BYTES: usize = 64 * 1024;
 const MAX_RAW_HTTP1_GROUP_MEMBERS: usize = 32;
 const MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HTTP_REQUEST_DELAY_MS: u64 = 30_000;
+const MAX_ANALYSIS_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_COMPRESSED_ANALYSIS_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOTAL_ANALYSIS_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -73,6 +78,23 @@ pub struct PluginManifest {
     pub actions: Vec<PluginAction>,
     #[serde(default)]
     pub limits: PluginLimits,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginDescription {
+    #[serde(flatten)]
+    pub manifest: PluginManifest,
+    pub effective_limits: EffectivePluginLimits,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectivePluginLimits {
+    pub job_timeout_ms: u64,
+    pub js_stage_timeout_ms: u64,
+    pub host_max_js_stage_timeout_ms: u64,
+    pub max_operations: usize,
+    pub max_concurrency: usize,
+    pub memory_mb: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +123,33 @@ fn max_requested_exchange_contexts(manifest: &PluginManifest) -> usize {
         .max_operations
         .unwrap_or(DEFAULT_MAX_OPERATIONS)
         .clamp(1, MAX_OPERATIONS)
+}
+
+fn effective_plugin_limits(manifest: &PluginManifest) -> EffectivePluginLimits {
+    EffectivePluginLimits {
+        job_timeout_ms: manifest
+            .limits
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1_000, MAX_TIMEOUT_MS),
+        js_stage_timeout_ms: manifest
+            .limits
+            .js_stage_timeout_ms
+            .unwrap_or(DEFAULT_JS_STAGE_TIMEOUT_MS)
+            .clamp(250, MAX_JS_STAGE_TIMEOUT_MS),
+        host_max_js_stage_timeout_ms: MAX_JS_STAGE_TIMEOUT_MS,
+        max_operations: manifest
+            .limits
+            .max_operations
+            .unwrap_or(DEFAULT_MAX_OPERATIONS)
+            .clamp(1, MAX_OPERATIONS),
+        max_concurrency: manifest.limits.max_concurrency.unwrap_or(4).clamp(1, 100),
+        memory_mb: manifest
+            .limits
+            .memory_mb
+            .unwrap_or(DEFAULT_MEMORY_MB)
+            .clamp(4, MAX_MEMORY_MB),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -181,6 +230,10 @@ pub struct PluginJobView {
     /// Adaptive hint for agents and UIs. Omitted for terminal jobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommended_poll_interval_ms: Option<u64>,
+    pub analysis_resume_available: bool,
+    pub analysis_checkpoint_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_resume_reason: Option<String>,
     pub error: Option<String>,
 }
 
@@ -196,6 +249,9 @@ struct PluginJobRecord {
     operation_count: usize,
     completed_operations: usize,
     result: Option<Value>,
+    analysis_resume_available: bool,
+    analysis_checkpoint_status: String,
+    analysis_resume_reason: Option<String>,
     error: Option<String>,
 }
 
@@ -212,6 +268,9 @@ impl PluginJobRecord {
             operation_count: self.operation_count,
             completed_operations: self.completed_operations,
             recommended_poll_interval_ms: recommended_poll_interval_ms(self),
+            analysis_resume_available: self.analysis_resume_available,
+            analysis_checkpoint_status: self.analysis_checkpoint_status.clone(),
+            analysis_resume_reason: self.analysis_resume_reason.clone(),
             error: self.error.clone(),
         }
     }
@@ -220,6 +279,33 @@ impl PluginJobRecord {
 struct PluginJob {
     view: parking_lot::RwLock<PluginJobRecord>,
     cancel: CancellationToken,
+    analysis_checkpoint: parking_lot::Mutex<Option<AnalysisCheckpoint>>,
+}
+
+#[derive(Debug, Clone)]
+struct AnalysisCheckpoint {
+    plugin_version: String,
+    entrypoint_sha256: String,
+    input: Value,
+    observations_zstd: Arc<Vec<u8>>,
+    observations_bytes: usize,
+    observations_fallback: Option<Value>,
+    context: Value,
+    plan_result: Value,
+    execution_evidence_exchange_ids: Vec<ExchangeId>,
+    _reservation: Arc<CheckpointReservation>,
+}
+
+#[derive(Debug)]
+struct CheckpointReservation {
+    bytes: usize,
+    total: Arc<AtomicUsize>,
+}
+
+impl Drop for CheckpointReservation {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 fn recommended_poll_interval_ms(job: &PluginJobRecord) -> Option<u64> {
@@ -254,6 +340,9 @@ pub struct PluginService {
     load_issues: Arc<Vec<PluginLoadIssue>>,
     jobs: Arc<DashMap<Uuid, Arc<PluginJob>>>,
     active_jobs: Arc<tokio::sync::Semaphore>,
+    preview_slots: Arc<tokio::sync::Semaphore>,
+    analysis_retry_slots: Arc<tokio::sync::Semaphore>,
+    analysis_checkpoint_bytes: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +355,30 @@ struct PluginPlan {
     execution: PluginExecution,
     #[serde(default)]
     stop_on_error: bool,
+    #[serde(default)]
+    preview: Option<PluginPlanPreview>,
+}
+
+struct PreparedPluginPlan {
+    plan: PluginPlan,
+    context: Value,
+    resolved_identities: Arc<HashMap<String, ResolvedPluginIdentity>>,
+    planned_requests: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct PluginPlanPreview {
+    stage: Option<String>,
+    scope: Option<String>,
+    follow_up_expected: Option<bool>,
+    candidate_count: Option<usize>,
+    candidate_unit: Option<String>,
+    candidate_breakdown: BTreeMap<String, usize>,
+    selected_mode: Option<String>,
+    supported_modes: Vec<String>,
+    recommended_mode: Option<String>,
+    recommendation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -300,6 +413,61 @@ impl PluginOperation {
             Self::RaceGroup(group) => &group.id,
         }
     }
+}
+
+fn operation_type_name(operation: &PluginOperation) -> &'static str {
+    match operation {
+        PluginOperation::HttpRequest(_) => "http_request",
+        PluginOperation::HttpWorkflow(_) => "http_workflow",
+        PluginOperation::AwsApiGateway(_) => "aws_api_gateway",
+        PluginOperation::RawHttp1(_) => "raw_http1",
+        PluginOperation::RawHttp1Group(_) => "raw_http1_group",
+        PluginOperation::RawHttp2(_) => "raw_http2",
+        PluginOperation::RaceGroup(_) => "race_group",
+    }
+}
+
+fn operation_required_capability(operation: &PluginOperation) -> &'static str {
+    match operation {
+        PluginOperation::HttpRequest(_) | PluginOperation::HttpWorkflow(_) => "http.semantic",
+        PluginOperation::AwsApiGateway(_) => "aws.api_gateway",
+        PluginOperation::RawHttp1(_)
+        | PluginOperation::RawHttp1Group(_)
+        | PluginOperation::RawHttp2(_) => "http.raw",
+        PluginOperation::RaceGroup(_) => "http.race",
+    }
+}
+
+fn validate_plugin_input_size(input: &Value) -> DomainResult<()> {
+    let input_bytes = serde_json::to_vec(input)
+        .map_err(|error| DomainError::invalid(format!("invalid plugin input: {error}")))?;
+    if input_bytes.len() > MAX_INPUT_BYTES {
+        return Err(DomainError::new(
+            ErrorCode::BodyTooLarge,
+            "plugin input exceeds 2 MiB",
+        ));
+    }
+    Ok(())
+}
+
+fn reserve_checkpoint_bytes(
+    total: &Arc<AtomicUsize>,
+    compressed: Vec<u8>,
+) -> Option<(Arc<Vec<u8>>, Arc<CheckpointReservation>)> {
+    let bytes = compressed.len();
+    let admitted = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current
+            .checked_add(bytes)
+            .filter(|next| *next <= MAX_TOTAL_ANALYSIS_CHECKPOINT_BYTES)
+    });
+    admitted.ok()?;
+    Some((
+        Arc::new(compressed),
+        Arc::new(CheckpointReservation {
+            bytes,
+            total: total.clone(),
+        }),
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -751,6 +919,9 @@ impl PluginService {
             load_issues: Arc::new(load_issues),
             jobs: Arc::new(DashMap::new()),
             active_jobs: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_JOBS)),
+            preview_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            analysis_retry_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            analysis_checkpoint_bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -784,29 +955,11 @@ impl PluginService {
         &self.load_issues
     }
 
-    pub fn describe(&self, id: &str) -> DomainResult<PluginManifest> {
-        self.plugins
-            .get(id)
-            .map(|plugin| plugin.manifest.clone())
-            .ok_or_else(|| DomainError::not_found(format!("plugin {id}")))
-    }
-
-    pub async fn run(
+    fn enabled_plugin_action(
         &self,
-        project_id: ProjectId,
         plugin_id: &str,
         action: &str,
-        base_exchange_id: Option<ExchangeId>,
-        input: Value,
-    ) -> DomainResult<PluginJobView> {
-        let input_bytes = serde_json::to_vec(&input)
-            .map_err(|error| DomainError::invalid(format!("invalid plugin input: {error}")))?;
-        if input_bytes.len() > MAX_INPUT_BYTES {
-            return Err(DomainError::new(
-                ErrorCode::BodyTooLarge,
-                "plugin input exceeds 2 MiB",
-            ));
-        }
+    ) -> DomainResult<Arc<LoadedPlugin>> {
         let plugin = self
             .plugins
             .get(plugin_id)
@@ -818,12 +971,133 @@ impl PluginService {
                 format!("plugin {plugin_id} is installed but disabled"),
             ));
         }
+        if !plugin
+            .manifest
+            .actions
+            .iter()
+            .any(|candidate| candidate.name == action)
+        {
+            return Err(DomainError::not_found(format!("plugin action {action}")));
+        }
+        Ok(plugin)
+    }
+
+    pub fn describe(&self, id: &str) -> DomainResult<PluginDescription> {
+        self.plugins
+            .get(id)
+            .map(|plugin| PluginDescription {
+                manifest: plugin.manifest.clone(),
+                effective_limits: effective_plugin_limits(&plugin.manifest),
+            })
+            .ok_or_else(|| DomainError::not_found(format!("plugin {id}")))
+    }
+
+    pub async fn preview(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        action: &str,
+        base_exchange_id: Option<ExchangeId>,
+        input: Value,
+    ) -> DomainResult<Value> {
+        validate_plugin_input_size(&input)?;
+        let _preview_permit = self
+            .preview_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                DomainError::new(
+                    ErrorCode::ConcurrencyLimited,
+                    "at most 2 extension previews may plan concurrently",
+                )
+            })?;
+        let plugin = self.enabled_plugin_action(plugin_id, action)?;
+        let started = Instant::now();
+        let prepared = self
+            .prepare_plugin_plan(project_id, base_exchange_id, plugin.clone(), action, &input)
+            .await?;
+        let project = self.db.get_project(project_id).await?;
+        let mut by_type = BTreeMap::<String, usize>::new();
+        for operation in &prepared.plan.operations {
+            let kind = operation_type_name(operation).to_string();
+            *by_type.entry(kind).or_default() += operation_request_count(operation);
+        }
+        let concurrency = if prepared.plan.execution == PluginExecution::Sequential {
+            1
+        } else {
+            plugin
+                .manifest
+                .limits
+                .max_concurrency
+                .unwrap_or(4)
+                .clamp(1, project.limits.max_concurrent_requests.max(1) as usize)
+        };
+        let rate = project.limits.requests_per_second.max(0.1);
+        let rate_floor_ms = (prepared.planned_requests as f64 / rate * 1_000.0).ceil() as u64;
+        let request_runtime_ms = ((prepared.planned_requests as u64 * 1_000)
+            / concurrency.max(1) as u64)
+            .max(rate_floor_ms);
+        let preview = prepared.plan.preview.clone().unwrap_or_default();
+        let preview = json!({
+            "plugin_id": plugin.manifest.id,
+            "plugin_version": plugin.manifest.version,
+            "action": action,
+            "planning_ms": started.elapsed().as_millis() as u64,
+            "valid_for_ms": 30_000,
+            "operations": {
+                "requests": prepared.planned_requests,
+                "top_level": prepared.plan.operations.len(),
+                "limit": effective_plugin_limits(&plugin.manifest).max_operations,
+                "execution": match prepared.plan.execution { PluginExecution::Sequential => "sequential", PluginExecution::Parallel => "parallel" },
+                "by_type": by_type,
+            },
+            "runtime": {
+                "likely_ms": request_runtime_ms,
+                "low_ms": request_runtime_ms / 2,
+                "high_ms": request_runtime_ms.saturating_mul(2),
+                "confidence": "low",
+                "basis": "project request rate, effective concurrency, and a conservative one-second request-latency fallback",
+                "job_timeout_ms": effective_plugin_limits(&plugin.manifest).job_timeout_ms,
+            },
+            "stage": preview.stage,
+            "scope": preview.scope.unwrap_or_else(|| "current_stage".into()),
+            "follow_up_expected": preview.follow_up_expected,
+            "candidates": preview.candidate_count.map(|total| json!({"total":total,"unit":preview.candidate_unit,"by_family":preview.candidate_breakdown})),
+            "selected_mode": preview.selected_mode,
+            "supported_modes": preview.supported_modes,
+            "recommended_mode": preview.recommended_mode,
+            "recommendation": preview.recommended_mode.as_ref().map(|mode| format!("Use {mode} for the extension's recommended coverage; preview and run use the same planner.")),
+            "side_effects": false,
+            "warning": "Preview is stage-scoped and sends no requests; runtime and later follow-up stages remain estimates.",
+        });
+        let preview = self
+            .redact_plugin_output(project_id, base_exchange_id, preview)
+            .await?;
+        if serde_json::to_vec(&preview).map_or(true, |bytes| bytes.len() > 64 * 1024) {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "extension preview exceeds 64 KiB",
+            ));
+        }
+        Ok(preview)
+    }
+
+    pub async fn run(
+        &self,
+        project_id: ProjectId,
+        plugin_id: &str,
+        action: &str,
+        base_exchange_id: Option<ExchangeId>,
+        input: Value,
+    ) -> DomainResult<PluginJobView> {
+        validate_plugin_input_size(&input)?;
+        let plugin = self.enabled_plugin_action(plugin_id, action)?;
         let action_manifest = plugin
             .manifest
             .actions
             .iter()
             .find(|candidate| candidate.name == action)
-            .ok_or_else(|| DomainError::not_found(format!("plugin action {action}")))?;
+            .expect("enabled_plugin_action validated action");
         let declared = plugin.manifest.capabilities.iter().collect::<BTreeSet<_>>();
         if action_manifest
             .required_capabilities
@@ -858,9 +1132,13 @@ impl PluginService {
                 operation_count: 0,
                 completed_operations: 0,
                 result: None,
+                analysis_resume_available: false,
+                analysis_checkpoint_status: "not_created".into(),
+                analysis_resume_reason: None,
                 error: None,
             }),
             cancel: CancellationToken::new(),
+            analysis_checkpoint: parking_lot::Mutex::new(None),
         });
         self.jobs.insert(id, job.clone());
         let service = self.clone();
@@ -887,6 +1165,114 @@ impl PluginService {
         job.cancel.cancel();
         let status = job.view.read().status();
         Ok(status)
+    }
+
+    pub async fn resume_analysis(
+        &self,
+        id: Uuid,
+        requested_timeout_ms: Option<u64>,
+    ) -> DomainResult<PluginJobView> {
+        let job = self
+            .jobs
+            .get(&id)
+            .map(|entry| entry.clone())
+            .ok_or_else(|| DomainError::not_found("plugin job"))?;
+        let plugin = self
+            .plugins
+            .get(&job.view.read().plugin_id)
+            .cloned()
+            .ok_or_else(|| DomainError::not_found("plugin used by job is no longer installed"))?;
+        let checkpoint = job.analysis_checkpoint.lock().clone().ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::Conflict,
+                "plugin job has no resumable analysis checkpoint",
+            )
+        })?;
+        if plugin.manifest.version != checkpoint.plugin_version
+            || plugin.manifest.entrypoint_sha256 != checkpoint.entrypoint_sha256
+        {
+            let mut view = job.view.write();
+            view.state = PluginJobState::Failed;
+            view.phase = PluginJobPhase::Finished;
+            view.error = Some("plugin changed since execution; analysis retry refused".into());
+            return Err(DomainError::new(
+                ErrorCode::Conflict,
+                "plugin changed since execution; analysis retry refused",
+            ));
+        }
+        let retry_permit = self
+            .analysis_retry_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                DomainError::new(
+                    ErrorCode::ConcurrencyLimited,
+                    "another extension analysis retry is already running",
+                )
+            })?;
+        {
+            let mut view = job.view.write();
+            if !view.analysis_resume_available || view.state == PluginJobState::Running {
+                return Err(DomainError::new(
+                    ErrorCode::Conflict,
+                    "plugin analysis is not currently resumable",
+                ));
+            }
+            view.state = PluginJobState::Running;
+            view.phase = PluginJobPhase::Analyzing;
+            view.analysis_resume_available = false;
+            view.analysis_checkpoint_status = "retrying".into();
+            view.analysis_resume_reason = None;
+            view.error = None;
+        }
+        let manifest_timeout = effective_plugin_limits(&plugin.manifest).js_stage_timeout_ms;
+        let timeout_ms = requested_timeout_ms
+            .unwrap_or_else(|| manifest_timeout.saturating_mul(2).max(60_000))
+            .clamp(manifest_timeout, MAX_JS_STAGE_TIMEOUT_MS);
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _retry_permit = retry_permit;
+            let result = service
+                .analyze_and_persist(job.clone(), plugin, checkpoint.clone(), Some(timeout_ms))
+                .await;
+            let mut view = job.view.write();
+            match result {
+                Ok(result) => {
+                    view.state = PluginJobState::Completed;
+                    view.phase = PluginJobPhase::Finished;
+                    view.result = Some(result);
+                    view.analysis_resume_available = false;
+                    view.analysis_checkpoint_status = "consumed".into();
+                    *job.analysis_checkpoint.lock() = None;
+                }
+                Err(error) if error.code() == ErrorCode::Cancelled => {
+                    view.state = PluginJobState::Cancelled;
+                    view.phase = PluginJobPhase::Finished;
+                    view.analysis_resume_available = false;
+                    view.analysis_checkpoint_status = "consumed".into();
+                    view.analysis_resume_reason = None;
+                    view.error = Some(error.to_string());
+                    *job.analysis_checkpoint.lock() = None;
+                }
+                Err(error) => {
+                    view.state = PluginJobState::Failed;
+                    view.phase = PluginJobPhase::Finished;
+                    view.analysis_resume_available = error.code() == ErrorCode::Timeout;
+                    view.analysis_checkpoint_status = if error.code() == ErrorCode::Timeout {
+                        "retained"
+                    } else {
+                        "unavailable"
+                    }
+                    .into();
+                    view.analysis_resume_reason = (error.code() != ErrorCode::Timeout).then(|| "Analysis retry failed with a non-timeout error; the checkpoint cannot be retried automatically.".into());
+                    view.error = Some(error.to_string());
+                    if error.code() != ErrorCode::Timeout {
+                        *job.analysis_checkpoint.lock() = None;
+                    }
+                }
+            }
+        });
+        self.status(id)
     }
 
     pub fn results(
@@ -982,66 +1368,15 @@ impl PluginService {
         prune_finished_jobs(&self.jobs);
     }
 
-    async fn execute_job(
+    async fn prepare_plugin_plan(
         &self,
-        job: Arc<PluginJob>,
-        plugin: Arc<LoadedPlugin>,
-        action: String,
-        input: Value,
-    ) {
-        {
-            let mut view = job.view.write();
-            view.state = PluginJobState::Running;
-            view.phase = PluginJobPhase::Planning;
-        }
-        let timeout_ms = plugin
-            .manifest
-            .limits
-            .timeout_ms
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .clamp(1_000, MAX_TIMEOUT_MS);
-        let result = tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            self.execute_job_inner(job.clone(), plugin, &action, &input),
-        )
-        .await;
-        let mut view = job.view.write();
-        match result {
-            Ok(Ok(result)) => {
-                view.state = PluginJobState::Completed;
-                view.phase = PluginJobPhase::Finished;
-                view.result = Some(result);
-            }
-            Ok(Err(error)) if error.code() == ErrorCode::Cancelled => {
-                view.state = PluginJobState::Cancelled;
-                view.phase = PluginJobPhase::Finished;
-                view.error = Some(error.to_string());
-            }
-            Ok(Err(error)) => {
-                view.state = PluginJobState::Failed;
-                view.phase = PluginJobPhase::Finished;
-                view.error = Some(error.to_string());
-            }
-            Err(_) => {
-                job.cancel.cancel();
-                view.state = PluginJobState::Failed;
-                view.phase = PluginJobPhase::Finished;
-                view.error = Some(format!("plugin job timed out after {timeout_ms} ms"));
-            }
-        }
-    }
-
-    async fn execute_job_inner(
-        &self,
-        job: Arc<PluginJob>,
+        project_id: ProjectId,
+        base_exchange_id: Option<ExchangeId>,
         plugin: Arc<LoadedPlugin>,
         action: &str,
         input: &Value,
-    ) -> DomainResult<Value> {
-        let (project_id, base_exchange_id) = {
-            let view = job.view.read();
-            (view.project_id, view.base_exchange_id)
-        };
+    ) -> DomainResult<PreparedPluginPlan> {
+        self.db.get_project(project_id).await?;
         let privileged_identity = plugin
             .manifest
             .capabilities
@@ -1087,18 +1422,14 @@ impl PluginService {
         let plan_value = run_js_stage(&plugin, "plan", input, &Value::Null, &context).await?;
         let plan: PluginPlan = serde_json::from_value(plan_value)
             .map_err(|error| DomainError::invalid(format!("invalid plugin plan: {error}")))?;
+        validate_plan_preview(plan.preview.as_ref())?;
         validate_race_data_flow(&plan)?;
         if plan.stop_on_error && plan.execution != PluginExecution::Sequential {
             return Err(DomainError::invalid(
                 "stop_on_error requires execution=sequential",
             ));
         }
-        let max_operations = plugin
-            .manifest
-            .limits
-            .max_operations
-            .unwrap_or(DEFAULT_MAX_OPERATIONS)
-            .clamp(1, MAX_OPERATIONS);
+        let limits = effective_plugin_limits(&plugin.manifest);
         let planned_requests = plan
             .operations
             .iter()
@@ -1106,22 +1437,17 @@ impl PluginService {
                 count.checked_add(operation_request_count(operation))
             })
             .unwrap_or(usize::MAX);
-        if planned_requests > max_operations {
+        if planned_requests > limits.max_operations {
             return Err(DomainError::new(
                 ErrorCode::CombinationLimit,
-                format!("plugin planned {planned_requests} requests; limit is {max_operations}",),
+                format!(
+                    "plugin planned {planned_requests} requests; limit is {}",
+                    limits.max_operations
+                ),
             ));
         }
         for operation in &plan.operations {
-            let required = match operation {
-                PluginOperation::HttpRequest(_) => "http.semantic",
-                PluginOperation::HttpWorkflow(_) => "http.semantic",
-                PluginOperation::AwsApiGateway(_) => "aws.api_gateway",
-                PluginOperation::RawHttp1(_) => "http.raw",
-                PluginOperation::RawHttp1Group(_) => "http.raw",
-                PluginOperation::RawHttp2(_) => "http.raw",
-                PluginOperation::RaceGroup(_) => "http.race",
-            };
+            let required = operation_required_capability(operation);
             if !plugin
                 .manifest
                 .capabilities
@@ -1145,6 +1471,87 @@ impl PluginService {
                 .await?,
         );
         validate_resolved_identity_comparisons(&plan.operations, &resolved_identities)?;
+        Ok(PreparedPluginPlan {
+            plan,
+            context,
+            resolved_identities,
+            planned_requests,
+        })
+    }
+
+    async fn execute_job(
+        &self,
+        job: Arc<PluginJob>,
+        plugin: Arc<LoadedPlugin>,
+        action: String,
+        input: Value,
+    ) {
+        {
+            let mut view = job.view.write();
+            view.state = PluginJobState::Running;
+            view.phase = PluginJobPhase::Planning;
+        }
+        let timeout_ms = plugin
+            .manifest
+            .limits
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1_000, MAX_TIMEOUT_MS);
+        let result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            self.execute_job_inner(job.clone(), plugin, &action, &input),
+        )
+        .await;
+        let mut view = job.view.write();
+        match result {
+            Ok(Ok(result)) => {
+                view.state = PluginJobState::Completed;
+                view.phase = PluginJobPhase::Finished;
+                view.result = Some(result);
+            }
+            Ok(Err(error)) if error.code() == ErrorCode::Cancelled => {
+                *job.analysis_checkpoint.lock() = None;
+                view.state = PluginJobState::Cancelled;
+                view.phase = PluginJobPhase::Finished;
+                view.error = Some(error.to_string());
+            }
+            Ok(Err(error)) => {
+                if error.code() != ErrorCode::Timeout {
+                    *job.analysis_checkpoint.lock() = None;
+                }
+                view.state = PluginJobState::Failed;
+                view.phase = PluginJobPhase::Finished;
+                view.error = Some(error.to_string());
+            }
+            Err(_) => {
+                job.cancel.cancel();
+                *job.analysis_checkpoint.lock() = None;
+                view.state = PluginJobState::Failed;
+                view.phase = PluginJobPhase::Finished;
+                view.error = Some(format!("plugin job timed out after {timeout_ms} ms"));
+            }
+        }
+    }
+
+    async fn execute_job_inner(
+        &self,
+        job: Arc<PluginJob>,
+        plugin: Arc<LoadedPlugin>,
+        action: &str,
+        input: &Value,
+    ) -> DomainResult<Value> {
+        let (project_id, base_exchange_id) = {
+            let view = job.view.read();
+            (view.project_id, view.base_exchange_id)
+        };
+        let PreparedPluginPlan {
+            plan,
+            context,
+            resolved_identities,
+            planned_requests,
+        } = self
+            .prepare_plugin_plan(project_id, base_exchange_id, plugin.clone(), action, input)
+            .await?;
         job.view.write().operation_count = planned_requests;
         job.view.write().phase = PluginJobPhase::Executing;
         let project_id = job.view.read().project_id;
@@ -1289,15 +1696,147 @@ impl PluginService {
             self.annotate_plugin_job_exchange(project_id, *exchange_id, job_id)
                 .await?;
         }
+        let observations_json = serde_json::to_vec(&observations).map_err(|error| {
+            DomainError::invalid(format!("serialize plugin observations: {error}"))
+        })?;
+        let resumable_observations = if observations_json.len() <= MAX_ANALYSIS_CHECKPOINT_BYTES {
+            let bytes = observations_json.clone();
+            tokio::task::spawn_blocking(move || zstd::stream::encode_all(bytes.as_slice(), 1))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .filter(|compressed| compressed.len() <= MAX_COMPRESSED_ANALYSIS_CHECKPOINT_BYTES)
+                .and_then(|compressed| {
+                    reserve_checkpoint_bytes(&self.analysis_checkpoint_bytes, compressed)
+                })
+        } else {
+            None
+        };
+        let reservation = resumable_observations
+            .as_ref()
+            .map(|(_, reservation)| reservation.clone());
+        let compressed = resumable_observations
+            .as_ref()
+            .map(|(bytes, _)| bytes.clone());
+        let checkpoint = AnalysisCheckpoint {
+            plugin_version: plugin.manifest.version.clone(),
+            entrypoint_sha256: plugin.manifest.entrypoint_sha256.clone(),
+            input: input.clone(),
+            observations_zstd: compressed.clone().unwrap_or_else(|| Arc::new(Vec::new())),
+            observations_bytes: observations_json.len(),
+            observations_fallback: resumable_observations
+                .is_none()
+                .then(|| json!(observations)),
+            context,
+            plan_result: plan.result,
+            execution_evidence_exchange_ids,
+            _reservation: reservation.unwrap_or_else(|| {
+                Arc::new(CheckpointReservation {
+                    bytes: 0,
+                    total: self.analysis_checkpoint_bytes.clone(),
+                })
+            }),
+        };
+        if compressed.is_some() {
+            *job.analysis_checkpoint.lock() = Some(checkpoint.clone());
+            job.view.write().analysis_checkpoint_status = "retained".into();
+        } else {
+            let mut view = job.view.write();
+            view.analysis_checkpoint_status = "unavailable".into();
+            view.analysis_resume_reason = Some("Observations exceeded the bounded in-memory analysis checkpoint; target probes remain available in History but automatic analysis retry is unavailable.".into());
+        }
         job.view.write().phase = PluginJobPhase::Analyzing;
-        let analyzed =
-            run_js_stage(&plugin, "analyze", input, &json!(observations), &context).await?;
+        self.analyze_and_persist(job, plugin, checkpoint, None)
+            .await
+    }
+
+    async fn analyze_and_persist(
+        &self,
+        job: Arc<PluginJob>,
+        plugin: Arc<LoadedPlugin>,
+        checkpoint: AnalysisCheckpoint,
+        timeout_override_ms: Option<u64>,
+    ) -> DomainResult<Value> {
+        let (project_id, base_exchange_id) = {
+            let view = job.view.read();
+            (view.project_id, view.base_exchange_id)
+        };
+        let observations = if checkpoint.observations_zstd.is_empty() {
+            checkpoint.observations_fallback.clone().ok_or_else(|| {
+                DomainError::new(
+                    ErrorCode::StorageError,
+                    "analysis checkpoint has no observations",
+                )
+            })?
+        } else {
+            let compressed = checkpoint.observations_zstd.clone();
+            let observations_json = tokio::task::spawn_blocking(move || {
+                zstd::stream::decode_all(compressed.as_slice())
+            })
+            .await
+            .map_err(|error| {
+                DomainError::new(
+                    ErrorCode::Internal,
+                    format!("analysis checkpoint task: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                DomainError::new(
+                    ErrorCode::StorageError,
+                    format!("decode analysis checkpoint: {error}"),
+                )
+            })?;
+            if observations_json.len() != checkpoint.observations_bytes
+                || observations_json.len() > MAX_ANALYSIS_CHECKPOINT_BYTES
+            {
+                return Err(DomainError::new(
+                    ErrorCode::StorageError,
+                    "analysis checkpoint size mismatch",
+                ));
+            }
+            serde_json::from_slice(&observations_json).map_err(|error| {
+                DomainError::new(
+                    ErrorCode::StorageError,
+                    format!("parse analysis checkpoint: {error}"),
+                )
+            })?
+        };
+        let analyzed = run_js_stage_with_timeout(
+            &plugin,
+            "analyze",
+            &checkpoint.input,
+            &observations,
+            &checkpoint.context,
+            timeout_override_ms,
+            Some(job.cancel.clone()),
+        )
+        .await;
+        let analyzed = match analyzed {
+            Ok(analyzed) => analyzed,
+            Err(error) => {
+                if error.code() == ErrorCode::Timeout {
+                    let checkpoint_available = job.analysis_checkpoint.lock().is_some();
+                    let mut view = job.view.write();
+                    view.analysis_resume_available = checkpoint_available;
+                    if checkpoint_available {
+                        view.analysis_checkpoint_status = "retained".into();
+                        view.analysis_resume_reason = Some("Aggregation timed out; retry before restarting HuntProxy or before this job is evicted from the 256-job in-memory retention window.".into());
+                    }
+                }
+                return Err(error);
+            }
+        };
         let mut analyzed = self
             .redact_plugin_output(project_id, base_exchange_id, analyzed)
             .await?;
         remove_remediation_fields(&mut analyzed);
-        job.view.write().phase = PluginJobPhase::Persisting;
-        let mut persisted_findings = Vec::new();
+        if job.cancel.is_cancelled() {
+            return Err(DomainError::new(
+                ErrorCode::Cancelled,
+                "plugin job cancelled before finding persistence",
+            ));
+        }
+        let mut pending_findings = Vec::new();
         if let Some(findings) = analyzed.get("findings").and_then(Value::as_array) {
             if findings.len() > 1000 {
                 return Err(DomainError::new(
@@ -1365,18 +1904,28 @@ impl PluginService {
                         .unwrap_or("No explanation supplied.");
                     format!("Severity: {severity}\nConfidence: {confidence}\n\n{explanation}\n\nEvidence exchanges: {}", evidence.iter().map(|id| id.get().to_string()).collect::<Vec<_>>().join(", "))
                 };
-                persisted_findings.push(
-                    self.db
-                        .create_finding(project_id, exchange_id, title.into(), description)
-                        .await?,
-                );
+                pending_findings.push((exchange_id, title.to_string(), description));
             }
         }
-        let result = json!({"plan_result": plan.result, "execution": {"evidence_exchange_ids": execution_evidence_exchange_ids}, "analysis": analyzed, "persisted_findings": persisted_findings});
-        let result = self
-            .redact_plugin_output(project_id, base_exchange_id, result)
+        let provisional_findings = pending_findings
+            .iter()
+            .map(|(exchange_id, title, description)| {
+                json!({
+                    "id": i64::MAX,
+                    "project_id": project_id,
+                    "exchange_id": exchange_id,
+                    "title": title,
+                    "description": description,
+                    "created_at": "9999-12-31T23:59:59.999999999Z",
+                    "updated_at": "9999-12-31T23:59:59.999999999Z",
+                })
+            })
+            .collect::<Vec<_>>();
+        let provisional_result = json!({"plan_result": checkpoint.plan_result.clone(), "execution": {"evidence_exchange_ids": checkpoint.execution_evidence_exchange_ids.clone()}, "analysis": analyzed.clone(), "persisted_findings": provisional_findings});
+        let provisional_result = self
+            .redact_plugin_output(project_id, base_exchange_id, provisional_result)
             .await?;
-        if serde_json::to_vec(&result)
+        if serde_json::to_vec(&provisional_result)
             .map(|bytes| bytes.len())
             .unwrap_or(usize::MAX)
             > MAX_RESULT_BYTES
@@ -1386,6 +1935,21 @@ impl PluginService {
                 "plugin result exceeds 8 MiB",
             ));
         }
+        if job.cancel.is_cancelled() {
+            return Err(DomainError::new(
+                ErrorCode::Cancelled,
+                "plugin job cancelled before finding persistence",
+            ));
+        }
+        job.view.write().phase = PluginJobPhase::Persisting;
+        let persisted_findings = self
+            .db
+            .create_findings_atomic(project_id, pending_findings)
+            .await?;
+        let result = json!({"plan_result": checkpoint.plan_result, "execution": {"evidence_exchange_ids": checkpoint.execution_evidence_exchange_ids}, "analysis": analyzed, "persisted_findings": persisted_findings});
+        job.view.write().analysis_resume_available = false;
+        job.view.write().analysis_checkpoint_status = "consumed".into();
+        *job.analysis_checkpoint.lock() = None;
         Ok(result)
     }
 
@@ -3131,6 +3695,79 @@ impl PluginService {
     }
 }
 
+fn validate_plan_preview(preview: Option<&PluginPlanPreview>) -> DomainResult<()> {
+    let Some(preview) = preview else {
+        return Ok(());
+    };
+    let slug = |value: &str| {
+        value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    for value in [
+        preview.stage.as_deref(),
+        preview.candidate_unit.as_deref(),
+        preview.selected_mode.as_deref(),
+        preview.recommended_mode.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !slug(value) {
+            return Err(DomainError::invalid(
+                "plugin plan preview identifiers must be bounded slugs",
+            ));
+        }
+    }
+    if preview
+        .scope
+        .as_deref()
+        .is_some_and(|scope| !matches!(scope, "current_stage" | "complete_action"))
+    {
+        return Err(DomainError::invalid(
+            "plugin plan preview scope must be current_stage or complete_action",
+        ));
+    }
+    if preview.candidate_breakdown.len() > 16 || preview.supported_modes.len() > 16 {
+        return Err(DomainError::new(
+            ErrorCode::CombinationLimit,
+            "plugin plan preview exceeds 16 breakdown entries or modes",
+        ));
+    }
+    if preview.candidate_breakdown.keys().any(|key| !slug(key))
+        || preview.supported_modes.iter().any(|mode| !slug(mode))
+    {
+        return Err(DomainError::invalid(
+            "plugin plan preview breakdown keys and modes must be bounded slugs",
+        ));
+    }
+    if preview
+        .recommendation
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 512)
+    {
+        return Err(DomainError::new(
+            ErrorCode::BodyTooLarge,
+            "plugin plan preview recommendation exceeds 512 characters",
+        ));
+    }
+    for selected in [
+        preview.selected_mode.as_ref(),
+        preview.recommended_mode.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !preview.supported_modes.is_empty() && !preview.supported_modes.contains(selected) {
+            return Err(DomainError::invalid(
+                "selected and recommended preview modes must be declared in supported_modes",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn remove_remediation_fields(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -4871,6 +5508,18 @@ async fn run_js_stage(
     observations: &Value,
     context: &Value,
 ) -> DomainResult<Value> {
+    run_js_stage_with_timeout(plugin, stage, input, observations, context, None, None).await
+}
+
+async fn run_js_stage_with_timeout(
+    plugin: &LoadedPlugin,
+    stage: &'static str,
+    input: &Value,
+    observations: &Value,
+    context: &Value,
+    timeout_override_ms: Option<u64>,
+    cancel: Option<CancellationToken>,
+) -> DomainResult<Value> {
     let script = plugin.script.clone();
     let input =
         serde_json::to_string(input).map_err(|error| DomainError::invalid(error.to_string()))?;
@@ -4886,12 +5535,15 @@ async fn run_js_stage(
         .clamp(4, MAX_MEMORY_MB)
         * 1024
         * 1024;
-    let js_stage_timeout_ms = plugin
+    let configured_timeout_ms = plugin
         .manifest
         .limits
         .js_stage_timeout_ms
         .unwrap_or(DEFAULT_JS_STAGE_TIMEOUT_MS)
         .clamp(250, MAX_JS_STAGE_TIMEOUT_MS);
+    let js_stage_timeout_ms = timeout_override_ms
+        .unwrap_or(configured_timeout_ms)
+        .clamp(configured_timeout_ms, MAX_JS_STAGE_TIMEOUT_MS);
     tokio::task::spawn_blocking(move || {
         run_js_sync(
             &script,
@@ -4901,6 +5553,7 @@ async fn run_js_stage(
             &context,
             memory,
             Duration::from_millis(js_stage_timeout_ms),
+            cancel,
         )
     })
     .await
@@ -4917,6 +5570,7 @@ fn run_js_sync(
     context: &str,
     memory_limit: usize,
     stage_timeout: Duration,
+    cancel: Option<CancellationToken>,
 ) -> DomainResult<Value> {
     let runtime = Runtime::new().map_err(|error| {
         DomainError::new(ErrorCode::Unavailable, format!("QuickJS runtime: {error}"))
@@ -4926,7 +5580,13 @@ fn run_js_sync(
     let deadline = Instant::now() + stage_timeout;
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_handler = interrupted.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_handler = cancelled.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            cancelled_handler.store(true, Ordering::Relaxed);
+            return true;
+        }
         let expired = Instant::now() >= deadline;
         if expired {
             interrupted_handler.store(true, Ordering::Relaxed);
@@ -4940,19 +5600,56 @@ fn run_js_sync(
         ctx.eval::<(), _>(script)
             .catch(&ctx)
             .map_err(|error| bounded_javascript_error(error.to_string()))?;
-        let expression = match stage {
-            "plan" => format!(
-                "JSON.stringify(globalThis.HuntProxyPlugin.plan({input},{context}))"
-            ),
-            "analyze" => format!(
-                "JSON.stringify(globalThis.HuntProxyPlugin.analyze({input},{observations},{context}))"
-            ),
-            _ => unreachable!(),
-        };
-        ctx.eval(expression)
+        let plugin: Object = ctx
+            .globals()
+            .get("HuntProxyPlugin")
             .catch(&ctx)
-            .map_err(|error| bounded_javascript_error(error.to_string()))
+            .map_err(|error| bounded_javascript_error(error.to_string()))?;
+        let function: Function = plugin
+            .get(stage)
+            .catch(&ctx)
+            .map_err(|error| bounded_javascript_error(error.to_string()))?;
+        let input_value = ctx
+            .json_parse(input.as_bytes())
+            .catch(&ctx)
+            .map_err(|error| bounded_javascript_error(error.to_string()))?;
+        let context_value = ctx
+            .json_parse(context.as_bytes())
+            .catch(&ctx)
+            .map_err(|error| bounded_javascript_error(error.to_string()))?;
+        let output: JsValue = if stage == "plan" {
+            function.call((This(plugin.clone()), input_value, context_value))
+        } else {
+            let observations_value = ctx
+                .json_parse(observations.as_bytes())
+                .catch(&ctx)
+                .map_err(|error| bounded_javascript_error(error.to_string()))?;
+            function.call((
+                This(plugin.clone()),
+                input_value,
+                observations_value,
+                context_value,
+            ))
+        }
+        .catch(&ctx)
+        .map_err(|error| bounded_javascript_error(error.to_string()))?;
+        ctx.json_stringify(output)
+            .catch(&ctx)
+            .map_err(|error| bounded_javascript_error(error.to_string()))?
+            .map(|value| {
+                value
+                    .to_string()
+                    .map_err(|error| bounded_javascript_error(error.to_string()))
+            })
+            .transpose()?
+            .ok_or_else(|| "plugin returned undefined".to_string())
     });
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(DomainError::new(
+            ErrorCode::Cancelled,
+            "plugin JavaScript stage cancelled",
+        ));
+    }
     if interrupted.load(Ordering::Relaxed) {
         return Err(DomainError::new(
             ErrorCode::Timeout,
@@ -5033,9 +5730,13 @@ mod tests {
                 operation_count: 0,
                 completed_operations: 0,
                 result: None,
+                analysis_resume_available: false,
+                analysis_checkpoint_status: "not_created".into(),
+                analysis_resume_reason: None,
                 error: None,
             }),
             cancel: CancellationToken::new(),
+            analysis_checkpoint: parking_lot::Mutex::new(None),
         })
     }
 
@@ -5132,6 +5833,9 @@ mod tests {
             load_issues: Arc::new(Vec::new()),
             jobs: Arc::new(DashMap::new()),
             active_jobs: Arc::new(tokio::sync::Semaphore::new(1)),
+            preview_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            analysis_retry_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            analysis_checkpoint_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let job = test_job(PluginJobState::Completed);
         let id = job.view.read().id;
@@ -5219,6 +5923,7 @@ mod tests {
             r#"{"api_version":1}"#,
             4 * 1024 * 1024,
             Duration::from_secs(2),
+            None,
         )
         .unwrap();
         assert_eq!(plan["result"]["value"], 7);
@@ -5230,9 +5935,56 @@ mod tests {
             "{}",
             4 * 1024 * 1024,
             Duration::from_secs(2),
+            None,
         )
         .unwrap();
         assert_eq!(analysis, json!({"count":0,"value":7}));
+        let method_script = r#"globalThis.HuntProxyPlugin = {
+          helper() { return 9; }, plan() { return {operations: [], result: {value: this.helper()}}; }, analyze() { return {}; }
+        };"#;
+        let method_plan = run_js_sync(
+            method_script,
+            "plan",
+            "{}",
+            "null",
+            "{}",
+            4 * 1024 * 1024,
+            Duration::from_secs(2),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            method_plan["result"]["value"], 9,
+            "native calls preserve HuntProxyPlugin as the JavaScript receiver"
+        );
+    }
+
+    #[test]
+    fn javascript_runtime_parses_large_observations_as_json_not_source() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { return {operations: []}; },
+          analyze(input, observations) { return {count: observations.length, tail: observations[observations.length - 1].body.length}; }
+        };"#;
+        let observations = serde_json::to_string(
+            &(0..770)
+                .map(|index| json!({"id": index, "body": "x".repeat(9_500)}))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let analysis = run_js_sync(
+            script,
+            "analyze",
+            "{}",
+            &observations,
+            "{}",
+            64 * 1024 * 1024,
+            Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        assert_eq!(analysis, json!({"count":770,"tail":9500}));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -5248,10 +6000,211 @@ mod tests {
             "{}",
             4 * 1024 * 1024,
             Duration::from_millis(10),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Timeout);
         assert!(error.to_string().contains("10 ms"));
+    }
+
+    #[test]
+    fn javascript_stage_cancellation_interrupts_promptly() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { while (true) {} }, analyze() { return {}; }
+        };"#;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let started = Instant::now();
+        let error = run_js_sync(
+            script,
+            "plan",
+            "{}",
+            "null",
+            "{}",
+            4 * 1024 * 1024,
+            Duration::from_secs(60),
+            Some(cancel),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn effective_limits_expose_requested_fallback_and_host_ceiling() {
+        let mut manifest: PluginManifest = serde_json::from_value(json!({
+            "schema_version":1,"id":"test","name":"Test","version":"1.0.0","description":"test","enabled":true,
+            "entrypoint":"index.js","entrypoint_sha256":"0".repeat(64),"actions":[{"name":"run","description":"run"}],
+            "limits":{"timeout_ms":900000,"max_operations":700,"max_concurrency":1,"memory_mb":32}
+        })).unwrap();
+        assert_eq!(
+            effective_plugin_limits(&manifest).js_stage_timeout_ms,
+            2_000
+        );
+        manifest.limits.js_stage_timeout_ms = Some(60_000);
+        let limits = effective_plugin_limits(&manifest);
+        assert_eq!(limits.js_stage_timeout_ms, 60_000);
+        assert_eq!(limits.host_max_js_stage_timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn plan_preview_metadata_is_strictly_bounded() {
+        let mut preview = PluginPlanPreview {
+            stage: Some("screen".into()),
+            scope: Some("current_stage".into()),
+            supported_modes: vec!["light".into(), "full".into()],
+            selected_mode: Some("full".into()),
+            recommended_mode: Some("full".into()),
+            recommendation: Some("Complete coverage".into()),
+            ..Default::default()
+        };
+        validate_plan_preview(Some(&preview)).unwrap();
+        preview.recommendation = Some("x".repeat(513));
+        assert_eq!(
+            validate_plan_preview(Some(&preview)).unwrap_err().code(),
+            ErrorCode::BodyTooLarge
+        );
+        preview.recommendation = None;
+        preview.scope = Some("everything".into());
+        assert_eq!(
+            validate_plan_preview(Some(&preview)).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn analysis_checkpoint_reservations_enforce_and_release_global_budget() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let (_, reservation) = reserve_checkpoint_bytes(&total, vec![0; 1024]).unwrap();
+        assert_eq!(total.load(Ordering::Relaxed), 1024);
+        total.store(MAX_TOTAL_ANALYSIS_CHECKPOINT_BYTES, Ordering::Relaxed);
+        assert!(reserve_checkpoint_bytes(&total, vec![0]).is_none());
+        total.store(1024, Ordering::Relaxed);
+        drop(reservation);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn timed_out_analysis_resumes_without_replaying_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().join("data"))).unwrap();
+        let db = Arc::new(crate::storage::Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "analysis retry".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let plugin_directory = directory.path().join("plugins");
+        let package = plugin_directory.join("retry-test");
+        crate::config::create_private_dir(&package).unwrap();
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { return {operations: [], result: {planned: true}}; },
+          analyze() { const end = Date.now() + 400; while (Date.now() < end) {} return {findings: [], result: {resumed: true}}; }
+        };"#;
+        std::fs::write(package.join("index.js"), script).unwrap();
+        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+        std::fs::write(
+            package.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":1,"id":"retry-test","name":"Retry Test","version":"1.0.0","description":"test","enabled":true,
+                "entrypoint":"index.js","entrypoint_sha256":digest,"capabilities":[],
+                "limits":{"timeout_ms":3000,"js_stage_timeout_ms":250,"max_operations":1,"max_concurrency":1,"memory_mb":8},
+                "actions":[{"name":"run","description":"run","input_schema":{"type":"object"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let service = PluginService::load(plugin_directory, db, reply).unwrap();
+        let initial = service
+            .run(project.id, "retry-test", "run", None, json!({}))
+            .await
+            .unwrap();
+        let failed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = service.status(initial.id).unwrap();
+                if status.state == PluginJobState::Failed {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failed.completed_operations, 0);
+        assert!(failed.analysis_resume_available);
+        assert_eq!(failed.analysis_checkpoint_status, "retained");
+        service
+            .resume_analysis(initial.id, Some(1000))
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = service.status(initial.id).unwrap();
+                if status.state == PluginJobState::Completed {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            completed.completed_operations, 0,
+            "analysis retry never replays target operations"
+        );
+        assert!(!completed.analysis_resume_available);
+        assert_eq!(completed.analysis_checkpoint_status, "consumed");
+        let result = service
+            .results(initial.id, PluginResultView::Full, 0, 25)
+            .unwrap();
+        assert_eq!(result["result"]["analysis"]["result"]["resumed"], true);
+
+        let cancelled_job = service
+            .run(project.id, "retry-test", "run", None, json!({}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if service
+                    .status(cancelled_job.id)
+                    .unwrap()
+                    .analysis_resume_available
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        service
+            .resume_analysis(cancelled_job.id, Some(1000))
+            .await
+            .unwrap();
+        service.cancel(cancelled_job.id).unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = service.status(cancelled_job.id).unwrap();
+                if status.state == PluginJobState::Cancelled {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cancelled.phase, PluginJobPhase::Finished);
+        assert!(!cancelled.analysis_resume_available);
+        assert_eq!(cancelled.analysis_checkpoint_status, "consumed");
     }
 
     #[test]
@@ -5268,6 +6221,7 @@ mod tests {
             "{}",
             4 * 1024 * 1024,
             Duration::from_secs(2),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::ProtocolError);

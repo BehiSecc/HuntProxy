@@ -161,16 +161,25 @@ bounded flow:
 ```text
 extension_list
   -> extension_describe(plugin_id)
+  -> extension_preview(project_id, plugin_id, action, base_exchange_id, input)
   -> extension_run(project_id, plugin_id, action, base_exchange_id, input)
   -> job_status(job_id) / job_results(job_id) / job_cancel(job_id)
+  -> job_resume_analysis(job_id) when aggregation alone timed out
 ```
 
 `extension_list` is intentionally compact; action schemas and limits live only
-in `extension_describe`. `job_status` returns progress, the current phase, and
+in `extension_describe`, which also exposes host-resolved effective limits.
+`extension_preview` runs the exact planner without sending requests and returns
+stage-scoped request, candidate, runtime, and mode estimates. `job_status`
+returns progress, the current phase, and
 `recommended_poll_interval_ms` while a job is active without serializing its
 result. `job_results` defaults to a bounded summary and supports
-`view=findings|full`, `offset`, and `limit` for stable finding pages. Semantic
-plugin requests may set `credential_mode` to `with_project_credentials`
+`view=findings|full`, `offset`, and `limit` for stable finding pages. When
+target execution completed but JavaScript aggregation timed out,
+`job_resume_analysis` retries the retained checkpoint at up to 120 seconds
+without replaying probes; the bounded checkpoint is memory-only, so retry it
+before restarting HuntProxy. Semantic plugin requests may set
+`credential_mode` to `with_project_credentials`
 (default) or `without_project_credentials`; the latter removes inherited,
 managed-cookie, and request-rule credentials while retaining credentials the
 probe explicitly supplies.

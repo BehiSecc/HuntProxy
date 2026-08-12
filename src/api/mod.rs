@@ -302,6 +302,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(run_extension).layer(DefaultBodyLimit::max(payload_body_limit)),
         )
         .route(
+            "/api/v1/projects/{id}/extension-plans/preview",
+            post(preview_extension).layer(DefaultBodyLimit::max(payload_body_limit)),
+        )
+        .route(
             "/api/v1/projects/{id}/extension-jobs/{job_id}",
             get(extension_job),
         )
@@ -312,6 +316,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/projects/{id}/extension-jobs/{job_id}/cancel",
             post(cancel_extension_job),
+        )
+        .route(
+            "/api/v1/projects/{id}/extension-jobs/{job_id}/resume-analysis",
+            post(resume_extension_analysis).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route("/api/v1/projects/{id}/ip-rotation", get(ip_rotation_status))
         .route(
@@ -487,6 +495,27 @@ async fn run_extension(
     }
 }
 
+async fn preview_extension(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RunExtensionBody>,
+) -> Response {
+    match state
+        .plugins
+        .preview(
+            ProjectId(id),
+            &body.plugin_id,
+            &body.action,
+            body.base_exchange_id.map(ExchangeId),
+            body.input,
+        )
+        .await
+    {
+        Ok(preview) => Json(preview).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
 fn parse_project_job(
     state: &AppState,
     project_id: i64,
@@ -571,6 +600,30 @@ async fn cancel_extension_job(
         Err(error) => return error_response(error),
     };
     match state.plugins.cancel(job.id) {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResumeAnalysisBody {
+    js_stage_timeout_ms: Option<u64>,
+}
+
+async fn resume_extension_analysis(
+    State(state): State<Arc<AppState>>,
+    Path((id, job_id)): Path<(i64, String)>,
+    Json(body): Json<ResumeAnalysisBody>,
+) -> Response {
+    let job = match parse_project_job(&state, id, &job_id) {
+        Ok(job) => job,
+        Err(error) => return error_response(error),
+    };
+    match state
+        .plugins
+        .resume_analysis(job.id, body.js_stage_timeout_ms)
+        .await
+    {
         Ok(job) => Json(job).into_response(),
         Err(error) => error_response(error),
     }

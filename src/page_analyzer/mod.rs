@@ -42,9 +42,8 @@ static BASE_HREF: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?is)<base\b[^>]*?\bhref\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'=<>`]+))"#)
         .expect("base-href regex")
 });
-static PASSIVE_EXTENSION: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\.(?:js|mjs|css|json)$").expect("passive extension regex")
-});
+static PASSIVE_EXTENSION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\.(?:js|mjs|css|json)$").expect("passive extension regex"));
 
 static STATIC_ASSET: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
@@ -167,9 +166,16 @@ fn passive_targets(source_url: &str, content: &[u8], limit: usize) -> PassiveTar
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
     if let (Some(source), Some(base)) = (source.as_ref(), base.as_ref()) {
-        for captures in SCRIPT_SRC.captures_iter(&text).chain(LINK_HREF.captures_iter(&text)) {
-            let Some(value) = attribute_value(&captures) else { continue };
-            let Ok(mut target) = base.join(value) else { continue };
+        for captures in SCRIPT_SRC
+            .captures_iter(&text)
+            .chain(LINK_HREF.captures_iter(&text))
+        {
+            let Some(value) = attribute_value(&captures) else {
+                continue;
+            };
+            let Ok(mut target) = base.join(value) else {
+                continue;
+            };
             if !matches!(target.scheme(), "http" | "https")
                 || !same_origin(source, &target)
                 || !target.username().is_empty()
@@ -181,9 +187,23 @@ fn passive_targets(source_url: &str, content: &[u8], limit: usize) -> PassiveTar
             if target.as_str().len() > MAX_CANDIDATE_LEN
                 || !PASSIVE_EXTENSION.is_match(target.path())
                 || target.query_pairs().any(|(name, value)| {
-                    !matches!(name.to_ascii_lowercase().as_str(), "callback" | "cb" | "v" | "ver" | "version" | "lang" | "locale" | "theme" | "format" | "module")
-                        || value.len() > 128
-                        || !value.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '~' | '-'))
+                    !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "callback"
+                            | "cb"
+                            | "v"
+                            | "ver"
+                            | "version"
+                            | "lang"
+                            | "locale"
+                            | "theme"
+                            | "format"
+                            | "module"
+                    ) || value.len() > 128
+                        || !value.chars().all(|character| {
+                            character.is_ascii_alphanumeric()
+                                || matches!(character, '.' | '_' | '~' | '-')
+                        })
                 })
             {
                 continue;
@@ -196,7 +216,12 @@ fn passive_targets(source_url: &str, content: &[u8], limit: usize) -> PassiveTar
     }
     let total = targets.len();
     targets.truncate(limit.min(64));
-    PassiveTargetDiscovery { source_url: source_url.to_string(), truncated: total > targets.len(), total, targets }
+    PassiveTargetDiscovery {
+        source_url: source_url.to_string(),
+        truncated: total > targets.len(),
+        total,
+        targets,
+    }
 }
 
 /// Resolve and sanitize passive same-origin resources referenced by the saved
@@ -209,7 +234,11 @@ pub async fn discover_passive_targets(
     limit: usize,
 ) -> DomainResult<PassiveTargetDiscovery> {
     let detail = db
-        .get_exchange_detail(project_id, exchange_id, crate::policy::PresentationOptions::default())
+        .get_exchange_detail(
+            project_id,
+            exchange_id,
+            crate::policy::PresentationOptions::default(),
+        )
         .await?;
     let mut body = db
         .load_raw_body(project_id, exchange_id, MessageSide::Response)
@@ -218,7 +247,9 @@ pub async fn discover_passive_targets(
     if detail.protocol == "HTTP/1.1 raw" {
         body = crate::reply::presented_raw_response_body(&body);
     }
-    let headers = db.load_raw_headers(project_id, exchange_id, MessageSide::Response).await?;
+    let headers = db
+        .load_raw_headers(project_id, exchange_id, MessageSide::Response)
+        .await?;
     let encodings = headers
         .iter()
         .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
@@ -226,11 +257,24 @@ pub async fn discover_passive_targets(
         .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
         .collect::<Vec<_>>();
     if !encodings.is_empty() {
-        body = crate::codec::decode_content_encodings(&body, &encodings.join(", "), MAX_PASSIVE_DISCOVERY_BODY)?;
+        body = crate::codec::decode_content_encodings(
+            &body,
+            &encodings.join(", "),
+            MAX_PASSIVE_DISCOVERY_BODY,
+        )?;
     }
     body.truncate(MAX_PASSIVE_DISCOVERY_BODY);
-    let query = detail.summary.query.as_deref().filter(|query| !query.is_empty()).map(|query| format!("?{query}")).unwrap_or_default();
-    let source_url = format!("{}://{}{}{}", detail.summary.scheme, detail.summary.authority, detail.summary.path, query);
+    let query = detail
+        .summary
+        .query
+        .as_deref()
+        .filter(|query| !query.is_empty())
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let source_url = format!(
+        "{}://{}{}{}",
+        detail.summary.scheme, detail.summary.authority, detail.summary.path, query
+    );
     Ok(passive_targets(&source_url, &body, limit))
 }
 
@@ -682,8 +726,12 @@ mod tests {
         assert_eq!(result.total, 3);
         assert_eq!(result.targets.len(), 2);
         assert!(result.truncated);
-        assert!(result.targets.contains(&"https://example.test/resources/js/geolocate.js".to_string()));
-        assert!(result.targets.contains(&"https://example.test/app.js".to_string()));
+        assert!(result
+            .targets
+            .contains(&"https://example.test/resources/js/geolocate.js".to_string()));
+        assert!(result
+            .targets
+            .contains(&"https://example.test/app.js".to_string()));
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("credential"));
