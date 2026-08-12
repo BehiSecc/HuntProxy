@@ -116,9 +116,12 @@ HuntProxy browser cdp enable <project-id> <session-id>
 ```
 
 Open the returned `devtools_url` in a browser on the VPS. From another machine,
-first run `ssh -N -L 9222:127.0.0.1:9222 user@vps`, then open that same URL.
-The result also includes a `hosted_devtools_url` from Chrome's hosted frontend;
-the local URL is more reliable when browsers restrict local-network WebSockets.
+first run the returned `ssh_forward_command`, which uses the HuntProxy process's
+current operating-system user and routed VPS IP. Then try `hosted_devtools_url`;
+it can avoid transferring DevTools' many static assets through the SSH tunnel.
+Use `devtools_url` when the hosted frontend cannot connect because the browser
+restricts its local-network WebSocket; its first load over a high-latency tunnel
+may be slower while those assets are fetched.
 Agent browser actions pause during the handoff. Return control with
 `browser_cdp` `op: "disable"` or `HuntProxy browser cdp disable <project-id> <session-id>`.
 

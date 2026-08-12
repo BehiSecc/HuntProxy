@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2043,7 +2044,7 @@ fn cdp_status_view(
             endpoint: Some(cdp.endpoint),
             devtools_url: Some(cdp.devtools_url),
             hosted_devtools_url: Some(cdp.hosted_devtools_url),
-            ssh_forward_command: Some("ssh -N -L 9222:127.0.0.1:9222 user@vps".into()),
+            ssh_forward_command: ssh_forward_command(),
         },
         None => BrowserCdpStatus {
             project_id,
@@ -2056,6 +2057,60 @@ fn cdp_status_view(
             ssh_forward_command: None,
         },
     }
+}
+
+fn ssh_forward_command() -> Option<String> {
+    let user = runtime_username()?;
+    let ip = runtime_host_ip()?;
+    let host = match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    Some(format!("ssh -N -L 9222:127.0.0.1:9222 {user}@{host}"))
+}
+
+fn runtime_username() -> Option<String> {
+    (|| {
+        let output = StdCommand::new("id").arg("-un").output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    })()
+    .filter(|value| valid_ssh_username(value))
+    .or_else(|| {
+        ["USER", "LOGNAME"]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .map(|value| value.trim().to_owned())
+            .find(|value| valid_ssh_username(value))
+    })
+    .filter(|value| valid_ssh_username(value))
+}
+
+fn valid_ssh_username(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn runtime_host_ip() -> Option<IpAddr> {
+    if let Some(ip) = std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|connection| ssh_server_ip(&connection))
+    {
+        return Some(ip);
+    }
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("1.1.1.1:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+fn ssh_server_ip(connection: &str) -> Option<IpAddr> {
+    connection.split_whitespace().nth(2)?.parse().ok()
 }
 
 fn existing_path(configured: Option<PathBuf>, executable_name: &str) -> Option<PathBuf> {
@@ -2362,10 +2417,9 @@ mod tests {
         assert!(handed_off.active);
         assert!(!handed_off.agent_control);
         assert_eq!(handed_off.session_id, Some(BrowserSessionId(9)));
-        assert!(handed_off
-            .ssh_forward_command
-            .unwrap()
-            .contains("9222:127.0.0.1:9222"));
+        let command = handed_off.ssh_forward_command.unwrap();
+        assert!(command.starts_with("ssh -N -L 9222:127.0.0.1:9222 "));
+        assert!(command.contains('@'));
 
         let available = cdp_status_view(ProjectId(7), None);
         assert!(!available.active);
@@ -2377,6 +2431,15 @@ mod tests {
             "hosted_devtools_url": "https://example.test/"
         })))
         .is_err());
+    }
+
+    #[test]
+    fn ssh_connection_server_address_is_parsed_at_runtime() {
+        assert_eq!(
+            ssh_server_ip("192.0.2.10 54321 198.51.100.20 22"),
+            Some("198.51.100.20".parse().unwrap())
+        );
+        assert_eq!(ssh_server_ip("invalid"), None);
     }
 
     #[test]
