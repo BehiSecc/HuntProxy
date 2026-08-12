@@ -70,73 +70,77 @@ impl Db {
         let schema = self.schema_version().await?;
         let secrets = options.secrets;
         tokio::task::spawn_blocking(move || {
-            prune_snapshot(&snapshot, project_id, secrets)?;
-            let database_sha256 = sha256_file(&snapshot)?;
-            let manifest = BundleManifest {
-                format: BUNDLE_FORMAT.into(),
-                version: BUNDLE_VERSION,
-                archive_id: uuid::Uuid::new_v4().to_string(),
-                created_at: crate::storage::now_rfc3339(),
-                producer_version: env!("CARGO_PKG_VERSION").into(),
-                source_schema: schema,
-                secrets: match secrets {
-                    SecretMode::Sanitized => "sanitized",
-                    SecretMode::Full => "full",
-                }
-                .into(),
-                chromium_profile: options.include_chromium_profile,
-                database_sha256,
-            };
-            write_private_file(
-                &staging.join("manifest.json"),
-                &serde_json::to_vec_pretty(&manifest).map_err(storage_error)?,
-            )?;
-            let source_profile = profiles_root
-                .join("projects")
-                .join(project_id.get().to_string());
-            if secrets == SecretMode::Full {
-                let state = source_profile.join("state.json");
-                if state.is_file() {
-                    let target = staging.join("browser/state.json");
-                    if let Some(parent) = target.parent() {
-                        create_private_dir(parent)?;
+            let result = (|| {
+                prune_snapshot(&snapshot, project_id, secrets)?;
+                let database_sha256 = sha256_file(&snapshot)?;
+                let manifest = BundleManifest {
+                    format: BUNDLE_FORMAT.into(),
+                    version: BUNDLE_VERSION,
+                    archive_id: uuid::Uuid::new_v4().to_string(),
+                    created_at: crate::storage::now_rfc3339(),
+                    producer_version: env!("CARGO_PKG_VERSION").into(),
+                    source_schema: schema,
+                    secrets: match secrets {
+                        SecretMode::Sanitized => "sanitized",
+                        SecretMode::Full => "full",
                     }
-                    std::fs::copy(&state, &target)
-                        .map_err(|error| storage_error(format!("copy browser state: {error}")))?;
-                }
-                if options.include_chromium_profile {
-                    let chromium = source_profile.join("chromium");
-                    if chromium.is_dir() {
-                        copy_tree_safe(&chromium, &staging.join("browser/chromium"))?;
+                    .into(),
+                    chromium_profile: options.include_chromium_profile,
+                    database_sha256,
+                };
+                write_private_file(
+                    &staging.join("manifest.json"),
+                    &serde_json::to_vec_pretty(&manifest).map_err(storage_error)?,
+                )?;
+                let source_profile = profiles_root
+                    .join("projects")
+                    .join(project_id.get().to_string());
+                if secrets == SecretMode::Full {
+                    let state = source_profile.join("state.json");
+                    if state.is_file() {
+                        let target = staging.join("browser/state.json");
+                        if let Some(parent) = target.parent() {
+                            create_private_dir(parent)?;
+                        }
+                        std::fs::copy(&state, &target).map_err(|error| {
+                            storage_error(format!("copy browser state: {error}"))
+                        })?;
+                    }
+                    if options.include_chromium_profile {
+                        let chromium = source_profile.join("chromium");
+                        if chromium.is_dir() {
+                            copy_tree_safe(&chromium, &staging.join("browser/chromium"))?;
+                        }
                     }
                 }
-            }
-            if let Some(parent) = destination.parent() {
-                create_private_dir(parent)?;
-            }
-            let output = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&destination)
-                .map_err(|error| storage_error(format!("create bundle: {error}")))?;
-            let encoder = zstd::Encoder::new(output, 3).map_err(storage_error)?;
-            let mut tar = tar::Builder::new(encoder);
-            tar.append_path_with_name(staging.join("manifest.json"), "manifest.json")
-                .map_err(storage_error)?;
-            tar.append_path_with_name(&snapshot, "project.sqlite3")
-                .map_err(storage_error)?;
-            let browser = staging.join("browser");
-            if browser.is_dir() {
-                tar.append_dir_all("browser", &browser)
+                if let Some(parent) = destination.parent() {
+                    create_private_dir(parent)?;
+                }
+                let output = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&destination)
+                    .map_err(|error| storage_error(format!("create bundle: {error}")))?;
+                let encoder = zstd::Encoder::new(output, 3).map_err(storage_error)?;
+                let mut tar = tar::Builder::new(encoder);
+                tar.append_path_with_name(staging.join("manifest.json"), "manifest.json")
                     .map_err(storage_error)?;
-            }
-            let encoder = tar.into_inner().map_err(storage_error)?;
-            let mut output = encoder.finish().map_err(storage_error)?;
-            output.flush().map_err(storage_error)?;
-            secure_file(&destination)?;
+                tar.append_path_with_name(&snapshot, "project.sqlite3")
+                    .map_err(storage_error)?;
+                let browser = staging.join("browser");
+                if browser.is_dir() {
+                    tar.append_dir_all("browser", &browser)
+                        .map_err(storage_error)?;
+                }
+                let encoder = tar.into_inner().map_err(storage_error)?;
+                let mut output = encoder.finish().map_err(storage_error)?;
+                output.flush().map_err(storage_error)?;
+                secure_file(&destination)?;
+                Ok(destination)
+            })();
             let _ = std::fs::remove_dir_all(&staging);
-            Ok(destination)
+            result
         })
         .await
         .map_err(|error| storage_error(format!("bundle export task: {error}")))?

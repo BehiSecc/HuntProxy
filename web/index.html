@@ -75,18 +75,19 @@
     .btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
     .btn.danger { color: var(--danger); }
     .btn:disabled { cursor: not-allowed; opacity: .5; }
+    #toggleProjectTools { display: none; }
     .stack { display: grid; gap: .55rem; }
     .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: .85rem; min-width: 0; }
     .split { display: grid; grid-template-columns: minmax(420px, 1.2fr) minmax(320px, .8fr); gap: .8rem; }
     .three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .6rem; }
     .toolbar { display: flex; align-items: end; gap: .55rem; margin-bottom: .75rem; flex-wrap: wrap; }
     .toolbar .grow { flex: 1 1 280px; }
-    .status { min-height: 1.2rem; color: var(--muted); margin-top: .45rem; font-size: .82rem; }
+    .status { min-height: 1.2rem; color: var(--muted); margin-top: .45rem; font-size: .82rem; overflow-wrap: anywhere; }
     .status.ok { color: var(--success); }
     .status.err { color: var(--danger); }
     .status.warn { color: var(--warning); }
     .mono { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
-    pre { margin: .35rem 0; max-height: 280px; overflow: auto; background: var(--panel-2); border-radius: 7px; padding: .65rem; }
+    pre { margin: .35rem 0; max-width: 100%; min-width: 0; max-height: 280px; overflow: auto; background: var(--panel-2); border-radius: 7px; padding: .65rem; }
     .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
     table { width: 100%; border-collapse: collapse; min-width: 720px; }
     th, td { padding: .58rem .65rem; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
@@ -103,14 +104,27 @@
     .tabs { display: flex; gap: .25rem; overflow-x: auto; border-bottom: 1px solid var(--border); margin-bottom: .8rem; padding-bottom: .35rem; }
     .tab-button { border: 1px solid transparent; }
     .tab-button.active { border-color: var(--border); }
-    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
+    .detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: .65rem; }
+    .detail-grid > * { min-width: 0; }
     .detail-grid h3 { margin-top: .35rem; }
     .body-tools { display: flex; gap: .35rem; align-items: center; margin-bottom: .35rem; }
     .body-tools select { width: auto; min-width: 92px; padding: .38rem .45rem; }
     .body-tools .btn { padding: .38rem .55rem; }
-    .sitemap-tree { margin-top: .55rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .sitemap-card { padding: 0; overflow: hidden; }
+    .sitemap-host-row { display: flex; align-items: stretch; }
+    .sitemap-host { flex: 1; min-width: 0; display: flex; align-items: center; gap: .55rem; border: 0; background: transparent; padding: .8rem .85rem; text-align: left; }
+    .sitemap-host-filter { flex: 0 0 auto; border: 0; border-left: 1px solid var(--border); background: transparent; padding: .55rem .8rem; color: var(--accent); }
+    .sitemap-host:hover, .sitemap-host-filter:hover, .sitemap-link:hover { background: var(--accent-soft); }
+    .sitemap-host-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+    .sitemap-chevron { flex: 0 0 auto; color: var(--muted); transition: transform .15s ease; }
+    .sitemap-card.open .sitemap-chevron { transform: rotate(90deg); }
+    .sitemap-tree { display: none; padding: 0 .85rem .8rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .sitemap-card.open .sitemap-tree { display: block; }
     .sitemap-node { margin-left: 1rem; border-left: 1px solid var(--border); padding-left: .55rem; }
-    .sitemap-route { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; padding: .2rem 0; }
+    .sitemap-route { display: grid; grid-template-columns: minmax(8rem, 1fr) auto; gap: .4rem; align-items: center; padding: .2rem 0; min-width: 0; }
+    .sitemap-link { min-width: 0; max-width: 100%; border: 0; border-radius: 5px; background: transparent; padding: .2rem .3rem; color: inherit; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: inherit; }
+    .sitemap-meta { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: .35rem; flex-wrap: wrap; }
+    .sitemap-meta .parameters { max-width: 24rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .annotation { border-top: 1px solid var(--border); margin-top: .75rem; padding-top: .55rem; }
     .muted { color: var(--muted); }
     .small { font-size: .78rem; }
@@ -129,6 +143,13 @@
       .three { grid-template-columns: 1fr; }
       .row { flex-wrap: wrap; }
       .row > * { flex: 1 1 180px; }
+      #toggleProjectTools { display: block; }
+      #projectTools { display: none; }
+      aside { padding: .7rem; }
+      .sitemap-node { margin-left: .35rem; padding-left: .35rem; }
+      .sitemap-route { grid-template-columns: minmax(0, 1fr); }
+      .sitemap-meta { justify-content: flex-start; padding-left: .3rem; }
+      #projectTools.mobile-open { display: block; }
     }
   </style>
 </head>
@@ -155,10 +176,12 @@
       <h2>Project</h2>
       <label for="projectSelect">Active project</label>
       <select id="projectSelect"></select>
-      <div class="row" style="margin-top:.55rem">
+      <div class="row project-quick-actions" style="margin-top:.55rem">
         <button class="btn" id="refreshProjects">Refresh</button>
+        <button class="btn fit" id="toggleProjectTools" aria-expanded="false">Project tools</button>
       </div>
 
+      <div id="projectTools">
       <h3>Create project</h3>
       <label for="projectName">Name</label>
       <input id="projectName" placeholder="Acme portal" />
@@ -231,6 +254,7 @@
       </div>
       <pre class="mono hidden" id="credentialOutput"></pre>
       <div class="status" id="sideStatus"></div>
+      </div>
     </aside>
 
     <div class="workspace">
@@ -563,6 +587,8 @@ test
       historyTotal: 0,
       historyTotalExact: true,
       ipRotationBusy: false,
+      historyRequestId: 0,
+      sitemapRequestId: 0,
       bodies: { request: null, response: null },
     };
 
@@ -592,6 +618,9 @@ test
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[c]);
+    }
+    function quoteFilterValue(value) {
+      return `"${String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
     }
 
     function bytes(value) { return Array.from(encoder.encode(value || '')); }
@@ -667,19 +696,34 @@ test
 
     $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
     $('refreshProjects').onclick = () => loadProjects().catch(e => status('sideStatus', e.message, 'err'));
+    $('toggleProjectTools').onclick = () => {
+      const open = $('projectTools').classList.toggle('mobile-open');
+      $('toggleProjectTools').setAttribute('aria-expanded', String(open));
+      $('toggleProjectTools').textContent = open ? 'Hide tools' : 'Project tools';
+    };
     async function createProject(browse = false) {
+      const name = $('projectName').value.trim();
+      const targetUrl = $('projectUrl').value.trim();
+      if (!name) return status('sideStatus', 'Enter a project name', 'err');
+      if (!targetUrl) return status('sideStatus', 'Enter a target URL', 'err');
+      const button = $(browse ? 'createAndBrowse' : 'createProject');
+      button.disabled = true;
+      status('sideStatus', browse ? 'Creating project and starting Chromium…' : 'Creating project…');
       try {
         const hosts = $('scopeHosts').value.split(',').map(v => v.trim()).filter(Boolean);
         const excludedHosts = $('scopeExcludedHosts').value.split(',').map(v => v.trim()).filter(Boolean);
         const advanced = (hosts.length || excludedHosts.length) ? { schemes: ['http', 'https'], host_patterns: hosts, excluded_host_patterns: excludedHosts, ports: [], path_prefixes: [] } : null;
-        const project = await api('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name: $('projectName').value.trim(), target_url: $('projectUrl').value.trim(), advanced }) });
-        status('sideStatus', `Created project ${project.id}`, 'ok');
+        const project = await api('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name, target_url: targetUrl, advanced }) });
         await loadProjects(project.id);
         if (browse) {
           activateView('browser');
-          $('startBrowser').click();
+          const session = await startBrowserSession();
+          status('sideStatus', `Created project ${project.id}; browser session ${session.id} is ready`, 'ok');
+        } else {
+          status('sideStatus', `Created project ${project.id}`, 'ok');
         }
       } catch (e) { status('sideStatus', e.message, 'err'); }
+      finally { button.disabled = false; }
     }
     $('createProject').onclick = () => createProject(false);
     $('createAndBrowse').onclick = () => createProject(true);
@@ -784,26 +828,34 @@ test
         state.projectId = null; await loadProjects(); status('sideStatus', 'Project deleted', 'ok');
       } catch (error) { status('sideStatus', error.message, 'err'); }
     };
-    async function downloadProject(path, filename) {
-      const response = await fetch(path);
-      if (!response.ok) { let message = `HTTP ${response.status}`; try { message = (await response.json()).message || message; } catch (_) {} throw new Error(message); }
-      const blob = await response.blob();
-      const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(link.href), 0);
+    async function downloadProject(button, path, filename, label) {
+      button.disabled = true;
+      status('sideStatus', `Preparing ${label}…`);
+      try {
+        const response = await fetch(path);
+        if (!response.ok) { let message = `HTTP ${response.status}`; try { message = (await response.json()).message || message; } catch (_) {} throw new Error(message); }
+        const blob = await response.blob();
+        if (!blob.size) throw new Error(`${label} was empty`);
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a'); link.href = url; link.download = filename; document.body.appendChild(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30_000);
+        status('sideStatus', `${label} downloaded (${humanBytes(blob.size)})`, 'ok');
+      } finally { button.disabled = false; }
     }
     $('exportProject').onclick = async () => {
       if (!state.projectId) return;
       try {
-        await downloadProject(`/api/v1/projects/${state.projectId}/bundle`, `huntproxy-project-${state.projectId}.huntproxy`);
+        await downloadProject($('exportProject'), `/api/v1/projects/${state.projectId}/bundle`, `huntproxy-project-${state.projectId}.huntproxy`, 'Sanitized export');
       } catch (error) { status('sideStatus', error.message, 'err'); }
     };
     $('exportProjectFull').onclick = async () => {
       if (!state.projectId || !confirm('Full export includes raw credentials, cookies, bodies, Reply/Fuzzer data, and portable browser state. Continue?')) return;
-      try { await downloadProject(`/api/v1/projects/${state.projectId}/bundle?include_secrets=true`, `huntproxy-project-${state.projectId}-full.huntproxy`); }
+      try { await downloadProject($('exportProjectFull'), `/api/v1/projects/${state.projectId}/bundle?include_secrets=true`, `huntproxy-project-${state.projectId}-full.huntproxy`, 'Full export'); }
       catch (error) { status('sideStatus', error.message, 'err'); }
     };
     $('exportHar').onclick = async () => {
       if (!state.projectId) return;
-      try { await downloadProject(`/api/v1/projects/${state.projectId}/har`, `huntproxy-project-${state.projectId}.har`); }
+      try { await downloadProject($('exportHar'), `/api/v1/projects/${state.projectId}/har`, `huntproxy-project-${state.projectId}.har`, 'HAR export'); }
       catch (error) { status('sideStatus', error.message, 'err'); }
     };
     $('importProject').onclick = () => $('importProjectFile').click();
@@ -938,18 +990,21 @@ test
 
     async function loadHistory(append = false) {
       if (!state.projectId) return;
+      const projectId = state.projectId;
+      const requestId = ++state.historyRequestId;
       try {
         const q = new URLSearchParams({ limit: '100' });
         if ($('historyFilter').value.trim()) q.set('q', $('historyFilter').value.trim());
         if (append && state.historyCursor) q.set('cursor', state.historyCursor);
-        const result = await api(`/api/v1/projects/${state.projectId}/history?${q}`);
+        const result = await api(`/api/v1/projects/${projectId}/history?${q}`);
+        if (projectId !== state.projectId || requestId !== state.historyRequestId) return;
         const items = result.items || [];
         state.historyItems = append ? state.historyItems.concat(items) : items;
         state.historyCursor = result.next_cursor || null;
         state.historyTotal = Number(result.total ?? state.historyItems.length);
         state.historyTotalExact = result.total_exact !== false;
         renderHistory();
-      } catch (e) { status('historyStatus', e.message, 'err'); }
+      } catch (e) { if (projectId === state.projectId && requestId === state.historyRequestId) status('historyStatus', e.message, 'err'); }
     }
     $('loadHistory').onclick = () => loadHistory(false);
     $('historyMore').onclick = () => loadHistory(true);
@@ -1050,10 +1105,11 @@ test
           while (state.bodies[side] && state.bodies[side].loaded < state.bodies[side].total) await loadExchangeBody(state.selectedExchange, side, true);
           const body = state.bodies[side];
           const link = document.createElement('a');
-          link.href = URL.createObjectURL(new Blob([body.bytes], { type: 'application/octet-stream' }));
+          const url = URL.createObjectURL(new Blob([body.bytes], { type: 'application/octet-stream' }));
+          link.href = url;
           link.download = `exchange-${state.selectedExchange}-${side}${body.raw ? '-raw' : ''}.bin`;
-          link.click();
-          setTimeout(() => URL.revokeObjectURL(link.href), 0);
+          document.body.appendChild(link); link.click(); link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 30_000);
         } catch (error) { status('inspectorStatus', error.message, 'err'); }
       };
     }
@@ -1125,29 +1181,59 @@ test
         const metadata = route ? `<span class="pill">${escapeHtml(route.methods.join(', '))}</span>
           ${route.status_codes.length ? `<span class="pill">${escapeHtml(route.status_codes.join(', '))}</span>` : ''}
           ${route.content_types.length ? `<span class="pill" title="Content types">${escapeHtml(route.content_types.join(', '))}</span>` : ''}
-          ${route.parameters.length ? `<span class="small muted" title="Query parameters">? ${escapeHtml(route.parameters.join(', '))}</span>` : ''}
+          ${route.parameters.length ? `<span class="small muted parameters" title="Query parameters: ${escapeHtml(route.parameters.join(', '))}">? ${escapeHtml(route.parameters.join(', '))}</span>` : ''}
           <span class="small muted">${route.exchange_count}×</span>` : '<span class="small muted">directory</span>';
-        return `<div class="sitemap-node"><div class="sitemap-route"><strong title="${escapeHtml(node.path)}">${escapeHtml(node.segment)}</strong>${metadata}</div>${renderSitemapNodes(node.children)}</div>`;
+        return `<div class="sitemap-node"><div class="sitemap-route"><button type="button" class="sitemap-link" data-sitemap-path="${escapeHtml(node.path)}" title="Filter History by ${escapeHtml(node.path)}" aria-label="View ${escapeHtml(node.path)} in History">${escapeHtml(node.segment)}</button><div class="sitemap-meta">${metadata}</div></div>${renderSitemapNodes(node.children)}</div>`;
       }).join('');
     }
 
     async function loadSitemap() {
       if (!state.projectId) return;
+      const projectId = state.projectId;
+      const requestId = ++state.sitemapRequestId;
+      const button = $('loadSitemap');
+      button.disabled = true;
+      status('sitemapStatus', 'Loading sitemap…');
       try {
         const query = new URLSearchParams();
         if ($('sitemapHost').value.trim()) query.set('host', $('sitemapHost').value.trim());
-        const result = await api(`/api/v1/projects/${state.projectId}/sitemap?${query}`);
+        const result = await api(`/api/v1/projects/${projectId}/sitemap?${query}`);
+        if (projectId !== state.projectId || requestId !== state.sitemapRequestId) return;
         const hosts = result.hosts || [];
         $('sitemapHosts').innerHTML = hosts.map(host => {
           const exchanges = (host.routes || []).reduce((sum, route) => sum + route.exchange_count, 0);
-          return `<div class="card"><div class="row"><strong>${escapeHtml(host.host)}</strong><span class="pill fit">${host.paths.length} route${host.paths.length === 1 ? '' : 's'} · ${exchanges} exchange${exchanges === 1 ? '' : 's'}</span></div><div class="sitemap-tree">${renderSitemapNodes(host.tree || [])}</div></div>`;
+          return `<div class="card sitemap-card" data-sitemap-host-card="${escapeHtml(host.host)}"><div class="sitemap-host-row"><button type="button" class="sitemap-host" data-sitemap-host="${escapeHtml(host.host)}" aria-expanded="false"><span class="sitemap-chevron">›</span><span class="sitemap-host-name" title="${escapeHtml(host.host)}">${escapeHtml(host.host)}</span><span class="pill fit">${host.paths.length} route${host.paths.length === 1 ? '' : 's'} · ${exchanges} exchange${exchanges === 1 ? '' : 's'}</span></button><button type="button" class="sitemap-host-filter" data-sitemap-host-filter="${escapeHtml(host.host)}" title="View this host in History">History</button></div><div class="sitemap-tree">${renderSitemapNodes(host.tree || [])}</div></div>`;
         }).join('');
         $('sitemapEmpty').classList.toggle('hidden', hosts.length > 0);
         status('sitemapStatus', `${hosts.length} host${hosts.length === 1 ? '' : 's'}`);
-      } catch (error) { status('sitemapStatus', error.message, 'err'); }
+      } catch (error) { if (projectId === state.projectId && requestId === state.sitemapRequestId) { $('sitemapHosts').innerHTML = ''; $('sitemapEmpty').classList.add('hidden'); status('sitemapStatus', error.message, 'err'); } }
+      finally { if (projectId === state.projectId && requestId === state.sitemapRequestId) button.disabled = false; }
     }
     $('loadSitemap').onclick = loadSitemap;
     $('sitemapHost').onkeydown = event => { if (event.key === 'Enter') loadSitemap(); };
+    $('sitemapHosts').onclick = async event => {
+      const hostFilter = event.target.closest('[data-sitemap-host-filter]');
+      if (hostFilter) {
+        $('historyFilter').value = `host:${quoteFilterValue(hostFilter.dataset.sitemapHostFilter)}`;
+        activateView('history');
+        await loadHistory(false);
+        return;
+      }
+      const hostButton = event.target.closest('[data-sitemap-host]');
+      if (hostButton) {
+        const card = hostButton.closest('.sitemap-card');
+        const open = card.classList.toggle('open');
+        hostButton.setAttribute('aria-expanded', String(open));
+        return;
+      }
+      const pathButton = event.target.closest('[data-sitemap-path]');
+      if (!pathButton) return;
+      const host = pathButton.closest('[data-sitemap-host-card]').dataset.sitemapHostCard;
+      $('historyFilter').value = `host:${quoteFilterValue(host)} path:${quoteFilterValue(pathButton.dataset.sitemapPath)}`;
+      activateView('history');
+      await loadHistory(false);
+      if (state.historyItems.length) selectExchange(state.historyItems[0].exchange_id);
+    };
 
     async function loadRules() {
       if (!state.projectId) return;
@@ -1619,14 +1705,21 @@ test
       }
       catch (e) { $('browserInstallStatus').textContent = e.message; }
     }
-    $('startBrowser').onclick = async () => {
+    async function startBrowserSession() {
       if (!state.projectId) return status('browserStatus', 'Select a project', 'err');
-      try {
-        const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, { method: 'POST', body: JSON.stringify({ url: $('browserUrl').value.trim() }) });
-        state.browserSession = session; $('stopBrowser').disabled = false; $('runBrowserAction').disabled = false;
-        status('browserStatus', `Session ${session.id} running with ${session.engine}`, 'ok');
-        $('browserOutput').textContent = JSON.stringify(session, null, 2);
-      } catch (e) { status('browserStatus', e.message, 'err'); }
+      const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, { method: 'POST', body: JSON.stringify({ url: $('browserUrl').value.trim() }) });
+      state.browserSession = session; $('stopBrowser').disabled = false; $('runBrowserAction').disabled = false;
+      status('browserStatus', `Session ${session.id} running with ${session.engine}`, 'ok');
+      $('browserOutput').textContent = JSON.stringify(session, null, 2);
+      await loadBrowserStatus();
+      return session;
+    }
+    $('startBrowser').onclick = async () => {
+      $('startBrowser').disabled = true;
+      status('browserStatus', 'Starting Chromium…');
+      try { await startBrowserSession(); }
+      catch (e) { status('browserStatus', e.message, 'err'); }
+      finally { $('startBrowser').disabled = false; }
     };
     $('stopBrowser').onclick = async () => {
       if (!state.browserSession) return;
