@@ -67,10 +67,15 @@
     }
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent); }
     textarea { min-height: 90px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .row { display: flex; gap: .55rem; align-items: end; }
+    .row { display: flex; gap: .55rem; align-items: end; flex-wrap: wrap; }
     .row > * { flex: 1; min-width: 0; }
     .row .fit { flex: 0 0 auto; }
-    .btn { border: 1px solid var(--border); background: var(--panel); border-radius: 7px; padding: .55rem .75rem; }
+    .row > .btn { flex: 0 0 auto; }
+    .btn {
+      min-height: 37px; display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid var(--border); background: var(--panel); border-radius: 7px;
+      padding: .55rem .75rem; line-height: 1.2; white-space: nowrap;
+    }
     .btn:hover { border-color: var(--accent); }
     .btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
     .btn.danger { color: var(--danger); }
@@ -107,9 +112,9 @@
     .detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: .65rem; }
     .detail-grid > * { min-width: 0; }
     .detail-grid h3 { margin-top: .35rem; }
-    .body-tools { display: flex; gap: .35rem; align-items: center; margin-bottom: .35rem; }
+    .body-tools { display: flex; gap: .35rem; align-items: center; flex-wrap: wrap; margin-bottom: .35rem; }
     .body-tools select { width: auto; min-width: 92px; padding: .38rem .45rem; }
-    .body-tools .btn { padding: .38rem .55rem; }
+    .body-tools .btn { min-height: 32px; padding: .38rem .55rem; }
     .sitemap-card { padding: 0; overflow: hidden; }
     .sitemap-host-row { display: flex; align-items: stretch; }
     .sitemap-host { flex: 1; min-width: 0; display: flex; align-items: center; gap: .55rem; border: 0; background: transparent; padding: .8rem .85rem; text-align: left; }
@@ -141,8 +146,8 @@
       aside { border-right: 0; border-bottom: 1px solid var(--border); }
       .workspace { padding: .7rem; }
       .three { grid-template-columns: 1fr; }
-      .row { flex-wrap: wrap; }
-      .row > * { flex: 1 1 180px; }
+      .row > :not(.btn):not(.fit) { flex: 1 1 180px; }
+      .row > .btn { flex: 0 0 auto; }
       #toggleProjectTools { display: block; }
       #projectTools { display: none; }
       aside { padding: .7rem; }
