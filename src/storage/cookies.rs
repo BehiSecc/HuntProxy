@@ -7,6 +7,125 @@ use crate::storage::Db;
 use rusqlite::{params, OptionalExtension};
 
 impl Db {
+    pub async fn upsert_named_cookie_profile(
+        &self,
+        project_id: ProjectId,
+        name: &str,
+        profile: ValidatedCookieProfile,
+    ) -> DomainResult<CookieProfileStatus> {
+        validate_profile_name(name)?;
+        self.get_project(project_id).await?;
+        let name = name.to_string();
+        let now = now_rfc3339();
+        let names_json = cookie_metadata_json(&profile)?;
+        self.with_conn(move |connection| {
+            let created_at = connection
+                .query_row(
+                    "SELECT created_at FROM named_cookie_profiles WHERE project_id=?1 AND name=?2",
+                    params![project_id.get(), name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?
+                .unwrap_or_else(|| now.clone());
+            connection
+                .execute(
+                    "INSERT INTO named_cookie_profiles
+                 (project_id, name, target_url, cookie_header, names_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(project_id, name) DO UPDATE SET
+                   target_url=excluded.target_url, cookie_header=excluded.cookie_header,
+                   names_json=excluded.names_json, updated_at=excluded.updated_at",
+                    params![
+                        project_id.get(),
+                        name,
+                        profile.target_url,
+                        profile.cookie_header,
+                        names_json,
+                        now
+                    ],
+                )
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            Ok(CookieProfileStatus {
+                project_id,
+                host: profile.host,
+                target_url: profile.target_url,
+                names: profile.names.clone(),
+                cookie_count: profile.names.len(),
+                created_at,
+                updated_at: now,
+            })
+        })
+        .await
+    }
+
+    pub async fn list_named_cookie_profiles(
+        &self,
+        project_id: ProjectId,
+    ) -> DomainResult<Vec<(String, CookieProfileStatus)>> {
+        self.get_project(project_id).await?;
+        self.with_conn(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name, target_url, cookie_header, names_json, created_at, updated_at
+                 FROM named_cookie_profiles WHERE project_id=?1 ORDER BY name",
+                )
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            let rows = statement
+                .query_map(params![project_id.get()], |row| {
+                    let name: String = row.get(0)?;
+                    let profile = row_to_named_profile(project_id, row)?;
+                    Ok((name, profile.status()))
+                })
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            rows.map(|row| {
+                row.map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+            })
+            .collect()
+        })
+        .await
+    }
+
+    pub async fn get_named_cookie_profile(
+        &self,
+        project_id: ProjectId,
+        name: &str,
+    ) -> DomainResult<Option<StoredCookieProfile>> {
+        validate_profile_name(name)?;
+        let name = name.to_string();
+        self.with_conn(move |connection| {
+            connection
+                .query_row(
+                    "SELECT name, target_url, cookie_header, names_json, created_at, updated_at
+                 FROM named_cookie_profiles WHERE project_id=?1 AND name=?2",
+                    params![project_id.get(), name],
+                    |row| row_to_named_profile(project_id, row),
+                )
+                .optional()
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+        })
+        .await
+    }
+
+    pub async fn delete_named_cookie_profile(
+        &self,
+        project_id: ProjectId,
+        name: &str,
+    ) -> DomainResult<bool> {
+        validate_profile_name(name)?;
+        let name = name.to_string();
+        self.with_conn(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM named_cookie_profiles WHERE project_id=?1 AND name=?2",
+                    params![project_id.get(), name],
+                )
+                .map(|count| count > 0)
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+        })
+        .await
+    }
+
     pub async fn upsert_cookie_profile(
         &self,
         project_id: ProjectId,
@@ -248,6 +367,64 @@ impl Db {
     }
 }
 
+fn validate_profile_name(name: &str) -> DomainResult<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(DomainError::invalid(
+            "cookie profile name must use 1-64 letters, digits, hyphens, or underscores",
+        ));
+    }
+    Ok(())
+}
+
+fn cookie_metadata_json(profile: &ValidatedCookieProfile) -> DomainResult<String> {
+    let metadata = match &profile.managed_cookies {
+        Some(managed_cookies) => CookieMetadata::Structured {
+            names: profile.names.clone(),
+            managed_cookies: managed_cookies.clone(),
+        },
+        None => CookieMetadata::Legacy(profile.names.clone()),
+    };
+    serde_json::to_string(&metadata)
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+}
+
+fn row_to_named_profile(
+    project_id: ProjectId,
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredCookieProfile> {
+    let target_url: String = row.get(1)?;
+    let host = url::Url::parse(&target_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let names_json: String = row.get(3)?;
+    let metadata: CookieMetadata = serde_json::from_str(&names_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let (names, managed_cookies) = match metadata {
+        CookieMetadata::Legacy(names) => (names, None),
+        CookieMetadata::Structured {
+            names,
+            managed_cookies,
+        } => (names, Some(managed_cookies)),
+    };
+    Ok(StoredCookieProfile {
+        project_id,
+        host,
+        target_url,
+        cookie_header: row.get(2)?,
+        names,
+        managed_cookies,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
 fn load_profile(
     connection: &rusqlite::Connection,
     project_id: ProjectId,
@@ -479,5 +656,76 @@ mod tests {
                 .value,
             "raw-newer"
         );
+    }
+
+    #[tokio::test]
+    async fn named_profiles_allow_two_isolated_identities_for_one_host() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "named".into(),
+                target_url: "https://example.com".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        db.upsert_named_cookie_profile(
+            project.id,
+            "first",
+            validate_cookie_profile("https://example.com", "sid=one".into()).unwrap(),
+        )
+        .await
+        .unwrap();
+        db.upsert_named_cookie_profile(
+            project.id,
+            "second",
+            validate_cookie_profile("https://example.com", "sid=two".into()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.list_named_cookie_profiles(project.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            db.get_named_cookie_profile(project.id, "first")
+                .await
+                .unwrap()
+                .unwrap()
+                .cookie_header,
+            "sid=one"
+        );
+        assert_eq!(
+            db.get_named_cookie_profile(project.id, "second")
+                .await
+                .unwrap()
+                .unwrap()
+                .cookie_header,
+            "sid=two"
+        );
+        assert_eq!(
+            db.get_named_cookie_profile(project.id, "first")
+                .await
+                .unwrap()
+                .unwrap()
+                .cookie_header_for_url("https://other.example.com/")
+                .unwrap(),
+            None,
+            "raw named identities are exact-host scoped"
+        );
+        assert!(
+            db.get_cookie_profile_for_target(project.id, "https://example.com")
+                .await
+                .unwrap()
+                .is_none(),
+            "named profiles do not affect the active jar"
+        );
+        assert!(db
+            .delete_named_cookie_profile(project.id, "first")
+            .await
+            .unwrap());
     }
 }

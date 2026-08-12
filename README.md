@@ -84,6 +84,12 @@ cookie pairs for each managed request URL. Values remain hidden from normal tool
 Matching cookies are then used automatically by Reply, Fuzzer, and new or
 active browser sessions. Raw Reply remains byte-exact unless
 `use_project_cookies: true` is explicitly set.
+
+For identity-aware extensions such as AuthAnalyzer, add `profile_name` while
+setting cookies to store an independently selectable identity without changing
+the active project jar. Extension inputs can then use `{"profile":"name"}`.
+They can also use `cookie_file`; the host reads and validates that file once at
+job start, and cookie values are never passed into plugin code or results.
 The managed cookie jar is explicit: proxy and Reply `Set-Cookie` responses do
 not silently overwrite it. Browser responses update the separate persistent
 Chromium profile in the normal browser way.

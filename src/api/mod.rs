@@ -857,12 +857,20 @@ impl Drop for DeleteOnDrop {
 struct SetCookieBody {
     target_url: String,
     cookie: serde_json::Value,
+    profile_name: Option<String>,
 }
 
 async fn list_project_cookies(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
-    match state.db.list_cookie_profiles(ProjectId(id)).await {
-        Ok(profiles) => Json(serde_json::json!({ "profiles": profiles })).into_response(),
-        Err(error) => error_response(error),
+    let project_id = ProjectId(id);
+    match (
+        state.db.list_cookie_profiles(project_id).await,
+        state.db.list_named_cookie_profiles(project_id).await,
+    ) {
+        (Ok(profiles), Ok(named)) => Json(serde_json::json!({
+            "profiles": profiles,
+            "named_profiles": named.into_iter().map(|(name, profile)| serde_json::json!({"name":name,"profile":profile})).collect::<Vec<_>>()
+        })).into_response(),
+        (Err(error), _) | (_, Err(error)) => error_response(error),
     }
 }
 
@@ -875,16 +883,34 @@ async fn set_project_cookie(
         Ok(cookie) => cookie,
         Err(error) => return error_response(error),
     };
-    match crate::cookies::set_project_cookie(&state, ProjectId(id), &body.target_url, cookie).await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(error) => error_response(error),
+    if let Some(name) = body.profile_name.as_deref() {
+        let profile = match crate::cookies::validate_cookie_profile(&body.target_url, cookie) {
+            Ok(profile) => profile,
+            Err(error) => return error_response(error),
+        };
+        match state
+            .db
+            .upsert_named_cookie_profile(ProjectId(id), name, profile)
+            .await
+        {
+            Ok(profile) => Json(serde_json::json!({"name":name,"profile":profile,"active":false}))
+                .into_response(),
+            Err(error) => error_response(error),
+        }
+    } else {
+        match crate::cookies::set_project_cookie(&state, ProjectId(id), &body.target_url, cookie)
+            .await
+        {
+            Ok(result) => Json(result).into_response(),
+            Err(error) => error_response(error),
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct ClearCookieBody {
-    target_url: String,
+    target_url: Option<String>,
+    profile_name: Option<String>,
 }
 
 async fn clear_project_cookie(
@@ -892,7 +918,21 @@ async fn clear_project_cookie(
     Path(id): Path<i64>,
     Json(body): Json<ClearCookieBody>,
 ) -> Response {
-    match crate::cookies::clear_project_cookie(&state, ProjectId(id), &body.target_url).await {
+    if let Some(name) = body.profile_name.as_deref() {
+        return match state
+            .db
+            .delete_named_cookie_profile(ProjectId(id), name)
+            .await
+        {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => error_response(error),
+        };
+    }
+    let Some(target_url) = body.target_url.as_deref() else {
+        return error_response(DomainError::invalid("target_url or profile_name required"));
+    };
+    match crate::cookies::clear_project_cookie(&state, ProjectId(id), target_url).await {
         Ok(Some(result)) => Json(result).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(error),

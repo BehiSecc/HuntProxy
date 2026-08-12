@@ -119,7 +119,11 @@ impl StoredCookieProfile {
 
     pub fn cookie_header_for_url(&self, target_url: &str) -> DomainResult<Option<String>> {
         let Some(cookies) = &self.managed_cookies else {
-            return Ok(Some(self.cookie_header.clone()));
+            let target = parse_cookie_target(target_url)?;
+            let host = target.host_str().unwrap_or_default().trim_end_matches('.');
+            return Ok(host
+                .eq_ignore_ascii_case(&self.host)
+                .then(|| self.cookie_header.clone()));
         };
         let target = parse_cookie_target(target_url)?;
         let now = unix_time_seconds();
@@ -133,6 +137,22 @@ impl StoredCookieProfile {
             .map(|cookie| format!("{}={}", cookie.name, cookie.value))
             .collect::<Vec<_>>();
         Ok((!pairs.is_empty()).then(|| pairs.join("; ")))
+    }
+}
+
+impl ValidatedCookieProfile {
+    pub fn cookie_header_for_url(&self, target_url: &str) -> DomainResult<Option<String>> {
+        let profile = StoredCookieProfile {
+            project_id: ProjectId(0),
+            host: self.host.clone(),
+            target_url: self.target_url.clone(),
+            cookie_header: self.cookie_header.clone(),
+            names: self.names.clone(),
+            managed_cookies: self.managed_cookies.clone(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        profile.cookie_header_for_url(target_url)
     }
 }
 

@@ -323,7 +323,7 @@ fn tool_defs() -> Value {
         {"name":"job_cancel","description":"Cancel an active extension job.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
         {"name":"job_results","description":"Read completed extension output. summary is compact (default); findings returns a stable page; full returns complete non-finding data plus a paged findings array.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"},"view":{"type":"string","enum":["summary","findings","full"],"default":"summary"},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":100,"default":25}},"required":["job_id"],"additionalProperties":false}},
         {"name":"capture_sessions","description":"List proxy capture credentials, create a one-time credential, revoke one, or renew one. create returns the secret once; copy it immediately. revoke and renew require session_id. This does not start Chromium; use browser_start for browser traffic.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","revoke","renew"]},"session_id":{"type":"integer","description":"Required for revoke and renew."}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
+        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file. profile_name stores an independently selectable identity for identity-aware extensions instead of changing the active cookie jar.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
         {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; exchange_id:3011; response_hash:abc123; (request:~this OR request:~that) method:PUT. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Return an alphanumerically sorted host/path tree derived from saved project history, including methods, statuses, query parameters, content types, and exchange counts. Omit host for every host or provide one exact host.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive."}},"required":["project_id"]}},
@@ -878,7 +878,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
             match action {
                 "list" => Ok(json!({
-                    "profiles": state.db.list_cookie_profiles(project_id).await?
+                    "profiles": state.db.list_cookie_profiles(project_id).await?,
+                    "named_profiles": state.db.list_named_cookie_profiles(project_id).await?.into_iter().map(|(name, profile)| json!({"name":name,"profile":profile})).collect::<Vec<_>>()
                 })),
                 "set" => {
                     let target_url = args
@@ -898,24 +899,34 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             ))
                         }
                     };
-                    Ok(json!(
-                        crate::cookies::set_project_cookie(&state, project_id, target_url, cookie,)
+                    if let Some(name) = args.get("profile_name").and_then(Value::as_str) {
+                        let profile = crate::cookies::validate_cookie_profile(target_url, cookie)?;
+                        Ok(
+                            json!({"profile": state.db.upsert_named_cookie_profile(project_id, name, profile).await?, "name": name, "active": false}),
+                        )
+                    } else {
+                        Ok(json!(
+                            crate::cookies::set_project_cookie(
+                                &state, project_id, target_url, cookie
+                            )
                             .await?
-                    ))
+                        ))
+                    }
                 }
                 "clear" => {
-                    let target_url = args
-                        .get("target_url")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| DomainError::invalid("target_url required"))?;
-                    Ok(json!({
-                        "cleared": crate::cookies::clear_project_cookie(
-                            &state,
-                            project_id,
-                            target_url,
+                    if let Some(name) = args.get("profile_name").and_then(Value::as_str) {
+                        Ok(
+                            json!({"cleared": state.db.delete_named_cookie_profile(project_id, name).await?, "name": name}),
                         )
-                        .await?
-                    }))
+                    } else {
+                        let target_url = args
+                            .get("target_url")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| DomainError::invalid("target_url required"))?;
+                        Ok(
+                            json!({"cleared": crate::cookies::clear_project_cookie(&state, project_id, target_url).await?}),
+                        )
+                    }
                 }
                 _ => Err(DomainError::invalid("action must be set|list|clear")),
             }

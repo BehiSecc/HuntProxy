@@ -477,6 +477,21 @@ struct PluginHttpRequest {
     body_params: Vec<PluginParamPatch>,
     #[serde(default)]
     credential_mode: PluginCredentialMode,
+    identity: Option<PluginIdentitySelector>,
+    identity_comparison: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginIdentitySelector {
+    profile: Option<String>,
+    cookie_file: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedPluginIdentity {
+    Profile(crate::cookies::StoredCookieProfile),
+    CookieInput(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -1118,7 +1133,18 @@ impl PluginService {
                     format!("plugin operation requires {required} capability"),
                 ));
             }
+            if operation_identity_selectors(operation).next().is_some() && !privileged_identity {
+                return Err(DomainError::new(
+                    ErrorCode::Forbidden,
+                    "plugin identity selectors require identity.use capability",
+                ));
+            }
         }
+        let resolved_identities = Arc::new(
+            self.resolve_plugin_identities(project_id, input, &plan.operations)
+                .await?,
+        );
+        validate_resolved_identity_comparisons(&plan.operations, &resolved_identities)?;
         job.view.write().operation_count = planned_requests;
         job.view.write().phase = PluginJobPhase::Executing;
         let project_id = job.view.read().project_id;
@@ -1158,6 +1184,7 @@ impl PluginService {
                             operation,
                             &project.scope,
                             target_host.as_deref(),
+                            &resolved_identities,
                             &job.cancel,
                         )
                         .await
@@ -1204,6 +1231,7 @@ impl PluginService {
                 let plugin_name = plugin.manifest.name.clone();
                 let scope = project.scope.clone();
                 let target_host = target_host.clone();
+                let resolved_identities = resolved_identities.clone();
                 let next_slot = next_slot.clone();
                 async move {
                     let operation_id = operation.id().to_string();
@@ -1221,7 +1249,7 @@ impl PluginService {
                         _ = tokio::time::sleep_until(ready_at) => {}
                     }
                     let result = service
-                        .execute_operation(project_id, &plugin_id, &plugin_name, operation, &scope, target_host.as_deref(), &job.cancel)
+                        .execute_operation(project_id, &plugin_id, &plugin_name, operation, &scope, target_host.as_deref(), &resolved_identities, &job.cancel)
                         .await;
                     job.view.write().completed_operations += completed_count;
                     isolate_operation_result(operation_id, result)
@@ -1237,6 +1265,29 @@ impl PluginService {
                 ErrorCode::Cancelled,
                 "plugin job cancelled",
             ));
+        }
+        let execution_evidence_exchange_ids = collect_exchange_ids(&json!(observations));
+        let partial_result = json!({
+            "plan_result": plan.result.clone(),
+            "execution": {"evidence_exchange_ids": execution_evidence_exchange_ids},
+            "analysis": Value::Null,
+            "persisted_findings": [],
+        });
+        let partial_result = self
+            .redact_plugin_output(project_id, base_exchange_id, partial_result)
+            .await?;
+        if serde_json::to_vec(&partial_result).map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES)
+        {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "plugin partial result exceeds 8 MiB",
+            ));
+        }
+        job.view.write().result = Some(partial_result);
+        let job_id = job.view.read().id;
+        for exchange_id in &execution_evidence_exchange_ids {
+            self.annotate_plugin_job_exchange(project_id, *exchange_id, job_id)
+                .await?;
         }
         job.view.write().phase = PluginJobPhase::Analyzing;
         let analyzed =
@@ -1321,7 +1372,7 @@ impl PluginService {
                 );
             }
         }
-        let result = json!({"plan_result": plan.result, "analysis": analyzed, "persisted_findings": persisted_findings});
+        let result = json!({"plan_result": plan.result, "execution": {"evidence_exchange_ids": execution_evidence_exchange_ids}, "analysis": analyzed, "persisted_findings": persisted_findings});
         let result = self
             .redact_plugin_output(project_id, base_exchange_id, result)
             .await?;
@@ -1336,6 +1387,50 @@ impl PluginService {
             ));
         }
         Ok(result)
+    }
+
+    async fn resolve_plugin_identities(
+        &self,
+        project_id: ProjectId,
+        input: &Value,
+        operations: &[PluginOperation],
+    ) -> DomainResult<HashMap<String, ResolvedPluginIdentity>> {
+        let authorized = collect_input_identity_selector_keys(input)?;
+        let selectors = operations
+            .iter()
+            .flat_map(operation_identity_selectors)
+            .map(|selector| Ok((identity_selector_key(selector)?, selector.clone())))
+            .collect::<DomainResult<Vec<_>>>()?;
+        let mut resolved = HashMap::new();
+        for (key, selector) in selectors {
+            if !authorized.contains(&key) {
+                return Err(DomainError::new(
+                    ErrorCode::Forbidden,
+                    "plugin planned an identity selector not explicitly supplied in action input",
+                ));
+            }
+            if resolved.contains_key(&key) {
+                continue;
+            }
+            let identity = if let Some(name) = selector.profile.as_deref() {
+                let profile = self
+                    .db
+                    .get_named_cookie_profile(project_id, name)
+                    .await?
+                    .ok_or_else(|| {
+                        DomainError::not_found(format!("named cookie profile {name}"))
+                    })?;
+                ResolvedPluginIdentity::Profile(profile)
+            } else if let Some(path) = selector.cookie_file.as_deref() {
+                ResolvedPluginIdentity::CookieInput(crate::cookies::read_cookie_file(Path::new(
+                    path,
+                ))?)
+            } else {
+                unreachable!()
+            };
+            resolved.insert(key, identity);
+        }
+        Ok(resolved)
     }
 
     async fn redact_plugin_output(
@@ -1398,7 +1493,14 @@ impl PluginService {
             "request_preview": detail.request_preview.clone(),
         });
         if page_discovery_access {
-            match crate::page_analyzer::discover_passive_targets(&self.db, project_id, exchange_id, 64).await {
+            match crate::page_analyzer::discover_passive_targets(
+                &self.db,
+                project_id,
+                exchange_id,
+                64,
+            )
+            .await
+            {
                 Ok(analysis) => {
                     context["page_discovery"] = serde_json::to_value(analysis)
                         .unwrap_or_else(|_| json!({"available": false}));
@@ -1532,6 +1634,7 @@ impl PluginService {
         workflow: PluginHttpWorkflow,
         scope: &ScopePolicy,
         target_host: Option<&str>,
+        resolved_identities: &HashMap<String, ResolvedPluginIdentity>,
         cancel: &CancellationToken,
     ) -> DomainResult<Value> {
         validate_workflow_name(&workflow.id, "id")?;
@@ -1604,6 +1707,7 @@ impl PluginService {
                 PluginOperation::HttpRequest(request),
                 scope,
                 target_host,
+                resolved_identities,
                 cancel,
             ))
             .await;
@@ -1835,6 +1939,7 @@ impl PluginService {
         operation: PluginOperation,
         scope: &ScopePolicy,
         target_host: Option<&str>,
+        resolved_identities: &HashMap<String, ResolvedPluginIdentity>,
         cancel: &CancellationToken,
     ) -> DomainResult<Value> {
         match operation {
@@ -1874,6 +1979,11 @@ impl PluginService {
                     ));
                 };
                 enforce_plugin_scope(&effective_url, scope, target_host)?;
+                let identity_cookie = resolve_operation_identity_cookie(
+                    request.identity.as_ref(),
+                    resolved_identities,
+                    &effective_url,
+                )?;
                 if request.body_text.is_some() && request.body_base64.is_some() {
                     return Err(DomainError::invalid(
                         "plugin request body_text and body_base64 are mutually exclusive",
@@ -1889,7 +1999,11 @@ impl PluginService {
                     })?;
                 let mut url_override = request.url;
                 let mut header_overrides = request.headers;
-                let credential_mode = request.credential_mode;
+                let credential_mode = if request.identity.is_some() {
+                    PluginCredentialMode::WithoutProjectCredentials
+                } else {
+                    request.credential_mode
+                };
                 if !request.query_params.is_empty() {
                     let mut url = url::Url::parse(&effective_url).map_err(|error| {
                         DomainError::invalid(format!("invalid plugin request URL: {error}"))
@@ -2022,6 +2136,13 @@ impl PluginService {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
                 };
+                if let Some(cookie) = identity_cookie {
+                    header_overrides.retain(|header| !header.name.eq_ignore_ascii_case("cookie"));
+                    header_overrides.push(HeaderPatch {
+                        name: "Cookie".into(),
+                        value: cookie.into_bytes(),
+                    });
+                }
                 let draft = ReplyDraft {
                     method: request.method,
                     url: url_override,
@@ -2106,6 +2227,7 @@ impl PluginService {
                     workflow,
                     scope,
                     target_host,
+                    resolved_identities,
                     cancel,
                 )
                 .await
@@ -2976,6 +3098,37 @@ impl PluginService {
             .await?;
         Ok(())
     }
+
+    async fn annotate_plugin_job_exchange(
+        &self,
+        project_id: ProjectId,
+        exchange_id: ExchangeId,
+        job_id: Uuid,
+    ) -> DomainResult<()> {
+        let existing = self.db.get_annotation(project_id, exchange_id).await?;
+        let mut labels = existing
+            .as_ref()
+            .map(|value| value.labels.clone())
+            .unwrap_or_default();
+        labels.push(format!("plugin-job:{job_id}"));
+        labels.sort_by_key(|label| label.to_ascii_lowercase());
+        labels.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        self.db
+            .upsert_annotation(
+                project_id,
+                exchange_id,
+                AnnotationUpdate {
+                    display_title: existing
+                        .as_ref()
+                        .and_then(|value| value.display_title.clone()),
+                    note: existing.as_ref().and_then(|value| value.note.clone()),
+                    labels,
+                    expected_revision: existing.map(|value| value.revision),
+                },
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 fn remove_remediation_fields(value: &mut Value) {
@@ -3010,12 +3163,18 @@ fn summarize_plugin_result(result: &Value) -> Value {
     if let Some(object) = plan_result.as_object_mut() {
         object.remove("coverage");
     }
-    let mut analysis_result = compact_json(result.pointer("/analysis/result").unwrap_or(&Value::Null), 0);
+    let mut analysis_result = compact_json(
+        result.pointer("/analysis/result").unwrap_or(&Value::Null),
+        0,
+    );
     if let Some(object) = analysis_result.as_object_mut() {
         object.remove("follow_up");
     }
     json!({
         "plan_result": plan_result,
+        "execution_evidence": {
+            "count": result.pointer("/execution/evidence_exchange_ids").and_then(Value::as_array).map_or(0, Vec::len)
+        },
         "analysis_result": analysis_result,
         "follow_up": follow_up,
         "persisted_findings": result
@@ -4345,6 +4504,149 @@ fn isolate_operation_result(
     }
 }
 
+fn collect_exchange_ids(value: &Value) -> Vec<ExchangeId> {
+    fn visit(value: &Value, ids: &mut BTreeSet<i64>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(id) = object.get("exchange_id").and_then(Value::as_i64) {
+                    if id > 0 {
+                        ids.insert(id);
+                    }
+                }
+                object.values().for_each(|child| visit(child, ids));
+            }
+            Value::Array(items) => items.iter().for_each(|child| visit(child, ids)),
+            _ => {}
+        }
+    }
+    let mut ids = BTreeSet::new();
+    visit(value, &mut ids);
+    ids.into_iter().map(ExchangeId).collect()
+}
+
+fn operation_identity_selectors(
+    operation: &PluginOperation,
+) -> Box<dyn Iterator<Item = &PluginIdentitySelector> + '_> {
+    match operation {
+        PluginOperation::HttpRequest(request) => Box::new(request.identity.iter()),
+        PluginOperation::HttpWorkflow(workflow) => Box::new(
+            workflow
+                .steps
+                .iter()
+                .filter_map(|step| step.request.identity.as_ref()),
+        ),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+fn collect_input_identity_selector_keys(input: &Value) -> DomainResult<BTreeSet<String>> {
+    fn visit(value: &Value, keys: &mut BTreeSet<String>) -> DomainResult<()> {
+        match value {
+            Value::Object(object) => {
+                let profile = object.get("profile").and_then(Value::as_str);
+                let cookie_file = object.get("cookie_file").and_then(Value::as_str);
+                if profile.is_some() || cookie_file.is_some() {
+                    keys.insert(identity_selector_key(&PluginIdentitySelector {
+                        profile: profile.map(str::to_string),
+                        cookie_file: cookie_file.map(str::to_string),
+                    })?);
+                }
+                for child in object.values() {
+                    visit(child, keys)?;
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    visit(child, keys)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut keys = BTreeSet::new();
+    visit(input, &mut keys)?;
+    Ok(keys)
+}
+
+fn identity_selector_key(selector: &PluginIdentitySelector) -> DomainResult<String> {
+    match (selector.profile.as_deref(), selector.cookie_file.as_deref()) {
+        (Some(name), None) if !name.is_empty() => Ok(format!("profile:{name}")),
+        (None, Some(path)) if !path.is_empty() => Ok(format!("file:{path}")),
+        _ => Err(DomainError::invalid(
+            "plugin identity must provide exactly one non-empty profile or cookie_file",
+        )),
+    }
+}
+
+fn resolve_operation_identity_cookie(
+    selector: Option<&PluginIdentitySelector>,
+    resolved: &HashMap<String, ResolvedPluginIdentity>,
+    target_url: &str,
+) -> DomainResult<Option<String>> {
+    let Some(selector) = selector else {
+        return Ok(None);
+    };
+    let key = identity_selector_key(selector)?;
+    let identity = resolved
+        .get(&key)
+        .ok_or_else(|| DomainError::new(ErrorCode::Internal, "plugin identity was not resolved"))?;
+    let cookie = match identity {
+        ResolvedPluginIdentity::Profile(profile) => profile.cookie_header_for_url(target_url)?,
+        ResolvedPluginIdentity::CookieInput(input) => {
+            crate::cookies::validate_cookie_profile(target_url, input.clone())?
+                .cookie_header_for_url(target_url)?
+        }
+    };
+    cookie
+        .ok_or_else(|| {
+            DomainError::invalid("plugin identity has no applicable cookies for request URL")
+        })
+        .map(Some)
+}
+
+fn validate_resolved_identity_comparisons(
+    operations: &[PluginOperation],
+    resolved: &HashMap<String, ResolvedPluginIdentity>,
+) -> DomainResult<()> {
+    let mut groups = HashMap::<String, HashMap<String, String>>::new();
+    for operation in operations {
+        let PluginOperation::HttpRequest(request) = operation else {
+            continue;
+        };
+        let (Some(group), Some(selector), Some(base_id)) = (
+            &request.identity_comparison,
+            &request.identity,
+            request.base_exchange_id,
+        ) else {
+            continue;
+        };
+        let key = identity_selector_key(selector)?;
+        let identity = resolved.get(&key).ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::Internal,
+                "plugin comparison identity was not resolved",
+            )
+        })?;
+        let fingerprint = match identity {
+            ResolvedPluginIdentity::Profile(profile) => profile.cookie_header.clone(),
+            ResolvedPluginIdentity::CookieInput(input) => input.clone(),
+        };
+        let comparison_key = format!("{group}:{base_id:?}");
+        let members = groups.entry(comparison_key).or_default();
+        if members
+            .values()
+            .any(|existing| existing == &fingerprint && !members.contains_key(&key))
+        {
+            return Err(DomainError::invalid(
+                "identity comparison sources resolve to identical cookie credentials",
+            ));
+        }
+        members.insert(key, fingerprint);
+    }
+    Ok(())
+}
+
 fn skipped_operation_observation(operation: &PluginOperation) -> Value {
     json!({
         "id": operation.id(),
@@ -4879,6 +5181,28 @@ mod tests {
                 .len(),
             1
         );
+
+        let failed = test_job(PluginJobState::Failed);
+        let failed_id = failed.view.read().id;
+        failed.view.write().result = Some(json!({
+            "plan_result": {"request_shapes": 1},
+            "execution": {"evidence_exchange_ids": [41, 42]},
+            "analysis": null,
+            "persisted_findings": []
+        }));
+        service.jobs.insert(failed_id, failed);
+        let failed_summary = service
+            .results(failed_id, PluginResultView::Summary, 0, 25)
+            .unwrap();
+        assert!(failed_summary["result_available"].as_bool().unwrap());
+        assert_eq!(failed_summary["summary"]["execution_evidence"]["count"], 2);
+        let failed_full = service
+            .results(failed_id, PluginResultView::Full, 0, 25)
+            .unwrap();
+        assert_eq!(
+            failed_full["result"]["execution"]["evidence_exchange_ids"],
+            json!([41, 42])
+        );
     }
 
     #[test]
@@ -5257,6 +5581,7 @@ mod tests {
                 operation,
                 &project.scope,
                 Some("127.0.0.1"),
+                &HashMap::new(),
                 &CancellationToken::new(),
             ),
         )
@@ -5671,6 +5996,97 @@ mod tests {
         .unwrap_err();
         assert_eq!(cancelled.code(), ErrorCode::Cancelled);
         assert_eq!(normalize_operation_label("a:b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn execution_evidence_collects_nested_exchange_ids_once() {
+        let ids = collect_exchange_ids(&json!([
+            {"exchange_id": 3},
+            {"steps": [{"exchange_id": 1}, {"members": [{"exchange_id": 3}]}]},
+            {"error": {"code": "protocol_error"}}
+        ]));
+        assert_eq!(ids, vec![ExchangeId(1), ExchangeId(3)]);
+    }
+
+    #[test]
+    fn plugin_identity_selectors_are_exclusive_and_url_scoped() {
+        let selector = PluginIdentitySelector {
+            profile: Some("sco".into()),
+            cookie_file: None,
+        };
+        assert_eq!(identity_selector_key(&selector).unwrap(), "profile:sco");
+        assert!(identity_selector_key(&PluginIdentitySelector {
+            profile: Some("a".into()),
+            cookie_file: Some("b".into())
+        })
+        .is_err());
+        let profile = crate::cookies::validate_cookie_profile("https://example.test/admin", r#"[{"name":"sid","value":"secret","domain":"example.test","path":"/admin","secure":true}]"#.into()).unwrap();
+        let mut resolved = HashMap::new();
+        resolved.insert(
+            "profile:sco".into(),
+            ResolvedPluginIdentity::Profile(crate::cookies::StoredCookieProfile {
+                project_id: ProjectId(1),
+                host: profile.host,
+                target_url: profile.target_url,
+                cookie_header: profile.cookie_header,
+                names: profile.names,
+                managed_cookies: profile.managed_cookies,
+                created_at: String::new(),
+                updated_at: String::new(),
+            }),
+        );
+        assert_eq!(
+            resolve_operation_identity_cookie(
+                Some(&selector),
+                &resolved,
+                "https://example.test/admin/users"
+            )
+            .unwrap(),
+            Some("sid=secret".into())
+        );
+        assert!(resolve_operation_identity_cookie(
+            Some(&selector),
+            &resolved,
+            "https://example.test/public"
+        )
+        .is_err());
+        let input =
+            json!({"primary":{"profile":"sco"},"secondary":{"cookie_file":"/private/two.json"}});
+        let keys = collect_input_identity_selector_keys(&input).unwrap();
+        assert!(keys.contains("profile:sco"));
+        assert!(keys.contains("file:/private/two.json"));
+
+        let duplicate_operations: Vec<PluginOperation> = serde_json::from_value(json!([{
+            "type":"http_request", "id":"one", "base_exchange_id":42,
+            "identity":{"profile":"first"}, "identity_comparison":"auth-analyzer"
+        }, {
+            "type":"http_request", "id":"two", "base_exchange_id":42,
+            "identity":{"profile":"second"}, "identity_comparison":"auth-analyzer"
+        }]))
+        .unwrap();
+        let duplicate = crate::cookies::StoredCookieProfile {
+            project_id: ProjectId(1),
+            host: "example.test".into(),
+            target_url: "https://example.test/".into(),
+            cookie_header: "sid=same".into(),
+            names: vec!["sid".into()],
+            managed_cookies: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let mut duplicate_resolved = HashMap::new();
+        duplicate_resolved.insert(
+            "profile:first".into(),
+            ResolvedPluginIdentity::Profile(duplicate.clone()),
+        );
+        duplicate_resolved.insert(
+            "profile:second".into(),
+            ResolvedPluginIdentity::Profile(duplicate),
+        );
+        assert!(
+            validate_resolved_identity_comparisons(&duplicate_operations, &duplicate_resolved)
+                .is_err()
+        );
     }
 
     #[test]
