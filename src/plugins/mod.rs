@@ -40,7 +40,8 @@ const MAX_TIMEOUT_MS: u64 = 15 * 60_000;
 const DEFAULT_MAX_OPERATIONS: usize = 100;
 const MAX_OPERATIONS: usize = 10_000;
 const DEFAULT_MEMORY_MB: usize = 16;
-const MAX_MEMORY_MB: usize = 64;
+const MAX_MEMORY_MB: usize = 128;
+const MAX_ANALYSIS_OBSERVATION_BYTES: usize = 24 * 1024 * 1024;
 const DEFAULT_JS_STAGE_TIMEOUT_MS: u64 = 2_000;
 const MAX_JS_STAGE_TIMEOUT_MS: u64 = 120_000;
 const MAX_ACTIVE_JOBS: usize = 4;
@@ -647,6 +648,16 @@ struct PluginHttpRequest {
     credential_mode: PluginCredentialMode,
     identity: Option<PluginIdentitySelector>,
     identity_comparison: Option<String>,
+    observe: Option<PluginObservationPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct PluginObservationPolicy {
+    #[serde(default)]
+    body_bytes: usize,
+    #[serde(default)]
+    body_contains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1465,6 +1476,9 @@ impl PluginService {
                     "plugin identity selectors require identity.use capability",
                 ));
             }
+            for policy in operation_observation_policies(operation) {
+                validate_observation_policy(policy)?;
+            }
         }
         let resolved_identities = Arc::new(
             self.resolve_plugin_identities(project_id, input, &plan.operations)
@@ -1566,8 +1580,10 @@ impl PluginService {
             .ok()
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
         let rate = project.limits.requests_per_second.max(0.1);
-        let operations = if plan.execution == PluginExecution::Sequential {
+        let operations: Vec<DomainResult<Value>> = if plan.execution == PluginExecution::Sequential
+        {
             let mut observations = Vec::with_capacity(plan.operations.len());
+            let mut observation_bytes = 2usize;
             let mut operations = plan.operations.into_iter().peekable();
             let mut race_values = HashMap::<String, String>::new();
             let mut race_value_bytes = 0usize;
@@ -1618,20 +1634,28 @@ impl PluginService {
                 let failed = observation
                     .get("error")
                     .is_some_and(|error| !error.is_null());
-                observations.push(Ok(observation));
+                push_bounded_analysis_observation(
+                    &mut observations,
+                    observation,
+                    &mut observation_bytes,
+                )?;
                 if failed && plan.stop_on_error {
                     for skipped in operations {
-                        observations.push(Ok(skipped_operation_observation(&skipped)));
+                        push_bounded_analysis_observation(
+                            &mut observations,
+                            skipped_operation_observation(&skipped),
+                            &mut observation_bytes,
+                        )?;
                     }
                     break;
                 }
                 index += 1;
             }
-            observations
+            observations.into_iter().map(Ok).collect()
         } else {
             let spacing = Duration::from_secs_f64(1.0 / rate);
             let next_slot = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
-            stream::iter(plan.operations.into_iter().map(|operation| {
+            let mut pending = Box::pin(stream::iter(plan.operations.into_iter().map(|operation| {
                 let service = self.clone();
                 let job = job.clone();
                 let plugin_id = plugin.manifest.id.clone();
@@ -1662,11 +1686,28 @@ impl PluginService {
                     isolate_operation_result(operation_id, result)
                 }
             }))
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
-            .await
+            .buffer_unordered(concurrency));
+            let mut observations = Vec::new();
+            let mut observation_bytes = 2usize;
+            while let Some(observation) = pending.next().await {
+                push_bounded_analysis_observation(
+                    &mut observations,
+                    observation?,
+                    &mut observation_bytes,
+                )?;
+            }
+            observations.into_iter().map(Ok).collect()
         };
-        let observations = operations.into_iter().collect::<DomainResult<Vec<_>>>()?;
+        let raw_observations = operations.into_iter().collect::<DomainResult<Vec<_>>>()?;
+        let mut observations = Vec::with_capacity(raw_observations.len());
+        let mut observation_bytes = 2usize;
+        for observation in raw_observations {
+            push_bounded_analysis_observation(
+                &mut observations,
+                observation,
+                &mut observation_bytes,
+            )?;
+        }
         if job.cancel.is_cancelled() {
             return Err(DomainError::new(
                 ErrorCode::Cancelled,
@@ -1696,6 +1737,10 @@ impl PluginService {
             self.annotate_plugin_job_exchange(project_id, *exchange_id, job_id)
                 .await?;
         }
+        let observations = compact_analysis_observations(
+            Value::Array(observations),
+            MAX_ANALYSIS_OBSERVATION_BYTES,
+        )?;
         let observations_json = serde_json::to_vec(&observations).map_err(|error| {
             DomainError::invalid(format!("serialize plugin observations: {error}"))
         })?;
@@ -2731,6 +2776,8 @@ impl PluginService {
                 let mut response_headers = Vec::new();
                 let mut response_body_base64 = None;
                 let mut response_body_truncated = false;
+                let mut response_body_contains = BTreeMap::<String, bool>::new();
+                let mut response_body_search_complete = false;
                 if let Some(exchange_id) = response.exchange_id {
                     self.annotate_plugin_exchange(
                         project_id,
@@ -2753,9 +2800,22 @@ impl PluginService {
                         .load_raw_body(project_id, exchange_id, MessageSide::Response)
                         .await?
                     {
-                        let presented = plugin_response_body(&raw_response_headers, body);
+                        let policy = request.observe.as_ref();
+                        if let Some(policy) = policy {
+                            validate_observation_policy(policy)?;
+                        }
+                        let body_limit =
+                            policy.map_or(MAX_RESPONSE_BODY_FOR_PLUGIN, |value| value.body_bytes);
+                        let presented = plugin_response_body(
+                            &raw_response_headers,
+                            body,
+                            body_limit,
+                            policy.map_or(&[], |value| value.body_contains.as_slice()),
+                        );
                         response_body_base64 = presented.body_base64;
                         response_body_truncated = presented.truncated;
+                        response_body_contains = presented.contains;
+                        response_body_search_complete = presented.search_complete;
                     }
                 }
                 Ok(json!({
@@ -2769,6 +2829,8 @@ impl PluginService {
                     "response_headers": response_headers,
                     "response_body_base64": response_body_base64,
                     "response_body_truncated": response_body_truncated,
+                    "response_body_contains": response_body_contains,
+                    "response_body_search_complete": response_body_search_complete,
                 }))
             }
             PluginOperation::AwsApiGateway(operation) => {
@@ -3018,7 +3080,12 @@ impl PluginService {
                             .load_raw_body(project_id, exchange_id, MessageSide::Response)
                             .await?
                         {
-                            let presented = plugin_response_body(&raw_headers, body);
+                            let presented = plugin_response_body(
+                                &raw_headers,
+                                body,
+                                MAX_RESPONSE_BODY_FOR_PLUGIN,
+                                &[],
+                            );
                             response_body_hash = presented.body_base64.as_ref().map(|encoded| {
                                 let bytes = base64::engine::general_purpose::STANDARD
                                     .decode(encoded)
@@ -3277,7 +3344,7 @@ impl PluginService {
             .db
             .load_raw_body(project_id, exchange_id, MessageSide::Response)
             .await?
-            .map(|body| plugin_response_body(&headers, body));
+            .map(|body| plugin_response_body(&headers, body, MAX_RESPONSE_BODY_FOR_PLUGIN, &[]));
         Ok(json!({
             "response_headers": response_headers,
             "response_body_base64": body.as_ref().and_then(|body| body.body_base64.clone()),
@@ -4307,13 +4374,20 @@ async fn run_aws_control_helper(
 struct PluginResponseBody {
     body_base64: Option<String>,
     truncated: bool,
+    contains: BTreeMap<String, bool>,
+    search_complete: bool,
 }
 
 /// Plugin analyzers compare semantic responses. Supplying compressed wire bytes
 /// makes otherwise identical dynamic pages look unrelated, so decode bounded
 /// bodies here. Oversized or unsupported encodings deliberately fall back to
 /// Reply's already-decoded preview instead of exposing binary data as text.
-fn plugin_response_body(headers: &[HeaderEntry], mut body: Vec<u8>) -> PluginResponseBody {
+fn plugin_response_body(
+    headers: &[HeaderEntry],
+    mut body: Vec<u8>,
+    body_limit: usize,
+    needles: &[String],
+) -> PluginResponseBody {
     let encodings = headers
         .iter()
         .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
@@ -4331,15 +4405,33 @@ fn plugin_response_body(headers: &[HeaderEntry], mut body: Vec<u8>) -> PluginRes
                 return PluginResponseBody {
                     body_base64: None,
                     truncated: true,
+                    contains: BTreeMap::new(),
+                    search_complete: false,
                 };
             }
         }
     }
-    let truncated = body.len() > MAX_RESPONSE_BODY_FOR_PLUGIN;
-    body.truncate(MAX_RESPONSE_BODY_FOR_PLUGIN);
+    let contains = needles
+        .iter()
+        .map(|needle| {
+            (
+                needle.clone(),
+                !needle.is_empty()
+                    && body
+                        .windows(needle.len())
+                        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes())),
+            )
+        })
+        .collect();
+    let body_limit = body_limit.min(MAX_RESPONSE_BODY_FOR_PLUGIN);
+    let truncated = body.len() > body_limit;
+    body.truncate(body_limit);
     PluginResponseBody {
-        body_base64: Some(base64::engine::general_purpose::STANDARD.encode(body)),
+        body_base64: (body_limit > 0)
+            .then(|| base64::engine::general_purpose::STANDARD.encode(body)),
         truncated,
+        contains,
+        search_complete: true,
     }
 }
 
@@ -5176,6 +5268,139 @@ fn operation_identity_selectors(
     }
 }
 
+fn operation_observation_policies(
+    operation: &PluginOperation,
+) -> Box<dyn Iterator<Item = &PluginObservationPolicy> + '_> {
+    match operation {
+        PluginOperation::HttpRequest(request) => Box::new(request.observe.iter()),
+        PluginOperation::HttpWorkflow(workflow) => Box::new(
+            workflow
+                .steps
+                .iter()
+                .filter_map(|step| step.request.observe.as_ref()),
+        ),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+fn validate_observation_policy(policy: &PluginObservationPolicy) -> DomainResult<()> {
+    if policy.body_bytes > MAX_RESPONSE_BODY_FOR_PLUGIN {
+        return Err(DomainError::invalid(format!(
+            "observe.body_bytes cannot exceed {MAX_RESPONSE_BODY_FOR_PLUGIN}"
+        )));
+    }
+    if policy.body_contains.len() > 32
+        || policy
+            .body_contains
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 200)
+    {
+        return Err(DomainError::invalid(
+            "observe.body_contains accepts at most 32 non-empty strings of at most 200 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn compact_analysis_observations(mut observations: Value, maximum: usize) -> DomainResult<Value> {
+    if serde_json::to_vec(&observations).is_ok_and(|bytes| bytes.len() <= maximum) {
+        return Ok(observations);
+    }
+    fn omit(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if object
+                    .get("response_body_base64")
+                    .is_some_and(Value::is_string)
+                {
+                    object.insert("response_body_base64".into(), Value::Null);
+                    object.insert("response_body_truncated".into(), Value::Bool(true));
+                    object.insert(
+                        "response_body_omitted_reason".into(),
+                        Value::String("analysis_budget".into()),
+                    );
+                }
+                if object.get("response_base64").is_some_and(Value::is_string) {
+                    object.insert("response_base64".into(), Value::Null);
+                    object.insert("truncated".into(), Value::Bool(true));
+                    object.insert(
+                        "response_transcript_omitted_reason".into(),
+                        Value::String("analysis_budget".into()),
+                    );
+                }
+                if object
+                    .get("response_transcript_base64")
+                    .is_some_and(Value::is_string)
+                {
+                    object.insert("response_transcript_base64".into(), Value::Null);
+                    object.insert("response_transcript_truncated".into(), Value::Bool(true));
+                    object.insert(
+                        "response_transcript_omitted_reason".into(),
+                        Value::String("analysis_budget".into()),
+                    );
+                }
+                object.values_mut().for_each(omit);
+            }
+            Value::Array(items) => items.iter_mut().for_each(omit),
+            _ => {}
+        }
+    }
+    omit(&mut observations);
+    let size = serde_json::to_vec(&observations)
+        .map_err(|error| DomainError::invalid(error.to_string()))?
+        .len();
+    if size > maximum {
+        return Err(DomainError::new(ErrorCode::BodyTooLarge, format!("plugin observations remain larger than {maximum} bytes after omitting captured bodies")));
+    }
+    Ok(observations)
+}
+
+fn push_bounded_analysis_observation(
+    observations: &mut Vec<Value>,
+    mut observation: Value,
+    approximate_bytes: &mut usize,
+) -> DomainResult<()> {
+    let mut encoded = serde_json::to_vec(&observation)
+        .map_err(|error| DomainError::invalid(error.to_string()))?;
+    if approximate_bytes.saturating_add(encoded.len()) > MAX_ANALYSIS_OBSERVATION_BYTES {
+        match compact_analysis_observations(observation.clone(), 256 * 1024) {
+            Ok(compacted) => {
+                observation = compacted;
+                encoded = serde_json::to_vec(&observation)
+                    .map_err(|error| DomainError::invalid(error.to_string()))?;
+            }
+            Err(error) if error.code() == ErrorCode::BodyTooLarge => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if approximate_bytes.saturating_add(encoded.len()) > MAX_ANALYSIS_OBSERVATION_BYTES {
+        let operation_id = observation.get("id").cloned().unwrap_or(Value::Null);
+        let evidence = collect_exchange_ids(&observation)
+            .into_iter()
+            .map(|exchange_id| json!({"exchange_id": exchange_id}))
+            .collect::<Vec<_>>();
+        observation = json!({
+            "id": operation_id,
+            "error": {
+                "code": ErrorCode::BodyTooLarge.as_str(),
+                "message": "observation details omitted because the aggregate analysis budget was exhausted",
+            },
+            "evidence": evidence,
+        });
+        encoded = serde_json::to_vec(&observation)
+            .map_err(|error| DomainError::invalid(error.to_string()))?;
+        if approximate_bytes.saturating_add(encoded.len()) > MAX_ANALYSIS_OBSERVATION_BYTES {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "plugin observation index exceeds the aggregate analysis budget",
+            ));
+        }
+    }
+    *approximate_bytes += encoded.len();
+    observations.push(observation);
+    Ok(())
+}
+
 fn collect_input_identity_selector_keys(input: &Value) -> DomainResult<BTreeSet<String>> {
     fn visit(value: &Value, keys: &mut BTreeSet<String>) -> DomainResult<()> {
         match value {
@@ -5527,7 +5752,7 @@ async fn run_js_stage_with_timeout(
         .map_err(|error| DomainError::invalid(error.to_string()))?;
     let context =
         serde_json::to_string(context).map_err(|error| DomainError::invalid(error.to_string()))?;
-    let memory = plugin
+    let configured_memory = plugin
         .manifest
         .limits
         .memory_mb
@@ -5535,6 +5760,20 @@ async fn run_js_stage_with_timeout(
         .clamp(4, MAX_MEMORY_MB)
         * 1024
         * 1024;
+    // Parsing observations into QuickJS necessarily duplicates their serialized
+    // representation, and analyzers may temporarily normalize or decode bodies.
+    // Give large, bounded stages proportional headroom instead of applying a
+    // fixed heap that can be smaller than the input plus its parse tree.
+    let dynamic_memory = observations
+        .len()
+        .saturating_mul(4)
+        .saturating_add(script.len())
+        .saturating_add(input.len())
+        .saturating_add(context.len())
+        .saturating_add(16 * 1024 * 1024);
+    let memory = configured_memory
+        .max(dynamic_memory)
+        .min(MAX_MEMORY_MB * 1024 * 1024);
     let configured_timeout_ms = plugin
         .manifest
         .limits
@@ -5985,6 +6224,71 @@ mod tests {
         .unwrap();
         assert_eq!(analysis, json!({"count":770,"tail":9500}));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn analysis_observation_budget_omits_bodies_but_keeps_proof_metadata() {
+        let observations = Value::Array((0..80).map(|index| json!({
+            "id": format!("probe-{index}"), "exchange_id": index + 1,
+            "response_body_hash": format!("hash-{index}"),
+            "response_body_base64": base64::engine::general_purpose::STANDARD.encode(vec![index as u8; 4096]),
+            "response_body_contains": {"marker": index == 79},
+            "response_preview": {"text":"bounded"}
+        })).collect());
+        let compacted = compact_analysis_observations(observations, 32 * 1024).unwrap();
+        assert!(serde_json::to_vec(&compacted).unwrap().len() <= 32 * 1024);
+        assert!(compacted[0]["response_body_base64"].is_null());
+        assert_eq!(
+            compacted[0]["response_body_omitted_reason"],
+            "analysis_budget"
+        );
+        assert_eq!(compacted[79]["response_body_contains"]["marker"], true);
+        assert_eq!(compacted[79]["response_body_hash"], "hash-79");
+        assert_eq!(compacted[79]["exchange_id"], 80);
+        let raw = compact_analysis_observations(
+            json!([{"response_transcript_base64":"eA==".repeat(100),"raw":{"exchange_id":9}}]),
+            160,
+        )
+        .unwrap();
+        assert!(raw[0]["response_transcript_base64"].is_null());
+        assert_eq!(
+            raw[0]["response_transcript_omitted_reason"],
+            "analysis_budget"
+        );
+    }
+
+    #[test]
+    fn observation_policy_is_bounded_before_execution() {
+        assert!(validate_observation_policy(&PluginObservationPolicy {
+            body_bytes: 0,
+            body_contains: vec!["marker".into()]
+        })
+        .is_ok());
+        assert!(validate_observation_policy(&PluginObservationPolicy {
+            body_bytes: MAX_RESPONSE_BODY_FOR_PLUGIN + 1,
+            body_contains: vec![]
+        })
+        .is_err());
+        assert!(validate_observation_policy(&PluginObservationPolicy {
+            body_bytes: 0,
+            body_contains: vec!["x".repeat(201)]
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn aggregate_budget_keeps_evidence_when_observation_metadata_is_oversized() {
+        let mut observations = Vec::new();
+        let mut bytes = MAX_ANALYSIS_OBSERVATION_BYTES - 1024;
+        push_bounded_analysis_observation(
+            &mut observations,
+            json!({"id":"oversized","exchange_id":77,"metadata":"x".repeat(300_000)}),
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(observations[0]["id"], "oversized");
+        assert_eq!(observations[0]["evidence"][0]["exchange_id"], 77);
+        assert_eq!(observations[0]["error"]["code"], "body_too_large");
     }
 
     #[test]
@@ -7094,8 +7398,10 @@ mod tests {
             value: b"gzip".to_vec(),
             ordinal: 0,
         }];
-        let presented = plugin_response_body(&headers, compressed);
+        let presented =
+            plugin_response_body(&headers, compressed, MAX_RESPONSE_BODY_FOR_PLUGIN, &[]);
         assert!(!presented.truncated);
+        assert!(presented.search_complete);
         assert_eq!(
             base64::engine::general_purpose::STANDARD
                 .decode(presented.body_base64.unwrap())
@@ -7110,7 +7416,10 @@ mod tests {
                 ordinal: 0,
             }],
             b"binary".to_vec(),
+            MAX_RESPONSE_BODY_FOR_PLUGIN,
+            &[],
         );
+        assert!(!unsupported.search_complete);
         assert!(unsupported.body_base64.is_none());
         assert!(unsupported.truncated);
     }
