@@ -1621,9 +1621,12 @@ impl PluginService {
             .max_concurrency
             .unwrap_or(4)
             .clamp(1, project.limits.max_concurrent_requests.max(1) as usize);
-        let target_host = url::Url::parse(&project.target_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+        // With no explicit host scope, base-exchange plugins must be able to
+        // replay the selected request even when the project's landing page is
+        // on a different host (for example, a lab catalog that opens a unique
+        // lab subdomain). The job remains pinned to exactly one implicit host.
+        let target_host =
+            implicit_plugin_target_host(&project.target_url, base_exchange_id.is_some(), &context);
         let rate = project.limits.requests_per_second.max(0.1);
         let operations: Vec<DomainResult<Value>> = if plan.execution == PluginExecution::Sequential
         {
@@ -5930,6 +5933,23 @@ fn enforce_plugin_scope(
     Ok(())
 }
 
+fn implicit_plugin_target_host(
+    project_target_url: &str,
+    has_base_exchange: bool,
+    context: &Value,
+) -> Option<String> {
+    let source = if has_base_exchange {
+        context
+            .pointer("/base_exchange/url")
+            .and_then(Value::as_str)
+    } else {
+        Some(project_target_url)
+    }?;
+    url::Url::parse(source)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
 fn load_plugin(directory: &Path) -> DomainResult<LoadedPlugin> {
     let manifest_path = directory.join("plugin.json");
     let metadata = std::fs::metadata(&manifest_path).map_err(|error| {
@@ -7609,6 +7629,51 @@ mod tests {
                 .unwrap_err()
                 .code(),
             ErrorCode::ScopeDenied
+        );
+    }
+
+    #[test]
+    fn plugin_scope_uses_selected_base_host_as_implicit_boundary() {
+        let context = json!({
+            "base_exchange": {"url":"https://lab.web-security-academy.net/change"}
+        });
+        let host = implicit_plugin_target_host(
+            "https://portswigger.net/web-security/all-labs",
+            true,
+            &context,
+        );
+        let scope = ScopePolicy::default();
+        assert_eq!(host.as_deref(), Some("lab.web-security-academy.net"));
+        assert!(enforce_plugin_scope(
+            "https://lab.web-security-academy.net/change",
+            &scope,
+            host.as_deref(),
+        )
+        .is_ok());
+        assert_eq!(
+            enforce_plugin_scope(
+                "https://portswigger.net/web-security/all-labs",
+                &scope,
+                host.as_deref(),
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::ScopeDenied
+        );
+        assert_eq!(
+            enforce_plugin_scope("https://unrelated.test/", &scope, host.as_deref())
+                .unwrap_err()
+                .code(),
+            ErrorCode::ScopeDenied
+        );
+        assert_eq!(
+            implicit_plugin_target_host(
+                "https://portswigger.net/web-security/all-labs",
+                false,
+                &Value::Null,
+            )
+            .as_deref(),
+            Some("portswigger.net")
         );
     }
 
