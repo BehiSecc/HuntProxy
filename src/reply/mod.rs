@@ -563,6 +563,8 @@ pub struct MaterializedRequest {
 pub struct ReplySendContext {
     pub source: ExchangeSource,
     pub lineage: ExchangeLineage,
+    /// Plugin operations revalidate their final URL after project rewrite rules.
+    pub plugin_target_host: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -609,6 +611,7 @@ impl ReplySendContext {
                 reply_tab_id: tab_id,
                 ..Default::default()
             },
+            plugin_target_host: None,
         }
     }
 
@@ -621,6 +624,7 @@ impl ReplySendContext {
                 fuzz_case_id: Some(case_id),
                 ..Default::default()
             },
+            plugin_target_host: None,
         }
     }
 }
@@ -726,6 +730,23 @@ impl ReplyService {
         // for the effective destination, not the draft destination.
         let mut applied_rules =
             crate::request_rules::apply_url_rules(&self.db, project_id, &mut mat.url).await?;
+        if let Some(target_host) = context.plugin_target_host.as_deref() {
+            if !url_is_in_scope(&mat.url, &project.scope)? {
+                return Err(DomainError::scope_denied(
+                    "plugin operation is outside project scope after URL rewrite rules",
+                ));
+            }
+            if project.scope.host_patterns.is_empty() {
+                let rewritten_host = url::Url::parse(&mat.url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+                if rewritten_host.as_deref() != Some(target_host) {
+                    return Err(DomainError::scope_denied(
+                        "plugin URL rewrite changed the project target host",
+                    ));
+                }
+            }
+        }
         let cookie_overridden = draft
             .header_overrides
             .iter()

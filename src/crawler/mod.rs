@@ -190,6 +190,7 @@ impl CrawlerService {
                         browser_action_id: detail.lineage.browser_action_id,
                         ..Default::default()
                     },
+                    plugin_target_host: None,
                 };
                 match self
                     .reply

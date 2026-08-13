@@ -1491,6 +1491,7 @@ impl PluginService {
             .await?;
         let context = json!({
             "api_version": PLUGIN_API_VERSION,
+            "execution_nonce": Uuid::new_v4().simple().to_string(),
             "plugin_id": plugin.manifest.id,
             "plugin_version": plugin.manifest.version,
             "action": action,
@@ -2816,6 +2817,7 @@ impl PluginService {
                 let context = ReplySendContext {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
+                    plugin_target_host: target_host.map(str::to_string),
                 };
                 if let Some(cookie) = identity_cookie {
                     header_overrides.retain(|header| !header.name.eq_ignore_ascii_case("cookie"));
@@ -2960,6 +2962,7 @@ impl PluginService {
                         ReplySendContext {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
+                            plugin_target_host: None,
                         },
                     ) => response?,
                 };
@@ -3077,7 +3080,7 @@ impl PluginService {
                                 bytes,
                                 use_project_cookies,
                                 options,
-                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default() },
+                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default(), plugin_target_host: None },
                             ) => response,
                         };
                         let observation = match result {
@@ -3121,6 +3124,7 @@ impl PluginService {
                         ReplySendContext {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
+                            plugin_target_host: None,
                         },
                     ) => response?,
                 };
@@ -3641,7 +3645,7 @@ impl PluginService {
             enforce_plugin_scope(&url, scope, target_host)?;
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() } }) => response?,
+                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() }, plugin_target_host: target_host.map(str::to_string) }) => response?,
             };
             if let Some(exchange_id) = response.exchange_id {
                 self.annotate_plugin_exchange(
@@ -3862,6 +3866,7 @@ impl PluginService {
                 ReplySendContext {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
+                    plugin_target_host: None,
                 },
             ) => result,
         };
@@ -3971,6 +3976,7 @@ impl PluginService {
                             parent_exchange_id: request.base_exchange_id,
                             ..Default::default()
                         },
+                        plugin_target_host: None,
                     },
                 ) => response?,
             };
