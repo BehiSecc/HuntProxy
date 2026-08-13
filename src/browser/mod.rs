@@ -161,6 +161,15 @@ pub struct ActionResult {
     pub error_code: Option<String>,
 }
 
+/// Result of a bounded, host-owned cross-site navigation template. Secret
+/// browser state is intentionally absent; network evidence is persisted by the
+/// normal proxy capture path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserCsrfProbeResult {
+    pub final_url: String,
+    pub navigations: Vec<Value>,
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeSession {
     project_id: ProjectId,
@@ -557,6 +566,16 @@ impl BrowserService {
         self.start_with_persistence(project_id, url, false).await
     }
 
+    pub async fn start_ephemeral_with_profile(
+        &self,
+        project_id: ProjectId,
+        profile: &StoredCookieProfile,
+    ) -> DomainResult<BrowserSession> {
+        let cookies = browser_cookies(std::slice::from_ref(profile))?;
+        self.start_runtime_with_cookies(project_id, "about:blank".into(), false, Some(cookies))
+            .await
+    }
+
     async fn start_with_persistence(
         &self,
         project_id: ProjectId,
@@ -596,8 +615,19 @@ impl BrowserService {
     async fn start_runtime(
         &self,
         project_id: ProjectId,
+        url: String,
+        persistent: bool,
+    ) -> DomainResult<BrowserSession> {
+        self.start_runtime_with_cookies(project_id, url, persistent, None)
+            .await
+    }
+
+    async fn start_runtime_with_cookies(
+        &self,
+        project_id: ProjectId,
         mut url: String,
         persistent: bool,
+        cookie_override: Option<Vec<Value>>,
     ) -> DomainResult<BrowserSession> {
         let status = self.status();
         if !status.worker_available {
@@ -672,8 +702,10 @@ impl BrowserService {
                 "browser capture credential missing one-time token",
             )
         })?;
-        let managed_cookies =
-            browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
+        let managed_cookies = match cookie_override {
+            Some(cookies) => cookies,
+            None => browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?,
+        };
         let pending_cookie_clears = restored_profile
             .as_ref()
             .map(|profile| profile.pending_cookie_clears.clone())
@@ -790,6 +822,57 @@ impl BrowserService {
         }
         schedule_page_title_association(self.db.clone(), &session);
         Ok(session)
+    }
+
+    pub async fn csrf_probe(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        target_url: &str,
+        method: &str,
+        params: &[(String, String)],
+        timeout_ms: u64,
+    ) -> DomainResult<BrowserCsrfProbeResult> {
+        let parsed = url::Url::parse(target_url)
+            .map_err(|error| DomainError::invalid(format!("invalid CSRF target URL: {error}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(DomainError::invalid(
+                "CSRF target URL must use HTTP or HTTPS",
+            ));
+        }
+        if !matches!(method, "GET" | "POST") {
+            return Err(DomainError::invalid(
+                "CSRF browser probe method must be GET or POST",
+            ));
+        }
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
+        let active = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .is_some_and(|runtime| runtime.project_id == project_id && !runtime.persistent);
+        if !active {
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                "isolated browser session is not active",
+            ));
+        }
+        let result = self
+            .call_worker(
+                "session.csrf_probe",
+                json!({
+                    "session_id": session_id.get(),
+                    "target_url": target_url,
+                    "method": method,
+                    "params": params.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>(),
+                    "timeout_ms": timeout_ms.clamp(1_000, 30_000),
+                }),
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))
     }
 
     async fn cleanup_failed_start(

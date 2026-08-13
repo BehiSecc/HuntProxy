@@ -256,11 +256,6 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         reply.clone(),
         PlaceholderKey::from_bytes(key_bytes),
     ));
-    let plugins = Arc::new(crate::plugins::PluginService::load(
-        config.plugin_dir.clone(),
-        db.clone(),
-        reply.clone(),
-    )?);
     let managed_worker = config.browser_worker_path.clone().or_else(|| {
         crate::browser::prepare_browser_worker_installation(&config.data_dir)
             .ok()
@@ -274,6 +269,12 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         Some(config.ca_cert_path()),
         config.browser_profiles_dir(),
     ));
+    let plugins = Arc::new(crate::plugins::PluginService::load_with_browser(
+        config.plugin_dir.clone(),
+        db.clone(),
+        reply.clone(),
+        Some(browser.clone()),
+    )?);
     let (events, _) = broadcast::channel(256);
     let crawler = Arc::new(CrawlerService::new(
         db.clone(),

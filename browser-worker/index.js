@@ -607,6 +607,82 @@ async function handle(req) {
           engine: session.engine,
         });
       }
+      case "session.csrf_probe": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session) throw rpcError(-32001, "session not found");
+        if (session.persistent) {
+          throw rpcError(-32602, "CSRF probes require an isolated browser session");
+        }
+        const targetUrl = new URL(String(params.target_url || ""));
+        if (!['http:', 'https:'].includes(targetUrl.protocol)) {
+          throw rpcError(-32602, "target_url must use HTTP or HTTPS");
+        }
+        const method = String(params.method || "").toUpperCase();
+        if (!['GET', 'POST'].includes(method)) {
+          throw rpcError(-32602, "method must be GET or POST");
+        }
+        const fields = Array.isArray(params.params) ? params.params : [];
+        if (fields.length > 128) throw rpcError(-32602, "too many form parameters");
+        const normalized = fields.map((field) => {
+          const name = String(field?.name ?? "");
+          const value = String(field?.value ?? "");
+          if (!name || Buffer.byteLength(name) > 1024 || Buffer.byteLength(value) > 64 * 1024) {
+            throw rpcError(-32602, "invalid form parameter");
+          }
+          return { name, value };
+        });
+        const navigations = [];
+        const onResponse = (response) => {
+          if (!response.request().isNavigationRequest()) return;
+          navigations.push({
+            url: response.url(),
+            status: response.status(),
+            method: response.request().method(),
+          });
+        };
+        session.page.on('response', onResponse);
+        try {
+          // A data document is an opaque, cross-site initiator. The submitted
+          // request is created by Chromium, so SameSite, Origin, Referer and
+          // redirect behavior are browser decisions rather than simulations.
+          await session.page.goto('data:text/html,<title>HuntProxy CSRF probe</title>', {
+            waitUntil: 'domcontentloaded',
+            timeout: 10_000,
+          });
+          const navigationTimeout = Math.max(1_000, Math.min(Number(params.timeout_ms || 15_000), 30_000));
+          await Promise.all([
+            session.page.waitForNavigation({
+              waitUntil: 'domcontentloaded',
+              timeout: navigationTimeout,
+            }),
+            session.page.evaluate(({ target, method, fields }) => {
+              const form = document.createElement('form');
+              form.method = method;
+              form.action = target;
+              for (const field of fields) {
+                const input = document.createElement('input');
+                input.name = field.name;
+                input.value = field.value;
+                form.appendChild(input);
+              }
+              document.body.appendChild(form);
+              form.submit();
+            }, { target: targetUrl.href, method, fields: normalized }),
+          ]);
+          const finalUrl = new URL(session.page.url());
+          if (finalUrl.origin !== targetUrl.origin) {
+            throw rpcError(-32002, "CSRF probe did not navigate to the target origin");
+          }
+          await reconcileCurrentOriginStorage(session);
+          return respond(id, {
+            final_url: finalUrl.href,
+            navigations: navigations.slice(-16),
+          });
+        } finally {
+          session.page.off('response', onResponse);
+        }
+      }
       case "session.set_cookies": {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);

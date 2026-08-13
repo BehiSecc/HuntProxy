@@ -4,6 +4,7 @@
 //! HTTP and explicitly declared cloud operations, but receive no filesystem,
 //! process, socket, or secret APIs; HuntProxy validates and executes them.
 
+use crate::cookies::CookiePair;
 use crate::domain::*;
 use crate::policy::url_is_in_scope;
 use crate::reply::{ReplySendContext, ReplyService};
@@ -337,6 +338,7 @@ pub struct PluginService {
     directory: PathBuf,
     reply: Arc<ReplyService>,
     db: Arc<crate::storage::Db>,
+    browser: Option<Arc<crate::browser::BrowserService>>,
     plugins: Arc<HashMap<String, Arc<LoadedPlugin>>>,
     load_issues: Arc<Vec<PluginLoadIssue>>,
     jobs: Arc<DashMap<Uuid, Arc<PluginJob>>>,
@@ -400,6 +402,7 @@ enum PluginOperation {
     RawHttp1Group(PluginRawHttp1Group),
     RawHttp2(PluginRawHttp2),
     RaceGroup(PluginRaceGroup),
+    BrowserCsrf(PluginBrowserCsrf),
 }
 
 impl PluginOperation {
@@ -412,6 +415,7 @@ impl PluginOperation {
             Self::RawHttp1Group(group) => &group.id,
             Self::RawHttp2(request) => &request.id,
             Self::RaceGroup(group) => &group.id,
+            Self::BrowserCsrf(probe) => &probe.id,
         }
     }
 }
@@ -425,6 +429,7 @@ fn operation_type_name(operation: &PluginOperation) -> &'static str {
         PluginOperation::RawHttp1Group(_) => "raw_http1_group",
         PluginOperation::RawHttp2(_) => "raw_http2",
         PluginOperation::RaceGroup(_) => "race_group",
+        PluginOperation::BrowserCsrf(_) => "browser_csrf",
     }
 }
 
@@ -436,6 +441,7 @@ fn operation_required_capability(operation: &PluginOperation) -> &'static str {
         | PluginOperation::RawHttp1Group(_)
         | PluginOperation::RawHttp2(_) => "http.raw",
         PluginOperation::RaceGroup(_) => "http.race",
+        PluginOperation::BrowserCsrf(_) => "browser.csrf",
     }
 }
 
@@ -876,11 +882,49 @@ struct PluginParamPatch {
     value: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PluginBrowserCsrfMode {
+    TopLevelGet,
+    CrossSiteFormPost,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginBrowserCsrf {
+    id: String,
+    base_exchange_id: ExchangeId,
+    mode: PluginBrowserCsrfMode,
+    #[serde(default)]
+    query_params: Vec<PluginParamPatch>,
+    #[serde(default)]
+    body_params: Vec<PluginParamPatch>,
+    #[serde(default)]
+    header_tombstones: Vec<String>,
+    identity: Option<PluginIdentitySelector>,
+    attacker_origin: Option<String>,
+    #[serde(default = "default_browser_csrf_timeout_ms")]
+    timeout_ms: u64,
+}
+
+fn default_browser_csrf_timeout_ms() -> u64 {
+    15_000
+}
+
 impl PluginService {
     pub fn load(
         directory: PathBuf,
         db: Arc<crate::storage::Db>,
         reply: Arc<ReplyService>,
+    ) -> DomainResult<Self> {
+        Self::load_with_browser(directory, db, reply, None)
+    }
+
+    pub fn load_with_browser(
+        directory: PathBuf,
+        db: Arc<crate::storage::Db>,
+        reply: Arc<ReplyService>,
+        browser: Option<Arc<crate::browser::BrowserService>>,
     ) -> DomainResult<Self> {
         crate::config::create_private_dir(&directory)?;
         let mut plugins = HashMap::new();
@@ -926,6 +970,7 @@ impl PluginService {
             directory,
             reply,
             db,
+            browser,
             plugins: Arc::new(plugins),
             load_issues: Arc::new(load_issues),
             jobs: Arc::new(DashMap::new()),
@@ -3270,7 +3315,278 @@ impl PluginService {
                     "responses": responses,
                 }))
             }
+            PluginOperation::BrowserCsrf(probe) => {
+                self.execute_browser_csrf(
+                    project_id,
+                    probe,
+                    scope,
+                    target_host,
+                    resolved_identities,
+                    cancel,
+                )
+                .await
+            }
         }
+    }
+
+    async fn execute_browser_csrf(
+        &self,
+        project_id: ProjectId,
+        probe: PluginBrowserCsrf,
+        scope: &ScopePolicy,
+        target_host: Option<&str>,
+        resolved_identities: &HashMap<String, ResolvedPluginIdentity>,
+        cancel: &CancellationToken,
+    ) -> DomainResult<Value> {
+        let unavailable = |reason: &str| {
+            Ok(json!({
+                "id": probe.id,
+                "tested": false,
+                "status": "not_tested",
+                "reason": reason,
+            }))
+        };
+        let Some(browser) = &self.browser else {
+            return unavailable("browser_service_unavailable");
+        };
+        let install = browser.status();
+        if !install.worker_available || !install.chromium_available {
+            return unavailable("browser_runtime_unavailable");
+        }
+        if probe.timeout_ms < 1_000 || probe.timeout_ms > 30_000 {
+            return Err(DomainError::invalid(
+                "browser_csrf timeout_ms must be between 1000 and 30000",
+            ));
+        }
+        if probe.attacker_origin.is_some() {
+            return unavailable("custom_attacker_origin_not_supported");
+        }
+        if !probe.header_tombstones.is_empty() {
+            return unavailable("browser_managed_headers_cannot_be_overridden");
+        }
+        let detail = self
+            .db
+            .get_exchange_detail(
+                project_id,
+                probe.base_exchange_id,
+                crate::policy::PresentationOptions::default(),
+            )
+            .await?;
+        let query = detail.summary.query.as_deref().unwrap_or_default();
+        let mut target = url::Url::parse(&format!(
+            "{}://{}{}{}{}",
+            detail.summary.scheme,
+            detail.summary.authority,
+            detail.summary.path,
+            if query.is_empty() { "" } else { "?" },
+            query,
+        ))
+        .map_err(|error| DomainError::invalid(format!("invalid base exchange URL: {error}")))?;
+        enforce_plugin_scope(target.as_str(), scope, target_host)?;
+        let method = match probe.mode {
+            PluginBrowserCsrfMode::TopLevelGet => "GET",
+            PluginBrowserCsrfMode::CrossSiteFormPost => "POST",
+        };
+        let base_method = detail.summary.method.to_ascii_uppercase();
+        if (method == "GET" && base_method != "GET") || (method == "POST" && base_method != "POST")
+        {
+            return Err(DomainError::invalid(
+                "browser_csrf mode must match the base exchange method",
+            ));
+        }
+        apply_url_param_patches(&mut target, &probe.query_params)?;
+        let mut fields = if method == "POST" {
+            let headers = self
+                .db
+                .load_raw_headers(project_id, probe.base_exchange_id, MessageSide::Request)
+                .await?;
+            let content_type = headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+                .and_then(|header| std::str::from_utf8(&header.value).ok())
+                .unwrap_or_default();
+            if !content_type
+                .to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+            {
+                return unavailable("base_request_not_form_compatible");
+            }
+            let body = self
+                .db
+                .load_raw_body(project_id, probe.base_exchange_id, MessageSide::Request)
+                .await?
+                .unwrap_or_default();
+            url::form_urlencoded::parse(&body)
+                .into_owned()
+                .collect::<Vec<_>>()
+        } else {
+            let pairs = target.query_pairs().into_owned().collect::<Vec<_>>();
+            // HTML GET form submission constructs the query string from form
+            // controls, so preserve the materialized base query as controls.
+            target.set_query(None);
+            pairs
+        };
+        apply_form_param_patches(&mut fields, &probe.body_params)?;
+        if fields.len() > 128
+            || fields
+                .iter()
+                .any(|(name, value)| name.len() > 1024 || value.len() > 64 * 1024)
+        {
+            return Err(DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "browser_csrf form parameters exceed host limits",
+            ));
+        }
+        let Some(selector) = probe.identity.as_ref() else {
+            return unavailable("identity_required");
+        };
+        let key = identity_selector_key(selector)?;
+        let Some(ResolvedPluginIdentity::Profile(profile)) = resolved_identities.get(&key) else {
+            return unavailable("managed_cookie_profile_required");
+        };
+        if profile.managed_cookies.is_none() {
+            return unavailable("browser_cookie_metadata_required");
+        }
+        let session = match browser
+            .start_ephemeral_with_profile(project_id, profile)
+            .await
+        {
+            Ok(session) => session,
+            Err(error)
+                if matches!(
+                    error.code(),
+                    ErrorCode::BrowserDisabled
+                        | ErrorCode::ChromiumNotInstalled
+                        | ErrorCode::ConcurrencyLimited
+                ) =>
+            {
+                return unavailable(error.code().as_str());
+            }
+            Err(error) => return Err(error),
+        };
+        let session_id = session.id;
+        let result = tokio::select! {
+            _ = cancel.cancelled() => Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+            result = browser.csrf_probe(project_id, session_id, target.as_str(), method, &fields, probe.timeout_ms) => result,
+        };
+        // Proxy persistence is asynchronous with respect to Playwright's load
+        // event. Wait briefly for the bounded evidence set to become visible.
+        let mut evidence_exchange_ids = Vec::new();
+        if result.is_ok() {
+            for delay in [0, 25, 75, 200, 500] {
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                evidence_exchange_ids = self
+                    .db
+                    .browser_session_exchange_ids(project_id, session_id, 128)
+                    .await?;
+                let target_seen = futures::future::try_join_all(evidence_exchange_ids.iter().map(
+                    |exchange_id| async {
+                        let evidence = self
+                            .db
+                            .get_exchange_detail(
+                                project_id,
+                                *exchange_id,
+                                crate::policy::PresentationOptions::default(),
+                            )
+                            .await?;
+                        Ok::<_, DomainError>(
+                            evidence
+                                .summary
+                                .scheme
+                                .eq_ignore_ascii_case(target.scheme())
+                                && evidence
+                                    .summary
+                                    .authority
+                                    .eq_ignore_ascii_case(target.authority())
+                                && evidence.summary.path == target.path(),
+                        )
+                    },
+                ))
+                .await?
+                .into_iter()
+                .any(|matched| matched);
+                if target_seen {
+                    break;
+                }
+            }
+        }
+        let expected_cookie_header = profile
+            .cookie_header_for_url(target.as_str())?
+            .unwrap_or_default();
+        let expected_cookie_pairs = crate::cookies::parse_cookie_header(&expected_cookie_header)?;
+        let expected_cookie_names = expected_cookie_pairs
+            .iter()
+            .map(|pair| pair.name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut sent_cookie_names = BTreeSet::new();
+        for exchange_id in &evidence_exchange_ids {
+            let evidence = self
+                .db
+                .get_exchange_detail(
+                    project_id,
+                    *exchange_id,
+                    crate::policy::PresentationOptions::default(),
+                )
+                .await?;
+            if !evidence
+                .summary
+                .scheme
+                .eq_ignore_ascii_case(target.scheme())
+                || !evidence
+                    .summary
+                    .authority
+                    .eq_ignore_ascii_case(target.authority())
+                || evidence.summary.path != target.path()
+            {
+                continue;
+            }
+            let headers = self
+                .db
+                .load_raw_headers(project_id, *exchange_id, MessageSide::Request)
+                .await?;
+            for header in headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("cookie"))
+            {
+                let Ok(value) = std::str::from_utf8(&header.value) else {
+                    continue;
+                };
+                sent_cookie_names.extend(matched_cookie_names(&expected_cookie_pairs, value)?);
+            }
+            // Only the initial target request proves the browser's cross-site
+            // cookie decision; redirects may set or refresh cookies later.
+            break;
+        }
+        let stop_result = browser.stop(project_id, session_id).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Err(stop_error) = stop_result {
+                    tracing::warn!(%stop_error, session_id = session_id.get(), "failed to clean up isolated CSRF browser after probe error");
+                }
+                return Err(error);
+            }
+        };
+        stop_result?;
+        Ok(json!({
+            "id": probe.id,
+            "tested": true,
+            "status": "completed",
+            "exchanges": evidence_exchange_ids.iter().map(|id| json!({"exchange_id": id})).collect::<Vec<_>>(),
+            "cookie_delivery": {
+                "managed_cookie_delivered": !sent_cookie_names.is_empty(),
+                "expected_count": expected_cookie_names.len(),
+                "sent_matched_count": sent_cookie_names.len(),
+            },
+            "browser": {
+                "isolated": true,
+                "initiator": "opaque_cross_site_document",
+                "final_url": result.final_url,
+                "navigations": result.navigations,
+            }
+        }))
     }
 
     async fn send_race_semantic(
@@ -4777,6 +5093,50 @@ fn reserve_plugin_request_slot(
     ready_at
 }
 
+fn apply_url_param_patches(url: &mut url::Url, patches: &[PluginParamPatch]) -> DomainResult<()> {
+    let mut pairs = url.query_pairs().into_owned().collect::<Vec<_>>();
+    apply_form_param_patches(&mut pairs, patches)?;
+    url.set_query(None);
+    if !pairs.is_empty() {
+        url.query_pairs_mut().extend_pairs(pairs);
+    }
+    Ok(())
+}
+
+fn apply_form_param_patches(
+    pairs: &mut Vec<(String, String)>,
+    patches: &[PluginParamPatch],
+) -> DomainResult<()> {
+    for patch in patches {
+        if patch.name.is_empty() || patch.name.len() > 1024 {
+            return Err(DomainError::invalid(
+                "browser_csrf parameter name is invalid",
+            ));
+        }
+        pairs.retain(|(name, _)| name != &patch.name);
+        if let Some(value) = &patch.value {
+            pairs.push((patch.name.clone(), value.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn matched_cookie_names(
+    expected: &[CookiePair],
+    actual_header: &str,
+) -> DomainResult<BTreeSet<String>> {
+    let actual = crate::cookies::parse_cookie_header(actual_header)?;
+    Ok(actual
+        .iter()
+        .filter(|actual| {
+            expected
+                .iter()
+                .any(|expected| expected.name == actual.name && expected.value == actual.value)
+        })
+        .map(|pair| pair.name.clone())
+        .collect())
+}
+
 fn operation_request_count(operation: &PluginOperation) -> usize {
     match operation {
         PluginOperation::RaceGroup(group) => group.requests.len(),
@@ -4787,6 +5147,7 @@ fn operation_request_count(operation: &PluginOperation) -> usize {
             regions.len()
         }
         PluginOperation::AwsApiGateway(_) => 1,
+        PluginOperation::BrowserCsrf(_) => 1,
         _ => 1,
     }
 }
@@ -5264,6 +5625,7 @@ fn operation_identity_selectors(
                 .iter()
                 .filter_map(|step| step.request.identity.as_ref()),
         ),
+        PluginOperation::BrowserCsrf(probe) => Box::new(probe.identity.iter()),
         _ => Box::new(std::iter::empty()),
     }
 }
@@ -6068,6 +6430,7 @@ mod tests {
             directory: PathBuf::from("plugins"),
             reply,
             db,
+            browser: None,
             plugins: Arc::new(HashMap::new()),
             load_issues: Arc::new(Vec::new()),
             jobs: Arc::new(DashMap::new()),
@@ -6758,6 +7121,76 @@ mod tests {
             panic!("expected workflow")
         };
         assert_eq!(workflow.steps[0].extract[0].name(), "csrf");
+    }
+
+    #[test]
+    fn browser_csrf_operation_is_bounded_and_uses_explicit_identity() {
+        let operation: PluginOperation = serde_json::from_value(json!({
+            "type": "browser_csrf",
+            "id": "csrf-browser-1",
+            "base_exchange_id": 42,
+            "mode": "cross_site_form_post",
+            "body_params": [{"name":"csrf","value":null}],
+            "identity": {"profile":"victim"}
+        }))
+        .unwrap();
+        assert_eq!(operation.id(), "csrf-browser-1");
+        assert_eq!(operation_type_name(&operation), "browser_csrf");
+        assert_eq!(operation_required_capability(&operation), "browser.csrf");
+        assert_eq!(operation_request_count(&operation), 1);
+        assert_eq!(operation_identity_selectors(&operation).count(), 1);
+    }
+
+    #[test]
+    fn browser_csrf_operation_rejects_unknown_fields() {
+        assert!(serde_json::from_value::<PluginOperation>(json!({
+            "type": "browser_csrf",
+            "id": "unsafe",
+            "base_exchange_id": 42,
+            "mode": "top_level_get",
+            "script": "alert(1)"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn browser_csrf_get_materialization_preserves_and_mutates_query() {
+        let mut url =
+            url::Url::parse("https://example.test/change?email=old%40test&keep=1").unwrap();
+        apply_url_param_patches(
+            &mut url,
+            &[
+                PluginParamPatch {
+                    name: "email".into(),
+                    value: Some("new@test".into()),
+                },
+                PluginParamPatch {
+                    name: "keep".into(),
+                    value: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://example.test/change?email=new%40test");
+    }
+
+    #[test]
+    fn browser_csrf_cookie_delivery_requires_matching_identity_value() {
+        let expected =
+            crate::cookies::parse_cookie_header("session=secret; preference=dark").unwrap();
+        assert!(matched_cookie_names(&expected, "unrelated=1")
+            .unwrap()
+            .is_empty());
+        assert!(matched_cookie_names(&expected, "session=wrong")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            matched_cookie_names(&expected, "session=secret; other=1")
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["session"]
+        );
     }
 
     #[tokio::test]

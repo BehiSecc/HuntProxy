@@ -72,6 +72,31 @@ pub struct JavascriptProvenanceInput {
 }
 
 impl Db {
+    pub async fn browser_session_exchange_ids(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        limit: usize,
+    ) -> DomainResult<Vec<ExchangeId>> {
+        let limit = limit.clamp(1, 128) as i64;
+        self.with_conn(move |conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT exchange_id FROM exchanges
+                     WHERE project_id=?1 AND browser_session_id=?2
+                     ORDER BY exchange_id ASC LIMIT ?3",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map(params![project_id.get(), session_id.get(), limit], |row| {
+                    row.get::<_, i64>(0).map(ExchangeId)
+                })
+                .map_err(storage_error)?;
+            collect_rows(rows)
+        })
+        .await
+    }
+
     pub async fn set_static_page_title(
         &self,
         project_id: ProjectId,
