@@ -113,10 +113,26 @@ pub struct PluginAction {
     pub input_schema: Value,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub requires_base_exchange: bool,
 }
 
 fn object_schema() -> Value {
     json!({"type":"object"})
+}
+
+fn validate_action_base_exchange(
+    plugin: &PluginManifest,
+    action: &PluginAction,
+    base_exchange_id: Option<ExchangeId>,
+) -> DomainResult<()> {
+    if action.requires_base_exchange && base_exchange_id.is_none() {
+        return Err(DomainError::invalid(format!(
+            "{} requires base_exchange_id. Capture a saved request, then preview the {} action again.",
+            plugin.name, action.name
+        )));
+    }
+    Ok(())
 }
 
 fn max_requested_exchange_contexts(manifest: &PluginManifest) -> usize {
@@ -1068,6 +1084,13 @@ impl PluginService {
                 )
             })?;
         let plugin = self.enabled_plugin_action(plugin_id, action)?;
+        let action_manifest = plugin
+            .manifest
+            .actions
+            .iter()
+            .find(|candidate| candidate.name == action)
+            .expect("enabled_plugin_action validated action");
+        validate_action_base_exchange(&plugin.manifest, action_manifest, base_exchange_id)?;
         let started = Instant::now();
         let prepared = self
             .prepare_plugin_plan(project_id, base_exchange_id, plugin.clone(), action, &input)
@@ -1154,6 +1177,7 @@ impl PluginService {
             .iter()
             .find(|candidate| candidate.name == action)
             .expect("enabled_plugin_action validated action");
+        validate_action_base_exchange(&plugin.manifest, action_manifest, base_exchange_id)?;
         let declared = plugin.manifest.capabilities.iter().collect::<BTreeSet<_>>();
         if action_manifest
             .required_capabilities
@@ -6692,6 +6716,95 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Timeout);
         assert!(error.to_string().contains("10 ms"));
+    }
+
+    #[test]
+    fn required_base_exchange_is_rejected_before_plugin_planning() {
+        let manifest = PluginManifest {
+            schema_version: PLUGIN_API_VERSION,
+            id: "saved-request-test".into(),
+            name: "Saved Request Test".into(),
+            version: "1.0.0".into(),
+            description: "test".into(),
+            enabled: true,
+            entrypoint: "index.js".into(),
+            entrypoint_sha256: "0".repeat(64),
+            resources: HashMap::new(),
+            capabilities: vec![],
+            actions: vec![],
+            limits: PluginLimits::default(),
+        };
+        let action = PluginAction {
+            name: "scan".into(),
+            description: "scan".into(),
+            input_schema: object_schema(),
+            required_capabilities: vec![],
+            requires_base_exchange: true,
+        };
+        let error = validate_action_base_exchange(&manifest, &action, None).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.to_string(), "Saved Request Test requires base_exchange_id. Capture a saved request, then preview the scan action again.");
+        assert!(validate_action_base_exchange(&manifest, &action, Some(ExchangeId(42))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn preview_and_run_reject_required_base_before_javascript() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().join("data"))).unwrap();
+        let db = Arc::new(crate::storage::Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "saved request requirement".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let plugin_directory = directory.path().join("plugins");
+        let package = plugin_directory.join("saved-request-test");
+        crate::config::create_private_dir(&package).unwrap();
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { throw new Error('javascript planner must not run'); },
+          analyze() { return {}; }
+        };"#;
+        std::fs::write(package.join("index.js"), script).unwrap();
+        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+        std::fs::write(
+            package.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":1,"id":"saved-request-test","name":"Saved Request Test","version":"1.0.0","description":"test","enabled":true,
+                "entrypoint":"index.js","entrypoint_sha256":digest,"capabilities":[],
+                "limits":{"timeout_ms":3000,"js_stage_timeout_ms":250,"max_operations":1,"max_concurrency":1,"memory_mb":8},
+                "actions":[{"name":"scan","description":"scan","requires_base_exchange":true,"input_schema":{"type":"object"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let service = PluginService::load(plugin_directory, db, reply).unwrap();
+
+        for error in [
+            service
+                .preview(project.id, "saved-request-test", "scan", None, json!({}))
+                .await
+                .unwrap_err(),
+            service
+                .run(project.id, "saved-request-test", "scan", None, json!({}))
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(error.to_string(), "Saved Request Test requires base_exchange_id. Capture a saved request, then preview the scan action again.");
+            assert!(!error
+                .to_string()
+                .contains("javascript planner must not run"));
+            assert!(!error.to_string().contains("eval_script"));
+        }
     }
 
     #[test]

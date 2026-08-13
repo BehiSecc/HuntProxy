@@ -187,6 +187,10 @@ before restarting HuntProxy. Semantic plugin requests may set
 managed-cookie, and request-rule credentials while retaining credentials the
 probe explicitly supplies.
 
+Actions with `requires_base_exchange: true` advertise that requirement through
+`extension_describe`; preview and run reject a missing `base_exchange_id`
+before starting plugin JavaScript.
+
 HuntProxy owns all extension network I/O, scope checks, concurrency, rate
 limits, cancellation, history, and findings. Generated requests appear in
 History with `plugin`, the extension name, and `plugin:<id>` labels. Packages
