@@ -189,8 +189,9 @@ info "Initializing $DATA_DIR"
 "$HUNTPROXY_BIN" doctor
 
 ok 'HuntProxy is ready'
-printf '\nRun: %s serve\nUI:  http://127.0.0.1:17890\n' "$HUNTPROXY_BIN"
+printf '\nNext: connect HuntProxy to your AI agent through MCP.\n'
 printf 'MCP:  {"command":"%s","args":["mcp"]}\n' "$HUNTPROXY_BIN"
+printf 'Optional UI: run %s serve, then open http://127.0.0.1:17890\n' "$HUNTPROXY_BIN"
 if [[ ":$ORIGINAL_PATH:" != *":$INSTALL_DIR:"* ]]; then
   warn "Add this to your shell profile: export PATH=\"$INSTALL_DIR:\$PATH\""
 fi

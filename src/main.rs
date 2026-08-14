@@ -18,7 +18,7 @@ const MAX_DAEMON_LOG_BYTES: u64 = 5 * 1024 * 1024;
 #[command(
     name = "HuntProxy",
     version,
-    about = "Local-first agent-safe HTTP workbench"
+    about = "A web security workbench built for AI agents"
 )]
 struct Cli {
     #[arg(long, global = true, env = "HUNTPROXY_DATA_DIR")]
@@ -189,9 +189,14 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!("  CA cert:  {}", cfg.ca_cert_path().display());
             println!("  config:   {}", cfg.data_dir.join("config.toml").display());
             println!();
-            println!("Next: HuntProxy serve");
-            println!("  UI:    http://{}", cfg.api_listen);
-            println!("  proxy: {}", cfg.proxy_listen);
+            println!("Next: connect HuntProxy to your AI agent through MCP");
+            println!("  command: HuntProxy");
+            println!("  args:    [\"mcp\"]");
+            println!(
+                "  UI (optional): http://{} (run HuntProxy serve)",
+                cfg.api_listen
+            );
+            println!("  proxy:         {}", cfg.proxy_listen);
             Ok(())
         }
         Commands::Serve { foreground: _ } => {

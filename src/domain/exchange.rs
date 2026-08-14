@@ -32,7 +32,7 @@ pub enum CompletionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureQuality {
-    /// Best-effort wire preservation through Hyper/Hudsucker.
+    /// Best-effort wire preservation through the HTTP proxy stack.
     WirePreserved,
     /// Exact evidence on one message side and decoded/semantic evidence on the other.
     Mixed,

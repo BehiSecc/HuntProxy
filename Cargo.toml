@@ -3,7 +3,7 @@ name = "HuntProxy"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Local-first agent-safe HTTP workbench for authorized web application testing"
+description = "A web security workbench built for AI agents and authorized testing"
 license = "Apache-2.0"
 repository = "https://github.com/BehiSecc/HuntProxy"
 homepage = "https://github.com/BehiSecc/HuntProxy"
@@ -38,8 +38,6 @@ http2 = { version = "=0.5.19", features = ["unstable"] }
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "set-header"] }
-# hudsucker = { version = "0.25", default-features = false, features = ["http2", "rcgen-ca", "rustls-client"] }  # optional; enabled after spike-validated integration
-
 # Semantic egress — exact-pinned permissive prerelease (Apache-2.0).
 # Cookies, decompression, and system-proxy support intentionally stay disabled.
 wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["webpki-roots", "tokio-rt", "stream", "prefix-symbols", "socks"] }
