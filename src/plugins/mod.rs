@@ -6813,6 +6813,145 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn browser_csrf_plugin_preview_and_run_accept_explicit_profile_selector() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().join("data"))).unwrap();
+        let db = Arc::new(crate::storage::Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "browser csrf identity contract".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let exchange_id = db
+            .insert_exchange(crate::storage::NewExchange {
+                project_id: project.id,
+                source: ExchangeSource::Proxy,
+                protocol: "HTTP/1.1".into(),
+                method: "POST".into(),
+                scheme: "https".into(),
+                authority: "example.test".into(),
+                host: "example.test".into(),
+                port: 443,
+                path: "/change-email".into(),
+                query: None,
+                status_code: Some(302),
+                mime: None,
+                completion: CompletionState::Complete,
+                capture_quality: CaptureQuality::Semantic,
+                header_representation: HeaderRepresentation::Semantic,
+                body_representation: BodyRepresentation::SemanticEncoded,
+                cache_provenance: CacheProvenance::None,
+                transport_provenance: Some(TransportProvenance::SemanticProxy),
+                transport_profile: None,
+                request_headers: vec![HeaderEntry {
+                    name: "Content-Type".into(),
+                    value: b"application/x-www-form-urlencoded".to_vec(),
+                    ordinal: 0,
+                }],
+                response_headers: vec![],
+                request_body: Some(b"email=new%40example.test&csrf=token".to_vec()),
+                response_body: None,
+                duration_ms: Some(1),
+                lineage: ExchangeLineage::default(),
+                page_title: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+        let cookie_json = r#"[{"name":"session","value":"secret","domain":"example.test","host_only":true,"path":"/","secure":true,"same_site":"Lax","session":true}]"#;
+        db.upsert_named_cookie_profile(
+            project.id,
+            "victim",
+            crate::cookies::validate_cookie_profile("https://example.test", cookie_json.into())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let plugin_directory = directory.path().join("plugins");
+        let package = plugin_directory.join("browser-csrf-contract");
+        crate::config::create_private_dir(&package).unwrap();
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan(input, context) {
+            return {execution: "sequential", operations: [0, 1].map((repeat) => ({
+              id: `browser-${repeat}`, type: "browser_csrf",
+              base_exchange_id: context.base_exchange.exchange_id,
+              mode: "cross_site_form_post", body_params: [{name: "csrf", value: null}],
+              identity: {profile: input.identity.profile}
+            }))};
+          },
+          analyze(input, observations) {
+            return {findings: [], result: {reasons: observations.map((item) => item.reason)}};
+          }
+        };"#;
+        std::fs::write(package.join("index.js"), script).unwrap();
+        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+        std::fs::write(
+            package.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":1,"id":"browser-csrf-contract","name":"Browser CSRF Contract","version":"1.0.0","description":"test","enabled":true,
+                "entrypoint":"index.js","entrypoint_sha256":digest,"capabilities":["browser.csrf","identity.use"],
+                "limits":{"timeout_ms":3000,"js_stage_timeout_ms":250,"max_operations":2,"max_concurrency":1,"memory_mb":8},
+                "actions":[{"name":"browser_scan","description":"test","requires_base_exchange":true,"required_capabilities":["browser.csrf","identity.use"],"input_schema":{"type":"object"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let service = PluginService::load(plugin_directory, db, reply).unwrap();
+        let input = json!({"allow_state_change":true,"identity":{"profile":"victim"}});
+
+        let preview = service
+            .preview(
+                project.id,
+                "browser-csrf-contract",
+                "browser_scan",
+                Some(exchange_id),
+                input.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview["operations"]["by_type"]["browser_csrf"], 2);
+
+        let job = service
+            .run(
+                project.id,
+                "browser-csrf-contract",
+                "browser_scan",
+                Some(exchange_id),
+                input,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if service.status(job.id).unwrap().state == PluginJobState::Completed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let result = service
+            .results(job.id, PluginResultView::Full, 0, 25)
+            .unwrap();
+        assert_eq!(
+            result["result"]["analysis"]["result"]["reasons"],
+            json!(["browser_service_unavailable", "browser_service_unavailable"]),
+            "execution reaches browser dispatch instead of failing identity authorization"
+        );
+    }
+
     #[test]
     fn javascript_stage_cancellation_interrupts_promptly() {
         let script = r#"globalThis.HuntProxyPlugin = {
