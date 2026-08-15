@@ -180,6 +180,9 @@ HuntProxy gives agents a complete hunting loop: build context → investigate �
 | **Credential handling** | Keep credentials locally usable for authenticated work without exposing them through routine inspection tools. |
 | **Bounded plugins** | Add focused testing workflows while HuntProxy retains control of network access, credentials, limits, cancellation, History, and evidence. |
 
+> [!TIP]
+> **The cool part?** You do not need to learn or explore every feature before you start. Just ask your agent to use HuntProxy MCP for the hunt. It can discover the available tools, choose what it needs, and keep the workflow moving.
+
 ## 💬 Example Prompts
 
 Just describe what you want to investigate. HuntProxy keeps the browser, traffic, and results connected while your agent works.
@@ -217,6 +220,14 @@ Inspect the JavaScript:
 ```text
 Analyze the JavaScript files loaded by this project and show me the API routes,
 parameter names, and URLs that have not appeared in History yet.
+```
+
+Test for request smuggling:
+
+```text
+Use the Request Smuggler plugin on exchange 42. Generate a unique marker,
+choose the most relevant techniques, and show me confirmed findings separately
+from diagnostic signals.
 ```
 
 Save a finding:
