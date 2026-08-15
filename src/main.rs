@@ -255,10 +255,25 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!("  proxy:    {}", cfg.proxy_listen);
             println!("  idle:     {} seconds", cfg.idle_timeout_seconds);
             println!("  log:      {}", cfg.daemon_log_path().display());
-            if let Some(p) = &cfg.node_path {
-                println!("  node:       {} exists={}", p.display(), p.exists());
-            } else {
-                println!("  node:       (not in PATH)");
+            let browser = huntproxy::browser::inspect_browser_installation(&cfg);
+            println!(
+                "  node:       {}",
+                browser.node_path.as_deref().unwrap_or("not found")
+            );
+            println!(
+                "  worker:     {}",
+                if browser.worker_available {
+                    "ready"
+                } else {
+                    "not ready"
+                }
+            );
+            println!(
+                "  chromium:   {}",
+                browser.chromium_path.as_deref().unwrap_or("not found")
+            );
+            if let Some(hint) = &browser.install_hint {
+                println!("  browser:    {hint}");
             }
             if cfg.socket_path().exists() {
                 match daemon_get(&cfg, "/api/v1/doctor").await {

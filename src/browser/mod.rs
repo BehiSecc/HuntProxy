@@ -1,6 +1,6 @@
 //! Browser worker supervision, real actions, and private per-project browser state.
 
-use crate::config::{create_private_dir, write_private_file};
+use crate::config::{create_private_dir, write_private_file, Config};
 use crate::cookies::{CookiePair, StoredCookieProfile};
 use crate::domain::*;
 use crate::storage::{CreateCaptureSession, Db};
@@ -432,6 +432,68 @@ pub struct BrowserService {
     worker: Mutex<Option<WorkerProcess>>,
 }
 
+/// Inspect the installed browser runtime without starting the daemon, launching
+/// Chromium, or materializing the embedded worker.
+pub fn inspect_browser_installation(config: &Config) -> BrowserInstallStatus {
+    let node_path = existing_path(config.node_path.clone(), "node");
+    let worker_path = inspect_worker_path(config.browser_worker_path.clone(), &config.data_dir);
+    let playwright_core_path = worker_path
+        .as_deref()
+        .and_then(find_playwright_core)
+        .or_else(find_playwright_from_environment);
+    let chromium_path = chromium_executable(playwright_core_path.as_deref());
+
+    browser_install_status(
+        node_path.as_deref(),
+        worker_path.as_deref(),
+        playwright_core_path.as_deref(),
+        chromium_path.as_deref(),
+    )
+}
+
+fn browser_install_status(
+    node_path: Option<&Path>,
+    worker_path: Option<&Path>,
+    playwright_core_path: Option<&Path>,
+    chromium_path: Option<&Path>,
+) -> BrowserInstallStatus {
+    let node_available = node_path.is_some_and(Path::is_file);
+    let worker_script_available = worker_path.is_some_and(Path::is_file);
+    let worker_available =
+        node_available && worker_script_available && playwright_core_path.is_some_and(Path::is_dir);
+    let chromium_available = chromium_path.is_some_and(Path::is_file);
+
+    let install_hint = if !node_available {
+        Some("Install Node.js, then run: HuntProxy browser install".into())
+    } else if !worker_script_available {
+        Some(
+            "Browser worker missing; reinstall HuntProxy or set HUNTPROXY_BROWSER_WORKER_PATH"
+                .into(),
+        )
+    } else if !playwright_core_path.is_some_and(Path::is_dir) {
+        let directory = worker_path
+            .and_then(Path::parent)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "browser-worker".into());
+        Some(format!(
+            "playwright-core missing; run `npm install` in {directory}"
+        ))
+    } else if !chromium_available {
+        Some("Install Chromium: HuntProxy browser install".into())
+    } else {
+        None
+    };
+
+    BrowserInstallStatus {
+        node_available,
+        worker_available,
+        chromium_available,
+        chromium_path: chromium_path.map(|path| path.display().to_string()),
+        node_path: node_path.map(|path| path.display().to_string()),
+        install_hint,
+    }
+}
+
 impl BrowserService {
     pub fn new(db: Arc<Db>, node_path: Option<PathBuf>, worker_path: Option<PathBuf>) -> Self {
         let profiles_root = default_profiles_root(&db);
@@ -506,52 +568,12 @@ impl BrowserService {
     }
 
     pub fn status(&self) -> BrowserInstallStatus {
-        let node_available = self.node_path.as_ref().is_some_and(|path| path.exists());
-        let worker_script_available = self.worker_path.as_ref().is_some_and(|path| path.exists());
-        let worker_available =
-            node_available && worker_script_available && self.playwright_core_path.is_some();
-        let chromium_available = self
-            .chromium_path
-            .as_ref()
-            .is_some_and(|path| path.is_file());
-
-        let install_hint = if !node_available {
-            Some("Install Node.js, then run: HuntProxy browser install".into())
-        } else if !worker_script_available {
-            Some(
-                "Browser worker missing; reinstall HuntProxy or set HUNTPROXY_BROWSER_WORKER_PATH"
-                    .into(),
-            )
-        } else if self.playwright_core_path.is_none() {
-            let directory = self
-                .worker_path
-                .as_deref()
-                .and_then(Path::parent)
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "browser-worker".into());
-            Some(format!(
-                "playwright-core missing; run `npm install` in {directory}"
-            ))
-        } else if !chromium_available {
-            Some("Install Chromium: HuntProxy browser install".into())
-        } else {
-            None
-        };
-
-        BrowserInstallStatus {
-            node_available,
-            worker_available,
-            chromium_available,
-            chromium_path: self
-                .chromium_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            node_path: self
-                .node_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            install_hint,
-        }
+        browser_install_status(
+            self.node_path.as_deref(),
+            self.worker_path.as_deref(),
+            self.playwright_core_path.as_deref(),
+            self.chromium_path.as_deref(),
+        )
     }
 
     pub async fn start(&self, project_id: ProjectId, url: String) -> DomainResult<BrowserSession> {
@@ -2315,6 +2337,22 @@ fn find_chromium_binary(directory: &Path, remaining_depth: usize) -> Option<Path
 }
 
 fn resolve_worker_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    let mut candidates = worker_path_candidates(explicit);
+    if let Ok(materialized) = materialize_embedded_worker(&crate::config::default_data_dir()) {
+        candidates.push(materialized);
+    }
+    append_source_worker_candidate(&mut candidates);
+    first_existing_worker(candidates)
+}
+
+fn inspect_worker_path(explicit: Option<PathBuf>, data_dir: &Path) -> Option<PathBuf> {
+    let managed = explicit.or_else(|| Some(browser_worker_path(data_dir)));
+    let mut candidates = worker_path_candidates(managed);
+    append_source_worker_candidate(&mut candidates);
+    first_existing_worker(candidates)
+}
+
+fn worker_path_candidates(explicit: Option<PathBuf>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = explicit {
         candidates.push(path);
@@ -2332,16 +2370,26 @@ fn resolve_worker_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
             candidates.push(bin_dir.join("../share/bb/browser-worker/index.js"));
         }
     }
-    if let Ok(materialized) = materialize_embedded_worker(&crate::config::default_data_dir()) {
-        candidates.push(materialized);
-    }
+    candidates
+}
+
+fn append_source_worker_candidate(candidates: &mut Vec<PathBuf>) {
     if let Ok(current) = std::env::current_dir() {
         candidates.push(current.join("browser-worker/index.js"));
     }
-    if let Some(found) = candidates.into_iter().find(|path| path.is_file()) {
-        return Some(found.canonicalize().unwrap_or(found));
-    }
-    None
+}
+
+fn first_existing_worker(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+}
+
+fn browser_worker_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join(format!("browser-worker-{}", env!("CARGO_PKG_VERSION")))
+        .join("index.js")
 }
 
 /// Materialize the version-matched worker and package manifest in a stable,
@@ -2361,9 +2409,11 @@ pub fn prepare_browser_worker_installation(data_dir: &Path) -> DomainResult<Path
 }
 
 fn materialize_embedded_worker(data_dir: &Path) -> std::io::Result<PathBuf> {
-    let directory = data_dir.join(format!("browser-worker-{}", env!("CARGO_PKG_VERSION")));
-    std::fs::create_dir_all(&directory)?;
-    let worker_path = directory.join("index.js");
+    let worker_path = browser_worker_path(data_dir);
+    let directory = worker_path
+        .parent()
+        .expect("browser worker path always has a parent");
+    std::fs::create_dir_all(directory)?;
     let package_path = directory.join("package.json");
     let lock_path = directory.join("package-lock.json");
     write_if_changed(&worker_path, EMBEDDED_WORKER.as_bytes())?;
@@ -2788,6 +2838,53 @@ mod tests {
         let worker = directory.path().join("index.js");
         std::fs::write(&worker, "// worker").unwrap();
         assert_eq!(resolve_worker_path(Some(worker.clone())), Some(worker));
+    }
+
+    #[test]
+    fn browser_install_status_requires_the_complete_local_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = directory.path().join("node");
+        let worker = directory.path().join("index.js");
+        let playwright = directory.path().join("playwright-core");
+        let chromium = directory.path().join("chromium");
+        std::fs::write(&node, "node").unwrap();
+        std::fs::write(&worker, "worker").unwrap();
+        std::fs::create_dir(&playwright).unwrap();
+        std::fs::write(&chromium, "chromium").unwrap();
+
+        let ready = browser_install_status(
+            Some(&node),
+            Some(&worker),
+            Some(&playwright),
+            Some(&chromium),
+        );
+        assert!(ready.node_available);
+        assert!(ready.worker_available);
+        assert!(ready.chromium_available);
+        assert_eq!(ready.install_hint, None);
+
+        let missing_playwright =
+            browser_install_status(Some(&node), Some(&worker), None, Some(&chromium));
+        assert!(!missing_playwright.worker_available);
+        assert!(missing_playwright
+            .install_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("playwright-core missing")));
+    }
+
+    #[test]
+    fn browser_installation_inspection_does_not_materialize_the_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected_worker = browser_worker_path(directory.path());
+        let config = Config {
+            data_dir: directory.path().to_path_buf(),
+            browser_worker_path: Some(directory.path().join("missing-worker.js")),
+            ..Config::default()
+        };
+
+        assert!(!expected_worker.exists());
+        let _ = inspect_browser_installation(&config);
+        assert!(!expected_worker.exists());
     }
 
     #[test]
