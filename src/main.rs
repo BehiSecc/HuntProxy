@@ -277,7 +277,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
             }
             if cfg.socket_path().exists() {
                 match daemon_get(&cfg, "/api/v1/doctor").await {
-                    Ok(v) => println!("  daemon:     running\n{v}"),
+                    Ok(_) => println!("  daemon:     running"),
                     Err(e) => println!("  daemon:     socket present but unhealthy: {e}"),
                 }
             } else {
