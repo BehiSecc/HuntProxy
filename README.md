@@ -349,6 +349,13 @@ Any AI agent with MCP support on Linux or macOS.
 </details>
 
 <details>
+<summary><strong>Can I do bug hunting from my phone?</strong></summary>
+
+Yes. Run HuntProxy and your agent on a VPS, connect from your phone with [Tailscale](https://tailscale.com/) and SSH, and use [tmux](https://github.com/tmux/tmux) or [Herdr](https://github.com/herdrdev/herdr) to keep the session alive.
+
+</details>
+
+<details>
 <summary><strong>Do I need to keep HuntProxy running?</strong></summary>
 
 Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an inactive MCP bridge exits after one hour, and an MCP-started daemon also shuts down after one hour without MCP or UI control activity. Compatible clients can relaunch the bridge when needed. Run `HuntProxy serve` when you want the workbench to stay active until explicitly stopped.
@@ -408,7 +415,7 @@ No. Capture scope is not a general outbound allowlist: Proxy, Browser, Reply, an
 <details>
 <summary><strong>Can I take over the agent's browser?</strong></summary>
 
-Yes. Use the MCP `browser_cdp` tool or `HuntProxy browser cdp enable <project-id> <session-id>` to open the active persistent browser in Chrome DevTools. Agent browser actions pause during the handoff and resume after you disable it.
+Yes. Just ask your agent to hand you the browser. When you are done, ask it to take control back and continue.
 
 </details>
 
