@@ -79,9 +79,7 @@ docker run -d \
   huntproxy:local
 ```
 
-Open [http://127.0.0.1:17890](http://127.0.0.1:17890).
-
-For an MCP client, use the container's bridge command:
+Connect your AI agent to the running container:
 
 ```json
 {
@@ -93,6 +91,10 @@ For an MCP client, use the container's bridge command:
   }
 }
 ```
+
+The MCP bridge connects to the HuntProxy daemon already running inside the container.
+
+Optionally, open the web interface at [http://127.0.0.1:17890](http://127.0.0.1:17890).
 
 > [!NOTE]
 > This setup uses host networking because HuntProxy listens on loopback by default. Host-network support is platform-dependent; the native installer is currently the simplest path on macOS.
