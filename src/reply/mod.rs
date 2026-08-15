@@ -664,6 +664,7 @@ impl ReplyService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_with_proxy(
         &self,
         project_id: ProjectId,
@@ -707,6 +708,7 @@ impl ReplyService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_with_context_and_proxy(
         &self,
         project_id: ProjectId,

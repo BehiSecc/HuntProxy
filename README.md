@@ -141,7 +141,7 @@ After connecting HuntProxy, give your agent a target and an objective:
 
 ```text
 Use HuntProxy MCP. Create a project named "First Hunt" for
-https://google.com/. Start a browser, explore the
+https://example-target.com/. Start a browser, explore the
 application, and show me its sitemap and state-changing requests.
 ```
 
@@ -249,7 +249,7 @@ Most projects begin with a prompt, not a terminal command. MCP handles day-to-da
 | `HuntProxy doctor` | Check paths, browser dependencies, daemon state, and recent startup diagnostics. |
 | `HuntProxy status` | Show whether the daemon is running. |
 | `HuntProxy stop` | Gracefully stop HuntProxy and its managed browsers. |
-| `HuntProxy project …` | Create, list, rename, export, import, measure, reconcile, or delete projects. |
+| `HuntProxy project …` | Create, list, rename, export, import, view usage, reconcile, or delete projects. |
 | `HuntProxy har …` | Import or export HAR 1.2 HTTP history. |
 | `HuntProxy backup <file>` | Create a consistent SQLite backup. |
 | `HuntProxy history clear …` | Remove saved exchanges older than a chosen timestamp. |
@@ -271,7 +271,7 @@ HuntProxy har export 1 ./acme-history.har
 HuntProxy backup ./huntproxy-backup.sqlite3
 ```
 
-Sanitized project exports omit authentication state by default. Add `--include-secrets` only when you need a complete project export, and treat that file like a credential backup.
+Sanitized project exports are for sharing, not recovery: they omit credentials, bodies, replay state, and browser state. For the most complete export, add `--include-secrets --include-chromium-profile` and protect the result like credentials.
 
 </details>
 
@@ -289,7 +289,7 @@ Explore the maintained collection or learn how to build your own in [HuntProxy-P
 
 CAPTCHAs and bot checks are common when hunting from a VPS because datacenter IP addresses are easier to recognize. Routing HuntProxy through a reputable residential proxy is usually the most effective fix.
 
-Choose one of the following configurations, add it to `~/.huntproxy/config.toml`, then restart HuntProxy.
+Choose one configuration and add it to `~/.huntproxy/config.toml`. Then run `HuntProxy stop`, restart/reconnect your AI client, and verify with `HuntProxy doctor`.
 
 For all traffic:
 
@@ -414,14 +414,13 @@ Yes. Use the MCP `browser_cdp` tool or `HuntProxy browser cdp enable <project-id
 
 ### Update
 
-Back up important projects, then rerun the installer:
+Rerun the installer to replace the executable:
 
 ```bash
-HuntProxy backup ./huntproxy-backup.sqlite3
 curl -fsSL https://raw.githubusercontent.com/BehiSecc/HuntProxy/master/install.sh | bash
 ```
 
-The installer updates the application and prepares its version-matched browser runtime while preserving projects, configuration, and browser profiles in `~/.huntproxy`.
+`HuntProxy backup` copies only SQLite; it omits configuration, the CA, plugins, and browser profiles. For full recovery, stop HuntProxy and copy its data directory plus any configured external paths. The installer leaves that data untouched.
 
 ### Uninstall
 
@@ -432,7 +431,7 @@ HuntProxy stop
 rm "$HOME/.local/bin/HuntProxy"
 ```
 
-This keeps your projects and configuration in `~/.huntproxy`. To remove everything, back up or export anything you need first, then delete that directory manually. This cannot be undone.
+This keeps your projects and configuration in `~/.huntproxy`. Before deleting that directory, copy it in full if you may need to recover anything. Deletion cannot be undone.
 
 ## 🤝 Contribution
 

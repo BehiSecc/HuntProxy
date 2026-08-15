@@ -963,13 +963,16 @@ impl PluginService {
             match load_plugin(&entry.path()) {
                 Ok(plugin) => {
                     let plugin_id = plugin.manifest.id.clone();
-                    if plugins.contains_key(&plugin_id) {
-                        load_issues.push(PluginLoadIssue {
-                            package: entry.file_name().to_string_lossy().into_owned(),
-                            message: format!("duplicate plugin id {plugin_id}"),
-                        });
-                    } else {
-                        plugins.insert(plugin_id, Arc::new(plugin));
+                    match plugins.entry(plugin_id) {
+                        std::collections::hash_map::Entry::Occupied(existing) => {
+                            load_issues.push(PluginLoadIssue {
+                                package: entry.file_name().to_string_lossy().into_owned(),
+                                message: format!("duplicate plugin id {}", existing.key()),
+                            });
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(Arc::new(plugin));
+                        }
                     }
                 }
                 Err(error) => {
@@ -2308,6 +2311,7 @@ impl PluginService {
         Ok(contexts)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_http_workflow(
         &self,
         project_id: ProjectId,
@@ -2613,6 +2617,7 @@ impl PluginService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_operation(
         &self,
         project_id: ProjectId,
@@ -3620,6 +3625,7 @@ impl PluginService {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_race_semantic(
         &self,
         project_id: ProjectId,
@@ -3699,6 +3705,7 @@ impl PluginService {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_race_h2_single_packet(
         &self,
         project_id: ProjectId,
@@ -3929,6 +3936,7 @@ impl PluginService {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_race_last_byte(
         &self,
         project_id: ProjectId,
@@ -6213,6 +6221,7 @@ async fn run_js_stage_with_timeout(
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_js_sync(
     script: &str,
     stage: &str,
