@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+REPOSITORY="BehiSecc/HuntProxy"
+
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   GREEN='\033[0;32m'
   BLUE='\033[0;34m'
@@ -20,178 +22,195 @@ ok() { printf '%b✓%b %s\n' "$GREEN" "$RESET" "$*"; }
 warn() { printf '%b!%b %s\n' "$YELLOW" "$RESET" "$*"; }
 die() { printf '%berror:%b %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
+usage() {
+  cat <<'EOF'
+Download and install a verified HuntProxy binary from GitHub Releases.
+
+Usage: install.sh [--version VERSION] [--install-dir DIR]
+
+Options:
+  --version VERSION   Install a release such as 0.2.0 or v0.2.0 (default: latest)
+  --install-dir DIR   Install the executable here (default: ~/.local/bin)
+  -h, --help          Show this help
+
+Environment equivalents:
+  HUNTPROXY_VERSION, HUNTPROXY_INSTALL_DIR
+
+Private repositories require an authenticated GitHub CLI (`gh`). Public
+repositories use curl directly. This script only downloads, verifies, and
+installs the HuntProxy executable; it does not install dependencies or modify
+HuntProxy's data directory.
+EOF
+}
+
 [[ -n "${HOME:-}" ]] || die 'HOME is not set'
 
 INSTALL_DIR="${HUNTPROXY_INSTALL_DIR:-$HOME/.local/bin}"
-DATA_DIR="${HUNTPROXY_DATA_DIR:-$HOME/.huntproxy}"
+REQUESTED_VERSION="${HUNTPROXY_VERSION:-latest}"
 ORIGINAL_PATH="${PATH:-}"
-TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/huntproxy-install.XXXXXX")"
-trap 'rm -rf "$TEMP_DIR"' EXIT
 
-mkdir -p "$INSTALL_DIR" "$DATA_DIR"
-chmod 700 "$DATA_DIR"
+while (($#)); do
+  case "$1" in
+    --version)
+      (($# >= 2)) || die '--version requires a value'
+      REQUESTED_VERSION=$2
+      shift 2
+      ;;
+    --install-dir)
+      (($# >= 2)) || die '--install-dir requires a value'
+      INSTALL_DIR=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+[[ -n "$INSTALL_DIR" ]] || die 'install directory cannot be empty'
+
+case "$REQUESTED_VERSION" in
+  latest) ;;
+  v[0-9]*.[0-9]*.[0-9]*) ;;
+  [0-9]*.[0-9]*.[0-9]*) REQUESTED_VERSION="v$REQUESTED_VERSION" ;;
+  *) die 'version must be "latest" or a stable semantic version such as v0.2.0' ;;
+esac
+if [[ "$REQUESTED_VERSION" != latest ]] \
+  && [[ ! "$REQUESTED_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  die 'version must be a stable semantic version such as v0.2.0'
+fi
+
+for command_name in tar awk sed tr cp mv chmod mkdir mktemp head uname rm; do
+  command -v "$command_name" >/dev/null 2>&1 \
+    || die "$command_name is required; install it and rerun this script"
+done
+
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  die 'a SHA-256 tool (sha256sum or shasum) is required'
+fi
+
+have_authenticated_gh() {
+  command -v gh >/dev/null 2>&1 && gh auth status -h github.com >/dev/null 2>&1
+}
+
+if ! have_authenticated_gh; then
+  command -v curl >/dev/null 2>&1 \
+    || die 'curl is required for public GitHub Release downloads'
+fi
+
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/huntproxy-install.XXXXXX")"
+NEW_BIN=''
+cleanup() {
+  local status=$?
+  set +e
+  [[ -z "$NEW_BIN" || ! -e "$NEW_BIN" ]] || rm -f -- "$NEW_BIN"
+  rm -rf -- "$TEMP_DIR"
+  exit "$status"
+}
+trap cleanup EXIT
 
 os_name="$(uname -s)"
 arch_name="$(uname -m)"
-case "$os_name" in
-  Linux) platform=linux ;;
-  Darwin) platform=macos ;;
+case "$os_name/$arch_name" in
+  Linux/x86_64|Linux/amd64) ASSET_NAME='huntproxy-linux-x86_64.tar.gz' ;;
+  Linux/arm64|Linux/aarch64) ASSET_NAME='huntproxy-linux-aarch64.tar.gz' ;;
+  Darwin/x86_64|Darwin/amd64) ASSET_NAME='huntproxy-mac-intel-chip.tar.gz' ;;
+  Darwin/arm64|Darwin/aarch64) ASSET_NAME='huntproxy-mac-apple-chip.tar.gz' ;;
+  Linux/*|Darwin/*) die "unsupported CPU architecture: $arch_name" ;;
   *) die "unsupported operating system: $os_name" ;;
 esac
-case "$arch_name" in
-  x86_64|amd64) architecture=x86_64 ;;
-  arm64|aarch64) architecture=aarch64 ;;
-  *) die "unsupported CPU architecture: $arch_name" ;;
-esac
 
-as_root() {
-  if [[ "$(id -u)" -eq 0 ]]; then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
+curl_download() {
+  curl --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors -fsSL "$1" -o "$2"
+}
+
+DOWNLOAD_DIR="$TEMP_DIR/release"
+mkdir -p "$DOWNLOAD_DIR"
+
+if have_authenticated_gh; then
+  if [[ "$REQUESTED_VERSION" == latest ]]; then
+    RELEASE_TAG="$(gh release view --repo "$REPOSITORY" --json tagName --jq .tagName)" \
+      || die "no published HuntProxy release was found in $REPOSITORY"
   else
-    die "root access is required to install OS packages: $*"
+    RELEASE_TAG=$REQUESTED_VERSION
   fi
-}
-
-install_curl() {
-  command -v curl >/dev/null 2>&1 && return
-  info 'Installing curl'
-  if command -v apt-get >/dev/null 2>&1; then
-    as_root apt-get update
-    as_root apt-get install -y curl ca-certificates
-  elif command -v dnf >/dev/null 2>&1; then
-    as_root dnf install -y curl ca-certificates
-  elif command -v pacman >/dev/null 2>&1; then
-    as_root pacman -Syu --needed --noconfirm curl ca-certificates
-  elif command -v zypper >/dev/null 2>&1; then
-    as_root zypper --non-interactive install curl ca-certificates
+  info "Downloading HuntProxy $RELEASE_TAG from GitHub Releases"
+  gh release download "$RELEASE_TAG" --repo "$REPOSITORY" \
+    --pattern "$ASSET_NAME" --pattern SHA256SUMS --dir "$DOWNLOAD_DIR" --clobber \
+    || die "could not download $RELEASE_TAG from $REPOSITORY"
+else
+  if [[ "$REQUESTED_VERSION" == latest ]]; then
+    RELEASE_JSON="$TEMP_DIR/latest-release.json"
+    curl_download "https://api.github.com/repos/$REPOSITORY/releases/latest" "$RELEASE_JSON" \
+      || die "no public HuntProxy release was found; private repositories require authenticated gh"
+    RELEASE_TAG="$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$RELEASE_JSON" | head -n 1)"
+    [[ -n "$RELEASE_TAG" ]] || die 'the latest GitHub release response was invalid'
   else
-    die 'curl is required; install it and rerun this script'
+    RELEASE_TAG=$REQUESTED_VERSION
   fi
-}
-
-install_node() {
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 \
-    && [[ "$(node -p 'Number(process.versions.node.split(".")[0]) >= 18' 2>/dev/null)" == true ]]; then
-    return
-  fi
-  info 'Installing Node.js and npm'
-  if [[ "$platform" == macos ]] && command -v brew >/dev/null 2>&1; then
-    brew install node
-  elif command -v apt-get >/dev/null 2>&1; then
-    as_root apt-get update
-    as_root apt-get install -y nodejs npm
-  elif command -v dnf >/dev/null 2>&1; then
-    as_root dnf install -y nodejs npm
-  elif command -v pacman >/dev/null 2>&1; then
-    as_root pacman -Syu --needed --noconfirm nodejs npm
-  elif command -v zypper >/dev/null 2>&1; then
-    as_root zypper --non-interactive install nodejs npm
-  else
-    die 'Node.js and npm are required; install them and rerun this script'
-  fi
-  [[ "$(node -p 'Number(process.versions.node.split(".")[0]) >= 18' 2>/dev/null)" == true ]] \
-    || die 'HuntProxy requires Node.js 18 or newer; upgrade Node.js and rerun this script'
-}
-
-install_build_tools() {
-  if command -v cc >/dev/null 2>&1 && command -v c++ >/dev/null 2>&1 \
-    && command -v make >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 \
-    && command -v cmake >/dev/null 2>&1 && command -v clang >/dev/null 2>&1; then
-    return
-  fi
-  info 'Ensuring native build tools are installed'
-  if [[ "$platform" == macos ]]; then
-    xcode-select -p >/dev/null 2>&1 \
-      || die 'Install Xcode Command Line Tools with `xcode-select --install`, then rerun'
-  elif command -v apt-get >/dev/null 2>&1; then
-    as_root apt-get update
-    as_root apt-get install -y build-essential pkg-config cmake clang
-  elif command -v dnf >/dev/null 2>&1; then
-    as_root dnf install -y gcc gcc-c++ make pkgconf-pkg-config cmake clang
-  elif command -v pacman >/dev/null 2>&1; then
-    as_root pacman -Syu --needed --noconfirm base-devel pkgconf cmake clang
-  elif command -v zypper >/dev/null 2>&1; then
-    as_root zypper --non-interactive install -t pattern devel_basis
-    as_root zypper --non-interactive install pkg-config cmake clang
-  else
-    die 'Install a C/C++ compiler, make, pkg-config, CMake, and Clang, then rerun'
-  fi
-}
-
-install_rust() {
-  if command -v cargo >/dev/null 2>&1; then
-    return
-  fi
-  command -v curl >/dev/null 2>&1 || die 'curl is required to install Rust'
-  info 'Installing the Rust toolchain'
-  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal
-  export PATH="$HOME/.cargo/bin:$PATH"
-}
-
-install_huntproxy() {
-  local source_dir=$PWD
-  local destination="$INSTALL_DIR/HuntProxy"
-
-  if [[ -n "${HUNTPROXY_BINARY_URL:-}" ]]; then
-    command -v curl >/dev/null 2>&1 || die 'curl is required to download HuntProxy'
-    info 'Downloading HuntProxy'
-    curl --proto '=https' --tlsv1.2 -fL "$HUNTPROXY_BINARY_URL" -o "$TEMP_DIR/HuntProxy"
-    if [[ -n "${HUNTPROXY_BINARY_SHA256:-}" ]]; then
-      if command -v sha256sum >/dev/null 2>&1; then
-        printf '%s  %s\n' "$HUNTPROXY_BINARY_SHA256" "$TEMP_DIR/HuntProxy" | sha256sum -c -
-      elif command -v shasum >/dev/null 2>&1; then
-        printf '%s  %s\n' "$HUNTPROXY_BINARY_SHA256" "$TEMP_DIR/HuntProxy" | shasum -a 256 -c -
-      else
-        die 'cannot verify HUNTPROXY_BINARY_SHA256: no SHA-256 tool found'
-      fi
-    fi
-    chmod 755 "$TEMP_DIR/HuntProxy"
-    "$TEMP_DIR/HuntProxy" --version >/dev/null \
-      || die 'downloaded HuntProxy binary failed verification'
-    install -m 0755 "$TEMP_DIR/HuntProxy" "$destination"
-  elif [[ -f "$source_dir/Cargo.toml" && -f "$source_dir/src/main.rs" ]] \
-    && grep -q 'name = "HuntProxy"' "$source_dir/Cargo.toml"; then
-    install_build_tools
-    install_rust
-    info 'Building HuntProxy from this source checkout'
-    cargo build --release --manifest-path "$source_dir/Cargo.toml" --bin HuntProxy
-    install -m 0755 "$source_dir/target/release/HuntProxy" "$destination"
-  elif command -v HuntProxy >/dev/null 2>&1; then
-    destination="$(command -v HuntProxy)"
-    warn "Using the existing HuntProxy binary at $destination"
-  else
-    die 'HuntProxy has no published download URL yet. Run this script from its source checkout or set HUNTPROXY_BINARY_URL.'
-  fi
-
-  HUNTPROXY_BIN="$destination"
-  ok "HuntProxy: $HUNTPROXY_BIN"
-}
-
-install_curl
-install_huntproxy
-install_node
-
-export PATH="$INSTALL_DIR:$PATH"
-export HUNTPROXY_DATA_DIR="$DATA_DIR"
-
-browser_args=(browser install)
-if [[ "$platform" == linux ]] && command -v apt-get >/dev/null 2>&1; then
-  browser_args+=(--with-deps)
+  info "Downloading HuntProxy $RELEASE_TAG from GitHub Releases"
+  RELEASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
+  curl_download "$RELEASE_URL/$ASSET_NAME" "$DOWNLOAD_DIR/$ASSET_NAME" \
+    || die "could not download $ASSET_NAME; private repositories require authenticated gh"
+  curl_download "$RELEASE_URL/SHA256SUMS" "$DOWNLOAD_DIR/SHA256SUMS" \
+    || die 'could not download the release checksums'
 fi
-info 'Installing Playwright and Chromium'
-"$HUNTPROXY_BIN" "${browser_args[@]}"
 
-info "Initializing $DATA_DIR"
-"$HUNTPROXY_BIN" init >/dev/null
-"$HUNTPROXY_BIN" doctor
+[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || die "release has an unsupported version tag: $RELEASE_TAG"
+[[ -f "$DOWNLOAD_DIR/$ASSET_NAME" && -f "$DOWNLOAD_DIR/SHA256SUMS" ]] \
+  || die 'the release is missing its archive or SHA256SUMS'
 
-ok 'HuntProxy is ready'
-printf '\nNext: connect HuntProxy to your AI agent through MCP.\n'
-printf 'MCP:  {"command":"%s","args":["mcp"]}\n' "$HUNTPROXY_BIN"
-printf 'Optional UI: run %s serve, then open http://127.0.0.1:17890\n' "$HUNTPROXY_BIN"
+checksum_matches="$(awk -v name="$ASSET_NAME" '
+  ($2 == name || $2 == "*" name) { print $1 }
+' "$DOWNLOAD_DIR/SHA256SUMS")"
+[[ "$checksum_matches" =~ ^[0-9A-Fa-f]{64}$ ]] \
+  || die "SHA256SUMS must contain exactly one valid checksum for $ASSET_NAME"
+actual_checksum="$(sha256_file "$DOWNLOAD_DIR/$ASSET_NAME")"
+actual_checksum="$(printf '%s' "$actual_checksum" | tr '[:upper:]' '[:lower:]')"
+checksum_matches="$(printf '%s' "$checksum_matches" | tr '[:upper:]' '[:lower:]')"
+[[ "$actual_checksum" == "$checksum_matches" ]] \
+  || die "checksum verification failed for $ASSET_NAME"
+ok 'Release checksum verified'
+
+archive_members="$(tar -tzf "$DOWNLOAD_DIR/$ASSET_NAME")" \
+  || die 'the release archive could not be read'
+while IFS= read -r member; do
+  case "$member" in
+    HuntProxy|LICENSE) ;;
+    *) die "the release archive contains an unexpected member: $member" ;;
+  esac
+done <<<"$archive_members"
+member_count="$(awk '$0 == "HuntProxy" { count++ } END { print count + 0 }' <<<"$archive_members")"
+[[ "$member_count" == 1 ]] || die 'the release archive must contain exactly one HuntProxy executable'
+member_details="$(tar -tvzf "$DOWNLOAD_DIR/$ASSET_NAME" HuntProxy)" \
+  || die 'the HuntProxy archive member could not be inspected'
+[[ "${member_details:0:1}" == '-' ]] || die 'the HuntProxy archive member must be a regular file'
+STAGED_BIN="$TEMP_DIR/HuntProxy"
+tar -xOzf "$DOWNLOAD_DIR/$ASSET_NAME" HuntProxy >"$STAGED_BIN" \
+  || die 'the HuntProxy executable could not be extracted'
+chmod 755 "$STAGED_BIN"
+binary_version="$("$STAGED_BIN" --version 2>/dev/null | awk '{print $NF}')" \
+  || die 'the downloaded HuntProxy executable could not run on this machine'
+[[ "$binary_version" == "${RELEASE_TAG#v}" ]] \
+  || die "release $RELEASE_TAG contains HuntProxy $binary_version"
+
+mkdir -p "$INSTALL_DIR"
+NEW_BIN="$(mktemp "$INSTALL_DIR/.HuntProxy.new.XXXXXX")"
+cp -- "$STAGED_BIN" "$NEW_BIN"
+chmod 755 "$NEW_BIN"
+"$NEW_BIN" --version >/dev/null || die 'the installed executable failed its final check'
+mv -f -- "$NEW_BIN" "$INSTALL_DIR/HuntProxy"
+NEW_BIN=''
+
+ok "HuntProxy $binary_version installed"
+printf '\nBinary: %s\nRun:    %s --help\n' "$INSTALL_DIR/HuntProxy" "$INSTALL_DIR/HuntProxy"
 if [[ ":$ORIGINAL_PATH:" != *":$INSTALL_DIR:"* ]]; then
   warn "Add this to your shell profile: export PATH=\"$INSTALL_DIR:\$PATH\""
 fi

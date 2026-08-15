@@ -1,0 +1,178 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.88.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test release source
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          [[ "${GITHUB_REF_NAME#v}" == "$package_version" ]]
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: huntproxy-linux-x86_64.tar.gz
+            platform: linux
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: huntproxy-linux-aarch64.tar.gz
+            platform: linux
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: huntproxy-mac-intel-chip.tar.gz
+            platform: macos
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: huntproxy-mac-apple-chip.tar.gz
+            platform: macos
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config
+
+      - name: Install macOS build dependencies
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          brew install cmake llvm pkg-config
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup target add --toolchain "$RUST_VERSION" "${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo "+${RUST_VERSION}" build --release --locked --target "${{ matrix.target }}" --bin HuntProxy
+
+      - name: Smoke-test binary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          binary="target/${{ matrix.target }}/release/HuntProxy"
+          "$binary" --version
+          if [[ "${{ matrix.platform }}" == linux ]]; then
+            ldd "$binary"
+          else
+            dependencies="$(otool -L "$binary")"
+            printf '%s\n' "$dependencies"
+            if grep -q '/opt/homebrew\|/usr/local/Cellar\|/usr/local/opt' <<<"$dependencies"; then
+              exit 1
+            fi
+          fi
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          package_dir="${RUNNER_TEMP}/huntproxy-package"
+          mkdir -p "$package_dir"
+          cp "target/${{ matrix.target }}/release/HuntProxy" "$package_dir/HuntProxy"
+          cp LICENSE "$package_dir/LICENSE"
+          chmod 755 "$package_dir/HuntProxy"
+          tar -czf "${{ matrix.asset }}" -C "$package_dir" HuntProxy LICENSE
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum huntproxy-*.tar.gz | sort > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace published assets" >&2
+            exit 1
+          fi
+          created=0
+          cleanup_draft() {
+            if [[ "$created" == 1 ]]; then
+              gh release delete "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --yes || true
+            fi
+          }
+          trap cleanup_draft ERR
+          created=1
+          gh release create "$GITHUB_REF_NAME" dist/huntproxy-*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --draft \
+            --title "HuntProxy $GITHUB_REF_NAME"
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          created=0
