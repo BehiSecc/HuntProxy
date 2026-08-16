@@ -328,7 +328,7 @@ fn tool_defs() -> Value {
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file. profile_name stores an independently selectable identity for identity-aware extensions instead of changing the active cookie jar.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
         {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; exchange_id:3011; response_hash:abc123; (request:~this OR request:~that) method:PUT. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"sitemap","description":"Return an alphanumerically sorted host/path tree derived from saved project history, including methods, statuses, query parameters, content types, and exchange counts. Omit host for every host or provide one exact host.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive."}},"required":["project_id"]}},
+        {"name":"sitemap","description":"Discover saved routes without oversized responses. Omit host for a lightweight list of hosts and route counts. Provide one exact host for its detailed route tree, optionally limited to a path subtree.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive. Omit for host summaries."},"path_prefix":{"type":"string","description":"Optional slash-boundary path subtree, such as /api. Requires host."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_compare","description":"Compare the saved request and response of two exchanges. Sensitive values stay redacted, while changes are still detected. Text body diffs are bounded.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"left_exchange_id":{"type":"integer"},"right_exchange_id":{"type":"integer"},"include_noisy_headers":{"type":"boolean","default":false}},"required":["project_id","left_exchange_id","right_exchange_id"],"additionalProperties":false}},
@@ -1066,10 +1066,32 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "sitemap" => {
             let project_id = require_project_id(&args)?;
-            let host = args.get("host").and_then(Value::as_str).map(str::to_string);
-            Ok(json!({
-                "hosts": state.db.list_sitemap(project_id, host).await?
-            }))
+            let host = args
+                .get("host")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let path_prefix = args
+                .get("path_prefix")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            match host {
+                Some(host) => Ok(json!({
+                    "hosts": state
+                        .db
+                        .list_sitemap_subtree(project_id, Some(host), path_prefix)
+                        .await?
+                })),
+                None if path_prefix.is_some() => {
+                    Err(DomainError::invalid("sitemap path_prefix requires host"))
+                }
+                None => Ok(json!({
+                    "hosts": state.db.list_sitemap_hosts(project_id).await?
+                })),
+            }
         }
         "findings" => {
             let project_id = require_project_id(&args)?;
@@ -2568,7 +2590,15 @@ mod tests {
             true
         );
         assert!(tools.iter().any(|tool| tool["name"] == "huntproxy_stop"));
-        assert!(tools.iter().any(|tool| tool["name"] == "sitemap"));
+        let sitemap = tools.iter().find(|tool| tool["name"] == "sitemap").unwrap();
+        assert!(sitemap["description"]
+            .as_str()
+            .unwrap()
+            .contains("lightweight list of hosts and route counts"));
+        assert!(sitemap["inputSchema"]["properties"]
+            .get("path_prefix")
+            .is_some());
+        assert_eq!(sitemap["inputSchema"]["additionalProperties"], false);
         assert!(tools.iter().any(|tool| tool["name"] == "findings"));
     }
 }

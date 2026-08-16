@@ -194,6 +194,12 @@ pub struct SitemapHost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SitemapHostSummary {
+    pub host: String,
+    pub route_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SitemapRoute {
     pub path: String,
     pub methods: Vec<String>,

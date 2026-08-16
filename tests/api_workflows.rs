@@ -1085,6 +1085,101 @@ async fn sitemap_and_findings_work_through_http_api() {
 }
 
 #[tokio::test]
+async fn mcp_sitemap_starts_with_host_summaries_and_supports_path_subtrees() {
+    let (_directory, state, project_id) = test_state().await;
+    for (host, method, path) in [
+        ("Example.COM", "GET", "/api"),
+        ("example.com", "GET", "/api/users"),
+        ("example.com", "POST", "/api/users"),
+        ("example.com", "GET", "/api2"),
+        ("example.com", "GET", "/other"),
+        ("cdn.example.com", "GET", "/asset.js"),
+    ] {
+        let mut item = exchange(project_id, method, path);
+        item.host = host.into();
+        item.authority = host.into();
+        state.db.insert_exchange(item).await.unwrap();
+    }
+
+    let summary = huntproxy::mcp::call_tool(
+        state.clone(),
+        "sitemap",
+        serde_json::json!({ "project_id": project_id.get() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summary,
+        serde_json::json!({
+            "hosts": [
+                { "host": "cdn.example.com", "route_count": 1 },
+                { "host": "example.com", "route_count": 4 }
+            ]
+        })
+    );
+
+    let subtree = huntproxy::mcp::call_tool(
+        state.clone(),
+        "sitemap",
+        serde_json::json!({
+            "project_id": project_id.get(),
+            "host": "EXAMPLE.COM.",
+            "path_prefix": "api/"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        subtree["hosts"][0]["paths"],
+        serde_json::json!(["/api", "/api/users"])
+    );
+    assert_eq!(subtree["hosts"][0]["routes"][1]["exchange_count"], 2);
+    assert_eq!(subtree["hosts"][0]["tree"][0]["path"], "/api");
+
+    let root = huntproxy::mcp::call_tool(
+        state.clone(),
+        "sitemap",
+        serde_json::json!({
+            "project_id": project_id.get(),
+            "host": "example.com",
+            "path_prefix": "//"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        root["hosts"][0]["paths"],
+        serde_json::json!(["/api", "/api/users", "/api2", "/other"])
+    );
+
+    let no_match = huntproxy::mcp::call_tool(
+        state.clone(),
+        "sitemap",
+        serde_json::json!({
+            "project_id": project_id.get(),
+            "host": "example.com",
+            "path_prefix": "/missing"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(no_match, serde_json::json!({ "hosts": [] }));
+
+    let error = huntproxy::mcp::call_tool(
+        state,
+        "sitemap",
+        serde_json::json!({
+            "project_id": project_id.get(),
+            "path_prefix": "/api"
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert_eq!(error.to_string(), "sitemap path_prefix requires host");
+}
+
+#[tokio::test]
 async fn copy_as_includes_secrets_by_default_and_can_explicitly_redact_them() {
     let (_directory, state, project_id) = test_state().await;
     let mut captured = exchange(project_id, "POST", "/submit");

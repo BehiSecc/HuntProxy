@@ -22,15 +22,63 @@ struct TreeBuilder {
 }
 
 impl Db {
+    pub async fn list_sitemap_hosts(
+        &self,
+        project_id: ProjectId,
+    ) -> DomainResult<Vec<SitemapHostSummary>> {
+        self.get_project(project_id).await?;
+        self.with_conn(move |conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT lower(host), COUNT(DISTINCT path) FROM exchanges
+                     WHERE project_id=?1
+                     GROUP BY lower(host)
+                     ORDER BY lower(host) COLLATE NOCASE",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([project_id.get()], |row| {
+                    Ok(SitemapHostSummary {
+                        host: row.get(0)?,
+                        route_count: row.get::<_, i64>(1)? as u64,
+                    })
+                })
+                .map_err(storage_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)
+        })
+        .await
+    }
+
     pub async fn list_sitemap(
         &self,
         project_id: ProjectId,
         host: Option<String>,
     ) -> DomainResult<Vec<SitemapHost>> {
+        self.list_sitemap_subtree(project_id, host, None).await
+    }
+
+    pub async fn list_sitemap_subtree(
+        &self,
+        project_id: ProjectId,
+        host: Option<String>,
+        path_prefix: Option<String>,
+    ) -> DomainResult<Vec<SitemapHost>> {
         self.get_project(project_id).await?;
         let host = host
             .map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase())
             .filter(|value| !value.is_empty());
+        let path_prefix = path_prefix
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "/")
+            .and_then(|value| {
+                let value = if value.starts_with('/') {
+                    value
+                } else {
+                    format!("/{value}")
+                };
+                let value = value.trim_end_matches('/').to_string();
+                (!value.is_empty()).then_some(value)
+            });
         self.with_conn(move |conn| {
             let mut binds = vec![Value::Integer(project_id.get())];
             let host_clause = if let Some(host) = host {
@@ -39,9 +87,18 @@ impl Db {
             } else {
                 ""
             };
+            let path_clause = if let Some(path_prefix) = path_prefix {
+                binds.push(Value::Text(path_prefix));
+                let index = binds.len();
+                format!(
+                    " AND (path=?{index} OR substr(path, 1, length(?{index}) + 1)=?{index} || '/')"
+                )
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT lower(host), path, method, status_code, mime, query FROM exchanges
-                 WHERE project_id=?1{host_clause}
+                 WHERE project_id=?1{host_clause}{path_clause}
                  ORDER BY lower(host) COLLATE NOCASE, path COLLATE NOCASE, path, exchange_id"
             );
             let mut statement = conn.prepare(&sql).map_err(storage_error)?;
