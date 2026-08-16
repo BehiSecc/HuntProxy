@@ -180,8 +180,9 @@ async fn run(cli: Cli) -> DomainResult<()> {
             // Create DB via open
             let db = huntproxy::storage::Db::open(&cfg).await?;
             let ver = db.schema_version().await?;
-            // Generate CA
-            generate_ca(&cfg)?;
+            // Create the interception CA once. Existing installations keep the
+            // exact same identity across init and installer reruns.
+            ensure_ca(&cfg)?;
             // Placeholder key
             let _ = huntproxy::reply::PlaceholderKey::load_or_create(&cfg.placeholder_key_path())?;
             println!("Initialized {}", cfg.data_dir.display());
@@ -206,10 +207,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
             configure_daemon_mode(&mut cfg, auto_started);
             let mirror_to_stderr = !auto_started;
             init_daemon_logging(&cfg.log_level, cfg.daemon_log_path(), mirror_to_stderr);
-            // Ensure CA exists
-            if !cfg.ca_cert_path().exists() {
-                generate_ca(&cfg)?;
-            }
+            ensure_ca(&cfg)?;
             println!(
                 "HuntProxy serve\n  UI:    http://{}\n  proxy: {}\n  data:  {}",
                 cfg.api_listen,
@@ -678,7 +676,37 @@ fn read_log_tail(path: &std::path::Path, max_bytes: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
-fn generate_ca(cfg: &Config) -> DomainResult<()> {
+fn ensure_ca(cfg: &Config) -> DomainResult<()> {
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(cfg.data_dir.join("ca/.generation.lock"))
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+    #[cfg(unix)]
+    let _lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).map_err(
+        |(_, error)| DomainError::new(ErrorCode::StorageError, format!("CA lock: {error}")),
+    )?;
+    #[cfg(not(unix))]
+    let _lock = lock_file;
+
+    let cert_path = cfg.ca_cert_path();
+    let key_path = cfg.ca_key_path();
+    match (cert_path.exists(), key_path.exists()) {
+        (true, true) => return Ok(()),
+        (true, false) | (false, true) => {
+            return Err(DomainError::new(
+                ErrorCode::StorageError,
+                format!(
+                    "incomplete CA in {}: both certificate and key must exist; restore the missing file from backup",
+                    cert_path.parent().unwrap_or(&cfg.data_dir).display()
+                ),
+            ));
+        }
+        (false, false) => {}
+    }
+
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     let mut params = CertificateParams::new(vec!["HuntProxy local CA".into()])
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
@@ -688,11 +716,40 @@ fn generate_ca(cfg: &Config) -> DomainResult<()> {
     let cert = params
         .self_signed(&key)
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    huntproxy::config::write_private_file(cfg.ca_cert_path().as_path(), cert.pem().as_bytes())?;
-    huntproxy::config::write_private_file(
-        cfg.ca_key_path().as_path(),
-        key.serialize_pem().as_bytes(),
-    )?;
+
+    let suffix = std::process::id();
+    let cert_temp = cert_path.with_file_name(format!(".ca.crt.{suffix}.tmp"));
+    let key_temp = key_path.with_file_name(format!(".ca.key.{suffix}.tmp"));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&cert_temp);
+        let _ = std::fs::remove_file(&key_temp);
+    };
+    cleanup();
+    if let Err(error) = huntproxy::config::write_private_file(&cert_temp, cert.pem().as_bytes()) {
+        cleanup();
+        return Err(error);
+    }
+    if let Err(error) =
+        huntproxy::config::write_private_file(&key_temp, key.serialize_pem().as_bytes())
+    {
+        cleanup();
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&key_temp, &key_path) {
+        cleanup();
+        return Err(DomainError::new(
+            ErrorCode::StorageError,
+            format!("install CA key: {error}"),
+        ));
+    }
+    if let Err(error) = std::fs::rename(&cert_temp, &cert_path) {
+        let _ = std::fs::remove_file(&key_path);
+        cleanup();
+        return Err(DomainError::new(
+            ErrorCode::StorageError,
+            format!("install CA certificate: {error}"),
+        ));
+    }
     Ok(())
 }
 
@@ -871,6 +928,17 @@ async fn simple_http(method: &str, url: &str, body: Option<&str>) -> DomainResul
 mod tests {
     use super::*;
 
+    fn config_in(data_dir: PathBuf) -> Config {
+        Config {
+            data_dir: data_dir.clone(),
+            spool_dir: data_dir.join("spool"),
+            export_dir: data_dir.join("exports"),
+            runtime_dir: data_dir.join("runtime"),
+            plugin_dir: data_dir.join("plugins"),
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn daemon_log_rotates_at_the_size_limit() {
         let temp = tempfile::tempdir().unwrap();
@@ -908,5 +976,41 @@ mod tests {
         };
         configure_daemon_mode(&mut automatic, true);
         assert_eq!(automatic.idle_timeout_seconds, 3600);
+    }
+
+    #[test]
+    fn ensure_ca_preserves_an_existing_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_in(temp.path().to_path_buf());
+        config.ensure_layout().unwrap();
+
+        ensure_ca(&config).unwrap();
+        let cert = std::fs::read(config.ca_cert_path()).unwrap();
+        let key = std::fs::read(config.ca_key_path()).unwrap();
+
+        ensure_ca(&config).unwrap();
+        assert_eq!(std::fs::read(config.ca_cert_path()).unwrap(), cert);
+        assert_eq!(std::fs::read(config.ca_key_path()).unwrap(), key);
+    }
+
+    #[test]
+    fn ensure_ca_rejects_an_incomplete_pair() {
+        for missing_key in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = config_in(temp.path().to_path_buf());
+            config.ensure_layout().unwrap();
+            let existing = if missing_key {
+                config.ca_cert_path()
+            } else {
+                config.ca_key_path()
+            };
+            std::fs::write(&existing, b"keep me").unwrap();
+
+            let error = ensure_ca(&config).unwrap_err();
+            assert!(error.to_string().contains("incomplete CA"));
+            assert_eq!(std::fs::read(existing).unwrap(), b"keep me");
+            assert_eq!(config.ca_cert_path().exists(), missing_key);
+            assert_eq!(config.ca_key_path().exists(), !missing_key);
+        }
     }
 }

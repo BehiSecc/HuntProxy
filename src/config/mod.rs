@@ -197,6 +197,12 @@ impl Config {
             })?;
             cfg.apply_file(file);
         }
+        if cfg.node_path.as_ref().is_none_or(|path| !path.is_file()) {
+            let managed_node = cfg.runtime_dir.join("node/bin/node");
+            if managed_node.is_file() {
+                cfg.node_path = Some(managed_node);
+            }
+        }
         cfg.validate()?;
         cfg.ensure_layout()?;
         cfg.write_default_config()?;
@@ -488,6 +494,23 @@ mod tests {
 
         std::fs::write(data_dir.join(DB_FILE_NAME), b"current").unwrap();
         assert_eq!(config.db_path(), data_dir.join(DB_FILE_NAME));
+    }
+
+    #[test]
+    fn load_falls_back_to_the_managed_node_runtime() {
+        let parent = tempfile::tempdir().unwrap();
+        let data_dir = parent.path().join("data");
+        let node = data_dir.join("runtime/node/bin/node");
+        std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+        std::fs::write(&node, b"node").unwrap();
+        std::fs::write(
+            data_dir.join(CONFIG_FILE_NAME),
+            "node_path = '/missing/node'\n",
+        )
+        .unwrap();
+
+        let config = Config::load(Some(data_dir)).unwrap();
+        assert_eq!(config.node_path.as_deref(), Some(node.as_path()));
     }
 
     #[test]
