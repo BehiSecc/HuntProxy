@@ -40,7 +40,7 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "set-header"] }
 # Semantic egress — exact-pinned permissive prerelease (Apache-2.0).
 # Cookies, decompression, and system-proxy support intentionally stay disabled.
-wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["webpki-roots", "tokio-rt", "stream", "prefix-symbols", "socks"] }
+wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["webpki-roots", "tokio-rt", "stream", "socks"] }
 wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation", "tokio-rt"] }
 
 # TLS / CA
@@ -104,6 +104,11 @@ async-stream = "0.3"
 
 tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+# BoringSSL symbol prefixing is supported only on Linux and Android. Keeping it
+# enabled on macOS prefixes the Rust bindings but not the native libraries.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["prefix-symbols"] }
 
 [dev-dependencies]
 proptest = "1"
