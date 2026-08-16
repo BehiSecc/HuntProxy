@@ -95,7 +95,7 @@ fi
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/huntproxy-install.XXXXXX")"
 NEW_BIN=''; LOCK_DIR=''; LOCK_HELD=0; VERIFY_PID=''; NODE_BACKUP=''; WORKER_BACKUP=''; PLUGIN_DIR=''
 NODE_INCOMING=''; PLUGIN_INCOMING=''; PLUGIN_SOURCE_TEMP=''
-NODE_INSTALLED=0; WORKER_TOUCHED=0; STATE_BACKED_UP=0; INSTALL_COMPLETE=0
+NODE_INSTALLED=0; NODE_REUSED=0; WORKER_TOUCHED=0; STATE_BACKED_UP=0; INSTALL_COMPLETE=0
 NEW_PLUGIN_LIST="$TEMP_DIR/new-plugins"
 : >"$NEW_PLUGIN_LIST"
 STATE_BACKUP="$TEMP_DIR/state-backup"
@@ -155,6 +155,75 @@ curl_download() {
   curl --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors -fsSL "$1" -o "$2"
 }
 
+node_runtime_ready() {
+  local runtime=$1
+  [[ -x "$runtime/bin/node" && -x "$runtime/bin/npm" ]] \
+    && [[ "$("$runtime/bin/node" --version 2>/dev/null)" == "$NODE_VERSION" ]] \
+    && PATH="$runtime/bin:$PATH" "$runtime/bin/npm" --version >/dev/null 2>&1
+}
+
+browser_smoke() {
+  local worker=$1 output_name=$2
+  local worker_path="$worker/index.js"
+  local playwright_path="$worker/node_modules/playwright-core"
+  [[ -f "$worker_path" && -f "$playwright_path/cli.js" ]] || return 1
+  PLAYWRIGHT_BROWSERS_PATH=0 \
+  HUNTPROXY_PLAYWRIGHT_CORE_PATH="$playwright_path" \
+  "$MANAGED_NODE_DIR/bin/node" "$worker_path" \
+    <"$TEMP_DIR/browser-smoke.ndjson" \
+    >"$TEMP_DIR/$output_name.out" 2>"$TEMP_DIR/$output_name.err" || return 1
+  "$MANAGED_NODE_DIR/bin/node" -e '
+const fs = require("fs");
+const rows = fs.readFileSync(process.argv[1], "utf8").trim().split(/\n+/).map(JSON.parse);
+for (const id of [1, 2, 3]) {
+  const row = rows.find((entry) => entry.id === id);
+  if (!row || row.error) process.exit(1);
+}
+' "$TEMP_DIR/$output_name.out"
+}
+
+show_browser_smoke_error() {
+  local output_name=$1
+  [[ ! -f "$TEMP_DIR/$output_name.out" ]] || sed -n '1,120p' "$TEMP_DIR/$output_name.out" >&2
+  [[ ! -f "$TEMP_DIR/$output_name.err" ]] || sed -n '1,120p' "$TEMP_DIR/$output_name.err" >&2
+}
+
+install_chromium_runtime_libraries() {
+  local playwright_path="$WORKER_DIR/node_modules/playwright-core"
+  local package_list package
+  local packages=() missing_packages=()
+  for command_name in apt-get dpkg-query; do
+    command -v "$command_name" >/dev/null 2>&1 || return 1
+  done
+  package_list="$("$MANAGED_NODE_DIR/bin/node" -e '
+const path = require("path");
+const root = process.argv[1];
+const platform = require(path.join(root, "lib/utils/hostPlatform.js"));
+const native = require(path.join(root, "lib/server/registry/nativeDeps.js"));
+const packages = platform.isOfficiallySupportedPlatform && native.deps[platform.hostPlatform]?.chromium;
+if (!Array.isArray(packages) || !packages.length) process.exit(1);
+process.stdout.write(packages.join("\n"));
+' "$playwright_path")" || return 1
+  while IFS= read -r package; do
+    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
+    packages+=("$package")
+  done <<<"$package_list"
+  ((${#packages[@]})) || return 1
+  for package in "${packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+      missing_packages+=("$package")
+    fi
+  done
+  ((${#missing_packages[@]})) || return 1
+  if [[ "$(id -u)" == 0 ]]; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+  else
+    sudo apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+  fi
+}
+
 os_name="$(uname -s)"; arch_name="$(uname -m)"
 case "$os_name/$arch_name" in
   Linux/x86_64|Linux/amd64)
@@ -172,6 +241,7 @@ case "$os_name/$arch_name" in
   Linux/*|Darwin/*) die "unsupported CPU architecture: $arch_name" ;;
   *) die "unsupported operating system: $os_name" ;;
 esac
+MANAGED_NODE_DIR="$DATA_DIR/runtime/node"
 
 # Resolve and verify the HuntProxy release before touching its destination.
 DOWNLOAD_DIR="$TEMP_DIR/release"; mkdir -p "$DOWNLOAD_DIR"
@@ -216,33 +286,37 @@ chmod 755 "$STAGED_BIN"
 binary_version="$("$STAGED_BIN" --version 2>/dev/null | awk '{print $NF}')" || die 'the downloaded binary cannot run'
 [[ "$binary_version" == "${RELEASE_TAG#v}" ]] || die "release $RELEASE_TAG contains HuntProxy $binary_version"
 
-# Download an official, checksum-verified Node runtime for the browser worker.
-NODE_ASSET="node-$NODE_VERSION-$NODE_PLATFORM.tar.gz"
-NODE_DOWNLOAD="$TEMP_DIR/node-download"; mkdir -p "$NODE_DOWNLOAD"
-info "Downloading Node.js $NODE_VERSION"
-curl_download "https://nodejs.org/dist/$NODE_VERSION/$NODE_ASSET" "$NODE_DOWNLOAD/$NODE_ASSET" \
-  || die "could not download $NODE_ASSET"
-curl_download "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt" "$NODE_DOWNLOAD/SHASUMS256.txt" \
-  || die 'could not download Node.js checksums'
-node_checksum="$(awk -v name="$NODE_ASSET" '$2 == name { print $1 }' "$NODE_DOWNLOAD/SHASUMS256.txt")"
-[[ "$node_checksum" =~ ^[0-9A-Fa-f]{64}$ ]] || die "Node.js checksums do not contain $NODE_ASSET"
-[[ "$(sha256_file "$NODE_DOWNLOAD/$NODE_ASSET")" == "$node_checksum" ]] || die 'Node.js checksum verification failed'
-NODE_ROOT="${NODE_ASSET%.tar.gz}"
-node_members="$(tar -tzf "$NODE_DOWNLOAD/$NODE_ASSET")" || die 'the Node.js archive could not be read'
-while IFS= read -r member; do
-  case "${member%/}" in
-    "$NODE_ROOT"|"$NODE_ROOT"/*) ;;
-    *) die "unsafe Node.js archive member: $member" ;;
-  esac
-  case "/${member%/}/" in */../*|*//*) die "unsafe Node.js archive path: $member" ;; esac
-done <<<"$node_members"
-mkdir -p "$TEMP_DIR/node"
-tar -xzf "$NODE_DOWNLOAD/$NODE_ASSET" -C "$TEMP_DIR/node" || die 'could not extract Node.js'
-STAGED_NODE="$TEMP_DIR/node/$NODE_ROOT"
-[[ "$("$STAGED_NODE/bin/node" --version)" == "$NODE_VERSION" ]] || die 'the staged Node.js runtime failed verification'
-PATH="$STAGED_NODE/bin:$PATH" "$STAGED_NODE/bin/npm" --version >/dev/null \
-  || die 'the staged npm executable failed verification'
-ok 'Node.js checksum and runtime verified'
+# Reuse the private managed runtime when it is already the pinned version.
+if node_runtime_ready "$MANAGED_NODE_DIR"; then
+  STAGED_NODE=$MANAGED_NODE_DIR
+  NODE_REUSED=1
+  ok "Existing Node.js $NODE_VERSION runtime verified and reused"
+else
+  NODE_ASSET="node-$NODE_VERSION-$NODE_PLATFORM.tar.gz"
+  NODE_DOWNLOAD="$TEMP_DIR/node-download"; mkdir -p "$NODE_DOWNLOAD"
+  info "Downloading Node.js $NODE_VERSION"
+  curl_download "https://nodejs.org/dist/$NODE_VERSION/$NODE_ASSET" "$NODE_DOWNLOAD/$NODE_ASSET" \
+    || die "could not download $NODE_ASSET"
+  curl_download "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt" "$NODE_DOWNLOAD/SHASUMS256.txt" \
+    || die 'could not download Node.js checksums'
+  node_checksum="$(awk -v name="$NODE_ASSET" '$2 == name { print $1 }' "$NODE_DOWNLOAD/SHASUMS256.txt")"
+  [[ "$node_checksum" =~ ^[0-9A-Fa-f]{64}$ ]] || die "Node.js checksums do not contain $NODE_ASSET"
+  [[ "$(sha256_file "$NODE_DOWNLOAD/$NODE_ASSET")" == "$node_checksum" ]] || die 'Node.js checksum verification failed'
+  NODE_ROOT="${NODE_ASSET%.tar.gz}"
+  node_members="$(tar -tzf "$NODE_DOWNLOAD/$NODE_ASSET")" || die 'the Node.js archive could not be read'
+  while IFS= read -r member; do
+    case "${member%/}" in
+      "$NODE_ROOT"|"$NODE_ROOT"/*) ;;
+      *) die "unsafe Node.js archive member: $member" ;;
+    esac
+    case "/${member%/}/" in */../*|*//*) die "unsafe Node.js archive path: $member" ;; esac
+  done <<<"$node_members"
+  mkdir -p "$TEMP_DIR/node"
+  tar -xzf "$NODE_DOWNLOAD/$NODE_ASSET" -C "$TEMP_DIR/node" || die 'could not extract Node.js'
+  STAGED_NODE="$TEMP_DIR/node/$NODE_ROOT"
+  node_runtime_ready "$STAGED_NODE" || die 'the staged Node.js runtime failed verification'
+  ok 'Node.js checksum and runtime verified'
+fi
 
 # Resolve master once, then download and validate that immutable plugin snapshot.
 PLUGIN_JSON="$TEMP_DIR/plugin-commit.json"
@@ -318,19 +392,22 @@ STATE_BACKED_UP=1
 STOP_GUARD_EXISTED=0
 [[ ! -f "$STATE_BACKUP/.mcp-stop-guard" ]] || STOP_GUARD_EXISTED=1
 
-MANAGED_NODE_DIR="$DATA_DIR/runtime/node"
 mkdir -p "$DATA_DIR/runtime"
-NODE_INCOMING="$(mktemp -d "$DATA_DIR/runtime/.node.new.XXXXXX")"
-cp -R "$STAGED_NODE/." "$NODE_INCOMING/"
-[[ "$("$NODE_INCOMING/bin/node" --version)" == "$NODE_VERSION" ]] || die 'the copied Node.js runtime failed verification'
-if [[ -e "$MANAGED_NODE_DIR" ]]; then
-  NODE_BACKUP="$(mktemp -d "$DATA_DIR/runtime/.node.old.XXXXXX")"
-  rmdir "$NODE_BACKUP"
-  mv -- "$MANAGED_NODE_DIR" "$NODE_BACKUP"
+if [[ "$NODE_REUSED" -eq 1 ]]; then
+  node_runtime_ready "$MANAGED_NODE_DIR" || die 'the managed Node.js runtime changed during installation'
+else
+  NODE_INCOMING="$(mktemp -d "$DATA_DIR/runtime/.node.new.XXXXXX")"
+  cp -R "$STAGED_NODE/." "$NODE_INCOMING/"
+  node_runtime_ready "$NODE_INCOMING" || die 'the copied Node.js runtime failed verification'
+  if [[ -e "$MANAGED_NODE_DIR" ]]; then
+    NODE_BACKUP="$(mktemp -d "$DATA_DIR/runtime/.node.old.XXXXXX")"
+    rmdir "$NODE_BACKUP"
+    mv -- "$MANAGED_NODE_DIR" "$NODE_BACKUP"
+  fi
+  mv -- "$NODE_INCOMING" "$MANAGED_NODE_DIR"
+  NODE_INCOMING=''
+  NODE_INSTALLED=1
 fi
-mv -- "$NODE_INCOMING" "$MANAGED_NODE_DIR"
-NODE_INCOMING=''
-NODE_INSTALLED=1
 export PATH="$MANAGED_NODE_DIR/bin:$PATH"
 
 # Only initialize when there is no CA. This keeps old release binaries from
@@ -346,55 +423,51 @@ CA_CERT_HASH="$(sha256_file "$DATA_DIR/ca/ca.crt")"
 CA_KEY_HASH="$(sha256_file "$DATA_DIR/ca/ca.key")"
 
 WORKER_DIR="$DATA_DIR/browser-worker-$binary_version"
-if [[ -d "$WORKER_DIR" ]]; then
-  WORKER_BACKUP="$(mktemp -d "$DATA_DIR/.browser-worker.old.XXXXXX")"
-  rmdir "$WORKER_BACKUP"
-  mv -- "$WORKER_DIR" "$WORKER_BACKUP"
-fi
-WORKER_TOUCHED=1
-browser_args=(--data-dir "$DATA_DIR" browser install)
-if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
-  linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
-  if [[ "$linux_id" == ubuntu || "$linux_id" == debian ]]; then
-    if [[ "$(id -u)" == 0 ]] || { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
-      browser_args+=(--with-deps)
-      info 'Installing Chromium and required Debian/Ubuntu system libraries'
-    else
-      info 'Installing Chromium (system libraries cannot be elevated noninteractively)'
-    fi
-  else
-    info 'Installing Chromium; automatic system libraries are supported only on Debian/Ubuntu'
-  fi
-else
-  info 'Installing Chromium'
-fi
-"$STAGED_BIN" "${browser_args[@]}" >"$TEMP_DIR/browser-install.log" 2>&1 \
-  || { sed -n '1,160p' "$TEMP_DIR/browser-install.log" >&2; die 'browser runtime installation failed'; }
-
-WORKER_PATH="$WORKER_DIR/index.js"
-[[ -f "$WORKER_PATH" ]] || die 'browser worker was not installed'
 cat >"$TEMP_DIR/browser-smoke.ndjson" <<'EOF'
 {"jsonrpc":"2.0","id":1,"method":"hello"}
 {"jsonrpc":"2.0","id":2,"method":"session.start","params":{"session_id":1,"engine":"chromium","url":"about:blank","persistent":false}}
 {"jsonrpc":"2.0","id":3,"method":"session.stop","params":{"session_id":1}}
 EOF
-PLAYWRIGHT_BROWSERS_PATH=0 \
-HUNTPROXY_PLAYWRIGHT_CORE_PATH="$WORKER_DIR/node_modules/playwright-core" \
-"$MANAGED_NODE_DIR/bin/node" "$WORKER_PATH" <"$TEMP_DIR/browser-smoke.ndjson" >"$TEMP_DIR/browser-smoke.out" 2>"$TEMP_DIR/browser-smoke.err" \
-  || { sed -n '1,120p' "$TEMP_DIR/browser-smoke.err" >&2; die 'Chromium launch check failed'; }
-if ! "$MANAGED_NODE_DIR/bin/node" -e '
-const fs = require("fs");
-const rows = fs.readFileSync(process.argv[1], "utf8").trim().split(/\n+/).map(JSON.parse);
-for (const id of [1, 2, 3]) {
-  const row = rows.find((entry) => entry.id === id);
-  if (!row || row.error) process.exit(1);
-}
-' "$TEMP_DIR/browser-smoke.out"; then
-  sed -n '1,120p' "$TEMP_DIR/browser-smoke.out" >&2
-  sed -n '1,120p' "$TEMP_DIR/browser-smoke.err" >&2
-  die 'the browser worker did not complete its launch check'
+if browser_smoke "$WORKER_DIR" browser-existing; then
+  ok 'Existing Chromium runtime launched successfully and was reused'
+else
+  if [[ -d "$WORKER_DIR" ]]; then
+    WORKER_BACKUP="$(mktemp -d "$DATA_DIR/.browser-worker.old.XXXXXX")"
+    rmdir "$WORKER_BACKUP"
+    mv -- "$WORKER_DIR" "$WORKER_BACKUP"
+  fi
+  WORKER_TOUCHED=1
+  info 'Installing Chromium in the HuntProxy data directory'
+  "$STAGED_BIN" --data-dir "$DATA_DIR" browser install >"$TEMP_DIR/browser-install.log" 2>&1 \
+    || { sed -n '1,160p' "$TEMP_DIR/browser-install.log" >&2; die 'browser runtime installation failed'; }
+
+  if ! browser_smoke "$WORKER_DIR" browser-installed; then
+    linux_id=''
+    if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
+      linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
+    fi
+    if [[ "$linux_id" != ubuntu && "$linux_id" != debian ]]; then
+      show_browser_smoke_error browser-installed
+      die 'Chromium could not launch; automatic system libraries are supported only on Debian/Ubuntu'
+    fi
+    if [[ "$(id -u)" != 0 ]] && ! { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
+      show_browser_smoke_error browser-installed
+      die 'Chromium needs system libraries; rerun interactively with sudo available'
+    fi
+    info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
+    install_chromium_runtime_libraries >"$TEMP_DIR/browser-deps.log" 2>&1 \
+      || {
+        sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
+        show_browser_smoke_error browser-installed
+        die 'Chromium system library installation failed'
+      }
+    if ! browser_smoke "$WORKER_DIR" browser-with-deps; then
+      show_browser_smoke_error browser-with-deps
+      die 'Chromium still could not launch after installing its system libraries'
+    fi
+  fi
+  ok 'Chromium launched successfully'
 fi
-ok 'Chromium launched successfully'
 
 PLUGIN_DIR="$DATA_DIR/plugins"
 if [[ -f "$DATA_DIR/config.toml" ]]; then
