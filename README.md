@@ -423,10 +423,10 @@ Yes. Just ask your agent to hand you the browser. When you are done, ask it to t
 
 ### Update
 
-Rerun the installer to replace the executable:
+Update HuntProxy to the latest release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BehiSecc/HuntProxy/master/install.sh | bash
+HuntProxy update
 ```
 
 `HuntProxy backup` copies only SQLite; it omits configuration, the CA, plugins, and browser profiles. For full recovery, stop HuntProxy and copy its data directory plus any configured external paths. The installer leaves that data untouched.
