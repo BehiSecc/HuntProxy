@@ -33,4 +33,5 @@ pub mod request_rules;
 pub mod storage;
 pub mod transfer;
 pub mod transport;
+pub mod update;
 pub mod websocket;

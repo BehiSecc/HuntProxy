@@ -45,6 +45,15 @@ enum Commands {
     Status,
     /// Graceful stop.
     Stop,
+    /// Check for or install a verified GitHub Release binary.
+    Update {
+        /// Check whether another release is available without changing files.
+        #[arg(long)]
+        check: bool,
+        /// Install a specific stable release instead of the latest release.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+    },
     /// Project commands.
     Project {
         #[command(subcommand)]
@@ -307,6 +316,36 @@ async fn run(cli: Cli) -> DomainResult<()> {
             let cfg = Config::load(cli.data_dir)?;
             app::stop_daemon(&cfg).await?;
             println!("daemon stopped");
+            Ok(())
+        }
+        Commands::Update { check, version } => {
+            init_logging("error");
+            let outcome = huntproxy::update::run(huntproxy::update::UpdateRequest {
+                check,
+                version,
+                data_dir: cli.data_dir,
+            })
+            .await?;
+            match outcome {
+                huntproxy::update::UpdateOutcome::UpToDate { current } => {
+                    println!("HuntProxy {current} is already up to date");
+                }
+                huntproxy::update::UpdateOutcome::Available { current, target } => {
+                    println!("update available: HuntProxy {current} -> {target}");
+                }
+                huntproxy::update::UpdateOutcome::CurrentNewer { current, target } => {
+                    println!("HuntProxy {current} is newer than release {target}");
+                }
+                huntproxy::update::UpdateOutcome::Installed {
+                    previous,
+                    installed,
+                    backup_path,
+                } => {
+                    println!("Updated HuntProxy {previous} -> {installed}");
+                    println!("  rollback: {}", backup_path.display());
+                    println!("Restart/reconnect AI clients to use the new MCP binary.");
+                }
+            }
             Ok(())
         }
         Commands::Project { cmd } => {

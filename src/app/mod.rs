@@ -447,6 +447,18 @@ fn daemon_lock_is_stale(config: &Config) -> DomainResult<bool> {
     }
 }
 
+/// Check the daemon's advisory lock without creating or cleaning runtime files.
+pub fn daemon_is_active(config: &Config) -> DomainResult<bool> {
+    #[cfg(unix)]
+    {
+        Ok(!daemon_lock_is_stale(config)?)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(config.daemon_lock_path().exists())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn process_is_huntproxy(pid: i32) -> bool {
     let Ok(executable) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
