@@ -4,7 +4,7 @@
 </div>
 
 <p align="center">
-  <strong>A web security workbench, built for AI agents.</strong>
+  <strong>A web security workbench built for AI agents.</strong>
 </p>
 
 <p align="center">
