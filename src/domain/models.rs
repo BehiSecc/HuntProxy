@@ -455,6 +455,9 @@ pub struct BrowserSession {
     pub id: BrowserSessionId,
     pub project_id: ProjectId,
     pub engine: BrowserEngine,
+    /// Named persistent browser identity. Ephemeral internal sessions have no profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub current_url: Option<String>,
     /// Last title reported by the active page, retained for client reattachment.
     pub current_title: Option<String>,

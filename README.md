@@ -159,10 +159,12 @@ HuntProxy gives agents a complete hunting loop: build context â†’ investigate â†
 | --- | --- |
 | **Projects** | Keep a target's traffic, browser state, cookies, notes, and test results together. |
 | **Capture proxy & History** | Record HTTP/HTTPS traffic and search it by host, path, method, status, source, labels, request content, and Boolean expressions. |
-| **Persistent browser** | Let the agent browse authenticated applications through managed Chromium while cookies and site storage survive restarts. |
+| **Persistent browser profiles** | Run separate named Chromium identities in one project for cross-account testing. Each profile keeps its own cookies and site storage across restarts. |
 | **Sitemap** | Turn saved traffic into a host-and-route tree with methods, statuses, parameters, content types, and exchange counts. |
 | **JavaScript & page discovery** | Find JavaScript and the pages that loaded it, extract endpoints, URLs, and emails, and build target-specific wordlists. |
 | **WebSockets** | Inspect captured connections and messages, then inject text or binary frames into a live connection. |
+
+Different browser profiles can remain open together up to the project's browser limit (two by default). Browser commands share one worker queue, and only one session can be handed to CDP at a time.
 
 ### Test Hypotheses
 
@@ -222,6 +224,13 @@ Inspect the JavaScript:
 ```text
 Analyze the JavaScript files loaded by this project and show me the API routes,
 parameter names, and URLs that have not appeared in History yet.
+```
+
+Compare two accounts:
+
+```text
+Create browser profiles named member and admin in project 1, start both, and
+use their session IDs to compare what each account can view and change.
 ```
 
 Test for request smuggling:
@@ -365,7 +374,7 @@ Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an
 <details>
 <summary><strong>What survives between sessions?</strong></summary>
 
-Projects, captured traffic, findings, managed cookies, Reply and Fuzzer state, and the project's Chromium cookies and site storage are persisted locally. Starting the project browser again resumes its saved workspace. Plugin-generated History entries and saved findings also persist, but plugin job status, result summaries, and resumable analysis checkpoints should be collected before restarting HuntProxy.
+Projects, captured traffic, findings, managed cookies, Reply and Fuzzer state, and every named Chromium profile's cookies and site storage are persisted locally. Starting a profile again resumes its saved workspace. Plugin-generated History entries and saved findings also persist, but plugin job status, result summaries, and resumable analysis checkpoints should be collected before restarting HuntProxy.
 
 </details>
 

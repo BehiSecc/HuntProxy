@@ -325,7 +325,7 @@ fn tool_defs() -> Value {
         {"name":"job_resume_analysis","description":"Retry only a failed resumable aggregation stage without replaying network probes, then resume normal status polling. The memory-only checkpoint must be retried before restart; timeout is bounded to 120000 ms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"job_id":{"type":"string","format":"uuid"},"js_stage_timeout_ms":{"type":"integer","minimum":250,"maximum":120000}},"required":["project_id","job_id"],"additionalProperties":false}},
         {"name":"job_results","description":"Read completed extension output. summary is compact (default); findings returns a stable page; full returns complete non-finding data plus a paged findings array.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"},"view":{"type":"string","enum":["summary","findings","full"],"default":"summary"},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":100,"default":25}},"required":["job_id"],"additionalProperties":false}},
         {"name":"capture_sessions","description":"List proxy capture credentials, create a one-time credential, revoke one, or renew one. create returns the secret once; copy it immediately. revoke and renew require session_id. This does not start Chromium; use browser_start for browser traffic.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","revoke","renew"]},"session_id":{"type":"integer","description":"Required for revoke and renew."}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file. profile_name stores an independently selectable identity for identity-aware extensions instead of changing the active cookie jar.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
+        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file. Project cookies update the default browser profile and ephemeral sessions; named persistent browser profiles keep isolated cookie jars. profile_name stores an independently selectable identity for identity-aware extensions instead of changing the active cookie jar.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export JSON cookies.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"secure":{"type":"boolean"},"session":{"type":"boolean"},"expirationDate":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
         {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; exchange_id:3011; response_hash:abc123; (request:~this OR request:~that) method:PUT. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Discover saved routes without oversized responses. Omit host for a lightweight list of hosts and route counts. Provide one exact host for its detailed route tree, optionally limited to a path subtree.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive. Omit for host summaries."},"path_prefix":{"type":"string","description":"Optional slash-boundary path subtree, such as /api. Requires host."}},"required":["project_id"],"additionalProperties":false}},
@@ -342,10 +342,11 @@ fn tool_defs() -> Value {
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; use exchange_body to read the full response without replaying it. Continue case pages with next_before_case_index.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"browser_start","description":"Start or resume the project's persistent Chromium workspace. Omit url to resume the last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the persistent workspace's last page."}},"required":["project_id"]}},
+        {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
+        {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omit url to resume that profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
         {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on port 9222, inspect handoff status, or return control to the agent. While enabled, browser_action is paused. On a VPS, run the returned ssh_forward_command (ssh -N -L 9222:127.0.0.1:9222 <current-user>@<routed-host-ip>); its user and host are detected at runtime. Try hosted_devtools_url to avoid transferring the frontend through SSH; use devtools_url if the browser restricts the hosted frontend's local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; use the active browser session ID."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
-        {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset the persistent Chromium workspace. Status without session_id lists active browser sessions. Stop operations preserve browser state. reset_profile requires confirm=true and clears browser-derived state but not cookies configured with the cookies tool.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"]}},
+        {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page in Chromium. A domain filter matches either the JavaScript host or its related page host, including subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
         {"name":"get_words","description":"Build a sorted target-specific wordlist from saved request paths, parameter names, and textual responses. Related JavaScript files are included by default. Optionally filter by a domain and its subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"domain":{"type":"string","description":"Optional hostname, wildcard hostname, or HTTP URL."},"include_js":{"type":"boolean","default":true},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":5000}},"required":["project_id"],"additionalProperties":false}},
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -1842,8 +1843,46 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 )),
             }
         }
+        "browser_profiles" => {
+            let project_id = require_project_id(&args)?;
+            match args.get("action").and_then(Value::as_str).unwrap_or("list") {
+                "list" => Ok(json!({
+                    "profiles": state.browser.browser_profiles(project_id).await?
+                })),
+                "create" => {
+                    let profile = args
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("profile required"))?;
+                    Ok(json!(
+                        state
+                            .browser
+                            .create_browser_profile(project_id, profile)
+                            .await?
+                    ))
+                }
+                "delete" => {
+                    let profile = args
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| DomainError::invalid("profile required"))?;
+                    Ok(json!({
+                        "removed": state
+                            .browser
+                            .delete_browser_profile(project_id, profile)
+                            .await?,
+                        "profile": profile,
+                    }))
+                }
+                _ => Err(DomainError::invalid("action must be list|create|delete")),
+            }
+        }
         "browser_start" => {
             let project_id = require_project_id(&args)?;
+            let profile = args
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
             let url = args
                 .get("url")
                 .and_then(|v| v.as_str())
@@ -1858,7 +1897,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "engine_policy is obsolete; omit it to use Chromium",
                 ));
             }
-            Ok(json!(state.browser.start(project_id, url).await?))
+            let session = state
+                .browser
+                .start_with_profile(project_id, url, profile)
+                .await?;
+            let mut response = json!(session);
+            response["session_id"] = json!(session.id);
+            Ok(response)
         }
         "browser_action" => {
             let project_id = require_project_id(&args)?;
@@ -1924,10 +1969,18 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         "reset_profile permanently deletes browser state and requires confirm=true",
                     ));
                 }
-                let removed = state.browser.reset_project_profile(project_id).await?;
+                let profile = args
+                    .get("profile")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
+                let removed = state
+                    .browser
+                    .reset_browser_profile(project_id, profile)
+                    .await?;
                 return Ok(json!({
                     "ok": true,
                     "removed": removed,
+                    "profile": profile,
                     "managed_cookies_preserved": true,
                 }));
             }
@@ -2494,6 +2547,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("ssh -N -L 9222"));
+        let browser_profiles = tools
+            .iter()
+            .find(|tool| tool["name"] == "browser_profiles")
+            .unwrap();
+        assert_eq!(
+            browser_profiles["inputSchema"]["properties"]["action"]["enum"],
+            json!(["list", "create", "delete"])
+        );
+        assert_eq!(
+            browser_profiles["inputSchema"]["properties"]["profile"]["pattern"],
+            "^[A-Za-z0-9_-]{1,64}$"
+        );
         let browser_manage = tools
             .iter()
             .find(|tool| tool["name"] == "browser_manage")
@@ -2511,6 +2576,10 @@ mod tests {
         assert_eq!(
             browser_manage["inputSchema"]["properties"]["confirm"]["default"],
             false
+        );
+        assert_eq!(
+            browser_manage["inputSchema"]["properties"]["profile"]["default"],
+            "default"
         );
         assert!(!browser_manage["inputSchema"]["required"]
             .as_array()
@@ -2534,6 +2603,14 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "browser_start")
             .unwrap();
+        assert_eq!(
+            browser_start["inputSchema"]["properties"]["profile"]["default"],
+            "default"
+        );
+        assert_eq!(
+            browser_start["inputSchema"]["properties"]["profile"]["pattern"],
+            "^[A-Za-z0-9_-]{1,64}$"
+        );
         assert!(browser_start["inputSchema"]["properties"]
             .get("engine_policy")
             .is_none());

@@ -510,6 +510,12 @@ test
             <h2>Browser session</h2>
             <pre class="mono" id="browserInstallStatus">Checking runtime…</pre>
             <div class="card hidden" id="browserCurrent"></div>
+            <label for="browserProfile">Profile</label>
+            <div class="row">
+              <select id="browserProfile" aria-label="Browser profile"><option value="default">default</option></select>
+              <button class="btn fit" id="createBrowserProfile" type="button">New</button>
+              <button class="btn danger fit" id="deleteBrowserProfile" type="button" disabled>Delete</button>
+            </div>
             <label for="browserUrl">URL</label><input id="browserUrl" placeholder="https://app.example.com" />
             <div class="row">
               <button class="btn primary" id="startBrowser">Start Chromium</button>
@@ -581,6 +587,7 @@ test
       fuzzResultsMode: 'groups',
       selectedFuzzGroup: null,
       browserSession: null,
+      browserProfile: 'default',
       websocketConnection: null,
       events: null,
       fuzzTimer: null,
@@ -671,6 +678,8 @@ test
       state.selectedExchange = null;
       state.selectedDetail = null;
       state.websocketConnection = null;
+      state.browserSession = null;
+      state.browserProfile = 'default';
       state.historyItems = [];
       state.historyCursor = null;
       state.historyTotal = 0;
@@ -1694,37 +1703,82 @@ test
     async function loadBrowserStatus() {
       if (!state.projectId) return;
       try {
-        const result = await api(`/api/v1/projects/${state.projectId}/browser-sessions`);
+        const [result, profileResult] = await Promise.all([
+          api(`/api/v1/projects/${state.projectId}/browser-sessions`),
+          api(`/api/v1/projects/${state.projectId}/browser-profiles`),
+        ]);
         $('browserInstallStatus').textContent = JSON.stringify(result.runtime, null, 2);
         const sessions = result.sessions || [];
-        state.browserSession = sessions.length ? sessions[sessions.length - 1] : null;
+        const profiles = profileResult.profiles || [];
+        const selected = state.browserProfile || $('browserProfile').value || 'default';
+        $('browserProfile').innerHTML = profiles.map(profile => `<option value="${escapeHtml(profile.name)}">${escapeHtml(profile.name)}${profile.active ? ' · active' : ''}</option>`).join('');
+        state.browserProfile = profiles.some(profile => profile.name === selected) ? selected : 'default';
+        $('browserProfile').value = state.browserProfile;
+        state.browserSession = sessions.find(session => (session.profile || 'default') === state.browserProfile) || null;
         const active = state.browserSession;
+        $('startBrowser').disabled = Boolean(active);
         $('stopBrowser').disabled = !active;
         $('runBrowserAction').disabled = !active;
+        $('deleteBrowserProfile').disabled = state.browserProfile === 'default' || Boolean(active);
         $('browserCurrent').classList.toggle('hidden', !active);
         if (active) {
-          $('browserCurrent').innerHTML = `<strong>${escapeHtml(active.current_title || 'Untitled page')}</strong><div class="small muted">${escapeHtml(active.engine)} · session ${active.id}</div><div class="small" style="margin-top:.35rem;overflow-wrap:anywhere">${escapeHtml(active.current_url || 'No current URL')}</div>`;
+          $('browserCurrent').innerHTML = `<strong>${escapeHtml(active.current_title || 'Untitled page')}</strong><div class="small muted">${escapeHtml(active.profile || 'default')} · ${escapeHtml(active.engine)} · session ${active.id}</div><div class="small" style="margin-top:.35rem;overflow-wrap:anywhere">${escapeHtml(active.current_url || 'No current URL')}</div>`;
           $('browserUrl').value = active.current_url || $('browserUrl').value;
-          status('browserStatus', `Session ${active.id} active with ${active.engine}`, 'ok');
+          status('browserStatus', `${state.browserProfile} is active as session ${active.id}`, 'ok');
+        } else {
+          status('browserStatus', `${state.browserProfile} is stopped`);
         }
       }
       catch (e) { $('browserInstallStatus').textContent = e.message; }
     }
     async function startBrowserSession() {
       if (!state.projectId) return status('browserStatus', 'Select a project', 'err');
-      const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, { method: 'POST', body: JSON.stringify({ url: $('browserUrl').value.trim() }) });
+      const url = $('browserUrl').value.trim();
+      const body = { profile: state.browserProfile };
+      if (url) body.url = url;
+      const session = await api(`/api/v1/projects/${state.projectId}/browser-sessions`, { method: 'POST', body: JSON.stringify(body) });
       state.browserSession = session; $('stopBrowser').disabled = false; $('runBrowserAction').disabled = false;
-      status('browserStatus', `Session ${session.id} running with ${session.engine}`, 'ok');
+      status('browserStatus', `${session.profile || 'default'} is running as session ${session.id}`, 'ok');
       $('browserOutput').textContent = JSON.stringify(session, null, 2);
       await loadBrowserStatus();
       return session;
     }
+    $('browserProfile').onchange = async event => {
+      state.browserProfile = event.target.value || 'default';
+      $('browserOutput').textContent = '—';
+      await loadBrowserStatus();
+    };
+    $('createBrowserProfile').onclick = async () => {
+      if (!state.projectId) return status('browserStatus', 'Select a project', 'err');
+      const profile = window.prompt('New browser profile name (letters, numbers, _ or -):');
+      if (profile == null) return;
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(profile)) return status('browserStatus', 'Use 1-64 letters, numbers, _ or -', 'err');
+      try {
+        await api(`/api/v1/projects/${state.projectId}/browser-profiles`, { method: 'POST', body: JSON.stringify({ profile }) });
+        state.browserProfile = profile;
+        $('browserOutput').textContent = '—';
+        await loadBrowserStatus();
+        status('browserStatus', `Created ${profile}`, 'ok');
+      } catch (e) { status('browserStatus', e.message, 'err'); }
+    };
+    $('deleteBrowserProfile').onclick = async () => {
+      const profile = state.browserProfile;
+      if (!state.projectId || profile === 'default' || state.browserSession) return;
+      if (!window.confirm(`Delete browser profile ${profile} and all of its saved browser state?`)) return;
+      try {
+        await api(`/api/v1/projects/${state.projectId}/browser-profiles/${encodeURIComponent(profile)}`, { method: 'DELETE' });
+        state.browserProfile = 'default';
+        $('browserOutput').textContent = '—';
+        await loadBrowserStatus();
+        status('browserStatus', `Deleted ${profile}`, 'ok');
+      } catch (e) { status('browserStatus', e.message, 'err'); }
+    };
     $('startBrowser').onclick = async () => {
       $('startBrowser').disabled = true;
       status('browserStatus', 'Starting Chromium…');
       try { await startBrowserSession(); }
       catch (e) { status('browserStatus', e.message, 'err'); }
-      finally { $('startBrowser').disabled = false; }
+      finally { $('startBrowser').disabled = Boolean(state.browserSession); }
     };
     $('stopBrowser').onclick = async () => {
       if (!state.browserSession) return;
@@ -1732,6 +1786,7 @@ test
         await api(`/api/v1/projects/${state.projectId}/browser-sessions/${state.browserSession.id}/stop`, { method: 'POST' });
         state.browserSession = null; $('stopBrowser').disabled = true; $('runBrowserAction').disabled = true;
         status('browserStatus', 'Session stopped', 'ok');
+        await loadBrowserStatus();
       } catch (e) { status('browserStatus', e.message, 'err'); }
     };
     $('runBrowserAction').onclick = async () => {

@@ -57,6 +57,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "014_named_cookie_profiles",
         include_str!("../../migrations/014_named_cookie_profiles.sql"),
     ),
+    (
+        "015_browser_profiles",
+        include_str!("../../migrations/015_browser_profiles.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {
@@ -153,11 +157,20 @@ mod tests {
         .unwrap();
 
         migrate(&conn).unwrap();
-        let values: (String, String, String, i64, String) = conn
+        let values: (String, String, String, i64, String, String) = conn
             .query_row(
-                "SELECT engine,engine_policy,state,fallback_used,checkpoint_status FROM browser_sessions WHERE id=1",
+                "SELECT engine,engine_policy,state,fallback_used,checkpoint_status,profile_name FROM browser_sessions WHERE id=1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(
@@ -168,6 +181,7 @@ mod tests {
                 "interrupted".into(),
                 0,
                 "ok".into(),
+                "default".into(),
             )
         );
     }

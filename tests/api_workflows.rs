@@ -193,6 +193,117 @@ async fn ip_rotation_status_is_visible_and_blocks_project_deletion_until_cleanup
 }
 
 #[tokio::test]
+async fn browser_profile_api_manages_named_identities() {
+    let (_directory, state, project_id) = test_state().await;
+    let app = huntproxy::api::router(state);
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/projects/{}/browser-profiles",
+                project_id.get()
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"profile":"account1"}"#))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_response(created).await;
+    assert_eq!(created["name"], "account1");
+    assert_eq!(created["active"], false);
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/browser-profiles",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = json_response(listed).await;
+    let names = listed["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["default", "account1"]);
+
+    let default_delete = app
+        .clone()
+        .oneshot(
+            Request::delete(format!(
+                "/api/v1/projects/{}/browser-profiles/default",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(default_delete.status(), StatusCode::BAD_REQUEST);
+
+    let deleted = app
+        .oneshot(
+            Request::delete(format!(
+                "/api/v1/projects/{}/browser-profiles/account1",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn deleting_project_removes_all_named_browser_profiles() {
+    let (directory, state, project_id) = test_state().await;
+    state
+        .browser
+        .create_browser_profile(project_id, "account1")
+        .await
+        .unwrap();
+    state
+        .browser
+        .create_browser_profile(project_id, "account2")
+        .await
+        .unwrap();
+    let project_profiles = directory
+        .path()
+        .join("browser-profiles/projects")
+        .join(project_id.get().to_string());
+    assert!(project_profiles.join("profiles/account1").is_dir());
+    assert!(project_profiles.join("profiles/account2").is_dir());
+
+    let deleted = huntproxy::api::router(state.clone())
+        .oneshot(
+            Request::delete(format!("/api/v1/projects/{}", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert!(!project_profiles.exists());
+    assert!(state
+        .browser
+        .create_browser_profile(project_id, "late-profile")
+        .await
+        .is_err());
+    assert!(!project_profiles.exists());
+}
+
+#[tokio::test]
 async fn browser_cdp_api_reports_control_state_and_validates_session_requirements() {
     let (_directory, state, project_id) = test_state().await;
     let app = huntproxy::api::router(state);

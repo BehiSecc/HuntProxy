@@ -9,13 +9,14 @@ impl Db {
     pub async fn create_browser_session(
         &self,
         project_id: ProjectId,
+        profile: Option<String>,
     ) -> DomainResult<BrowserSession> {
         let ts = now_rfc3339();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT INTO browser_sessions (project_id, engine, engine_policy, state, fallback_used, checkpoint_version, created_at, updated_at)
-                 VALUES (?1,?2,?3,'starting',0,0,?4,?5)",
-                params![project_id.get(), "chromium", "chromium", ts, ts],
+                "INSERT INTO browser_sessions (project_id, engine, engine_policy, profile_name, state, fallback_used, checkpoint_version, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,'starting',0,0,?5,?6)",
+                params![project_id.get(), "chromium", "chromium", profile, ts, ts],
             )
             .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             let id = conn.last_insert_rowid();
@@ -23,6 +24,7 @@ impl Db {
                 id: BrowserSessionId(id),
                 project_id,
                 engine: BrowserEngine::Chromium,
+                profile,
                 current_url: None,
                 current_title: None,
                 state: BrowserSessionState::Starting,
@@ -104,7 +106,7 @@ impl Db {
     ) -> DomainResult<BrowserSession> {
         self.with_conn(move |conn| {
             conn.query_row(
-                "SELECT id, project_id, engine, current_url, current_title,
+                "SELECT id, project_id, engine, profile_name, current_url, current_title,
                         state, checkpoint_status, checkpoint_hash, created_at, updated_at
                  FROM browser_sessions WHERE id=?1 AND project_id=?2",
                 params![id.get(), project_id.get()],
@@ -113,13 +115,14 @@ impl Db {
                         id: BrowserSessionId(row.get(0)?),
                         project_id: ProjectId(row.get(1)?),
                         engine: parse_engine(&row.get::<_, String>(2)?, 2)?,
-                        current_url: row.get(3)?,
-                        current_title: row.get(4)?,
-                        state: parse_browser_state(&row.get::<_, String>(5)?),
-                        checkpoint_status: row.get(6)?,
-                        checkpoint_hash: row.get(7)?,
-                        created_at: parse_time(&row.get::<_, String>(8)?),
-                        updated_at: parse_time(&row.get::<_, String>(9)?),
+                        profile: row.get(3)?,
+                        current_url: row.get(4)?,
+                        current_title: row.get(5)?,
+                        state: parse_browser_state(&row.get::<_, String>(6)?),
+                        checkpoint_status: row.get(7)?,
+                        checkpoint_hash: row.get(8)?,
+                        created_at: parse_time(&row.get::<_, String>(9)?),
+                        updated_at: parse_time(&row.get::<_, String>(10)?),
                     })
                 },
             )

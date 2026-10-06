@@ -276,6 +276,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(send_websocket_message).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route(
+            "/api/v1/projects/{id}/browser-profiles",
+            get(list_browser_profiles)
+                .post(create_browser_profile)
+                .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
+            "/api/v1/projects/{id}/browser-profiles/{profile}",
+            delete(delete_browser_profile),
+        )
+        .route(
             "/api/v1/projects/{id}/browser-sessions",
             get(browser_status)
                 .post(start_browser)
@@ -703,10 +713,7 @@ async fn delete_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
         Err(error) => return error_response(error),
         _ => {}
     }
-    if let Err(error) = state.browser.reset_project_profile(project_id).await {
-        return error_response(error);
-    }
-    match state.db.delete_project(project_id).await {
+    match state.browser.delete_project(project_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error_response(error),
     }
@@ -2060,6 +2067,52 @@ async fn send_websocket_message(
     }
 }
 
+async fn list_browser_profiles(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Response {
+    match state.browser.browser_profiles(ProjectId(id)).await {
+        Ok(profiles) => Json(serde_json::json!({ "profiles": profiles })).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateBrowserProfile {
+    profile: String,
+}
+
+async fn create_browser_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateBrowserProfile>,
+) -> Response {
+    match state
+        .browser
+        .create_browser_profile(ProjectId(id), &body.profile)
+        .await
+    {
+        Ok(profile) => (StatusCode::CREATED, Json(profile)).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn delete_browser_profile(
+    State(state): State<Arc<AppState>>,
+    Path((id, profile)): Path<(i64, String)>,
+) -> Response {
+    match state
+        .browser
+        .delete_browser_profile(ProjectId(id), &profile)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error_response(DomainError::not_found("browser profile")),
+        Err(error) => error_response(error),
+    }
+}
+
 async fn browser_status(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     match state.browser.active_sessions(ProjectId(id)).await {
         Ok(sessions) => Json(serde_json::json!({
@@ -2073,8 +2126,14 @@ async fn browser_status(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
 
 #[derive(Deserialize)]
 struct StartBrowser {
+    #[serde(default = "default_browser_start_url")]
     url: String,
+    profile: Option<String>,
     engine_policy: Option<String>,
+}
+
+fn default_browser_start_url() -> String {
+    "about:blank".into()
 }
 
 async fn start_browser(
@@ -2091,7 +2150,15 @@ async fn start_browser(
             "engine_policy is obsolete; omit it to use Chromium",
         ));
     }
-    match state.browser.start(ProjectId(id), body.url).await {
+    match state
+        .browser
+        .start_with_profile(
+            ProjectId(id),
+            body.url,
+            body.profile.as_deref().unwrap_or("default"),
+        )
+        .await
+    {
         Ok(session) => {
             let _ = state.events.send(AppEvent {
                 project_id: id,

@@ -106,6 +106,10 @@ impl Db {
                             storage_error(format!("copy browser state: {error}"))
                         })?;
                     }
+                    let named_profiles = source_profile.join("profiles");
+                    if named_profiles.is_dir() {
+                        copy_tree_safe(&named_profiles, &staging.join("browser/profiles"))?;
+                    }
                     if options.include_chromium_profile {
                         let chromium = source_profile.join("chromium");
                         if chromium.is_dir() {
@@ -194,7 +198,8 @@ impl Db {
             .browser_profiles_dir()
             .join("projects")
             .join(project.id.get().to_string());
-        let browser_state_imported = source_browser.join("state.json").is_file();
+        let browser_state_imported =
+            source_browser.join("state.json").is_file() || source_browser.join("profiles").is_dir();
         let chromium_profile_imported = source_browser.join("chromium").is_dir();
         if source_browser.is_dir() {
             if let Err(error) = copy_tree_safe(&source_browser, &target_browser) {
@@ -502,8 +507,8 @@ fn import_sql(old: i64, new: i64, o: &IdOffsets) -> String {
     format!(
         r#"
 INSERT INTO bodies SELECT id+{body},sha256,original_length,stored_length,codec,mime_class,content FROM hp_archive.bodies;
-INSERT INTO browser_sessions (id,project_id,engine,engine_policy,current_url,state,fallback_used,checkpoint_status,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title)
- SELECT id+{browser},{new},'chromium','chromium',current_url,'interrupted',0,CASE WHEN checkpoint_status='fallback_chromium' THEN 'ok' ELSE checkpoint_status END,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title FROM hp_archive.browser_sessions WHERE project_id={old};
+INSERT INTO browser_sessions (id,project_id,engine,engine_policy,current_url,state,fallback_used,checkpoint_status,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title,profile_name)
+ SELECT id+{browser},{new},'chromium','chromium',current_url,'interrupted',0,CASE WHEN checkpoint_status='fallback_chromium' THEN 'ok' ELSE checkpoint_status END,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title,profile_name FROM hp_archive.browser_sessions WHERE project_id={old};
 INSERT INTO browser_actions SELECT id+{action},session_id+{browser},{new},action_type,CASE WHEN status IN ('running','queued') THEN 'failed' ELSE status END,error_code,created_at,finished_at FROM hp_archive.browser_actions WHERE project_id={old};
 INSERT INTO capture_sessions SELECT id+{capture},{new},CASE WHEN browser_session_id IS NULL THEN NULL ELSE browser_session_id+{browser} END,CASE WHEN browser_action_id IS NULL THEN NULL ELSE browser_action_id+{action} END,created_at,expires_at,COALESCE(revoked_at,created_at),'revoked',is_browser_bound,randomblob(32),randomblob(16) FROM hp_archive.capture_sessions WHERE project_id={old};
 INSERT INTO labels SELECT id+{label},{new},name FROM hp_archive.labels WHERE project_id={old};
@@ -733,12 +738,21 @@ mod tests {
         db.insert_exchange(sample_exchange(project.id))
             .await
             .unwrap();
+        db.create_browser_session(project.id, Some("account1".into()))
+            .await
+            .unwrap();
         let profile = config
             .browser_profiles_dir()
             .join("projects")
             .join(project.id.get().to_string());
         create_private_dir(&profile).unwrap();
         write_private_file(&profile.join("state.json"), br#"{"cookies":[]}"#).unwrap();
+        create_private_dir(&profile.join("profiles/account1")).unwrap();
+        write_private_file(
+            &profile.join("profiles/account1/state.json"),
+            br#"{"cookies":[{"name":"sid","value":"account-one"}]}"#,
+        )
+        .unwrap();
         let bundle = directory.path().join("project.huntproxy");
         db.export_bundle(
             &config,
@@ -773,6 +787,17 @@ mod tests {
             .join(imported.project.id.get().to_string())
             .join("state.json")
             .is_file());
+        assert!(config
+            .browser_profiles_dir()
+            .join("projects")
+            .join(imported.project.id.get().to_string())
+            .join("profiles/account1/state.json")
+            .is_file());
+        let imported_session = db
+            .get_browser_session(imported.project.id, BrowserSessionId(2))
+            .await
+            .unwrap();
+        assert_eq!(imported_session.profile.as_deref(), Some("account1"));
     }
 
     #[tokio::test]
