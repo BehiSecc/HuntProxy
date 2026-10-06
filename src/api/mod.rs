@@ -2129,6 +2129,7 @@ struct StartBrowser {
     #[serde(default = "default_browser_start_url")]
     url: String,
     profile: Option<String>,
+    cookie_profile: Option<String>,
     engine_policy: Option<String>,
 }
 
@@ -2152,10 +2153,11 @@ async fn start_browser(
     }
     match state
         .browser
-        .start_with_profile(
+        .start_with_profile_and_cookie_profile(
             ProjectId(id),
             body.url,
             body.profile.as_deref().unwrap_or("default"),
+            body.cookie_profile.as_deref(),
         )
         .await
     {

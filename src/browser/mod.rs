@@ -106,6 +106,20 @@ struct PersistentBrowserProfile {
     pending_cookie_clears: Vec<Value>,
 }
 
+struct CookieLaunchOverride {
+    cookies: Vec<Value>,
+    clear_cookies: Vec<Value>,
+}
+
+impl CookieLaunchOverride {
+    fn from_profile(profile: &StoredCookieProfile) -> DomainResult<Self> {
+        Ok(Self {
+            cookies: browser_cookies(std::slice::from_ref(profile))?,
+            clear_cookies: profile_cookie_identities(profile)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserAction {
@@ -599,9 +613,26 @@ impl BrowserService {
         url: String,
         profile: &str,
     ) -> DomainResult<BrowserSession> {
-        validate_browser_profile_name(profile)?;
-        self.start_with_persistence(project_id, url, true, Some(profile.to_string()))
+        self.start_with_profile_and_cookie_profile(project_id, url, profile, None)
             .await
+    }
+
+    pub async fn start_with_profile_and_cookie_profile(
+        &self,
+        project_id: ProjectId,
+        url: String,
+        profile: &str,
+        cookie_profile: Option<&str>,
+    ) -> DomainResult<BrowserSession> {
+        validate_browser_profile_name(profile)?;
+        self.start_with_persistence(
+            project_id,
+            url,
+            true,
+            Some(profile.to_string()),
+            cookie_profile.map(str::to_string),
+        )
+        .await
     }
 
     pub async fn start_ephemeral(
@@ -609,7 +640,7 @@ impl BrowserService {
         project_id: ProjectId,
         url: String,
     ) -> DomainResult<BrowserSession> {
-        self.start_with_persistence(project_id, url, false, None)
+        self.start_with_persistence(project_id, url, false, None, None)
             .await
     }
 
@@ -618,14 +649,14 @@ impl BrowserService {
         project_id: ProjectId,
         profile: &StoredCookieProfile,
     ) -> DomainResult<BrowserSession> {
-        let cookies = browser_cookies(std::slice::from_ref(profile))?;
+        let cookie_override = CookieLaunchOverride::from_profile(profile)?;
         let _lifecycle = self.lifecycle.lock().await;
         self.start_runtime_with_cookies(
             project_id,
             "about:blank".into(),
             false,
             None,
-            Some(cookies),
+            Some(cookie_override),
         )
         .await
     }
@@ -636,6 +667,7 @@ impl BrowserService {
         url: String,
         persistent: bool,
         profile: Option<String>,
+        cookie_profile: Option<String>,
     ) -> DomainResult<BrowserSession> {
         // Starting and stopping share one worker. Keep lifecycle transitions
         // atomic so a concurrent stop cannot terminate a worker between a new
@@ -678,9 +710,22 @@ impl BrowserService {
                 ));
             }
         }
-        let result = self
-            .start_runtime(project_id, url, persistent, profile)
-            .await;
+        let result = async {
+            let cookie_override = match cookie_profile.as_deref() {
+                Some(name) => {
+                    let stored = self
+                        .db
+                        .get_named_cookie_profile(project_id, name)
+                        .await?
+                        .ok_or_else(|| DomainError::not_found("cookie profile"))?;
+                    Some(CookieLaunchOverride::from_profile(&stored)?)
+                }
+                None => None,
+            };
+            self.start_runtime_with_cookies(project_id, url, persistent, profile, cookie_override)
+                .await
+        }
+        .await;
         if result.is_err() {
             if let Some(lease) = lease {
                 self.profile_leases.lock().await.remove(&lease);
@@ -689,24 +734,13 @@ impl BrowserService {
         result
     }
 
-    async fn start_runtime(
-        &self,
-        project_id: ProjectId,
-        url: String,
-        persistent: bool,
-        profile: Option<String>,
-    ) -> DomainResult<BrowserSession> {
-        self.start_runtime_with_cookies(project_id, url, persistent, profile, None)
-            .await
-    }
-
     async fn start_runtime_with_cookies(
         &self,
         project_id: ProjectId,
         mut url: String,
         persistent: bool,
         profile: Option<String>,
-        cookie_override: Option<Vec<Value>>,
+        cookie_override: Option<CookieLaunchOverride>,
     ) -> DomainResult<BrowserSession> {
         let status = self.status();
         if !status.worker_available {
@@ -792,14 +826,18 @@ impl BrowserService {
                 "browser capture credential missing one-time token",
             )
         })?;
+        let override_cookie_clears = cookie_override
+            .as_ref()
+            .map(|cookie_override| cookie_override.clear_cookies.clone())
+            .unwrap_or_default();
         let managed_cookies = match cookie_override {
-            Some(cookies) => cookies,
+            Some(cookie_override) => cookie_override.cookies,
             None if !persistent || profile_name == Some(DEFAULT_BROWSER_PROFILE) => {
                 browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?
             }
             None => Vec::new(),
         };
-        let pending_cookie_clears = if profile_name == Some(DEFAULT_BROWSER_PROFILE) {
+        let mut pending_cookie_clears = if profile_name == Some(DEFAULT_BROWSER_PROFILE) {
             restored_profile
                 .as_ref()
                 .map(|profile| profile.pending_cookie_clears.clone())
@@ -807,6 +845,11 @@ impl BrowserService {
         } else {
             Vec::new()
         };
+        for identity in override_cookie_clears {
+            if !pending_cookie_clears.contains(&identity) {
+                pending_cookie_clears.push(identity);
+            }
+        }
         let profile_dir = match profile_name.filter(|_| persistent) {
             Some(profile_name) => Some(self.chromium_profile_dir(project_id, profile_name)?),
             None => None,
@@ -3359,7 +3402,8 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         };
-        let cookies = browser_cookies(&[profile]).unwrap();
+        let launch_override = CookieLaunchOverride::from_profile(&profile).unwrap();
+        let cookies = launch_override.cookies;
         assert_eq!(cookies.len(), 2);
         assert_eq!(cookies[0]["domain"], ".example.com");
         assert_eq!(cookies[0]["path"], "/");
@@ -3369,6 +3413,11 @@ mod tests {
         assert_eq!(cookies[1]["httpOnly"], true);
         assert_eq!(cookies[1]["sameSite"], "Lax");
         assert_eq!(cookies[1]["expires"], 4102444800.5_f64);
+        assert_eq!(launch_override.clear_cookies.len(), 2);
+        assert!(launch_override
+            .clear_cookies
+            .iter()
+            .all(|cookie| cookie.get("value").is_none()));
     }
 
     #[test]

@@ -246,7 +246,20 @@ async function discoverCdp(page, port) {
   throw rpcError(-32000, `Chromium CDP endpoint did not become ready: ${lastError?.message || "unknown error"}`);
 }
 
-async function launchSessionRuntime(session, cdpPort, currentUrl) {
+function isSessionCookie(cookie) {
+  return cookie?.expires == null || cookie.expires === -1;
+}
+
+function cookieIdentityKey(cookie) {
+  return JSON.stringify([
+    String(cookie?.name || ""),
+    String(cookie?.domain || ""),
+    String(cookie?.path || "/"),
+    cookie?.partitionKey == null ? null : cookie.partitionKey,
+  ]);
+}
+
+async function launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies = []) {
   const runtime = await launchChromium(
     session.proxy || null,
     session.caCertPath || null,
@@ -254,6 +267,7 @@ async function launchSessionRuntime(session, cdpPort, currentUrl) {
     cdpPort,
   );
   try {
+    if (sessionCookies.length) await runtime.context.addCookies(sessionCookies);
     if (currentUrl && currentUrl !== "about:blank") {
       await runtime.page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
     }
@@ -270,13 +284,15 @@ async function relaunchSession(session, cdpPort) {
     throw rpcError(-32602, "CDP handoff requires a persistent project browser");
   }
   const currentUrl = session.page?.url() || "about:blank";
+  const sessionCookies = await session.context.cookies()
+    .then((cookies) => cookies.filter(isSessionCookie));
   await closeRuntime(session);
   let launched;
   try {
-    launched = await launchSessionRuntime(session, cdpPort, currentUrl);
+    launched = await launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies);
   } catch (error) {
     try {
-      const restored = await launchSessionRuntime(session, null, currentUrl);
+      const restored = await launchSessionRuntime(session, null, currentUrl, sessionCookies);
       Object.assign(session, restored.runtime, { cdp: null });
       trackJavascriptFiles(session);
     } catch (restoreError) {
@@ -294,14 +310,22 @@ async function relaunchSession(session, cdpPort) {
 
 async function restoreProjectState(session, state) {
   if (!state || typeof state !== "object") return;
-  if (session.preferProfileState) return;
-  session.restoreState = state;
-  session.restoredOrigins = new Set();
-  // For new/non-profile sessions, restore the portable checkpoint.
-  // Managed cookies are applied separately after this step.
+  // Initialized Chromium profiles keep native persistent state, but session
+  // cookies need the portable checkpoint because Chromium drops them on exit.
   if (Array.isArray(state.cookies) && state.cookies.length) {
-    const cookies = state.cookies
+    let checkpointCookies = state.cookies
       .filter((cookie) => cookie && cookie.name && cookie.domain)
+      .filter((cookie) => !session.preferProfileState
+        || isSessionCookie(cookie));
+    if (session.preferProfileState && checkpointCookies.length) {
+      const nativeIdentities = new Set(
+        (await session.context.cookies()).map(cookieIdentityKey),
+      );
+      checkpointCookies = checkpointCookies.filter(
+        (cookie) => !nativeIdentities.has(cookieIdentityKey(cookie)),
+      );
+    }
+    const cookies = checkpointCookies
       .map((cookie) => {
         const restored = {
           name: String(cookie.name),
@@ -324,6 +348,9 @@ async function restoreProjectState(session, state) {
       });
     if (cookies.length) await session.context.addCookies(cookies);
   }
+  if (session.preferProfileState) return;
+  session.restoreState = state;
+  session.restoredOrigins = new Set();
 }
 
 async function reconcileCurrentOriginStorage(session) {

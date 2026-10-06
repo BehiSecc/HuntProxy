@@ -237,6 +237,27 @@ async fn browser_profile_api_manages_named_identities() {
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["default", "account1"]);
 
+    let missing_cookie_profile = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/projects/{}/browser-sessions",
+                project_id.get()
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"profile":"account1","cookie_profile":"missing"}"#,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_cookie_profile.status(), StatusCode::NOT_FOUND);
+    assert!(json_response(missing_cookie_profile).await["message"]
+        .as_str()
+        .unwrap()
+        .contains("cookie profile"));
+
     let default_delete = app
         .clone()
         .oneshot(

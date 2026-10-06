@@ -17,7 +17,7 @@ struct ExportedCookie {
     #[serde(default)]
     domain: Option<String>,
     #[serde(default)]
-    host_only: bool,
+    host_only: Option<bool>,
     #[serde(default = "default_cookie_path")]
     path: String,
     #[serde(default)]
@@ -28,7 +28,7 @@ struct ExportedCookie {
     secure: bool,
     #[serde(default)]
     session: bool,
-    #[serde(default)]
+    #[serde(default, alias = "expires")]
     expiration_date: Option<f64>,
 }
 
@@ -260,7 +260,13 @@ fn parse_cookie_input(target_url: &str, input: &str) -> DomainResult<NormalizedC
             Some(domain) => normalize_exported_domain(domain)?,
             None => target_host.clone(),
         };
-        let effective_host_only = cookie.host_only || cookie.domain.is_none();
+        let effective_host_only = cookie.domain.is_none()
+            || cookie.host_only.unwrap_or_else(|| {
+                cookie
+                    .domain
+                    .as_deref()
+                    .is_none_or(|domain| !domain.trim().starts_with('.'))
+            });
         let domain_is_ip = domain.parse::<std::net::IpAddr>().is_ok();
         if !effective_host_only && domain_is_ip {
             return Err(DomainError::invalid(
@@ -282,9 +288,11 @@ fn parse_cookie_input(target_url: &str, input: &str) -> DomainResult<NormalizedC
             http_only: cookie.http_only,
             secure: cookie.secure,
             same_site,
-            expires: (!cookie.session)
-                .then_some(cookie.expiration_date)
-                .flatten(),
+            expires: if cookie.session || cookie.expiration_date == Some(-1.0) {
+                None
+            } else {
+                cookie.expiration_date
+            },
         };
         if managed_cookie_domain_matches(&managed, &target_host)
             && managed.expires.is_none_or(|expires| expires > now)
@@ -661,6 +669,42 @@ mod tests {
         let host_only = r#"[{"domain":"tydal.co","hostOnly":true,"name":"sid","value":"ok"}]"#;
         assert!(normalize_cookie_input("https://tydal.co", host_only).is_ok());
         assert!(normalize_cookie_input("https://app.tydal.co", host_only).is_err());
+    }
+
+    #[test]
+    fn json_cookie_domain_scope_is_inferred_when_host_only_is_omitted() {
+        let exact = r#"[{"domain":"app.example.com","name":"sid","value":"exact"}]"#;
+        let exact_profile =
+            validate_cookie_profile("https://app.example.com", exact.into()).unwrap();
+        assert!(exact_profile.managed_cookies.as_ref().unwrap()[0].host_only);
+        assert!(validate_cookie_profile("https://sub.app.example.com", exact.into()).is_err());
+
+        let parent = r#"[{"domain":".example.com","name":"sid","value":"parent"}]"#;
+        let parent_profile =
+            validate_cookie_profile("https://app.example.com", parent.into()).unwrap();
+        assert!(!parent_profile.managed_cookies.as_ref().unwrap()[0].host_only);
+
+        let no_domain = r#"[{"hostOnly":false,"name":"sid","value":"target"}]"#;
+        let no_domain_profile =
+            validate_cookie_profile("https://app.example.com", no_domain.into()).unwrap();
+        assert!(no_domain_profile.managed_cookies.as_ref().unwrap()[0].host_only);
+    }
+
+    #[test]
+    fn playwright_expires_alias_preserves_live_and_session_cookie_semantics() {
+        let input = r#"[
+            {"domain":"app.example.com","expires":-1,"name":"session","value":"one"},
+            {"domain":"app.example.com","expires":4102444800,"name":"live","value":"two"},
+            {"domain":"app.example.com","expires":1,"name":"expired","value":"three"},
+            {"domain":"app.example.com","expires":0,"name":"epoch","value":"four"}
+        ]"#;
+        let validated = validate_cookie_profile("https://app.example.com", input.into()).unwrap();
+        let cookies = validated.managed_cookies.unwrap();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0].name, "session");
+        assert_eq!(cookies[0].expires, None);
+        assert_eq!(cookies[1].name, "live");
+        assert_eq!(cookies[1].expires, Some(4102444800.0));
     }
 
     #[test]

@@ -229,8 +229,10 @@ parameter names, and URLs that have not appeared in History yet.
 Compare two accounts:
 
 ```text
-Create browser profiles named member and admin in project 1, start both, and
-use their session IDs to compare what each account can view and change.
+Store /tmp/member.json and /tmp/admin.json as cookie profiles named member and
+admin in project 1. Start matching browser profiles with cookie_profile set to
+the same names, then use their session IDs to compare the accounts. On later
+starts, omit cookie_profile to resume each browser's latest saved state.
 ```
 
 Test for request smuggling:
