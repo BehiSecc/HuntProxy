@@ -944,7 +944,8 @@ async fn set_project_cookie(
         Err(error) => return error_response(error),
     };
     if let Some(name) = body.profile_name.as_deref() {
-        let profile = match crate::cookies::validate_cookie_profile(&body.target_url, cookie) {
+        let profile = match crate::cookies::validate_named_cookie_profile(&body.target_url, cookie)
+        {
             Ok(profile) => profile,
             Err(error) => return error_response(error),
         };
@@ -2130,6 +2131,8 @@ struct StartBrowser {
     url: String,
     profile: Option<String>,
     cookie_profile: Option<String>,
+    #[serde(default)]
+    refresh_cookies: bool,
     engine_policy: Option<String>,
 }
 
@@ -2153,11 +2156,12 @@ async fn start_browser(
     }
     match state
         .browser
-        .start_with_profile_and_cookie_profile(
+        .start_with_profile_options(
             ProjectId(id),
             body.url,
             body.profile.as_deref().unwrap_or("default"),
             body.cookie_profile.as_deref(),
+            body.refresh_cookies,
         )
         .await
     {
@@ -2230,7 +2234,15 @@ async fn browser_cdp(
 ) -> Response {
     let project_id = ProjectId(id);
     let result = match body.op.as_str() {
-        "status" => state.browser.cdp_status(project_id).await,
+        "status" => match body.session_id {
+            Some(session_id) => {
+                state
+                    .browser
+                    .cdp_status_for_session(project_id, BrowserSessionId(session_id))
+                    .await
+            }
+            None => state.browser.cdp_status(project_id).await,
+        },
         "enable" | "disable" => {
             let session_id = match body.session_id {
                 Some(session_id) => BrowserSessionId(session_id),

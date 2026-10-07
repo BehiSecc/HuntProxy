@@ -343,7 +343,7 @@ fn tool_defs() -> Value {
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; use exchange_body to read the full response without replaying it. Continue case pages with next_before_case_index.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. To seed or refresh its cookie jar from a named identity created by cookies(profile_name=...), pass that name as cookie_profile. Omit cookie_profile on later starts to preserve newer browser state. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Optional named cookie identity to import before the first navigation. Create it with the cookies tool's profile_name field; omit it on later resumes unless intentionally refreshing cookies."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. Repeated unchanged seeds preserve newer browser cookies; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Explicitly reimport the matching cookie_profile into this browser profile only."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
         {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on port 9222, inspect handoff status, or return control to the agent. While enabled, browser_action is paused. On a VPS, run the returned ssh_forward_command (ssh -N -L 9222:127.0.0.1:9222 <current-user>@<routed-host-ip>); its user and host are detected at runtime. Try hosted_devtools_url to avoid transferring the frontend through SSH; use devtools_url if the browser restricts the hosted frontend's local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; use the active browser session ID."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
@@ -939,7 +939,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         }
                     };
                     if let Some(name) = args.get("profile_name").and_then(Value::as_str) {
-                        let profile = crate::cookies::validate_cookie_profile(target_url, cookie)?;
+                        let profile =
+                            crate::cookies::validate_named_cookie_profile(target_url, cookie)?;
                         Ok(
                             json!({"profile": state.db.upsert_named_cookie_profile(project_id, name, profile).await?, "name": name, "active": false}),
                         )
@@ -1900,7 +1901,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             }
             let session = state
                 .browser
-                .start_with_profile_and_cookie_profile(project_id, url, profile, cookie_profile)
+                .start_with_profile_options(
+                    project_id,
+                    url,
+                    profile,
+                    cookie_profile,
+                    args.get("refresh_cookies")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
                 .await?;
             let mut response = json!(session);
             response["session_id"] = json!(session.id);
@@ -1935,7 +1944,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("op required"))?;
             let result = match op {
-                "status" => state.browser.cdp_status(project_id).await?,
+                "status" => match args.get("session_id").and_then(Value::as_i64) {
+                    Some(session_id) => {
+                        state
+                            .browser
+                            .cdp_status_for_session(project_id, BrowserSessionId(session_id))
+                            .await?
+                    }
+                    None => state.browser.cdp_status(project_id).await?,
+                },
                 "enable" | "disable" => {
                     let session_id = args
                         .get("session_id")
@@ -2007,8 +2024,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 }
                 "status" => {
                     let s = state
-                        .db
-                        .get_browser_session(project_id, BrowserSessionId(sid))
+                        .browser
+                        .session_status(project_id, BrowserSessionId(sid))
                         .await?;
                     Ok(json!(s))
                 }

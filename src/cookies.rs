@@ -166,7 +166,25 @@ pub fn validate_cookie_profile(
     target_url: &str,
     cookie_input: String,
 ) -> DomainResult<ValidatedCookieProfile> {
-    let normalized = parse_cookie_input(target_url, &cookie_input)?;
+    validate_cookie_profile_scope(target_url, cookie_input, false)
+}
+
+/// Preserve an exported site's cookie jar for a named browser identity,
+/// including cookies restricted to a sibling host such as `www`. Request
+/// consumers still select cookies using their exact domain and path rules.
+pub fn validate_named_cookie_profile(
+    target_url: &str,
+    cookie_input: String,
+) -> DomainResult<ValidatedCookieProfile> {
+    validate_cookie_profile_scope(target_url, cookie_input, true)
+}
+
+fn validate_cookie_profile_scope(
+    target_url: &str,
+    cookie_input: String,
+    preserve_site_subhosts: bool,
+) -> DomainResult<ValidatedCookieProfile> {
+    let normalized = parse_cookie_input(target_url, &cookie_input, preserve_site_subhosts)?;
     let (host, target_url) = normalize_target(target_url)?;
     let cookie_header = normalized.cookie_header;
     let pairs = parse_cookie_header(&cookie_header)?;
@@ -189,10 +207,14 @@ pub fn validate_cookie_profile(
 /// Accept an ordinary Cookie header or a browser-export JSON cookie array and
 /// return the canonical header representation used by managed-cookie consumers.
 pub fn normalize_cookie_input(target_url: &str, input: &str) -> DomainResult<String> {
-    Ok(parse_cookie_input(target_url, input)?.cookie_header)
+    Ok(parse_cookie_input(target_url, input, false)?.cookie_header)
 }
 
-fn parse_cookie_input(target_url: &str, input: &str) -> DomainResult<NormalizedCookieInput> {
+fn parse_cookie_input(
+    target_url: &str,
+    input: &str,
+    preserve_site_subhosts: bool,
+) -> DomainResult<NormalizedCookieInput> {
     if input.len() > MAX_COOKIE_INPUT_BYTES {
         return Err(DomainError::new(
             ErrorCode::BodyTooLarge,
@@ -294,9 +316,9 @@ fn parse_cookie_input(target_url: &str, input: &str) -> DomainResult<NormalizedC
                 cookie.expiration_date
             },
         };
-        if managed_cookie_domain_matches(&managed, &target_host)
-            && managed.expires.is_none_or(|expires| expires > now)
-        {
+        let within_scope = managed_cookie_domain_matches(&managed, &target_host)
+            || (preserve_site_subhosts && same_cookie_site(&managed.domain, &target_host));
+        if within_scope && managed.expires.is_none_or(|expires| expires > now) {
             managed_cookies.push(managed);
         }
     }
@@ -316,6 +338,20 @@ fn parse_cookie_input(target_url: &str, input: &str) -> DomainResult<NormalizedC
         cookie_header: header,
         managed_cookies: Some(managed_cookies),
     })
+}
+
+fn same_cookie_site(domain: &str, target_host: &str) -> bool {
+    if domain == target_host {
+        return true;
+    }
+    if domain.parse::<std::net::IpAddr>().is_ok() || target_host.parse::<std::net::IpAddr>().is_ok()
+    {
+        return false;
+    }
+    match (psl::domain_str(domain), psl::domain_str(target_host)) {
+        (Some(domain_site), Some(target_site)) => domain_site == target_site,
+        _ => false,
+    }
 }
 
 /// Convert the public API/MCP cookie argument into the text form shared with
@@ -669,6 +705,100 @@ mod tests {
         let host_only = r#"[{"domain":"tydal.co","hostOnly":true,"name":"sid","value":"ok"}]"#;
         assert!(normalize_cookie_input("https://tydal.co", host_only).is_ok());
         assert!(normalize_cookie_input("https://app.tydal.co", host_only).is_err());
+    }
+
+    #[test]
+    fn named_cookie_exports_preserve_exact_www_and_sibling_hosts() {
+        let input = serde_json::json!([
+            {"domain":".example.co.uk","hostOnly":false,"name":"shared","value":"site"},
+            {"domain":"www.example.co.uk","hostOnly":true,"name":"identity","value":"www","secure":true},
+            {"domain":"app.example.co.uk","hostOnly":true,"name":"identity","value":"app","path":"/account"},
+            {"domain":"other.co.uk","hostOnly":true,"name":"unrelated","value":"other"},
+            {"domain":"evilexample.co.uk","hostOnly":true,"name":"boundary","value":"other"},
+            {"domain":"www.example.co.uk","hostOnly":true,"name":"expired","value":"old","expires":1}
+        ])
+        .to_string();
+        let named = validate_named_cookie_profile("https://example.co.uk", input.clone()).unwrap();
+        let cookies = named.managed_cookies.as_ref().unwrap();
+        assert_eq!(cookies.len(), 3);
+        assert_eq!(cookies[1].domain, "www.example.co.uk");
+        assert!(cookies[1].host_only);
+        assert_eq!(cookies[2].domain, "app.example.co.uk");
+        assert!(cookies[2].host_only);
+        for (url, expected) in [
+            ("https://example.co.uk/", "shared=site"),
+            ("https://www.example.co.uk/", "shared=site; identity=www"),
+            ("http://www.example.co.uk/", "shared=site"),
+            ("https://sub.www.example.co.uk/", "shared=site"),
+            (
+                "https://app.example.co.uk/account/home",
+                "identity=app; shared=site",
+            ),
+            ("https://app.example.co.uk/", "shared=site"),
+        ] {
+            assert_eq!(
+                named.cookie_header_for_url(url).unwrap().as_deref(),
+                Some(expected),
+                "wrong cookie scope for {url}"
+            );
+        }
+        assert!(named
+            .cookie_header_for_url("https://other.co.uk/")
+            .unwrap()
+            .is_none());
+
+        let exact = validate_cookie_profile("https://example.co.uk", input.clone()).unwrap();
+        assert_eq!(exact.managed_cookies.unwrap().len(), 1);
+        assert_eq!(
+            normalize_cookie_input("https://example.co.uk", &input).unwrap(),
+            "shared=site"
+        );
+    }
+
+    #[test]
+    fn named_cookie_exports_use_exact_ip_hosts_and_private_site_boundaries() {
+        let ips = r#"[
+            {"domain":"127.0.0.1","hostOnly":true,"name":"identity","value":"one"},
+            {"domain":"127.0.0.2","hostOnly":true,"name":"other","value":"two"}
+        ]"#;
+        let named = validate_named_cookie_profile("http://127.0.0.1", ips.into()).unwrap();
+        assert_eq!(named.managed_cookies.unwrap().len(), 1);
+        assert!(validate_named_cookie_profile("http://127.0.0.3", ips.into()).is_err());
+
+        let private_sites = r#"[
+            {"domain":"www.first.github.io","hostOnly":true,"name":"identity","value":"one"},
+            {"domain":"second.github.io","hostOnly":true,"name":"other","value":"two"}
+        ]"#;
+        let named =
+            validate_named_cookie_profile("https://first.github.io", private_sites.into()).unwrap();
+        assert_eq!(named.managed_cookies.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            named.managed_cookies.as_ref().unwrap()[0].domain,
+            "www.first.github.io"
+        );
+        assert!(named
+            .cookie_header_for_url("https://first.github.io")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            named
+                .cookie_header_for_url("https://www.first.github.io")
+                .unwrap()
+                .as_deref(),
+            Some("identity=one")
+        );
+    }
+
+    #[test]
+    fn named_raw_cookie_input_keeps_exact_host_behavior() {
+        let input = "identity=one";
+        let named = validate_named_cookie_profile("https://example.com", input.into()).unwrap();
+        assert!(named.managed_cookies.is_none());
+        assert_eq!(named.cookie_header, input);
+        assert!(named
+            .cookie_header_for_url("https://www.example.com")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

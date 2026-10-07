@@ -246,7 +246,7 @@ async fn browser_profile_api_manages_named_identities() {
             ))
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"profile":"account1","cookie_profile":"missing"}"#,
+                r#"{"profile":"missing","cookie_profile":"missing"}"#,
             ))
             .unwrap(),
         )
@@ -257,6 +257,26 @@ async fn browser_profile_api_manages_named_identities() {
         .as_str()
         .unwrap()
         .contains("cookie profile"));
+
+    for body in [
+        r#"{"profile":"account1","cookie_profile":"account2"}"#,
+        r#"{"profile":"account1","refresh_cookies":true}"#,
+    ] {
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/api/v1/projects/{}/browser-sessions",
+                    project_id.get()
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
 
     let default_delete = app
         .clone()

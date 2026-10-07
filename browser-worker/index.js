@@ -259,7 +259,7 @@ function cookieIdentityKey(cookie) {
   ]);
 }
 
-async function launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies = []) {
+async function launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies = [], sessionStorage = {}) {
   const runtime = await launchChromium(
     session.proxy || null,
     session.caCertPath || null,
@@ -270,6 +270,10 @@ async function launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies
     if (sessionCookies.length) await runtime.context.addCookies(sessionCookies);
     if (currentUrl && currentUrl !== "about:blank") {
       await runtime.page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await reconcileCurrentOriginStorage({
+        ...runtime, preferProfileState: true,
+        restoreState: { session_storage: sessionStorage }, restoredOrigins: new Set(),
+      });
     }
     const cdp = cdpPort == null ? null : await discoverCdp(runtime.page, cdpPort);
     return { runtime, cdp };
@@ -286,13 +290,17 @@ async function relaunchSession(session, cdpPort) {
   const currentUrl = session.page?.url() || "about:blank";
   const sessionCookies = await session.context.cookies()
     .then((cookies) => cookies.filter(isSessionCookie));
+  const checkpoint = await extractCheckpoint(session);
+  const sessionStorage = checkpoint.origin
+    ? { [checkpoint.origin]: checkpoint._private.session_storage }
+    : {};
   await closeRuntime(session);
   let launched;
   try {
-    launched = await launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies);
+    launched = await launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies, sessionStorage);
   } catch (error) {
     try {
-      const restored = await launchSessionRuntime(session, null, currentUrl, sessionCookies);
+      const restored = await launchSessionRuntime(session, null, currentUrl, sessionCookies, sessionStorage);
       Object.assign(session, restored.runtime, { cdp: null });
       trackJavascriptFiles(session);
     } catch (restoreError) {
@@ -348,8 +356,9 @@ async function restoreProjectState(session, state) {
       });
     if (cookies.length) await session.context.addCookies(cookies);
   }
-  if (session.preferProfileState) return;
-  session.restoreState = state;
+  session.restoreState = session.preferProfileState
+    ? { session_storage: state.session_storage || {} }
+    : state;
   session.restoredOrigins = new Set();
 }
 
@@ -373,21 +382,30 @@ async function reconcileCurrentOriginStorage(session) {
       session.restoredOrigins?.add(origin);
       return;
     }
+    const restoreLocal = !session.preferProfileState;
     const localValues = localByOrigin[origin] || {};
     const sessionValues = sessionByOrigin[origin] || {};
-    await session.page.evaluate(
-      ({ local, currentSession }) => {
-        localStorage.clear();
-        sessionStorage.clear();
-        for (const [key, value] of Object.entries(local)) localStorage.setItem(key, value);
-        for (const [key, value] of Object.entries(currentSession)) {
-          sessionStorage.setItem(key, value);
+    const changed = await session.page.evaluate(
+      ({ local, currentSession, restoreLocal }) => {
+        let changed = false;
+        if (restoreLocal) {
+          localStorage.clear();
+          sessionStorage.clear();
+          for (const [key, value] of Object.entries(local)) localStorage.setItem(key, value);
+          changed = true;
         }
+        for (const [key, value] of Object.entries(currentSession)) {
+          if (restoreLocal || sessionStorage.getItem(key) === null) {
+            sessionStorage.setItem(key, value);
+            changed = true;
+          }
+        }
+        return changed;
       },
-      { local: localValues, currentSession: sessionValues },
+      { local: localValues, currentSession: sessionValues, restoreLocal },
     );
     session.restoredOrigins?.add(origin);
-    await session.page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
+    if (changed) await session.page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
   }
 }
 
@@ -559,6 +577,16 @@ async function clearCookieIdentities(context, cookies, fieldName) {
   }
 }
 
+function sessionIdentity(sessionId, session) {
+  return {
+    session_id: sessionId,
+    requested_profile: session.profile,
+    active_profile: session.profile,
+    profile_dir: session.profileDir,
+    persistent: session.persistent,
+  };
+}
+
 async function handle(req) {
   const { id, method, params = {} } = req;
   try {
@@ -567,22 +595,34 @@ async function handle(req) {
         return respond(id, {
           protocol: PROTOCOL,
           engines: ["chromium"],
-          capabilities: ["actions", "checkpoints", "cdp_handoff"],
+          capabilities: ["actions", "checkpoints", "cdp_handoff", "profile_isolation"],
         });
       case "session.start": {
         const sessionId = Number(params.session_id);
         if (!Number.isSafeInteger(sessionId) || sessionId <= 0) {
           throw rpcError(-32602, "session_id must be a positive integer");
         }
-        if (sessions.has(sessionId)) await closeSession(sessionId);
+        if (sessions.has(sessionId)) throw rpcError(-32602, "session_id is already active");
         const engine = params.engine || "chromium";
         if (engine !== "chromium") {
           throw rpcError(-32602, "engine must be chromium");
         }
         const caCertPath = params.ca_cert_path || null;
-        const profileDir = params.persistent
+        let profileDir = params.persistent
           ? params.profile_dir || null
           : null;
+        const profile = params.persistent ? params.profile : null;
+        if (params.persistent) {
+          if (typeof profile !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(profile)
+              || typeof profileDir !== "string" || !path.isAbsolute(profileDir)) {
+            throw rpcError(-32602, "persistent browser requires a named profile and absolute profile_dir");
+          }
+          fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+          profileDir = fs.realpathSync(profileDir);
+          if ([...sessions.values()].some((session) => session.profileDir === profileDir)) {
+            throw rpcError(-32602, "profile_dir is already active in another session");
+          }
+        }
         const runtime = await launchChromium(params.proxy || null, caCertPath, profileDir);
         const session = {
           ...runtime,
@@ -591,6 +631,7 @@ async function handle(req) {
           caCertPath,
           persistent: Boolean(params.persistent),
           profileDir,
+          profile,
           preferProfileState: Boolean(params.prefer_profile_state),
           cdp: null,
         };
@@ -611,11 +652,20 @@ async function handle(req) {
           }
           const checkpoint = await extractCheckpoint(session);
           logMeta("session.start", { session_id: sessionId, engine });
-          return respond(id, { session_id: sessionId, engine, checkpoint });
+          return respond(id, { ...sessionIdentity(sessionId, session), engine, checkpoint });
         } catch (error) {
           await closeSession(sessionId);
           throw error;
         }
+      }
+      case "session.status": {
+        const sessionId = Number(params.session_id);
+        const session = sessions.get(sessionId);
+        if (!session || session.page.isClosed()
+            || !session.context.pages().includes(session.page)) {
+          throw rpcError(-32001, "requested browser profile is not active");
+        }
+        return respond(id, sessionIdentity(sessionId, session));
       }
       case "session.action": {
         const sessionId = Number(params.session_id);

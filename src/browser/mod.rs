@@ -91,6 +91,10 @@ pub struct Checkpoint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistentBrowserProfile {
     #[serde(default)]
+    cookie_seed: Option<CookieSeed>,
+    #[serde(default)]
+    managed_cookie_hash: Option<String>,
+    #[serde(default)]
     version: u64,
     #[serde(default)]
     checkpoint_hash: String,
@@ -106,9 +110,18 @@ struct PersistentBrowserProfile {
     pending_cookie_clears: Vec<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CookieSeed {
+    name: String,
+    hash: String,
+    #[serde(default)]
+    identities: Vec<Value>,
+}
+
 struct CookieLaunchOverride {
     cookies: Vec<Value>,
     clear_cookies: Vec<Value>,
+    seed: Option<CookieSeed>,
 }
 
 impl CookieLaunchOverride {
@@ -116,6 +129,7 @@ impl CookieLaunchOverride {
         Ok(Self {
             cookies: browser_cookies(std::slice::from_ref(profile))?,
             clear_cookies: profile_cookie_identities(profile)?,
+            seed: None,
         })
     }
 }
@@ -309,6 +323,21 @@ impl WorkerProcess {
             return Err(WorkerCallFailure::Transport(DomainError::new(
                 ErrorCode::ProtocolIncompatible,
                 format!("browser worker protocol {protocol:?}, expected {WORKER_PROTOCOL_VERSION}"),
+            )));
+        }
+        if !hello
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|value| value == "profile_isolation")
+            })
+        {
+            process.terminate().await;
+            return Err(WorkerCallFailure::Transport(DomainError::new(
+                ErrorCode::ProtocolIncompatible,
+                "browser worker cannot guarantee profile isolation; update the configured browser worker",
             )));
         }
         Ok(process)
@@ -624,13 +653,36 @@ impl BrowserService {
         profile: &str,
         cookie_profile: Option<&str>,
     ) -> DomainResult<BrowserSession> {
+        self.start_with_profile_options(project_id, url, profile, cookie_profile, false)
+            .await
+    }
+
+    pub async fn start_with_profile_options(
+        &self,
+        project_id: ProjectId,
+        url: String,
+        profile: &str,
+        cookie_profile: Option<&str>,
+        refresh_cookies: bool,
+    ) -> DomainResult<BrowserSession> {
         validate_browser_profile_name(profile)?;
+        if cookie_profile.is_some_and(|name| name != profile) {
+            return Err(DomainError::invalid(
+                "cookie_profile must match the requested browser profile",
+            ));
+        }
+        if refresh_cookies && cookie_profile.is_none() {
+            return Err(DomainError::invalid(
+                "refresh_cookies requires a matching cookie_profile",
+            ));
+        }
         self.start_with_persistence(
             project_id,
             url,
             true,
             Some(profile.to_string()),
             cookie_profile.map(str::to_string),
+            refresh_cookies,
         )
         .await
     }
@@ -640,7 +692,7 @@ impl BrowserService {
         project_id: ProjectId,
         url: String,
     ) -> DomainResult<BrowserSession> {
-        self.start_with_persistence(project_id, url, false, None, None)
+        self.start_with_persistence(project_id, url, false, None, None, false)
             .await
     }
 
@@ -668,12 +720,118 @@ impl BrowserService {
         persistent: bool,
         profile: Option<String>,
         cookie_profile: Option<String>,
+        refresh_cookies: bool,
     ) -> DomainResult<BrowserSession> {
         // Starting and stopping share one worker. Keep lifecycle transitions
         // atomic so a concurrent stop cannot terminate a worker between a new
         // session's launch and its registration, and concurrent starts cannot
         // race the per-project browser limit.
         let _lifecycle = self.lifecycle.lock().await;
+        let mut cookie_override = match cookie_profile.as_deref() {
+            Some(name) => {
+                let stored = self
+                    .db
+                    .get_named_cookie_profile(project_id, name)
+                    .await?
+                    .ok_or_else(|| DomainError::not_found("cookie profile"))?;
+                let mut cookie_override = CookieLaunchOverride::from_profile(&stored)?;
+                let seed = CookieSeed {
+                    name: name.to_string(),
+                    identities: cookie_override.clear_cookies.clone(),
+                    hash: hex::encode(Sha256::digest(
+                        serde_json::to_vec(&cookie_override.cookies).map_err(|error| {
+                            DomainError::new(ErrorCode::Internal, error.to_string())
+                        })?,
+                    )),
+                };
+                let saved_seed = self
+                    .load_persistent_profile(project_id, name)
+                    .await?
+                    .and_then(|state| state.cookie_seed);
+                if !refresh_cookies && saved_seed.as_ref() == Some(&seed) {
+                    None
+                } else {
+                    if let Some(previous) = saved_seed {
+                        for identity in previous.identities {
+                            if !cookie_override.clear_cookies.contains(&identity) {
+                                cookie_override.clear_cookies.push(identity);
+                            }
+                        }
+                    }
+                    cookie_override.seed = Some(seed);
+                    Some(cookie_override)
+                }
+            }
+            None => None,
+        };
+        if let Some(profile_name) = profile.as_deref().filter(|_| persistent) {
+            let active_id = self
+                .runtime_sessions
+                .lock()
+                .await
+                .iter()
+                .find_map(|(id, runtime)| {
+                    (runtime.project_id == project_id
+                        && runtime.persistent
+                        && runtime.profile.as_deref() == Some(profile_name))
+                    .then_some(BrowserSessionId(*id))
+                });
+            if let Some(session_id) = active_id {
+                // Reuse only the exact verified identity, without relaunching or touching its cookies.
+                let operation_lock = self.session_operation_lock(session_id).await;
+                let _operation_guard = operation_lock.lock().await;
+                let mut session = self.verified_session_status(project_id, session_id).await?;
+                if let Some(cookie_override) = cookie_override.take() {
+                    if self
+                        .runtime_sessions
+                        .lock()
+                        .await
+                        .get(&session_id.get())
+                        .is_some_and(|runtime| runtime.cdp.is_some())
+                    {
+                        return Err(DomainError::new(
+                            ErrorCode::Unavailable,
+                            "return CDP control before refreshing profile cookies",
+                        ));
+                    }
+                    let result = self
+                        .call_worker(
+                            "session.set_cookies",
+                            json!({
+                                "session_id": session_id.get(), "cookies": cookie_override.cookies,
+                                "clear_cookies": cookie_override.clear_cookies,
+                            }),
+                        )
+                        .await?;
+                    self.save_cookie_checkpoint(project_id, session_id, &result)
+                        .await?;
+                    self.record_cookie_seed(project_id, profile_name, cookie_override.seed)
+                        .await?;
+                    session = self.verified_session_status(project_id, session_id).await?;
+                }
+                if url != "about:blank" {
+                    if self
+                        .runtime_sessions
+                        .lock()
+                        .await
+                        .get(&session_id.get())
+                        .is_some_and(|runtime| runtime.cdp.is_some())
+                    {
+                        return Err(DomainError::new(
+                            ErrorCode::Unavailable,
+                            "return CDP control before navigating the profile",
+                        ));
+                    }
+                    let result = self.call_worker("session.action", json!({
+                        "session_id": session_id.get(), "action": {"type":"navigate", "url":url},
+                    })).await?;
+                    self.save_cookie_checkpoint(project_id, session_id, &result)
+                        .await?;
+                    session = self.verified_session_status(project_id, session_id).await?;
+                }
+                return Ok(session);
+            }
+        }
         let lease = if persistent {
             let profile = profile.as_deref().ok_or_else(|| {
                 DomainError::new(ErrorCode::Internal, "persistent browser profile missing")
@@ -711,17 +869,6 @@ impl BrowserService {
             }
         }
         let result = async {
-            let cookie_override = match cookie_profile.as_deref() {
-                Some(name) => {
-                    let stored = self
-                        .db
-                        .get_named_cookie_profile(project_id, name)
-                        .await?
-                        .ok_or_else(|| DomainError::not_found("cookie profile"))?;
-                    Some(CookieLaunchOverride::from_profile(&stored)?)
-                }
-                None => None,
-            };
             self.start_runtime_with_cookies(project_id, url, persistent, profile, cookie_override)
                 .await
         }
@@ -806,34 +953,36 @@ impl BrowserService {
             ));
         }
 
-        let mut session = self
-            .db
-            .create_browser_session(project_id, profile.clone())
-            .await?;
-        let capture = self
-            .db
-            .create_capture_session(CreateCaptureSession {
-                project_id,
-                browser_session_id: Some(session.id),
-                browser_action_id: None,
-                is_browser_bound: true,
-                ttl: None,
-            })
-            .await?;
-        let token = capture.token_once.clone().ok_or_else(|| {
-            DomainError::new(
-                ErrorCode::Internal,
-                "browser capture credential missing one-time token",
-            )
-        })?;
         let override_cookie_clears = cookie_override
             .as_ref()
             .map(|cookie_override| cookie_override.clear_cookies.clone())
             .unwrap_or_default();
+        let cookie_seed = cookie_override
+            .as_ref()
+            .and_then(|cookies| cookies.seed.clone());
+        let mut managed_cookie_hash = None;
         let managed_cookies = match cookie_override {
             Some(cookie_override) => cookie_override.cookies,
-            None if !persistent || profile_name == Some(DEFAULT_BROWSER_PROFILE) => {
+            None if !persistent => {
                 browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?
+            }
+            None if profile_name == Some(DEFAULT_BROWSER_PROFILE) => {
+                let cookies =
+                    browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
+                let hash =
+                    hex::encode(Sha256::digest(serde_json::to_vec(&cookies).map_err(
+                        |error| DomainError::new(ErrorCode::Internal, error.to_string()),
+                    )?));
+                managed_cookie_hash = Some(hash.clone());
+                if restored_profile
+                    .as_ref()
+                    .and_then(|state| state.managed_cookie_hash.as_ref())
+                    == Some(&hash)
+                {
+                    Vec::new()
+                } else {
+                    cookies
+                }
             }
             None => Vec::new(),
         };
@@ -857,6 +1006,26 @@ impl BrowserService {
         let prefer_profile_state = profile_dir
             .as_deref()
             .is_some_and(chromium_profile_has_state);
+        let mut session = self
+            .db
+            .create_browser_session(project_id, profile.clone())
+            .await?;
+        let capture = self
+            .db
+            .create_capture_session(CreateCaptureSession {
+                project_id,
+                browser_session_id: Some(session.id),
+                browser_action_id: None,
+                is_browser_bound: true,
+                ttl: None,
+            })
+            .await?;
+        let token = capture.token_once.clone().ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::Internal,
+                "browser capture credential missing one-time token",
+            )
+        })?;
         let start_params = json!({
             "session_id": session.id.get(),
             "engine": "chromium",
@@ -872,6 +1041,7 @@ impl BrowserService {
             "clear_cookies": pending_cookie_clears.clone(),
             "restore_state": restored_profile,
             "persistent": persistent,
+            "profile": profile_name,
             // An initialized Chromium profile is authoritative because it may
             // contain manual login and service-worker state. An empty profile
             // imports the portable checkpoint left by an older browser build.
@@ -897,6 +1067,13 @@ impl BrowserService {
                 return Err(error);
             }
         };
+        if let Err(error) =
+            verify_worker_identity(&result, session.id, profile_name, profile_dir.as_deref())
+        {
+            self.cleanup_failed_start(project_id, &mut session, capture.id)
+                .await;
+            return Err(error);
+        }
         let checkpoint = match result.get("checkpoint") {
             Some(checkpoint) => checkpoint,
             None => {
@@ -939,12 +1116,35 @@ impl BrowserService {
         session.current_url = saved.url;
         session.current_title = saved.title;
         session.state = BrowserSessionState::Ready;
+        session.active_profile = profile.clone();
         session.checkpoint_status = Some(checkpoint_status.into());
         session.checkpoint_hash = Some(saved.hash);
         if let Err(error) = self.db.update_browser_session(&session).await {
             self.cleanup_failed_start(project_id, &mut session, capture.id)
                 .await;
             return Err(error);
+        }
+        if let Some(profile_name) = profile_name {
+            if let Err(error) = self
+                .record_cookie_seed(project_id, profile_name, cookie_seed)
+                .await
+            {
+                self.cleanup_failed_start(project_id, &mut session, capture.id)
+                    .await;
+                return Err(error);
+            }
+            if let Some(hash) = managed_cookie_hash {
+                if let Err(error) = self
+                    .update_persistent_profile(project_id, profile_name, |state| {
+                        state.managed_cookie_hash = Some(hash)
+                    })
+                    .await
+                {
+                    self.cleanup_failed_start(project_id, &mut session, capture.id)
+                        .await;
+                    return Err(error);
+                }
+            }
         }
         self.runtime_sessions.lock().await.insert(
             session.id.get(),
@@ -1084,6 +1284,8 @@ impl BrowserService {
                 .await?;
             self.save_cookie_checkpoint(project_id, *session_id, &result)
                 .await?;
+            self.acknowledge_managed_cookie_import(project_id, *session_id, &removed_identities)
+                .await?;
         }
         Ok(session_ids.len())
     }
@@ -1117,6 +1319,8 @@ impl BrowserService {
                 .await?;
             self.save_cookie_checkpoint(project_id, *session_id, &result)
                 .await?;
+            self.acknowledge_managed_cookie_import(project_id, *session_id, &cookies)
+                .await?;
         }
         Ok(session_ids.len())
     }
@@ -1133,6 +1337,29 @@ impl BrowserService {
                 .then_some(BrowserSessionId(*id))
             })
             .collect()
+    }
+
+    async fn acknowledge_managed_cookie_import(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        cleared: &[Value],
+    ) -> DomainResult<()> {
+        if self.session_persistent_profile(session_id).await.as_deref()
+            == Some(DEFAULT_BROWSER_PROFILE)
+        {
+            let cookies = browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
+            let hash = hex::encode(Sha256::digest(
+                serde_json::to_vec(&cookies)
+                    .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?,
+            ));
+            self.update_persistent_profile(project_id, DEFAULT_BROWSER_PROFILE, |state| {
+                state.managed_cookie_hash = Some(hash)
+            })
+            .await?;
+            self.acknowledge_cookie_clears(project_id, cleared).await?;
+        }
+        Ok(())
     }
 
     pub async fn active_sessions(
@@ -1152,10 +1379,89 @@ impl BrowserService {
             .collect::<Vec<_>>();
         let mut sessions = Vec::with_capacity(ids.len());
         for session_id in ids {
-            sessions.push(self.db.get_browser_session(project_id, session_id).await?);
+            sessions.push(self.session_status(project_id, session_id).await?);
         }
         sessions.sort_by_key(|session| session.id.get());
         Ok(sessions)
+    }
+
+    pub async fn session_status(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+    ) -> DomainResult<BrowserSession> {
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
+        self.verified_session_status(project_id, session_id).await
+    }
+
+    async fn verified_session_status(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+    ) -> DomainResult<BrowserSession> {
+        let mut session = self.db.get_browser_session(project_id, session_id).await?;
+        let runtime = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .cloned();
+        if let Some(runtime) = runtime {
+            if runtime.project_id != project_id || runtime.profile != session.profile {
+                return Err(DomainError::new(
+                    ErrorCode::ProtocolError,
+                    "requested browser profile does not match the active runtime",
+                ));
+            }
+            let directory = runtime
+                .profile
+                .as_deref()
+                .map(|name| self.chromium_profile_path(project_id, name));
+            let directory = directory
+                .map(std::fs::canonicalize)
+                .transpose()
+                .map_err(|error| {
+                    DomainError::new(
+                        ErrorCode::Unavailable,
+                        format!("cannot verify browser profile directory: {error}"),
+                    )
+                })?;
+            let result = self
+                .call_worker("session.status", json!({"session_id":session_id.get()}))
+                .await?;
+            verify_worker_identity(
+                &result,
+                session_id,
+                runtime.profile.as_deref(),
+                directory.as_deref(),
+            )?;
+            session.active_profile = runtime.profile;
+        } else if matches!(
+            session.state,
+            BrowserSessionState::Ready | BrowserSessionState::Busy | BrowserSessionState::Starting
+        ) {
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                "requested browser profile is not active",
+            ));
+        }
+        Ok(session)
+    }
+
+    async fn record_cookie_seed(
+        &self,
+        project_id: ProjectId,
+        profile: &str,
+        seed: Option<CookieSeed>,
+    ) -> DomainResult<()> {
+        if let Some(seed) = seed {
+            self.update_persistent_profile(project_id, profile, |state| {
+                state.cookie_seed = Some(seed)
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn cdp_status(&self, project_id: ProjectId) -> DomainResult<BrowserCdpStatus> {
@@ -1171,6 +1477,23 @@ impl BrowserService {
                     .flatten()
             });
         Ok(cdp_status_view(project_id, active))
+    }
+
+    pub async fn cdp_status_for_session(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+    ) -> DomainResult<BrowserCdpStatus> {
+        self.session_status(project_id, session_id).await?;
+        let cdp = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .and_then(|runtime| runtime.cdp.clone());
+        let mut status = cdp_status_view(project_id, cdp.map(|cdp| (session_id.get(), cdp)));
+        status.session_id = Some(session_id);
+        Ok(status)
     }
 
     pub async fn enable_cdp(
@@ -1784,6 +2107,26 @@ impl BrowserService {
     fn chromium_profile_dir(&self, project_id: ProjectId, profile: &str) -> DomainResult<PathBuf> {
         let directory = self.chromium_profile_path(project_id, profile);
         create_private_dir(&directory)?;
+        let directory = std::fs::canonicalize(directory).map_err(|error| {
+            DomainError::new(
+                ErrorCode::Unavailable,
+                format!("cannot verify browser profile directory: {error}"),
+            )
+        })?;
+        // Detect case aliases and symlink aliases even across sequential launches.
+        let identity_path = directory.join("huntproxy-identity.json");
+        let identity = json!({"project_id":project_id.get(), "profile":profile});
+        match std::fs::read(&identity_path) {
+            Ok(bytes) if serde_json::from_slice::<Value>(&bytes).ok().as_ref() == Some(&identity) => {}
+            Ok(_) => return Err(DomainError::new(ErrorCode::Unavailable,
+                "browser profile directory belongs to a different identity; cannot guarantee isolation")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_private_file(&identity_path, &serde_json::to_vec(&identity)
+                    .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?)?;
+            }
+            Err(error) => return Err(DomainError::new(ErrorCode::Unavailable,
+                format!("cannot verify browser profile owner: {error}"))),
+        }
         Ok(directory)
     }
 
@@ -2398,6 +2741,25 @@ fn remove_browser_profile_path(path: &Path) -> DomainResult<bool> {
     Ok(true)
 }
 
+fn verify_worker_identity(
+    result: &Value,
+    session_id: BrowserSessionId,
+    profile: Option<&str>,
+    directory: Option<&Path>,
+) -> DomainResult<()> {
+    let directory = directory.map(|path| path.to_string_lossy());
+    if result.get("session_id").and_then(Value::as_i64) != Some(session_id.get())
+        || result.get("requested_profile").and_then(Value::as_str) != profile
+        || result.get("active_profile").and_then(Value::as_str) != profile
+        || result.get("profile_dir").and_then(Value::as_str) != directory.as_deref()
+        || result.get("persistent").and_then(Value::as_bool) != Some(profile.is_some())
+    {
+        return Err(DomainError::new(ErrorCode::ProtocolError,
+            "browser worker cannot guarantee the requested profile is active; session identity or profile directory mismatch"));
+    }
+    Ok(())
+}
+
 fn chromium_profile_has_state(profile_dir: &Path) -> bool {
     profile_dir.join("Local State").is_file()
         || profile_dir
@@ -2450,7 +2812,11 @@ fn browser_cookies(profiles: &[StoredCookieProfile]) -> DomainResult<Vec<Value>>
                 output.insert(
                     (
                         cookie.name.clone(),
-                        cookie.domain.clone(),
+                        if cookie.host_only {
+                            cookie.domain.clone()
+                        } else {
+                            format!(".{}", cookie.domain)
+                        },
                         cookie.path.clone(),
                     ),
                     Value::Object(value),
@@ -3447,6 +3813,37 @@ mod tests {
     }
 
     #[test]
+    fn browser_cookie_import_keeps_host_and_domain_cookie_identities_distinct() {
+        let validated = crate::cookies::validate_named_cookie_profile(
+            "https://www.example.com",
+            json!([
+                {"name":"sid","value":"host","domain":"www.example.com","hostOnly":true},
+                {"name":"sid","value":"domain","domain":".www.example.com","hostOnly":false},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let stored = StoredCookieProfile {
+            project_id: ProjectId(1),
+            host: validated.host,
+            target_url: validated.target_url,
+            cookie_header: validated.cookie_header,
+            names: validated.names,
+            managed_cookies: validated.managed_cookies,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let cookies = browser_cookies(&[stored]).unwrap();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies
+            .iter()
+            .any(|cookie| cookie["domain"] == "www.example.com" && cookie["value"] == "host"));
+        assert!(cookies
+            .iter()
+            .any(|cookie| cookie["domain"] == ".www.example.com" && cookie["value"] == "domain"));
+    }
+
+    #[test]
     fn explicit_worker_path_wins() {
         let directory = tempfile::tempdir().unwrap();
         let worker = directory.path().join("index.js");
@@ -3510,6 +3907,88 @@ mod tests {
 
         std::fs::write(profile.join("Default").join("Preferences"), "{}").unwrap();
         assert!(chromium_profile_has_state(&profile));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aliased_profile_directories_cannot_claim_another_identity() {
+        std::fs::create_dir_all("/tmp/artis").unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("huntproxy-profile-owner-")
+            .tempdir_in("/tmp/artis")
+            .unwrap();
+        let service = BrowserService::new_with_proxy_and_ca(
+            Arc::new(Db::open_in_memory().await.unwrap()),
+            None,
+            None,
+            DEFAULT_BROWSER_PROXY.into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let first = service.chromium_profile_dir(ProjectId(1), "acc1").unwrap();
+        std::os::unix::fs::symlink(&first, service.chromium_profile_path(ProjectId(1), "acc2"))
+            .unwrap();
+        let error = service
+            .chromium_profile_dir(ProjectId(1), "acc2")
+            .unwrap_err();
+        assert!(error.to_string().contains("different identity"));
+        assert_eq!(
+            first,
+            service.chromium_profile_dir(ProjectId(1), "acc1").unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_identity_requires_exact_session_profile_and_directory() {
+        let identity = json!({
+            "session_id": 8, "requested_profile": "acc2", "active_profile": "acc2",
+            "profile_dir": "/profiles/acc2", "persistent": true,
+        });
+        verify_worker_identity(
+            &identity,
+            BrowserSessionId(8),
+            Some("acc2"),
+            Some(Path::new("/profiles/acc2")),
+        )
+        .unwrap();
+        for field in [
+            "session_id",
+            "requested_profile",
+            "active_profile",
+            "profile_dir",
+            "persistent",
+        ] {
+            let mut missing = identity.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(verify_worker_identity(
+                &missing,
+                BrowserSessionId(8),
+                Some("acc2"),
+                Some(Path::new("/profiles/acc2"))
+            )
+            .is_err());
+        }
+        assert!(verify_worker_identity(
+            &identity,
+            BrowserSessionId(7),
+            Some("acc2"),
+            Some(Path::new("/profiles/acc2"))
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &identity,
+            BrowserSessionId(8),
+            Some("acc1"),
+            Some(Path::new("/profiles/acc2"))
+        )
+        .is_err());
+        assert!(verify_worker_identity(
+            &identity,
+            BrowserSessionId(8),
+            Some("acc2"),
+            Some(Path::new("/profiles/acc1"))
+        )
+        .is_err());
     }
 
     #[test]
