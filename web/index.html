@@ -248,7 +248,7 @@
         <button class="btn primary" id="setCookies">Set</button>
         <button class="btn" id="clearCookies">Clear</button>
       </div>
-      <p class="small muted">JSON exports are filtered for the target domain and retain browser cookie rules. Values stay hidden. Applies to Reply, Fuzzer, Raw opt-in, and Browser.</p>
+      <p class="small muted">JSON exports are filtered for the target domain and retain browser cookie rules. Values stay hidden. Applies to Reply, Fuzzer, Raw opt-in, and ephemeral browsers. Persistent browser profiles keep their own cookies.</p>
       <div class="status" id="cookieStatus"></div>
 
       <h3>Proxy credential</h3>
@@ -934,7 +934,7 @@ test
         });
         $('cookieValue').value = '';
         $('cookieFile').value = '';
-        status('cookieStatus', `Cookies set for ${result.profile.host}; ${result.active_browser_sessions_updated} active browser session(s) updated`, 'ok');
+        status('cookieStatus', `Cookies set for ${result.profile.host}; ${result.active_browser_sessions_updated} ephemeral browser session(s) updated`, 'ok');
       } catch (error) { status('cookieStatus', error.message, 'err'); }
     };
 

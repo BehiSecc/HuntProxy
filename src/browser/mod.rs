@@ -93,8 +93,6 @@ struct PersistentBrowserProfile {
     #[serde(default)]
     cookie_seed: Option<CookieSeed>,
     #[serde(default)]
-    managed_cookie_hash: Option<String>,
-    #[serde(default)]
     version: u64,
     #[serde(default)]
     checkpoint_hash: String,
@@ -106,8 +104,6 @@ struct PersistentBrowserProfile {
     local_storage: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     session_storage: BTreeMap<String, BTreeMap<String, String>>,
-    #[serde(default)]
-    pending_cookie_clears: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -953,52 +949,18 @@ impl BrowserService {
             ));
         }
 
-        let override_cookie_clears = cookie_override
+        // Persistent Chromium owns its jar. Only an explicitly selected seed
+        // may import or clear cookies; project jars remain for ephemeral work.
+        let clear_cookies = cookie_override
             .as_ref()
-            .map(|cookie_override| cookie_override.clear_cookies.clone())
+            .map(|cookies| cookies.clear_cookies.clone())
             .unwrap_or_default();
         let cookie_seed = cookie_override
             .as_ref()
             .and_then(|cookies| cookies.seed.clone());
-        let mut managed_cookie_hash = None;
-        let managed_cookies = match cookie_override {
-            Some(cookie_override) => cookie_override.cookies,
-            None if !persistent => {
-                browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?
-            }
-            None if profile_name == Some(DEFAULT_BROWSER_PROFILE) => {
-                let cookies =
-                    browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
-                let hash =
-                    hex::encode(Sha256::digest(serde_json::to_vec(&cookies).map_err(
-                        |error| DomainError::new(ErrorCode::Internal, error.to_string()),
-                    )?));
-                managed_cookie_hash = Some(hash.clone());
-                if restored_profile
-                    .as_ref()
-                    .and_then(|state| state.managed_cookie_hash.as_ref())
-                    == Some(&hash)
-                {
-                    Vec::new()
-                } else {
-                    cookies
-                }
-            }
-            None => Vec::new(),
-        };
-        let mut pending_cookie_clears = if profile_name == Some(DEFAULT_BROWSER_PROFILE) {
-            restored_profile
-                .as_ref()
-                .map(|profile| profile.pending_cookie_clears.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        for identity in override_cookie_clears {
-            if !pending_cookie_clears.contains(&identity) {
-                pending_cookie_clears.push(identity);
-            }
-        }
+        let cookies = self
+            .cookies_for_launch(project_id, persistent, cookie_override)
+            .await?;
         let profile_dir = match profile_name.filter(|_| persistent) {
             Some(profile_name) => Some(self.chromium_profile_dir(project_id, profile_name)?),
             None => None,
@@ -1037,8 +999,8 @@ impl BrowserService {
                 "password": token,
             },
             "ca_cert_path": self.ca_cert_path.as_ref().map(|path| path.display().to_string()),
-            "cookies": managed_cookies,
-            "clear_cookies": pending_cookie_clears.clone(),
+            "cookies": cookies,
+            "clear_cookies": clear_cookies,
             "restore_state": restored_profile,
             "persistent": persistent,
             "profile": profile_name,
@@ -1102,16 +1064,6 @@ impl BrowserService {
                 return Err(error);
             }
         };
-        if profile_name == Some(DEFAULT_BROWSER_PROFILE) {
-            if let Err(error) = self
-                .acknowledge_cookie_clears(project_id, &pending_cookie_clears)
-                .await
-            {
-                self.cleanup_failed_start(project_id, &mut session, capture.id)
-                    .await;
-                return Err(error);
-            }
-        }
         session.engine = BrowserEngine::Chromium;
         session.current_url = saved.url;
         session.current_title = saved.title;
@@ -1132,18 +1084,6 @@ impl BrowserService {
                 self.cleanup_failed_start(project_id, &mut session, capture.id)
                     .await;
                 return Err(error);
-            }
-            if let Some(hash) = managed_cookie_hash {
-                if let Err(error) = self
-                    .update_persistent_profile(project_id, profile_name, |state| {
-                        state.managed_cookie_hash = Some(hash)
-                    })
-                    .await
-                {
-                    self.cleanup_failed_start(project_id, &mut session, capture.id)
-                        .await;
-                    return Err(error);
-                }
             }
         }
         self.runtime_sessions.lock().await.insert(
@@ -1236,9 +1176,21 @@ impl BrowserService {
             .await;
     }
 
-    /// Apply managed project cookies to the default persistent identity and
-    /// ephemeral sessions. Named persistent identities keep their own cookie
-    /// jars so cross-account sessions cannot contaminate one another.
+    async fn cookies_for_launch(
+        &self,
+        project_id: ProjectId,
+        persistent: bool,
+        cookie_override: Option<CookieLaunchOverride>,
+    ) -> DomainResult<Vec<Value>> {
+        match cookie_override {
+            Some(cookies) => Ok(cookies.cookies),
+            None if persistent => Ok(Vec::new()),
+            None => browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?),
+        }
+    }
+
+    /// Apply managed project cookies only to ephemeral sessions. Persistent
+    /// identities import cookies solely through an explicit cookie_profile.
     pub async fn apply_cookie_profile(
         &self,
         project_id: ProjectId,
@@ -1258,14 +1210,6 @@ impl BrowserService {
             .map(profile_cookie_identities)
             .transpose()?
             .unwrap_or_default();
-        let current_identities = profile_cookie_identities(profile)?;
-        let removed_identities = previous_cookies
-            .iter()
-            .filter(|identity| !current_identities.contains(identity))
-            .cloned()
-            .collect::<Vec<_>>();
-        self.queue_cookie_clears(project_id, &removed_identities)
-            .await?;
         let session_ids = self.managed_cookie_session_ids(project_id).await;
         for session_id in &session_ids {
             let operation_lock = self.session_operation_lock(*session_id).await;
@@ -1284,8 +1228,6 @@ impl BrowserService {
                 .await?;
             self.save_cookie_checkpoint(project_id, *session_id, &result)
                 .await?;
-            self.acknowledge_managed_cookie_import(project_id, *session_id, &removed_identities)
-                .await?;
         }
         Ok(session_ids.len())
     }
@@ -1302,7 +1244,6 @@ impl BrowserService {
             Vec::new()
         };
         let cookies = profile_cookie_identities(profile)?;
-        self.queue_cookie_clears(project_id, &cookies).await?;
         for session_id in &session_ids {
             let operation_lock = self.session_operation_lock(*session_id).await;
             let _operation_guard = operation_lock.lock().await;
@@ -1319,8 +1260,6 @@ impl BrowserService {
                 .await?;
             self.save_cookie_checkpoint(project_id, *session_id, &result)
                 .await?;
-            self.acknowledge_managed_cookie_import(project_id, *session_id, &cookies)
-                .await?;
         }
         Ok(session_ids.len())
     }
@@ -1331,35 +1270,10 @@ impl BrowserService {
             .await
             .iter()
             .filter_map(|(id, runtime)| {
-                (runtime.project_id == project_id
-                    && (!runtime.persistent
-                        || runtime.profile.as_deref() == Some(DEFAULT_BROWSER_PROFILE)))
-                .then_some(BrowserSessionId(*id))
+                (runtime.project_id == project_id && !runtime.persistent)
+                    .then_some(BrowserSessionId(*id))
             })
             .collect()
-    }
-
-    async fn acknowledge_managed_cookie_import(
-        &self,
-        project_id: ProjectId,
-        session_id: BrowserSessionId,
-        cleared: &[Value],
-    ) -> DomainResult<()> {
-        if self.session_persistent_profile(session_id).await.as_deref()
-            == Some(DEFAULT_BROWSER_PROFILE)
-        {
-            let cookies = browser_cookies(&self.db.list_stored_cookie_profiles(project_id).await?)?;
-            let hash = hex::encode(Sha256::digest(
-                serde_json::to_vec(&cookies)
-                    .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?,
-            ));
-            self.update_persistent_profile(project_id, DEFAULT_BROWSER_PROFILE, |state| {
-                state.managed_cookie_hash = Some(hash)
-            })
-            .await?;
-            self.acknowledge_cookie_clears(project_id, cleared).await?;
-        }
-        Ok(())
     }
 
     pub async fn active_sessions(
@@ -2166,37 +2080,6 @@ impl BrowserService {
                 "browser profile state is invalid; reset the project browser profile",
             )
         })
-    }
-
-    async fn queue_cookie_clears(
-        &self,
-        project_id: ProjectId,
-        identities: &[Value],
-    ) -> DomainResult<()> {
-        if identities.is_empty() {
-            return Ok(());
-        }
-        self.update_persistent_profile(project_id, DEFAULT_BROWSER_PROFILE, |profile| {
-            for identity in identities {
-                if !profile.pending_cookie_clears.contains(identity) {
-                    profile.pending_cookie_clears.push(identity.clone());
-                }
-            }
-        })
-        .await
-    }
-
-    async fn acknowledge_cookie_clears(
-        &self,
-        project_id: ProjectId,
-        acknowledged: &[Value],
-    ) -> DomainResult<()> {
-        self.update_persistent_profile(project_id, DEFAULT_BROWSER_PROFILE, |profile| {
-            profile
-                .pending_cookie_clears
-                .retain(|identity| !acknowledged.contains(identity));
-        })
-        .await
     }
 
     async fn update_persistent_profile(
@@ -3640,45 +3523,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_cookie_clears_survive_until_browser_start_consumes_them() {
-        let directory = tempfile::tempdir().unwrap();
+    async fn persistent_launch_requires_an_explicit_cookie_override() {
         let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "Google workspace".into(),
+                target_url: "https://accounts.google.com".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        db.upsert_cookie_profile(
+            project.id,
+            crate::cookies::validate_cookie_profile(
+                "https://accounts.google.com",
+                "SID=project-account".into(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let stored = db
+            .get_cookie_profile_for_url(project.id, "https://accounts.google.com")
+            .await
+            .unwrap()
+            .unwrap();
         let service = BrowserService::new_with_proxy_and_ca(
             db,
             None,
             None,
             "http://127.0.0.1:17891".into(),
             None,
-            directory.path().join("profiles"),
+            PathBuf::from("unused-profiles"),
         );
-        let project_id = ProjectId(43);
-        let identity = json!({"name":"sid","domain":".example.test","path":"/admin"});
-        service
-            .queue_cookie_clears(project_id, std::slice::from_ref(&identity))
-            .await
-            .unwrap();
-        let loaded = service
-            .load_persistent_profile(project_id, DEFAULT_BROWSER_PROFILE)
+        assert!(service
+            .cookies_for_launch(project.id, true, None)
             .await
             .unwrap()
+            .is_empty());
+        let explicit = service
+            .cookies_for_launch(
+                project.id,
+                true,
+                Some(CookieLaunchOverride::from_profile(&stored).unwrap()),
+            )
+            .await
             .unwrap();
-        assert_eq!(loaded.pending_cookie_clears, vec![identity.clone()]);
+        assert_eq!(explicit[0]["value"], "project-account");
+        // Raw project headers and named imports use equivalent host-only
+        // identities even though their Playwright serialization differs.
+        let ephemeral = service
+            .cookies_for_launch(project.id, false, None)
+            .await
+            .unwrap();
+        assert_eq!(ephemeral.len(), 1);
+        assert_eq!(ephemeral[0]["name"], "SID");
+        assert_eq!(ephemeral[0]["value"], "project-account");
+        assert_eq!(ephemeral[0]["url"], "https://accounts.google.com/");
+    }
 
-        let second = json!({"name":"other","domain":"example.test","path":"/"});
-        service
-            .queue_cookie_clears(project_id, std::slice::from_ref(&second))
-            .await
-            .unwrap();
-        service
-            .acknowledge_cookie_clears(project_id, std::slice::from_ref(&identity))
-            .await
-            .unwrap();
-        let loaded = service
-            .load_persistent_profile(project_id, DEFAULT_BROWSER_PROFILE)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.pending_cookie_clears, vec![second]);
+    #[test]
+    fn legacy_project_cookie_metadata_cannot_modify_persistent_state() {
+        let state: PersistentBrowserProfile = serde_json::from_value(json!({
+            "managed_cookie_hash":"old-seed",
+            "pending_cookie_clears":[{"name":"SID", "domain":".google.com", "path":"/"}],
+            "cookies":[{"name":"SID", "value":"native-account", "domain":".google.com", "path":"/"}]
+        }))
+        .unwrap();
+        let saved = serde_json::to_value(state).unwrap();
+        assert_eq!(saved["cookies"][0]["value"], "native-account");
+        assert!(saved.get("managed_cookie_hash").is_none());
+        assert!(saved.get("pending_cookie_clears").is_none());
     }
 
     #[tokio::test]

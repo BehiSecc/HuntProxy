@@ -394,7 +394,7 @@ By default, HuntProxy stores its database, configuration, browser profiles, CA, 
 
 There are three common ways:
 
-- **Load existing cookies:** Save the cookies to a UTF-8 file as either a raw `Cookie` header value or a browser-export JSON cookie array, then ask the agent to load that file into the project for the target URL.
+- **Load existing cookies:** Save a raw `Cookie` header value or browser-export JSON cookie array to a UTF-8 file and load it into the project for HTTP tools. To import it into a persistent browser, store a named cookie profile and explicitly start its matching browser with `cookie_profile` set to that name. Starting or restarting a browser without `cookie_profile` preserves its own jar, including Google accounts, without importing project or named cookies.
 - **Log in through the browser:** Ask the agent to hand you the project's Chromium browser through CDP. Complete the login, CAPTCHA, or two-factor authentication yourself, then tell the agent to take control back and continue.
 - **Provide the credentials:** Give the agent the username and password and ask it to sign in through the managed browser.
 

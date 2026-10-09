@@ -7,7 +7,7 @@
 use futures::{FutureExt, SinkExt, StreamExt};
 use huntproxy::browser::{BrowserAction, BrowserService, Locator};
 use huntproxy::config::Config;
-use huntproxy::cookies::validate_cookie_profile;
+use huntproxy::cookies::{validate_cookie_profile, validate_named_cookie_profile};
 use huntproxy::domain::{BrowserSessionId, CreateProjectRequest, ProjectId};
 use huntproxy::storage::Db;
 use serde_json::{json, Value};
@@ -675,8 +675,8 @@ async fn verify_named_profiles(h: &Harness) {
         "cookie refresh modified another profile"
     );
 
-    // The legacy unnamed start still seeds project cookies, then treats its
-    // persistent jar as authoritative when the original seed has not changed.
+    // Even the unnamed/default profile requires an explicit cookie selection.
+    // Project cookie changes cannot overwrite its own persistent identity.
     h.service.stop_all().await.unwrap();
     h.service
         .db
@@ -693,7 +693,20 @@ async fn verify_named_profiles(h: &Harness) {
         .await
         .unwrap();
     assert_eq!(default.active_profile.as_deref(), Some("default"));
-    assert_eq!(h.state(default.id).await["cookie"], "default");
+    assert!(h.state(default.id).await["cookie"].is_null());
+    h.seed("default", "localhost").await;
+    let injected = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            "about:blank".into(),
+            "default",
+            Some("default"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(injected.id, default.id);
+    assert_eq!(h.click(default.id, "#read").await["cookie"], "default");
     assert_saved(&h.click(default.id, "#seed").await, "default");
     let resumed = h
         .service
@@ -738,15 +751,268 @@ async fn verify_named_profiles(h: &Harness) {
             .apply_cookie_profile(h.project, Some(&previous), &updated)
             .await
             .unwrap(),
+        0
+    );
+    assert_saved(&h.click(restarted.id, "#read").await, "default");
+    let ephemeral = h
+        .service
+        .start_ephemeral(h.project, target.clone())
+        .await
+        .unwrap();
+    assert_eq!(h.state(ephemeral.id).await["cookie"], "default2");
+    assert_eq!(
+        h.service
+            .apply_cookie_profile(h.project, Some(&previous), &updated)
+            .await
+            .unwrap(),
         1
     );
-    assert_eq!(h.click(restarted.id, "#read").await["cookie"], "default2");
-    assert_saved(&h.click(restarted.id, "#seed").await, "default2");
+    assert_saved(&h.click(restarted.id, "#read").await, "default");
+    assert_eq!(
+        h.service
+            .clear_cookie_profile(h.project, &updated)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(h.click(ephemeral.id, "#read").await["cookie"].is_null());
+    h.service.stop(h.project, ephemeral.id).await.unwrap();
+    assert_saved(&h.click(restarted.id, "#read").await, "default");
     h.service.stop(h.project, restarted.id).await.unwrap();
     let restarted = h
         .service
         .start(h.project, "about:blank".into())
         .await
         .unwrap();
-    assert_saved(&h.state(restarted.id).await, "default2");
+    assert_saved(&h.state(restarted.id).await, "default");
+}
+
+// Synthetic Google cookies never contact Google: profiles stay at about:blank.
+// Domain, host-only, Secure, HttpOnly, and session-cookie attributes match the
+// conflicting account jars involved in CookieMismatch/401 failures.
+fn google_cookies(account: &str) -> Value {
+    json!([
+        {"name":"SID", "value":format!("{account}-sid"), "domain":".google.com", "path":"/", "httpOnly":true, "secure":true, "expires":4102444800.0, "sameSite":"Lax"},
+        {"name":"__Secure-1PSID", "value":format!("{account}-secure"), "domain":".google.com", "path":"/", "httpOnly":true, "secure":true, "expires":4102444800.0, "sameSite":"None"},
+        {"name":"ACCOUNT_CHOOSER", "value":format!("{account}-chooser"), "domain":"accounts.google.com", "hostOnly":true, "path":"/", "httpOnly":true, "secure":true, "expires":-1.0, "sameSite":"Lax"}
+    ])
+}
+
+fn google_project_cookies(account: &str) -> Value {
+    let mut cookies = google_cookies(account);
+    cookies.as_array_mut().unwrap().push(json!({
+        "name":"SID", "value":format!("{account}-host-sid"),
+        "domain":"accounts.google.com", "hostOnly":true, "path":"/",
+        "httpOnly":true, "secure":true, "expires":4102444800.0,
+    }));
+    cookies
+}
+
+fn checkpoint_path(h: &Harness, profile: &str) -> std::path::PathBuf {
+    let root = h
+        ._directory
+        .path()
+        .join("profiles/projects")
+        .join(h.project.get().to_string());
+    if profile == "default" {
+        root.join("state.json")
+    } else {
+        root.join("profiles").join(profile).join("state.json")
+    }
+}
+
+fn assert_google_account(h: &Harness, profile: &str, account: &str) {
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(checkpoint_path(h, profile)).unwrap()).unwrap();
+    let actual = saved["cookies"].as_array().unwrap();
+    assert_eq!(actual.len(), 3, "extra or missing Google account cookies");
+    for expected in google_cookies(account).as_array().unwrap() {
+        let cookie = actual
+            .iter()
+            .find(|cookie| cookie["name"] == expected["name"])
+            .unwrap();
+        for field in ["value", "domain", "path", "httpOnly", "secure", "sameSite"] {
+            assert_eq!(
+                cookie[field], expected[field],
+                "{profile}: {} {field}",
+                expected["name"]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; Google cookies are synthetic and no Google requests are made"]
+async fn persistent_google_accounts_require_explicit_cookie_injection() {
+    let h = Harness::new().await;
+    let result = std::panic::AssertUnwindSafe(verify_google_cookie_selection(&h))
+        .catch_unwind()
+        .await;
+    h.service.force_stop_all().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+async fn verify_google_cookie_selection(h: &Harness) {
+    for (profile, account) in [("default", "primary"), ("google2", "secondary")] {
+        let path = checkpoint_path(h, profile);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Bootstrap profile-owned state as if saved after an interactive login.
+        // Also exercise legacy queued project-cookie removals on upgrade.
+        std::fs::write(
+            path,
+            json!({"cookies":google_cookies(account),
+                "managed_cookie_hash":"legacy",
+                "pending_cookie_clears":[{"name":"SID","domain":".google.com","path":"/"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        h.service
+            .db
+            .upsert_named_cookie_profile(
+                h.project,
+                profile,
+                validate_named_cookie_profile(
+                    "https://accounts.google.com",
+                    google_cookies("imported").to_string(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    h.service
+        .db
+        .upsert_cookie_profile(
+            h.project,
+            validate_cookie_profile(
+                "https://accounts.google.com",
+                google_project_cookies("project").to_string(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let primary = h
+        .service
+        .start(h.project, "about:blank".into())
+        .await
+        .unwrap();
+    let secondary = h
+        .service
+        .start_with_profile(h.project, "about:blank".into(), "google2")
+        .await
+        .unwrap();
+    assert_ne!(primary.id, secondary.id);
+    assert_google_account(h, "default", "primary");
+    assert_google_account(h, "google2", "secondary");
+    let previous = h
+        .service
+        .db
+        .get_cookie_profile_for_url(h.project, "https://accounts.google.com")
+        .await
+        .unwrap()
+        .unwrap();
+    h.service
+        .db
+        .upsert_cookie_profile(
+            h.project,
+            validate_cookie_profile(
+                "https://accounts.google.com",
+                google_project_cookies("updated-project").to_string(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let updated = h
+        .service
+        .db
+        .get_cookie_profile_for_url(h.project, "https://accounts.google.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.service
+            .apply_cookie_profile(h.project, Some(&previous), &updated)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        h.service
+            .clear_cookie_profile(h.project, &updated)
+            .await
+            .unwrap(),
+        0
+    );
+    h.service.stop(h.project, primary.id).await.unwrap();
+    let restarted = h
+        .service
+        .start(h.project, "about:blank".into())
+        .await
+        .unwrap();
+    assert_ne!(restarted.id, primary.id);
+    assert_google_account(h, "default", "primary");
+    assert_google_account(h, "google2", "secondary");
+
+    // Named imports require explicit selection, including on an already active profile.
+    let injected = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            "about:blank".into(),
+            "google2",
+            Some("google2"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(injected.id, secondary.id);
+    assert_google_account(h, "google2", "imported");
+    assert_google_account(h, "default", "primary");
+    h.service.stop(h.project, secondary.id).await.unwrap();
+    h.service
+        .start_with_profile(h.project, "about:blank".into(), "google2")
+        .await
+        .unwrap();
+    assert_google_account(h, "google2", "imported");
+
+    // A changed named jar also remains inert until explicitly requested.
+    h.service
+        .db
+        .upsert_named_cookie_profile(
+            h.project,
+            "google2",
+            validate_named_cookie_profile(
+                "https://accounts.google.com",
+                google_cookies("new-import").to_string(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    h.service.stop_all().await.unwrap();
+    h.service
+        .start(h.project, "about:blank".into())
+        .await
+        .unwrap();
+    h.service
+        .start_with_profile(h.project, "about:blank".into(), "google2")
+        .await
+        .unwrap();
+    assert_google_account(h, "default", "primary");
+    assert_google_account(h, "google2", "imported");
+    h.service.stop_all().await.unwrap();
+    h.service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            "about:blank".into(),
+            "google2",
+            Some("google2"),
+        )
+        .await
+        .unwrap();
+    assert_google_account(h, "google2", "new-import");
 }
