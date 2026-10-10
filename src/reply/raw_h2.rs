@@ -126,9 +126,11 @@ impl ReplyService {
             .timeout_ms
             .unwrap_or(60_000)
             .clamp(1_000, MAX_TIMEOUT_MS);
-        let upstream_proxy = self
-            .upstream_proxies
-            .proxy_for(&target.host, options.upstream_proxy.as_deref())?;
+        let upstream_proxy = self.upstream_proxies.proxy_for_project(
+            project_id.get(),
+            &target.host,
+            options.upstream_proxy.as_deref(),
+        )?;
         let mut io = tokio::time::timeout(
             Duration::from_secs(15),
             connect_target(&target, upstream_proxy.as_deref()),

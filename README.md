@@ -318,6 +318,19 @@ With authentication:
 default = "http://username:password@proxy.example.com:8080"
 ```
 
+For selected HuntProxy projects only:
+
+```toml
+[upstream_proxies]
+
+[[upstream_proxies.project_rules]]
+project_id = 41
+proxy = "socks5h://username:password@127.0.0.1:1080"
+```
+
+Project rules route all traffic for that project and take priority over host
+rules and the default. A transient per-request override still takes priority.
+
 For selected hosts only:
 
 ```toml

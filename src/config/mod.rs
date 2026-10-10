@@ -52,8 +52,17 @@ pub struct Config {
 pub struct UpstreamProxyConfig {
     /// Fallback proxy used when no host rule matches.
     pub default: Option<String>,
+    /// Project-wide proxies. These take precedence over host rules and the
+    /// default, while an explicit per-request override remains authoritative.
+    pub project_rules: Vec<ProjectUpstreamProxyRule>,
     /// Exact hosts and `*.example.com` suffix rules. Exact matches win.
     pub rules: Vec<UpstreamProxyRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectUpstreamProxyRule {
+    pub project_id: i64,
+    pub proxy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +72,26 @@ pub struct UpstreamProxyRule {
 }
 
 impl UpstreamProxyConfig {
+    pub fn proxy_for_project(
+        &self,
+        project_id: i64,
+        host: &str,
+        request_override: Option<&str>,
+    ) -> DomainResult<Option<String>> {
+        if let Some(proxy) = request_override {
+            validate_upstream_proxy_url(proxy)?;
+            return Ok(Some(proxy.to_string()));
+        }
+        if let Some(rule) = self
+            .project_rules
+            .iter()
+            .find(|rule| rule.project_id == project_id)
+        {
+            return Ok(Some(rule.proxy.clone()));
+        }
+        self.proxy_for(host, None)
+    }
+
     pub fn proxy_for(
         &self,
         host: &str,
@@ -92,6 +121,22 @@ impl UpstreamProxyConfig {
     fn validate(&self) -> DomainResult<()> {
         if let Some(proxy) = &self.default {
             validate_upstream_proxy_url(proxy)?;
+        }
+        let mut project_ids = std::collections::HashSet::new();
+        for rule in &self.project_rules {
+            if rule.project_id <= 0 {
+                return Err(DomainError::new(
+                    ErrorCode::ConfigInvalid,
+                    "upstream proxy project_id must be positive",
+                ));
+            }
+            if !project_ids.insert(rule.project_id) {
+                return Err(DomainError::new(
+                    ErrorCode::ConfigInvalid,
+                    "upstream proxy project_id must be unique",
+                ));
+            }
+            validate_upstream_proxy_url(&rule.proxy)?;
         }
         for rule in &self.rules {
             validate_host_pattern(&rule.host)?;
@@ -517,6 +562,10 @@ mod tests {
     fn upstream_proxy_selection_prefers_exact_and_longest_wildcard() {
         let config = UpstreamProxyConfig {
             default: Some("http://default.test:8080".into()),
+            project_rules: vec![ProjectUpstreamProxyRule {
+                project_id: 41,
+                proxy: "socks5h://project.test:1080".into(),
+            }],
             rules: vec![
                 UpstreamProxyRule {
                     host: "*.example.com".into(),
@@ -532,6 +581,20 @@ mod tests {
                 },
             ],
         };
+        assert_eq!(
+            config
+                .proxy_for_project(41, "one.api.example.com", None)
+                .unwrap()
+                .as_deref(),
+            Some("socks5h://project.test:1080")
+        );
+        assert_eq!(
+            config
+                .proxy_for_project(41, "one.api.example.com", Some("http://override.test:8080"))
+                .unwrap()
+                .as_deref(),
+            Some("http://override.test:8080")
+        );
         assert_eq!(
             config
                 .proxy_for("one.api.example.com", None)
@@ -557,6 +620,20 @@ mod tests {
                 .as_deref(),
             Some("socks5h://override.test:1080")
         );
+
+        let isolated = UpstreamProxyConfig {
+            project_rules: vec![ProjectUpstreamProxyRule {
+                project_id: 41,
+                proxy: "socks5h://project.test:1080".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            isolated
+                .proxy_for_project(42, "one.api.example.com", None)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -564,5 +641,29 @@ mod tests {
         assert!(validate_upstream_proxy_url("https://proxy.test:443").is_err());
         assert!(validate_upstream_proxy_url("http://proxy.test:8080/path").is_err());
         assert!(validate_host_pattern("foo.*.example.com").is_err());
+        assert!(UpstreamProxyConfig {
+            project_rules: vec![ProjectUpstreamProxyRule {
+                project_id: 0,
+                proxy: "http://proxy.test:8080".into(),
+            }],
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(UpstreamProxyConfig {
+            project_rules: vec![
+                ProjectUpstreamProxyRule {
+                    project_id: 41,
+                    proxy: "http://one.test:8080".into(),
+                },
+                ProjectUpstreamProxyRule {
+                    project_id: 41,
+                    proxy: "http://two.test:8080".into(),
+                },
+            ],
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 }

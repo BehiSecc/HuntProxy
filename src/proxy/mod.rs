@@ -168,10 +168,11 @@ async fn forward_request(
         None => url.clone(),
     };
     let wire_target = TargetRef::from_url(&wire_url)?;
-    let upstream_proxy = state
-        .config
-        .upstream_proxies
-        .proxy_for(&wire_target.host, None)?;
+    let upstream_proxy = state.config.upstream_proxies.proxy_for_project(
+        session.project_id.get(),
+        &wire_target.host,
+        None,
+    )?;
     let capture = url_is_in_scope(&url, &project.scope)?;
     let dial = resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?;
     let method = parts.method.clone();

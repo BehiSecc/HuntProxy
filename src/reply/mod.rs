@@ -1,6 +1,6 @@
 //! Reply drafts, placeholder resolution, send orchestration.
 
-mod raw;
+pub(crate) mod raw;
 mod raw_h2;
 
 pub use raw::*;
@@ -824,9 +824,11 @@ impl ReplyService {
         let method = mat.method.parse::<http::Method>().map_err(|error| {
             DomainError::invalid(format!("invalid HTTP method {}: {error}", mat.method))
         })?;
-        let upstream_proxy = self
-            .upstream_proxies
-            .proxy_for(&wire_target.host, upstream_proxy_override)?;
+        let upstream_proxy = self.upstream_proxies.proxy_for_project(
+            project_id.get(),
+            &wire_target.host,
+            upstream_proxy_override,
+        )?;
         let req_headers: Vec<HeaderEntry> = mat
             .headers
             .iter()

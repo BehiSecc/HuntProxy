@@ -56,6 +56,11 @@ pub(super) async fn handle(
     let target = TargetRef::from_url(&http_url)?;
     let capture = url_is_in_scope(&http_url, &project.scope)?;
     let dial = resolve_validated_dial(&http_url, &project.scope, Duration::from_secs(60)).await?;
+    let upstream_proxy = state.config.upstream_proxies.proxy_for_project(
+        session.project_id.get(),
+        &target.host,
+        None,
+    )?;
     let websocket_url = websocket_url(&http_url)?;
     let mut request_headers = parts
         .headers
@@ -74,7 +79,7 @@ pub(super) async fn handle(
         .await?,
     );
     let upstream_request = upstream_request(&websocket_url, &request_headers)?;
-    let socket = connect_socket(&dial).await?;
+    let socket = connect_socket(&target, &dial, upstream_proxy.as_deref()).await?;
     let cap = usize::try_from(project.limits.capture_body_bytes).unwrap_or(usize::MAX);
     let websocket_config = WebSocketConfig::default()
         .read_buffer_size(16 * 1024)
@@ -413,7 +418,33 @@ fn upstream_request(url: &str, headers: &[(String, Vec<u8>)]) -> DomainResult<ht
     Ok(request)
 }
 
-async fn connect_socket(dial: &ValidatedDial) -> DomainResult<BoxedSocket> {
+async fn connect_socket(
+    target: &TargetRef,
+    dial: &ValidatedDial,
+    upstream_proxy: Option<&str>,
+) -> DomainResult<BoxedSocket> {
+    if upstream_proxy.is_some() {
+        let stream = tokio::time::timeout(
+            Duration::from_secs(15),
+            crate::reply::raw::connect_target(target, upstream_proxy),
+        )
+        .await
+        .map_err(|_| DomainError::new(ErrorCode::Timeout, "upstream connection timed out"))??;
+        if dial.scheme == "https" {
+            let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server_name = ServerName::try_from(dial.hostname.clone())
+                .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+            let tls = TlsConnector::from(Arc::new(config))
+                .connect(server_name, stream)
+                .await
+                .map_err(|error| DomainError::new(ErrorCode::Unavailable, error.to_string()))?;
+            return Ok(Box::new(tls));
+        }
+        return Ok(Box::new(stream));
+    }
     let mut last_error = None;
     let mut stream = None;
     for address in &dial.approved_socket_addrs {

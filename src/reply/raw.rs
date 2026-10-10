@@ -133,7 +133,7 @@ pub struct RawResponseSummary {
     pub length: usize,
 }
 
-pub(super) trait RawIo: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait RawIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> RawIo for T {}
 
 /// Result returned by the raw Reply endpoint and MCP tool.
@@ -215,9 +215,11 @@ impl ReplyService {
         }
 
         let started = Instant::now();
-        let upstream_proxy = self
-            .upstream_proxies
-            .proxy_for(&target.host, options.upstream_proxy.as_deref())?;
+        let upstream_proxy = self.upstream_proxies.proxy_for_project(
+            project_id.get(),
+            &target.host,
+            options.upstream_proxy.as_deref(),
+        )?;
         let mut stream = tokio::time::timeout(
             Duration::from_secs(15),
             connect_target(&target, upstream_proxy.as_deref()),
@@ -363,7 +365,7 @@ async fn wait_for_start_barrier(
     }
 }
 
-pub(super) async fn connect_target(
+pub(crate) async fn connect_target(
     target: &TargetRef,
     upstream_proxy: Option<&str>,
 ) -> DomainResult<Pin<Box<dyn RawIo>>> {
