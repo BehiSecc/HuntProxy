@@ -2115,10 +2115,11 @@ async fn delete_browser_profile(
 }
 
 async fn browser_status(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
-    match state.browser.active_sessions(ProjectId(id)).await {
-        Ok(sessions) => Json(serde_json::json!({
+    match state.browser.active_status(ProjectId(id)).await {
+        Ok(status) => Json(serde_json::json!({
             "runtime": state.browser.status(),
-            "sessions": sessions,
+            "sessions": status.sessions,
+            "resources": status.resources,
         }))
         .into_response(),
         Err(error) => error_response(error),

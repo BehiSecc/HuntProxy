@@ -249,10 +249,14 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        std::fs::create_dir_all("/tmp/artis").unwrap();
+        Self::new_in(Path::new("/tmp/artis")).await
+    }
+
+    async fn new_in(parent: &Path) -> Self {
+        std::fs::create_dir_all(parent).unwrap();
         let directory = tempfile::Builder::new()
             .prefix("huntproxy-profile-regression-")
-            .tempdir_in("/tmp/artis")
+            .tempdir_in(parent)
             .unwrap();
         let fixture = LocalFixture::start().await;
         let config = Config {
@@ -373,6 +377,177 @@ impl Harness {
             .unwrap();
         self.state(session).await
     }
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; uses only a local fixture"]
+async fn browser_resource_status_preserves_profiles_at_capacity_and_reports_cdp_ownership() {
+    let h = Harness::new_in(&std::env::temp_dir()).await;
+    let result = std::panic::AssertUnwindSafe(verify_browser_resources(&h))
+        .catch_unwind()
+        .await;
+    h.service.force_stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn verify_browser_resources(h: &Harness) {
+    let empty = h.service.active_status(h.project).await.unwrap();
+    assert!(empty.sessions.is_empty());
+    assert_eq!(empty.resources.available_capacity, 2);
+    h.seed("default", "localhost").await;
+    h.seed("acc2", "localhost").await;
+    let first = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            h.fixture.url("localhost", "default"),
+            "default",
+            Some("default"),
+        )
+        .await
+        .unwrap();
+    let second = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            h.fixture.url("localhost", "acc2"),
+            "acc2",
+            Some("acc2"),
+        )
+        .await
+        .unwrap();
+    let full = h.service.active_status(h.project).await.unwrap();
+    assert_eq!(full.sessions.len(), 2);
+    assert_eq!(full.resources.active_persistent, 2);
+    assert_eq!(full.resources.active_ephemeral, 0);
+    assert_eq!(full.resources.available_capacity, 0);
+    assert_eq!(full.resources.sessions.len(), 2);
+    for actual in &full.sessions {
+        let expected = h
+            .service
+            .session_status(h.project, actual.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    assert_saved(&h.click(first.id, "#seed").await, "default");
+    assert_saved(&h.click(second.id, "#seed").await, "acc2");
+    let resumed = h
+        .service
+        .start(h.project, "about:blank".into())
+        .await
+        .unwrap();
+    assert_eq!(resumed.id, first.id);
+    assert_eq!(resumed.active_profile.as_deref(), Some("default"));
+    assert_eq!(resumed.current_url, first.current_url);
+    assert_saved(&h.state(resumed.id).await, "default");
+    assert_saved(&h.state(second.id).await, "acc2");
+    let denied = h
+        .service
+        .start_with_profile(h.project, "about:blank".into(), "acc3")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        denied.code(),
+        huntproxy::domain::ErrorCode::ConcurrencyLimited
+    );
+
+    let handed_off = h.service.enable_cdp(h.project, second.id).await.unwrap();
+    let local = h.service.active_status(h.project).await.unwrap();
+    assert!(local.resources.cdp_port_in_use);
+    assert!(
+        local
+            .resources
+            .sessions
+            .iter()
+            .find(|session| session.session_id == first.id)
+            .unwrap()
+            .agent_control
+    );
+    assert!(
+        !local
+            .resources
+            .sessions
+            .iter()
+            .find(|session| session.session_id == second.id)
+            .unwrap()
+            .agent_control
+    );
+    assert_eq!(handed_off.session_id, Some(second.id));
+    h.service.disable_cdp(h.project, second.id).await.unwrap();
+
+    h.service.stop(h.project, second.id).await.unwrap();
+    let ephemeral = h
+        .service
+        .start_ephemeral(h.project, "about:blank".into())
+        .await
+        .unwrap();
+    let mixed = h.service.active_status(h.project).await.unwrap();
+    assert_eq!(mixed.sessions.len(), 1);
+    assert_eq!(mixed.resources.active_persistent, 1);
+    assert_eq!(mixed.resources.active_ephemeral, 1);
+    assert_eq!(mixed.resources.available_capacity, 0);
+    assert_eq!(mixed.resources.sessions.len(), 1);
+    assert_eq!(mixed.resources.sessions[0].session_id, first.id);
+
+    let foreign = h
+        .service
+        .db
+        .create_project(CreateProjectRequest {
+            name: "Separate local workspace".into(),
+            target_url: h.fixture.url("localhost", "foreign"),
+            advanced: None,
+        })
+        .await
+        .unwrap();
+    let foreign_session = h
+        .service
+        .start_with_profile(foreign.id, "about:blank".into(), "foreign-account")
+        .await
+        .unwrap();
+    h.service
+        .enable_cdp(foreign.id, foreign_session.id)
+        .await
+        .unwrap();
+    let observed = h.service.active_status(h.project).await.unwrap();
+    assert!(observed.resources.cdp_port_in_use);
+    assert!(observed.resources.sessions[0].agent_control);
+    assert_eq!(observed.resources.sessions.len(), 1);
+    assert_eq!(observed.resources.sessions[0].profile, "default");
+    let serialized = serde_json::to_value(&observed.resources).unwrap();
+    assert_eq!(serialized.as_object().unwrap().len(), 7);
+    assert_eq!(serialized["sessions"][0].as_object().unwrap().len(), 3);
+    assert!(!serialized.to_string().contains("foreign-account"));
+    h.service
+        .disable_cdp(foreign.id, foreign_session.id)
+        .await
+        .unwrap();
+    h.service.stop(h.project, first.id).await.unwrap();
+    let ephemeral_only = h.service.active_status(h.project).await.unwrap();
+    assert!(ephemeral_only.sessions.is_empty());
+    assert!(ephemeral_only.resources.sessions.is_empty());
+    assert_eq!(ephemeral_only.resources.active_persistent, 0);
+    assert_eq!(ephemeral_only.resources.active_ephemeral, 1);
+    assert_eq!(ephemeral_only.resources.available_capacity, 1);
+    h.service.stop(h.project, ephemeral.id).await.unwrap();
+    let available = h.service.active_status(h.project).await.unwrap();
+    assert_eq!(available.resources.available_capacity, 2);
+    assert!(!available.resources.cdp_port_in_use);
+    h.service.stop_all().await.unwrap();
+    assert_eq!(
+        h.service
+            .active_status(h.project)
+            .await
+            .unwrap()
+            .resources
+            .available_capacity,
+        2
+    );
 }
 
 fn assert_saved(state: &Value, identity: &str) {

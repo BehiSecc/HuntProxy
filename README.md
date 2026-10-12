@@ -166,6 +166,8 @@ HuntProxy gives agents a complete hunting loop: build context â†’ investigate â†
 
 Different browser profiles can remain open together up to the project's browser limit (two by default). Browser commands share one worker queue, and only one session can be handed to CDP at a time.
 
+Use `browser_manage(project_id=PROJECT_ID, op="status")` at profile or control transitions to inspect active persistent sessions and browser resources. Resource capacity also counts temporary browsers used by tools and extensions; per-session control indicates whether the agent or a person through CDP owns that browser, and the CDP occupancy flag covers the shared port across projects. Reuse a valid matching session when capacity is full. Suspend only an unnecessary idle session you own, preserving its profile; keep simultaneous-account workflows and operator handoffs intact. Retain the result between transitions instead of checking status before every browser action.
+
 ### Test Hypotheses
 
 | Capability | What your agent can do |

@@ -64,6 +64,32 @@ pub struct BrowserProfileStatus {
     pub has_state: bool,
 }
 
+/// Compact resource observations for transition-time reuse. No page or private
+/// browser state is included, and foreign CDP ownership is only a busy flag.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrowserResources {
+    pub project_id: ProjectId,
+    pub max_concurrent_browsers: u32,
+    pub active_persistent: usize,
+    pub active_ephemeral: usize,
+    pub available_capacity: usize,
+    pub cdp_port_in_use: bool,
+    pub sessions: Vec<BrowserSessionResource>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrowserSessionResource {
+    pub session_id: BrowserSessionId,
+    pub profile: String,
+    pub agent_control: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserStatus {
+    pub sessions: Vec<BrowserSession>,
+    pub resources: BrowserResources,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BrowserCdpStatus {
     pub project_id: ProjectId,
@@ -1297,6 +1323,25 @@ impl BrowserService {
         }
         sessions.sort_by_key(|session| session.id.get());
         Ok(sessions)
+    }
+
+    pub async fn active_status(&self, project_id: ProjectId) -> DomainResult<BrowserStatus> {
+        // Live identity checks may wait for browser actions. Do not hold the
+        // global lifecycle or runtime map lock across them. The final sample
+        // rejects persistent identities changed by an interleaved transition.
+        let project = self.db.get_project(project_id).await?;
+        let sessions = self.active_sessions(project_id).await?;
+        let runtimes = self.runtime_sessions.lock().await;
+        let resources = browser_resources(
+            project_id,
+            project.limits.max_concurrent_browsers,
+            &sessions,
+            &runtimes,
+        )?;
+        Ok(BrowserStatus {
+            sessions,
+            resources,
+        })
     }
 
     pub async fn session_status(
@@ -2794,6 +2839,79 @@ fn parse_cdp_info(value: Option<&Value>) -> DomainResult<BrowserCdpInfo> {
     Ok(info)
 }
 
+fn browser_resources(
+    project_id: ProjectId,
+    max_concurrent_browsers: u32,
+    sessions: &[BrowserSession],
+    runtimes: &HashMap<i64, RuntimeSession>,
+) -> DomainResult<BrowserResources> {
+    let mut active_persistent = 0;
+    let mut active_ephemeral = 0;
+    for runtime in runtimes
+        .values()
+        .filter(|runtime| runtime.project_id == project_id)
+    {
+        if runtime.persistent {
+            active_persistent += 1;
+        } else {
+            active_ephemeral += 1;
+        }
+    }
+    let mut resources = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let runtime = runtimes.get(&session.id.get()).ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::Unavailable,
+                "requested browser profile is not active",
+            )
+        })?;
+        let profile = session.active_profile.as_ref().ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::ProtocolError,
+                "active browser profile was not verified",
+            )
+        })?;
+        if session.project_id != project_id
+            || runtime.project_id != project_id
+            || !runtime.persistent
+            || runtime.profile.as_ref() != Some(profile)
+            || session.profile.as_ref() != Some(profile)
+            || !matches!(
+                session.state,
+                BrowserSessionState::Ready
+                    | BrowserSessionState::Busy
+                    | BrowserSessionState::Starting
+            )
+        {
+            return Err(DomainError::new(
+                ErrorCode::ProtocolError,
+                "requested browser profile does not match the active runtime",
+            ));
+        }
+        resources.push(BrowserSessionResource {
+            session_id: session.id,
+            profile: profile.clone(),
+            agent_control: runtime.cdp.is_none(),
+        });
+    }
+    if resources.len() != active_persistent {
+        return Err(DomainError::new(
+            ErrorCode::Unavailable,
+            "active browser sessions changed during status verification",
+        ));
+    }
+    Ok(BrowserResources {
+        project_id,
+        max_concurrent_browsers,
+        active_persistent,
+        active_ephemeral,
+        available_capacity: (max_concurrent_browsers as usize)
+            .saturating_sub(active_persistent + active_ephemeral),
+        cdp_port_in_use: runtimes.values().any(|runtime| runtime.cdp.is_some()),
+        sessions: resources,
+    })
+}
+
 fn cdp_status_view(
     project_id: ProjectId,
     active: Option<(i64, BrowserCdpInfo)>,
@@ -3184,6 +3302,173 @@ mod tests {
         assert_eq!(restored.current_title.as_deref(), Some("Dashboard"));
         assert_eq!(restored.engine, BrowserEngine::Chromium);
         assert_eq!(restored.state, BrowserSessionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn browser_resources_count_ephemeral_capacity_and_hide_foreign_cdp_identity() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "Resource observation".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let mut session = db
+            .create_browser_session(project.id, Some("account1".into()))
+            .await
+            .unwrap();
+        session.active_profile = Some("account1".into());
+        session.state = BrowserSessionState::Ready;
+        session.current_url = Some("https://example.test/private?value=hidden".into());
+        session.current_title = Some("Private page".into());
+        let cdp = BrowserCdpInfo {
+            port: BROWSER_CDP_PORT,
+            endpoint: "http://127.0.0.1:9222".into(),
+            devtools_url: "foreign-devtools".into(),
+            hosted_devtools_url: "foreign-hosted-devtools".into(),
+        };
+        let mut runtimes = HashMap::from([
+            (
+                session.id.get(),
+                RuntimeSession {
+                    project_id: project.id,
+                    capture_session_id: CaptureSessionId(1),
+                    persistent: true,
+                    profile: Some("account1".into()),
+                    cdp: None,
+                },
+            ),
+            (
+                session.id.get() + 1,
+                RuntimeSession {
+                    project_id: project.id,
+                    capture_session_id: CaptureSessionId(2),
+                    persistent: false,
+                    profile: None,
+                    cdp: None,
+                },
+            ),
+            (
+                999,
+                RuntimeSession {
+                    project_id: ProjectId(project.id.get() + 1),
+                    capture_session_id: CaptureSessionId(3),
+                    persistent: true,
+                    profile: Some("foreign-account".into()),
+                    cdp: Some(cdp.clone()),
+                },
+            ),
+        ]);
+        let observed = browser_resources(project.id, 2, &[session.clone()], &runtimes).unwrap();
+        assert_eq!(
+            serde_json::to_value(observed).unwrap(),
+            json!({
+                "project_id": project.id,
+                "max_concurrent_browsers": 2,
+                "active_persistent": 1,
+                "active_ephemeral": 1,
+                "available_capacity": 0,
+                "cdp_port_in_use": true,
+                "sessions": [{"session_id": session.id, "profile": "account1", "agent_control": true}],
+            })
+        );
+
+        runtimes.remove(&(session.id.get() + 1));
+        runtimes.remove(&999);
+        let observed = browser_resources(project.id, 2, &[session.clone()], &runtimes).unwrap();
+        assert_eq!(observed.available_capacity, 1);
+        assert!(!observed.cdp_port_in_use);
+        runtimes.get_mut(&session.id.get()).unwrap().cdp = Some(cdp);
+        let observed = browser_resources(project.id, 0, &[session.clone()], &runtimes).unwrap();
+        assert_eq!(observed.available_capacity, 0);
+        assert!(!observed.sessions[0].agent_control);
+        assert!(observed.cdp_port_in_use);
+
+        let mut unverified = session.clone();
+        unverified.active_profile = None;
+        assert!(browser_resources(project.id, 2, &[unverified], &runtimes).is_err());
+        let mut mismatched = session.clone();
+        mismatched.active_profile = Some("account2".into());
+        assert!(browser_resources(project.id, 2, &[mismatched], &runtimes).is_err());
+        assert!(browser_resources(project.id, 2, &[], &runtimes).is_err());
+        runtimes.clear();
+        let error = browser_resources(project.id, 2, &[session], &runtimes).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn browser_resource_status_wait_does_not_block_other_project_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "Busy local workspace".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let other_project = db
+            .create_project(CreateProjectRequest {
+                name: "Other local workspace".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let own = db
+            .create_browser_session(project.id, Some("default".into()))
+            .await
+            .unwrap();
+        let other = db
+            .create_browser_session(other_project.id, Some("default".into()))
+            .await
+            .unwrap();
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            Some(directory.path().join("missing-worker.js")),
+            DEFAULT_BROWSER_PROXY.into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        service.runtime_sessions.lock().await.insert(
+            own.id.get(),
+            RuntimeSession {
+                project_id: project.id,
+                capture_session_id: CaptureSessionId(1),
+                persistent: true,
+                profile: Some("default".into()),
+                cdp: None,
+            },
+        );
+        let operation = service.session_operation_lock(own.id).await;
+        let operation_guard = operation.lock().await;
+        let observation = service.active_status(project.id);
+        tokio::pin!(observation);
+        // Poll status until it is waiting for the busy session. Cancellation
+        // here only drops the timer; the observation future remains pinned.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut observation)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.stop(other_project.id, other.id),
+        )
+        .await
+        .expect("status blocked an unrelated project's lifecycle")
+        .unwrap();
+        drop(operation_guard);
+        // This fixture has no live worker or directory, so normal identity
+        // verification still returns its existing unavailable error.
+        assert_eq!(
+            observation.await.unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
     }
 
     #[test]

@@ -381,6 +381,77 @@ async fn browser_cdp_api_reports_control_state_and_validates_session_requirement
 }
 
 #[tokio::test]
+async fn browser_resource_status_is_additive_in_mcp_and_api() {
+    let (_directory, state, project_id) = test_state().await;
+    let expected = serde_json::json!({
+        "project_id": project_id,
+        "max_concurrent_browsers": 2,
+        "active_persistent": 0,
+        "active_ephemeral": 0,
+        "available_capacity": 2,
+        "cdp_port_in_use": false,
+        "sessions": [],
+    });
+    let mcp = huntproxy::mcp::call_tool(
+        state.clone(),
+        "browser_manage",
+        serde_json::json!({"project_id": project_id, "op": "status"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mcp,
+        serde_json::json!({"sessions": [], "resources": expected})
+    );
+
+    let app = huntproxy::api::router(state.clone());
+    let response = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/browser-sessions",
+                project_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let api = json_response(response).await;
+    assert_eq!(api["sessions"], serde_json::json!([]));
+    assert_eq!(api["resources"], expected);
+    assert_eq!(
+        api["runtime"],
+        serde_json::to_value(state.browser.status()).unwrap()
+    );
+
+    // Single-session status retains its existing BrowserSession payload,
+    // including historical stopped sessions, without a resources envelope.
+    let session = state
+        .db
+        .create_browser_session(project_id, Some("default".into()))
+        .await
+        .unwrap();
+    let mut session = session;
+    session.state = BrowserSessionState::Stopped;
+    state.db.update_browser_session(&session).await.unwrap();
+    let session = state
+        .db
+        .get_browser_session(project_id, session.id)
+        .await
+        .unwrap();
+    let single = huntproxy::mcp::call_tool(
+        state,
+        "browser_manage",
+        serde_json::json!({"project_id": project_id, "op": "status", "session_id": session.id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(single, serde_json::to_value(session).unwrap());
+    assert!(single.get("resources").is_none());
+}
+
+#[tokio::test]
 async fn history_query_errors_explain_repairs_without_returning_items() {
     let (_directory, state, project_id) = test_state().await;
     state
