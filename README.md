@@ -250,6 +250,23 @@ Mark exchange 42 as a finding, add a short description and reproduction steps,
 and generate a cURL command.
 ```
 
+### Search Saved History
+
+Pass a query in `history_search`'s `q` argument. Keep each field, operator, and value together: `status>=400`, not `status:>=400` or `status >= 400`.
+
+| Query | Matches |
+| --- | --- |
+| `host:example.com method:GET status>=400` | GET requests to this host with status 400 or higher |
+| `path:~"monthly report"` | Paths containing the literal phrase |
+| `request:~"monthly report"` | Request target, headers, or decoded body containing the phrase |
+| `(status:200 OR status:304) NOT path:~.js` | Either status, excluding paths containing `.js` |
+| `time>2026-10-12T00:00:00Z time<=2026-10-13T00:00:00Z` | Exchanges within these timestamp bounds |
+| `duration>=1000 response_size>1024` | Duration of at least one second and response body larger than 1 KiB |
+
+`field:value` means equality; `field:~value` means contains. Comparisons use `>`, `>=`, `<`, `<=`, or `!=` directly after the field. Adjacent terms mean AND; Boolean precedence is NOT, AND, then OR. Double quotes keep spaces and parentheses inside a value. Bare words search summary fields, not request bodies. `path:/api/*`, `path:*.js`, and `path:*report*` select prefix, suffix, and contains matches.
+
+`duration` is milliseconds; `request_size` and `response_size` are body bytes. `time` compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the stored format for precise cutoffs. Use the tool schema's field names, and narrow full request searches with summary filters when practical. A query error is not an empty result: follow its returned repair guidance and rerun the corrected query before drawing conclusions.
+
 ## 💻 CLI Reference
 
 Most projects begin with a prompt, not a terminal command. MCP handles day-to-day hunting; the CLI handles setup, diagnostics, project maintenance and data transfer.

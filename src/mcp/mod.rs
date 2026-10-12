@@ -6,7 +6,7 @@ use crate::codec::{apply_pipeline, Transform};
 use crate::config::Config;
 use crate::domain::*;
 use crate::fuzzer::FuzzTemplate;
-use crate::history::parse_text_query;
+use crate::history::{parse_text_query, query_error, HISTORY_QUERY_SYNTAX};
 use crate::policy::{is_sensitive_header, PresentationOptions};
 use crate::storage::CreateCaptureSession;
 use serde::{Deserialize, Serialize};
@@ -327,7 +327,7 @@ fn tool_defs() -> Value {
         {"name":"capture_sessions","description":"List proxy capture credentials, create a one-time credential, revoke one, or renew one. create returns the secret once; copy it immediately. revoke and renew require session_id. This does not start Chromium; use browser_start for browser traffic.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","revoke","renew"]},"session_id":{"type":"integer","description":"Required for revoke and renew."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file. Project cookies apply to HTTP tools and ephemeral sessions. Persistent browser jars change only with an explicit browser_start(cookie_profile=...). profile_name stores a reusable named cookie identity for extensions or browser_start(cookie_profile=...) without changing an already running browser.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Optional reusable identity name. Pass the same name as browser_start.cookie_profile to seed a persistent Chromium profile."},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export or Playwright cookie array.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"path":{"type":"string"},"httpOnly":{"type":"boolean"},"secure":{"type":"boolean"},"sameSite":{"type":"string"},"session":{"type":"boolean"},"expirationDate":{"type":"number"},"expires":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
-        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Supports AND/OR/NOT, parentheses, and quoted values. Examples: method:PUT; exchange_id:3011; response_hash:abc123; (request:~this OR request:~that) method:PUT. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":"field:value is exact; field:~value contains. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Adjacent terms are AND; explicit AND/OR/NOT and parentheses are supported."},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Comparisons attach directly to the field: status>=400 or time>2026-10-12T00:00:00Z. Supports AND/OR/NOT, parentheses, and quoted values. Query errors return repair guidance; correct q before retrying. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the saved format for precise cutoffs. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Bare words search summary fields. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Discover saved routes without oversized responses. Omit host for a lightweight list of hosts and route counts. Provide one exact host for its detailed route tree, optionally limited to a path subtree.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive. Omit for host summaries."},"path_prefix":{"type":"string","description":"Optional slash-boundary path subtree, such as /api. Requires host."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
@@ -575,16 +575,37 @@ async fn handle_rpc(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let result = backend.call(name, args).await?;
+            let (result, is_error) = match backend.call(name, args).await {
+                Ok(result) => (result, false),
+                Err(error) if name == "history_search" && is_history_query_error(&error) => {
+                    (json!(ErrorEnvelope::from(&error)), true)
+                }
+                Err(error) => return Err(error),
+            };
             let structured_content = object_structured_content(&result);
             Ok(Some(json!({
                 "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                 "structuredContent": structured_content,
-                "isError": false
+                "isError": is_error
             })))
         }
         other => Err(DomainError::invalid(format!("unknown method {other}"))),
     }
+}
+
+fn is_history_query_error(error: &DomainError) -> bool {
+    let DomainError::App {
+        code: ErrorCode::InvalidArgument,
+        details: Some(details),
+        ..
+    } = error
+    else {
+        return false;
+    };
+    // The private daemon bridge retains domain details inside its envelope.
+    let is_query =
+        |value: &Value| value.get("kind").and_then(Value::as_str) == Some("history_query");
+    is_query(details) || details.get("details").is_some_and(is_query)
 }
 
 fn object_structured_content(result: &Value) -> Value {
@@ -1041,9 +1062,16 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "history_search" => {
             let project_id = require_project_id(&args)?;
-            let filter = args
-                .get("q")
-                .and_then(|value| value.as_str())
+            let query = match args.get("q") {
+                None => None,
+                Some(Value::String(query)) => Some(query.as_str()),
+                Some(_) => {
+                    return Err(query_error(format!(
+                        "history_search q must be a query string; omit q to list history. {HISTORY_QUERY_SYNTAX}"
+                    )))
+                }
+            };
+            let filter = query
                 .filter(|query| !query.trim().is_empty())
                 .map(parse_text_query)
                 .transpose()?;
@@ -2423,6 +2451,162 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_call(arguments: Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({"name": "history_search", "arguments": arguments}),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn history_query_errors_are_actionable_through_the_daemon_bridge() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: directory.path().to_path_buf(),
+            spool_dir: directory.path().join("spool"),
+            export_dir: directory.path().join("exports"),
+            runtime_dir: directory.path().join("runtime"),
+            plugin_dir: directory.path().join("plugins"),
+            ..Config::default()
+        };
+        let state = crate::app::bootstrap_state(config.clone()).await.unwrap();
+        let project = state
+            .db
+            .create_project(CreateProjectRequest {
+                name: "History query validation".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(config.socket_path()).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(crate::api::serve_uds_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        for backend in [
+            Arc::new(LocalToolBackend { state }) as Arc<dyn ToolBackend>,
+            Arc::new(DaemonToolBackend { config }) as Arc<dyn ToolBackend>,
+        ] {
+            for query in [json!("time:>1970-01-01T00:00:00Z"), json!(100)] {
+                let request = history_call(json!({"project_id": project.id.get(), "q": query}));
+                let result = handle_rpc(backend.clone(), &request)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result["isError"], true);
+                let error = &result["structuredContent"];
+                assert_eq!(error["code"], "invalid_argument");
+                let message = error["message"].as_str().unwrap();
+                if query.is_string() {
+                    assert!(message.contains("time>VALUE"));
+                } else {
+                    assert!(message.contains("q must be a query string"));
+                }
+                assert!(error.get("items").is_none());
+                assert_eq!(
+                    serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+                        .unwrap(),
+                    *error
+                );
+            }
+            let corrected = history_call(json!({
+                "project_id": project.id.get(),
+                "q": "time>1970-01-01T00:00:00Z"
+            }));
+            let result = handle_rpc(backend, &corrected).await.unwrap().unwrap();
+            assert_eq!(result["isError"], false);
+            assert_eq!(result["structuredContent"]["items"], json!([]));
+            assert_eq!(result["structuredContent"]["saved_only"], true);
+        }
+        cancel.cancel();
+        server.await.unwrap().unwrap();
+    }
+
+    struct ErrorBackend {
+        code: ErrorCode,
+        details: Option<Value>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBackend for ErrorBackend {
+        async fn call(&self, _name: &str, _args: Value) -> DomainResult<Value> {
+            Err(DomainError::App {
+                code: self.code,
+                message: "backend failure".into(),
+                details: self.details.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn history_query_handling_preserves_other_rpc_errors() {
+        for code in [
+            ErrorCode::InvalidArgument,
+            ErrorCode::NotFound,
+            ErrorCode::Unavailable,
+            ErrorCode::Internal,
+        ] {
+            let request = history_call(json!({"project_id": 1}));
+            let error = handle_rpc(
+                Arc::new(ErrorBackend {
+                    code,
+                    details: None,
+                }),
+                &request,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), code);
+        }
+        // Even a marked validation error on another tool retains its RPC behavior.
+        let request = JsonRpcRequest {
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({"name": "projects", "arguments": {}}),
+        };
+        let error = handle_rpc(
+            Arc::new(ErrorBackend {
+                code: ErrorCode::InvalidArgument,
+                details: Some(json!({"kind": "history_query"})),
+            }),
+            &request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn advertised_history_query_examples_compile() {
+        let tools = tool_defs();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "history_search")
+            .unwrap();
+        let query = &tool["inputSchema"]["properties"]["q"];
+        for example in query["examples"].as_array().unwrap() {
+            let filter = parse_text_query(example.as_str().unwrap()).unwrap();
+            crate::history::filter_to_sql(&filter).unwrap();
+        }
+        let description = query["description"].as_str().unwrap();
+        for guidance in [
+            "no colon",
+            "RFC 3339",
+            "not Unix seconds",
+            "milliseconds",
+            "body bytes",
+        ] {
+            assert!(description.contains(guidance));
+        }
+    }
 
     #[test]
     fn reply_drafts_accept_the_minimal_shape_advertised_by_mcp() {
