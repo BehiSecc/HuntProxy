@@ -189,7 +189,7 @@ async fn explicit_restart_is_available_when_auto_start_is_disabled() {
         )
         .await;
     assert_eq!(stopped["error"]["data"]["code"], "daemon_not_running");
-    assert!(!agent.config.daemon_lock_path().exists());
+    assert!(!huntproxy::app::daemon_is_active(&agent.config).unwrap());
     let restarted = agent.tool("huntproxy_restart", json!({})).await;
     assert_eq!(restarted["ok"], true);
     agent.tool("projects", json!({"action": "list"})).await;

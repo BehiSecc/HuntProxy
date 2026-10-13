@@ -6,7 +6,7 @@ use crate::domain::{DomainError, DomainResult, ErrorCode};
 use flate2::read::GzDecoder;
 use futures::StreamExt;
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -48,6 +48,8 @@ pub enum UpdateOutcome {
         previous: String,
         installed: String,
         backup_path: PathBuf,
+        data_backup_path: Option<PathBuf>,
+        daemon_restarted: bool,
     },
 }
 
@@ -235,8 +237,31 @@ async fn run_with_context(
         });
     }
 
-    let daemon_config = daemon_config(request.data_dir);
-    ensure_daemon_stopped(&daemon_config)?;
+    let coordinated = target
+        >= StableVersion {
+            major: 0,
+            minor: 2,
+            patch: 0,
+        };
+    let daemon_config = if coordinated {
+        Config::load(request.data_dir.clone())?
+    } else {
+        daemon_config(request.data_dir)
+    };
+    if !coordinated {
+        ensure_daemon_stopped(&daemon_config)?;
+        if daemon_config.db_path().exists() {
+            let database = rusqlite::Connection::open_with_flags(
+                daemon_config.db_path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|error| update_error(format!("inspect database compatibility: {error}")))?;
+            let schema = crate::storage::schema_version(&database)?;
+            if schema > 14 {
+                return Err(update_error("this data directory requires HuntProxy 0.2 or newer; downgrading would make saved projects unavailable"));
+            }
+        }
+    }
     let executable = &context.executable;
     let metadata = fs::metadata(executable)
         .map_err(|error| update_error(format!("inspect current executable: {error}")))?;
@@ -276,7 +301,7 @@ async fn run_with_context(
         )));
     }
 
-    let mut staged = extract_staged_binary(&archive_path, parent)?;
+    let staged = extract_staged_binary(&archive_path, parent)?;
     let staged_version = inspect_binary_version(staged.path()).await?;
     if staged_version != target {
         return Err(update_error(format!(
@@ -287,63 +312,600 @@ async fn run_with_context(
     }
     archive_guard.remove_now()?;
 
-    ensure_daemon_stopped(&daemon_config)?;
-    if hash_file(executable)? != initial_hash {
-        return Err(DomainError::new(
-            ErrorCode::Conflict,
-            "the installed HuntProxy binary changed during the update; retry",
-        ));
-    }
+    let plugin_names = if coordinated {
+        inspect_release_plugins(staged.path(), target).await?
+    } else {
+        Vec::new()
+    };
+    activate_release(
+        &daemon_config,
+        ReleaseInstallation {
+            executable: executable.to_owned(),
+            staged,
+            target,
+            current: Some(context.current_version),
+            coordinated,
+            initial_hash: Some(initial_hash),
+            plugin_names,
+        },
+    )
+    .await
+}
 
-    let backup_path = backup_path(executable)?;
-    let mut backup = copy_to_temp(executable, parent, "previous")?;
-    if hash_file(backup.path())? != initial_hash {
-        return Err(update_error("could not verify the rollback binary"));
+/// Install an already checksum-verified release from the upstream installer.
+/// The executable and persisted state share the self-updater's transaction.
+pub async fn install_local(
+    data_dir: Option<PathBuf>,
+    executable: PathBuf,
+) -> DomainResult<UpdateOutcome> {
+    let parent = executable
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| update_error("installation path has no parent directory"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| update_error(format!("create installation directory: {error}")))?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|error| update_error(format!("resolve installation directory: {error}")))?;
+    let executable = parent.join(
+        executable
+            .file_name()
+            .ok_or_else(|| update_error("installation path has no filename"))?,
+    );
+    let _lock = UpdateLock::acquire(&parent)?;
+    if fs::symlink_metadata(&executable).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(update_error("refusing to replace a symlinked installation"));
     }
-    if hash_file(executable)? != initial_hash {
-        return Err(DomainError::new(
-            ErrorCode::Conflict,
-            "the installed HuntProxy binary changed during the update; retry",
-        ));
-    }
-    fs::rename(backup.path(), &backup_path)
-        .map_err(|error| update_error(format!("install rollback binary: {error}")))?;
-    backup.disarm();
-    sync_directory(parent)?;
-    ensure_daemon_stopped(&daemon_config)?;
-
-    if let Err(error) = fs::rename(staged.path(), executable) {
-        return Err(update_error(format!(
-            "replace HuntProxy binary: {error}; rollback remains at {}",
-            backup_path.display()
-        )));
-    }
-    staged.disarm();
-    if let Err(error) = sync_directory(parent) {
-        return Err(restore_previous(
-            &backup_path,
+    let current = if executable.exists() {
+        Some(inspect_binary_version(&executable).await?)
+    } else {
+        None
+    };
+    let initial_hash = executable
+        .exists()
+        .then(|| hash_file(&executable))
+        .transpose()?;
+    let config = Config::load(data_dir)?;
+    let target = StableVersion::parse(env!("CARGO_PKG_VERSION"))?;
+    let source = std::env::current_exe().map_err(|error| update_error(error.to_string()))?;
+    let staged = copy_to_temp(&source, &parent, "release")?;
+    let plugin_names = inspect_release_plugins(staged.path(), target).await?;
+    activate_release(
+        &config,
+        ReleaseInstallation {
             executable,
-            parent,
-            format!("could not sync the installed binary: {error}"),
+            staged,
+            target,
+            current,
+            coordinated: true,
+            initial_hash,
+            plugin_names,
+        },
+    )
+    .await
+}
+
+struct ReleaseInstallation {
+    executable: PathBuf,
+    staged: TempPath,
+    target: StableVersion,
+    current: Option<StableVersion>,
+    coordinated: bool,
+    initial_hash: Option<[u8; 32]>,
+    plugin_names: Vec<String>,
+}
+
+async fn activate_release(
+    config: &Config,
+    release: ReleaseInstallation,
+) -> DomainResult<UpdateOutcome> {
+    let ReleaseInstallation {
+        executable,
+        mut staged,
+        target,
+        current,
+        coordinated,
+        initial_hash,
+        plugin_names,
+    } = release;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| update_error("installation path has no parent directory"))?;
+    let _maintenance = if coordinated {
+        Some(app::acquire_bootstrap_lock(config).await?)
+    } else {
+        None
+    };
+    if coordinated {
+        app::recover_installation(config, true).await?;
+    }
+    let was_running = app::daemon_is_active(config)?;
+    if was_running && initial_hash.is_none() {
+        return Err(update_error(
+            "cannot replace a running installation without its original executable",
         ));
     }
-
-    match inspect_binary_version(executable).await {
-        Ok(version) if version == target => {}
-        result => {
-            let reason = match result {
-                Ok(version) => format!("installed binary reported HuntProxy {version}"),
-                Err(error) => error.to_string(),
-            };
-            return Err(restore_previous(&backup_path, executable, parent, reason));
+    if was_running && coordinated {
+        app::stop_daemon(config).await?;
+    } else {
+        ensure_daemon_stopped(config)?;
+    }
+    let snapshot = if coordinated {
+        let snapshot_config = config.clone();
+        let tag = target.tag();
+        match tokio::task::spawn_blocking(move || {
+            DataSnapshot::capture(&snapshot_config, &tag, &plugin_names)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => Some(snapshot),
+            result => {
+                if was_running {
+                    if let Err(restart) = app::start_daemon_binary(config, &executable).await {
+                        return Err(update_error(format!("could not preserve update state and could not restart the previous daemon: {restart}")));
+                    }
+                }
+                return Err(match result {
+                    Ok(Err(error)) => error,
+                    Err(error) => update_error(format!("update backup task: {error}")),
+                    _ => unreachable!(),
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let backup_path = backup_path(&executable)?;
+    let mut replaced = false;
+    let mut journal_started = false;
+    let mut binary_conflict = false;
+    let installation = async {
+        if let (Some(snapshot), Some(source)) = (&snapshot, current) {
+            if source != target {
+                journal_started = true;
+                crate::update_journal::begin(
+                    config,
+                    &source.to_string(),
+                    &target.to_string(),
+                    &executable,
+                    &snapshot.root,
+                )?;
+            }
+        }
+        if coordinated {
+            prepare_downloaded_release(staged.path(), config, target).await?;
+        }
+        ensure_daemon_stopped(config)?;
+        let actual_hash = executable
+            .exists()
+            .then(|| hash_file(&executable))
+            .transpose()?;
+        if actual_hash != initial_hash {
+            binary_conflict = true;
+            return Err(DomainError::new(
+                ErrorCode::Conflict,
+                "the installed HuntProxy binary changed during the update; retry",
+            ));
+        }
+        if let Some(initial_hash) = initial_hash {
+            let mut backup = copy_to_temp(&executable, parent, "previous")?;
+            if hash_file(backup.path())? != initial_hash {
+                return Err(update_error("could not verify the rollback binary"));
+            }
+            fs::rename(backup.path(), &backup_path)
+                .map_err(|error| update_error(format!("install rollback binary: {error}")))?;
+            backup.disarm();
+            sync_directory(parent)?;
+        }
+        ensure_daemon_stopped(config)?;
+        fs::rename(staged.path(), &executable)
+            .map_err(|error| update_error(format!("replace HuntProxy binary: {error}")))?;
+        staged.disarm();
+        replaced = true;
+        sync_directory(parent)?;
+        if inspect_binary_version(&executable).await? != target {
+            return Err(update_error(
+                "the installed executable returned a different version",
+            ));
+        }
+        if was_running {
+            app::start_daemon_binary(config, &executable).await?;
+        }
+        Ok::<_, DomainError>(())
+    }
+    .await;
+    if let Err(error) = installation {
+        if binary_conflict {
+            let recovery = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.root.display().to_string())
+                .unwrap_or_else(|| backup_path.display().to_string());
+            return Err(DomainError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "{error}; the executable was replaced by another process; recovery requires attention; restore point: {recovery}"
+                ),
+            ));
+        }
+        let mut failures = Vec::new();
+        if app::daemon_is_active(config)? {
+            if let Err(error) = app::stop_daemon(config).await {
+                failures.push(format!("stop failed release: {error}"));
+            }
+        }
+        if replaced && failures.is_empty() {
+            if initial_hash.is_some() {
+                let restore =
+                    copy_to_temp(&backup_path, parent, "restore").and_then(|mut restore| {
+                        fs::rename(restore.path(), &executable).map_err(|error| {
+                            update_error(format!("restore executable: {error}"))
+                        })?;
+                        restore.disarm();
+                        sync_directory(parent)
+                    });
+                if let Err(error) = restore {
+                    failures.push(error.to_string());
+                }
+            } else if let Err(error) =
+                fs::remove_file(&executable).and_then(|_| File::open(parent)?.sync_all())
+            {
+                failures.push(format!("remove failed new installation: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            if let Some(snapshot) = &snapshot {
+                if let Err(error) = snapshot.restore(config) {
+                    failures.push(error.to_string());
+                }
+            }
+        }
+        if failures.is_empty() && journal_started {
+            if let Err(error) = crate::update_journal::finish(config) {
+                failures.push(error.to_string());
+            }
+        }
+        if failures.is_empty() {
+            if let Some(snapshot) = &snapshot {
+                if let Err(error) =
+                    crate::update_journal::prune_restore_points(config, Some(&snapshot.root))
+                {
+                    tracing::warn!(%error, "rollback completed; older restore point cleanup failed");
+                }
+            }
+        }
+        // Once old data has been restored, retire the rollback journal before
+        // accepting new writes. Otherwise a cleanup failure could cause a
+        // later recovery to discard records saved after the restart.
+        if failures.is_empty() && was_running {
+            if let Err(error) = app::start_daemon_binary(config, &executable).await {
+                failures.push(format!("restart previous daemon: {error}"));
+            }
+        }
+        let recovery = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.root.display().to_string())
+            .unwrap_or_else(|| backup_path.display().to_string());
+        return Err(update_error(if failures.is_empty() {
+            format!("{error}; the previous installation was restored")
+        } else {
+            format!(
+                "{error}; recovery requires attention: {}; restore point: {recovery}",
+                failures.join("; ")
+            )
+        }));
+    }
+    if let Some(snapshot) = &snapshot {
+        // Cleanup failures cannot turn a healthy, activated release into a
+        // rollback. The durable journal lets the next startup retry cleanup.
+        if let Err(error) =
+            crate::update_journal::prune_restore_points(config, Some(&snapshot.root))
+        {
+            tracing::warn!(%error, "release installed; restore point cleanup will be retried");
+        } else if journal_started {
+            if let Err(error) = crate::update_journal::finish(config) {
+                tracing::warn!(%error, "release installed; recovery journal cleanup will be retried");
+            }
         }
     }
-
     Ok(UpdateOutcome::Installed {
-        previous: current_text,
-        installed: target_text,
+        previous: current
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "none".into()),
+        installed: target.to_string(),
         backup_path,
+        data_backup_path: snapshot.map(|snapshot| snapshot.root),
+        daemon_restarted: was_running,
     })
+}
+
+async fn inspect_release_plugins(path: &Path, version: StableVersion) -> DomainResult<Vec<String>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        binary_output(path, &["release-info"]),
+    )
+    .await
+    .map_err(|_| update_error("release metadata inspection timed out"))?
+    .map_err(|error| update_error(format!("inspect release metadata: {error}")))?;
+    if !output.status.success() || output.stdout.len() > MAX_RELEASE_JSON_BYTES as usize {
+        return Err(update_error(
+            "downloaded release has invalid installation metadata",
+        ));
+    }
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| update_error("downloaded release has invalid installation metadata"))?;
+    if result.get("version").and_then(serde_json::Value::as_str)
+        != Some(version.to_string().as_str())
+    {
+        return Err(update_error(
+            "release metadata version does not match the requested release",
+        ));
+    }
+    let names: Vec<String> =
+        serde_json::from_value(result.get("plugins").cloned().unwrap_or_default())
+            .map_err(|_| update_error("release plugin list is invalid"))?;
+    if names.len() > 256
+        || names.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 80
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(update_error(
+            "release plugin list contains an unsafe package name",
+        ));
+    }
+    Ok(names)
+}
+
+async fn prepare_downloaded_release(
+    path: &Path,
+    config: &Config,
+    version: StableVersion,
+) -> DomainResult<()> {
+    let arguments = [
+        std::ffi::OsStr::new("prepare-update"),
+        std::ffi::OsStr::new("--data-dir"),
+        config.data_dir.as_os_str(),
+    ];
+    let output = tokio::time::timeout(Duration::from_secs(900), binary_output(path, &arguments))
+        .await
+        .map_err(|_| update_error("release preparation timed out"))?
+        .map_err(|error| update_error(format!("prepare downloaded release: {error}")))?;
+    if !output.status.success() {
+        let tail = &output.stderr[output.stderr.len().saturating_sub(4096)..];
+        return Err(update_error(format!(
+            "release preparation failed: {}",
+            String::from_utf8_lossy(tail).trim()
+        )));
+    }
+    if output.stdout.len() > MAX_RELEASE_JSON_BYTES as usize {
+        return Err(update_error(
+            "release preparation result exceeded its size limit",
+        ));
+    }
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| update_error("release preparation returned an invalid result"))?;
+    if result.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || result.get("version").and_then(serde_json::Value::as_str)
+            != Some(version.to_string().as_str())
+    {
+        return Err(update_error(
+            "release preparation did not confirm the requested version",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct DataSnapshot {
+    pub(crate) root: PathBuf,
+    pub(crate) files: Vec<(PathBuf, Option<PathBuf>)>,
+    pub(crate) plugins: Vec<(String, bool)>,
+}
+
+impl DataSnapshot {
+    fn capture(config: &Config, tag: &str, target_plugins: &[String]) -> DomainResult<Self> {
+        let directory = config.runtime_dir.join("updates");
+        crate::config::create_private_dir(&directory)?;
+        let root = directory.join(format!("{tag}-{}", uuid::Uuid::new_v4()));
+        crate::config::create_private_dir(&root)?;
+        let mut snapshot = Self {
+            root,
+            files: Vec::new(),
+            plugins: Vec::new(),
+        };
+        let result = (|| {
+            for (name, source) in [
+                ("database.sqlite3", config.db_path()),
+                ("config.toml", config.data_dir.join("config.toml")),
+                (
+                    "plugin-source",
+                    config.plugin_dir.join(".huntproxy-first-party-source"),
+                ),
+            ] {
+                let destination = snapshot.root.join(name);
+                if fs::symlink_metadata(&source)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(update_error(format!(
+                        "cannot preserve a symlinked update state file: {}",
+                        source.display()
+                    )));
+                }
+                if source.exists() {
+                    if name == "database.sqlite3" {
+                        let connection = rusqlite::Connection::open_with_flags(
+                            &source,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .map_err(|error| update_error(format!("open database backup: {error}")))?;
+                        let mut target =
+                            rusqlite::Connection::open(&destination).map_err(|error| {
+                                update_error(format!("open restore point: {error}"))
+                            })?;
+                        let backup = rusqlite::backup::Backup::new(&connection, &mut target)
+                            .map_err(|error| update_error(format!("preserve database: {error}")))?;
+                        backup
+                            .run_to_completion(128, Duration::from_millis(10), None)
+                            .map_err(|error| update_error(format!("preserve database: {error}")))?;
+                        drop(backup);
+                        target
+                            .pragma_update(None, "journal_mode", "DELETE")
+                            .map_err(|error| {
+                                update_error(format!("finalize database restore point: {error}"))
+                            })?;
+                    } else {
+                        fs::copy(&source, &destination).map_err(|error| {
+                            update_error(format!("preserve {}: {error}", source.display()))
+                        })?;
+                    }
+                    secure_backup_file(&destination)?;
+                    snapshot.files.push((source, Some(destination)));
+                } else {
+                    snapshot.files.push((source, None));
+                }
+            }
+            let plugin_backup = snapshot.root.join("plugins");
+            crate::config::create_private_dir(&plugin_backup)?;
+            let mut names = crate::installation::bundled_plugin_names()?;
+            names.extend_from_slice(target_plugins);
+            names.sort();
+            names.dedup();
+            for name in names {
+                let source = config.plugin_dir.join(&name);
+                let existed = source.exists();
+                if existed {
+                    copy_backup_tree(&source, &plugin_backup.join(&name))?;
+                }
+                snapshot.plugins.push((name, existed));
+            }
+            let manifest = serde_json::json!({
+                "format":1,"version":tag,"data_dir":config.data_dir,"plugin_dir":config.plugin_dir,
+                "database":config.db_path(),"plugins":snapshot.plugins,
+                "snapshot": &snapshot,
+            });
+            crate::config::write_private_file(
+                &snapshot.root.join("restore.json"),
+                &serde_json::to_vec_pretty(&manifest)
+                    .map_err(|error| update_error(error.to_string()))?,
+            )?;
+            secure_backup_file(&snapshot.root.join("restore.json"))?;
+            sync_directory(&plugin_backup)?;
+            sync_directory(&snapshot.root)?;
+            sync_directory(&directory)?;
+            Ok::<_, DomainError>(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&snapshot.root);
+            return Err(error);
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn restore(&self, config: &Config) -> DomainResult<()> {
+        if app::daemon_is_active(config)? {
+            return Err(update_error(
+                "refusing to restore data while the daemon is running",
+            ));
+        }
+        for (destination, source) in &self.files {
+            if *destination == config.db_path() {
+                for suffix in ["-wal", "-shm"] {
+                    let sidecar = PathBuf::from(format!("{}{suffix}", destination.display()));
+                    match fs::remove_file(sidecar) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(update_error(format!("restore database sidecar: {error}")))
+                        }
+                    }
+                }
+            }
+            if let Some(source) = source {
+                let parent = destination
+                    .parent()
+                    .ok_or_else(|| update_error("restore path has no parent"))?;
+                crate::config::create_private_dir(parent)?;
+                let (path, mut file) = create_temp_file(parent, "data-restore", 0o600)?;
+                let mut guard = TempPath::new(path.clone());
+                let mut input = File::open(source)
+                    .map_err(|error| update_error(format!("read restore point: {error}")))?;
+                std::io::copy(&mut input, &mut file)
+                    .map_err(|error| update_error(format!("restore data: {error}")))?;
+                file.sync_all()
+                    .map_err(|error| update_error(format!("sync restored data: {error}")))?;
+                fs::rename(&path, destination)
+                    .map_err(|error| update_error(format!("replace restored data: {error}")))?;
+                guard.disarm();
+                sync_directory(parent)?;
+            } else if destination.exists() {
+                fs::remove_file(destination)
+                    .map_err(|error| update_error(format!("remove new data file: {error}")))?;
+                if let Some(parent) = destination.parent() {
+                    sync_directory(parent)?;
+                }
+            }
+        }
+        for (name, existed) in &self.plugins {
+            let destination = config.plugin_dir.join(name);
+            if fs::symlink_metadata(&destination).is_ok() {
+                fs::remove_dir_all(&destination)
+                    .map_err(|error| update_error(format!("restore plugin {name}: {error}")))?;
+            }
+            if *existed {
+                copy_backup_tree(&self.root.join("plugins").join(name), &destination)?;
+            }
+        }
+        sync_directory(&config.plugin_dir)?;
+        Ok(())
+    }
+}
+
+fn secure_backup_file(path: &Path) -> DomainResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| update_error(error.to_string()))?;
+    }
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| update_error(error.to_string()))
+}
+
+fn copy_backup_tree(source: &Path, destination: &Path) -> DomainResult<()> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| update_error(error.to_string()))?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            let link = fs::read_link(source).map_err(|error| update_error(error.to_string()))?;
+            std::os::unix::fs::symlink(link, destination)
+                .map_err(|error| update_error(error.to_string()))?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        return Err(update_error(
+            "cannot preserve symlinked plugin data on this platform",
+        ));
+    }
+    if metadata.is_dir() {
+        crate::config::create_private_dir(destination)?;
+        for entry in fs::read_dir(source).map_err(|error| update_error(error.to_string()))? {
+            let entry = entry.map_err(|error| update_error(error.to_string()))?;
+            copy_backup_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        sync_directory(destination)?;
+    } else if metadata.is_file() {
+        fs::copy(source, destination).map_err(|error| update_error(error.to_string()))?;
+        secure_backup_file(destination)?;
+    } else {
+        return Err(update_error(
+            "cannot preserve a special file in a managed plugin package",
+        ));
+    }
+    Ok(())
 }
 
 fn daemon_config(data_dir: Option<PathBuf>) -> Config {
@@ -549,6 +1111,7 @@ fn extract_staged_binary(archive_path: &Path, parent: &Path) -> DomainResult<Tem
                     ));
                 }
                 let (path, mut output) = create_temp_file(parent, "new", 0o755)?;
+                let temporary = TempPath::new(path.clone());
                 std::io::copy(&mut entry, &mut output)
                     .map_err(|error| update_error(format!("extract HuntProxy: {error}")))?;
                 output
@@ -558,7 +1121,7 @@ fn extract_staged_binary(archive_path: &Path, parent: &Path) -> DomainResult<Tem
                 output
                     .sync_all()
                     .map_err(|error| update_error(format!("sync HuntProxy: {error}")))?;
-                staged = Some(TempPath::new(path));
+                staged = Some(temporary);
             }
             b"LICENSE" => {
                 if saw_license || !is_file || entry.size() > MAX_LICENSE_BYTES {
@@ -578,9 +1141,7 @@ fn extract_staged_binary(archive_path: &Path, parent: &Path) -> DomainResult<Tem
 }
 
 async fn inspect_binary_version(path: &Path) -> DomainResult<StableVersion> {
-    let mut command = tokio::process::Command::new(path);
-    command.arg("--version").kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+    let output = tokio::time::timeout(Duration::from_secs(15), binary_output(path, &["--version"]))
         .await
         .map_err(|_| update_error("the downloaded binary version check timed out"))?
         .map_err(|error| update_error(format!("run downloaded binary: {error}")))?;
@@ -606,6 +1167,32 @@ async fn inspect_binary_version(path: &Path) -> DomainResult<StableVersion> {
         ));
     }
     StableVersion::parse(version)
+}
+
+/// A failed exec with ETXTBSY never started the program. A concurrent fork can
+/// briefly inherit a closing write descriptor, so retry that exec error only.
+pub(crate) async fn binary_output<S: AsRef<std::ffi::OsStr>>(
+    path: &Path,
+    args: &[S],
+) -> std::io::Result<std::process::Output> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let result = tokio::process::Command::new(path)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await;
+        match result {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 fn hash_file(path: &Path) -> DomainResult<[u8; 32]> {
@@ -655,6 +1242,7 @@ fn create_temp_file(parent: &Path, label: &str, mode: u32) -> DomainResult<(Path
 
 fn copy_to_temp(source: &Path, parent: &Path, label: &str) -> DomainResult<TempPath> {
     let (path, mut output) = create_temp_file(parent, label, 0o700)?;
+    let temporary = TempPath::new(path.clone());
     let mut input = File::open(source)
         .map_err(|error| update_error(format!("open rollback source: {error}")))?;
     std::io::copy(&mut input, &mut output)
@@ -670,7 +1258,7 @@ fn copy_to_temp(source: &Path, parent: &Path, label: &str) -> DomainResult<TempP
     output
         .sync_all()
         .map_err(|error| update_error(format!("sync rollback binary: {error}")))?;
-    Ok(TempPath::new(path))
+    Ok(temporary)
 }
 
 fn backup_path(executable: &Path) -> DomainResult<PathBuf> {
@@ -695,26 +1283,6 @@ fn sync_directory(path: &Path) -> DomainResult<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| update_error(format!("sync {}: {error}", path.display())))
-}
-
-fn restore_previous(
-    backup: &Path,
-    executable: &Path,
-    parent: &Path,
-    reason: String,
-) -> DomainError {
-    if let Err(error) = fs::rename(backup, executable) {
-        return update_error(format!(
-            "{reason}; automatic rollback failed: {error}; rollback remains at {}",
-            backup.display()
-        ));
-    }
-    if let Err(error) = sync_directory(parent) {
-        return update_error(format!(
-            "{reason}; the previous binary was restored but directory sync failed: {error}"
-        ));
-    }
-    update_error(format!("{reason}; the previous binary was restored"))
 }
 
 struct TempPath {
@@ -752,9 +1320,10 @@ impl Drop for TempPath {
 }
 
 struct UpdateLock {
-    path: PathBuf,
     #[cfg(unix)]
-    lock: Option<nix::fcntl::Flock<File>>,
+    _lock: nix::fcntl::Flock<File>,
+    #[cfg(not(unix))]
+    _file: File,
 }
 
 impl UpdateLock {
@@ -776,24 +1345,12 @@ impl UpdateLock {
                 .map_err(|_| {
                 DomainError::new(ErrorCode::Conflict, "another update is running")
             })?;
-            Ok(Self {
-                path,
-                lock: Some(lock),
-            })
+            Ok(Self { _lock: lock })
         }
         #[cfg(not(unix))]
         {
-            let _ = file;
-            Ok(Self { path })
+            Ok(Self { _file: file })
         }
-    }
-}
-
-impl Drop for UpdateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        #[cfg(unix)]
-        let _ = self.lock.take();
     }
 }
 
@@ -895,7 +1452,9 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".HuntProxy."))
+                    .is_some_and(|name| {
+                        name.starts_with(".HuntProxy.") && name != ".HuntProxy.update.lock"
+                    })
             })
             .collect()
     }
@@ -1077,7 +1636,9 @@ mod tests {
             UpdateOutcome::Installed {
                 previous: "0.1.0".into(),
                 installed: "0.1.1".into(),
-                backup_path: directory.path().join("HuntProxy.previous")
+                backup_path: directory.path().join("HuntProxy.previous"),
+                data_backup_path: None,
+                daemon_restarted: false,
             }
         );
         assert_eq!(fs::read(&executable).unwrap(), script("0.1.1"));
@@ -1161,6 +1722,295 @@ mod tests {
         assert!(error.to_string().contains("HuntProxy is running"));
         assert_eq!(fs::read(executable).unwrap(), original);
         assert!(staging_files(directory.path()).is_empty());
+    }
+
+    fn coordinated_script(fail_prepare: bool, bad_activation: bool) -> Vec<u8> {
+        // Only the installed filename reports the intentionally bad version;
+        // the verified staged binary passes both preflight inspections.
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  --version)
+    if [ "{bad_activation}" = true ] && [ "$(basename "$0")" = HuntProxy ]; then
+      printf 'HuntProxy 9.9.9\n'
+    else printf 'HuntProxy 0.2.0\n'; fi ;;
+  release-info) printf '%s\n' '{{"version":"0.2.0","schema":15,"plugins":["racer","new-target"]}}' ;;
+  prepare-update)
+    directory=$3
+    mkdir -p "$directory/plugins/racer" "$directory/plugins/new-target"
+    printf 'prepared package' > "$directory/plugins/racer/fixture.txt"
+    printf 'new package' > "$directory/plugins/new-target/fixture.txt"
+    if [ "{fail_prepare}" = true ]; then
+      printf 'interrupted preparation' > "$directory/huntproxy.db"
+      printf 'fixture preparation failed\n' >&2
+      exit 1
+    fi
+    printf '%s\n' '{{"ok":true,"version":"0.2.0","schema":15}}' ;;
+  *) exit 1 ;;
+esac
+"#
+        )
+        .into_bytes()
+    }
+
+    fn seed_update_state(directory: &Path) -> Config {
+        let config = Config::load(Some(directory.join("data"))).unwrap();
+        config.ensure_layout().unwrap();
+        let database = rusqlite::Connection::open(config.db_path()).unwrap();
+        database.execute_batch("CREATE TABLE saved_fixture (name TEXT); INSERT INTO saved_fixture VALUES ('Existing project'); PRAGMA user_version=14;").unwrap();
+        fs::create_dir(config.plugin_dir.join("racer")).unwrap();
+        fs::write(
+            config.plugin_dir.join("racer/fixture.txt"),
+            b"previous package",
+        )
+        .unwrap();
+        fs::create_dir(config.plugin_dir.join("custom-tool")).unwrap();
+        fs::write(
+            config.plugin_dir.join("custom-tool/fixture.txt"),
+            b"custom preserved",
+        )
+        .unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn coordinated_update_preserves_projects_and_keeps_one_private_restore_point() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = seed_update_state(directory.path());
+        let executable = directory.path().join("HuntProxy");
+        write_script(&executable, "0.1.1");
+        let older = DataSnapshot::capture(&config, "v0.1.1", &[]).unwrap();
+        let release = archive(&[
+            ("HuntProxy", coordinated_script(false, false)),
+            ("LICENSE", b"fixture license".to_vec()),
+        ]);
+        let server = MockServer::start().await;
+        mock_release(&server, "v0.2.0", &release, None).await;
+        let outcome = run_with_context(
+            UpdateRequest {
+                check: false,
+                version: Some("v0.2.0".into()),
+                data_dir: Some(config.data_dir.clone()),
+            },
+            context(&server, executable.clone(), "0.1.1"),
+        )
+        .await
+        .unwrap();
+        let UpdateOutcome::Installed {
+            data_backup_path: Some(root),
+            daemon_restarted,
+            ..
+        } = outcome
+        else {
+            panic!("expected installed release")
+        };
+        assert!(!daemon_restarted);
+        assert!(root.join("restore.json").exists());
+        assert!(!older.root.exists());
+        assert!(!config.runtime_dir.join("update-journal.json").exists());
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(root.join("database.sqlite3"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(config.plugin_dir.join("racer/fixture.txt")).unwrap(),
+            b"prepared package"
+        );
+        assert_eq!(
+            fs::read(config.plugin_dir.join("custom-tool/fixture.txt")).unwrap(),
+            b"custom preserved"
+        );
+        let database = rusqlite::Connection::open(config.db_path()).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT name FROM saved_fixture", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Existing project"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("HuntProxy.previous")).unwrap(),
+            script("0.1.1")
+        );
+        assert!(staging_files(directory.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn coordinated_preparation_and_activation_failures_restore_binary_database_and_plugins() {
+        for (fail_prepare, bad_activation) in [(true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = seed_update_state(directory.path());
+            let executable = directory.path().join("HuntProxy");
+            write_script(&executable, "0.1.1");
+            let release = archive(&[(
+                "HuntProxy",
+                coordinated_script(fail_prepare, bad_activation),
+            )]);
+            let server = MockServer::start().await;
+            mock_release(&server, "v0.2.0", &release, None).await;
+            let error = run_with_context(
+                UpdateRequest {
+                    check: false,
+                    version: Some("v0.2.0".into()),
+                    data_dir: Some(config.data_dir.clone()),
+                },
+                context(&server, executable.clone(), "0.1.1"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("previous installation was restored"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&executable).unwrap(), script("0.1.1"));
+            assert!(!config.runtime_dir.join("update-journal.json").exists());
+            assert_eq!(
+                fs::read(config.plugin_dir.join("racer/fixture.txt")).unwrap(),
+                b"previous package"
+            );
+            assert!(!config.plugin_dir.join("new-target").exists());
+            assert_eq!(
+                fs::read(config.plugin_dir.join("custom-tool/fixture.txt")).unwrap(),
+                b"custom preserved"
+            );
+            let database = rusqlite::Connection::open(config.db_path()).unwrap();
+            assert_eq!(
+                database
+                    .query_row("SELECT name FROM saved_fixture", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "Existing project"
+            );
+            assert_eq!(
+                database
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))
+                    .unwrap(),
+                14
+            );
+            assert!(staging_files(directory.path()).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_downgrade_rejects_current_schema_before_downloading_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = seed_update_state(directory.path());
+        let database = rusqlite::Connection::open(config.db_path()).unwrap();
+        database.pragma_update(None, "user_version", 15).unwrap();
+        let executable = directory.path().join("HuntProxy");
+        write_script(&executable, "0.2.0");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{REPOSITORY}/releases/tags/v0.1.1")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tag_name":"v0.1.1"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = run_with_context(
+            request(config.data_dir, false),
+            context(&server, executable.clone(), "0.2.0"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires HuntProxy 0.2 or newer"));
+        assert_eq!(fs::read(executable).unwrap(), script("0.2.0"));
+        assert!(staging_files(directory.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_binary_replacement_preserves_recovery_and_does_not_claim_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = seed_update_state(directory.path());
+        let executable = directory.path().join("HuntProxy");
+        write_script(&executable, "0.1.1");
+        let release_script = String::from_utf8(coordinated_script(false, false))
+            .unwrap()
+            .replace(
+                "directory=$3",
+                r#"directory=$3
+    printf '%s\n' '#!/bin/sh' 'printf "HuntProxy 0.3.0\n"' > "$directory/../HuntProxy""#,
+            );
+        let release = archive(&[("HuntProxy", release_script.into_bytes())]);
+        let server = MockServer::start().await;
+        mock_release(&server, "v0.2.0", &release, None).await;
+        let error = run_with_context(
+            UpdateRequest {
+                check: false,
+                version: Some("v0.2.0".into()),
+                data_dir: Some(config.data_dir.clone()),
+            },
+            context(&server, executable.clone(), "0.1.1"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Conflict);
+        assert!(
+            error.to_string().contains("recovery requires attention"),
+            "{error}"
+        );
+        assert!(!error
+            .to_string()
+            .contains("previous installation was restored"));
+        assert_eq!(
+            inspect_binary_version(&executable).await.unwrap(),
+            StableVersion::parse("0.3.0").unwrap()
+        );
+        assert!(config.runtime_dir.join("update-journal.json").exists());
+        assert_eq!(
+            fs::read(config.plugin_dir.join("racer/fixture.txt")).unwrap(),
+            b"prepared package"
+        );
+        assert!(!app::daemon_is_active(&config).unwrap());
+        assert!(staging_files(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn update_lock_inode_is_reused_and_mutual_exclusion_survives_release() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let first = UpdateLock::acquire(directory.path()).unwrap();
+        assert!(UpdateLock::acquire(directory.path()).is_err());
+        let path = directory.path().join(".HuntProxy.update.lock");
+        let inode = fs::metadata(&path).unwrap().ino();
+        drop(first);
+        let _second = UpdateLock::acquire(directory.path()).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().ino(), inode);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn version_inspection_waits_for_a_transient_executable_write_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("HuntProxy");
+        write_script(&executable, "0.2.0");
+        let writer = OpenOptions::new().write(true).open(&executable).unwrap();
+        let inspect = tokio::spawn(async move { inspect_binary_version(&executable).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !inspect.is_finished(),
+            "busy executable should still be awaiting its closing writer"
+        );
+        drop(writer);
+        let version = tokio::time::timeout(Duration::from_secs(2), inspect)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, StableVersion::parse("0.2.0").unwrap());
     }
 
     #[test]

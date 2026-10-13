@@ -2287,12 +2287,15 @@ async fn events(
     Path(id): Path<i64>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events.subscribe();
+    let cancel = state.shutdown.clone();
     let stream = futures::stream::unfold(Some(rx), move |state_rx| {
         let id = id;
+        let cancel = cancel.clone();
         async move {
             let mut rx = state_rx?;
             loop {
                 tokio::select! {
+                    _ = cancel.cancelled() => return None,
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
                         return Some((Ok(Event::default().event("ping").data("{}")), Some(rx)));
                     }

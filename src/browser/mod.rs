@@ -913,6 +913,14 @@ pub struct BrowserService {
 /// Inspect the installed browser runtime without starting the daemon, launching
 /// Chromium, or materializing the embedded worker.
 pub fn inspect_browser_installation(config: &Config) -> BrowserInstallStatus {
+    if let Some(prepared) = crate::installation::inspect(config) {
+        return browser_install_status(
+            Some(&prepared.node_path),
+            Some(&prepared.worker_path),
+            Some(&prepared.playwright_core_path),
+            Some(&prepared.chromium_path),
+        );
+    }
     let node_path = existing_path(config.node_path.clone(), "node");
     let worker_path = inspect_worker_path(config.browser_worker_path.clone(), &config.data_dir);
     let playwright_core_path = worker_path

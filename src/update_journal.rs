@@ -106,8 +106,12 @@ pub(crate) async fn recover(config: &Config) -> DomainResult<()> {
     let installed = inspect_binary_version(&binary).await?;
 
     if installed == target {
-        prune_restore_points(config, Some(&restore.root))?;
-        return finish(config);
+        if let Err(error) = prune_restore_points(config, Some(&restore.root)) {
+            tracing::warn!(%error, "activated update restore point cleanup will be retried");
+        } else if let Err(error) = finish(config) {
+            tracing::warn!(%error, "activated update journal cleanup will be retried");
+        }
+        return Ok(());
     }
     if installed == source {
         restore.snapshot.restore(config)?;
@@ -376,11 +380,7 @@ fn read_journal(path: &Path) -> DomainResult<Option<UpdateJournal>> {
 async fn inspect_binary_version(path: &Path) -> DomainResult<StableVersion> {
     let output = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio::process::Command::new(path)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        crate::update::binary_output(path, &["--version"]),
     )
     .await
     .map_err(|_| recovery_error("installed binary version check timed out"))?

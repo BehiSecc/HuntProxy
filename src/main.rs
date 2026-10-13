@@ -54,6 +54,16 @@ enum Commands {
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
     },
+    /// Prepare release-owned runtime, plugins, and project migrations.
+    #[command(hide = true)]
+    PrepareUpdate,
+    #[command(hide = true)]
+    ReleaseInfo,
+    #[command(hide = true)]
+    InstallRelease {
+        #[arg(long)]
+        executable: PathBuf,
+    },
     /// Project commands.
     Project {
         #[command(subcommand)]
@@ -176,16 +186,9 @@ async fn run(cli: Cli) -> DomainResult<()> {
     match cli.command {
         Commands::Init => {
             init_logging("info");
-            let mut cfg = Config::default();
-            if let Some(d) = cli.data_dir {
-                cfg.data_dir = d;
-                cfg.spool_dir = cfg.data_dir.join("spool");
-                cfg.export_dir = cfg.data_dir.join("exports");
-                cfg.runtime_dir = cfg.data_dir.join("runtime");
-                cfg.plugin_dir = cfg.data_dir.join("plugins");
-            }
-            cfg.ensure_layout()?;
-            cfg.write_default_config()?;
+            let cfg = Config::load(cli.data_dir)?;
+            let _maintenance = app::acquire_bootstrap_lock(&cfg).await?;
+            app::recover_installation(&cfg, true).await?;
             // Create DB via open
             let db = huntproxy::storage::Db::open(&cfg).await?;
             let ver = db.schema_version().await?;
@@ -224,6 +227,51 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 cfg.data_dir.display()
             );
             app::run_daemon(cfg).await
+        }
+        Commands::PrepareUpdate => {
+            init_logging_stderr("warn");
+            let mut cfg = Config::load(cli.data_dir)?;
+            app::prepare_release_runtime(&mut cfg).await?;
+            ensure_ca(&cfg)?;
+            let _ = huntproxy::reply::PlaceholderKey::load_or_create(&cfg.placeholder_key_path())?;
+            let db = huntproxy::storage::Db::open(&cfg).await?;
+            let schema = db.schema_version().await?;
+            println!(
+                "{}",
+                serde_json::json!({"ok":true,"version":env!("CARGO_PKG_VERSION"),"schema":schema})
+            );
+            Ok(())
+        }
+        Commands::ReleaseInfo => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version":env!("CARGO_PKG_VERSION"),
+                    "schema":huntproxy::storage::current_schema_version(),
+                    "plugins":huntproxy::installation::bundled_plugin_names()?,
+                })
+            );
+            Ok(())
+        }
+        Commands::InstallRelease { executable } => {
+            init_logging_stderr("warn");
+            let outcome = huntproxy::update::install_local(cli.data_dir, executable).await?;
+            if let huntproxy::update::UpdateOutcome::Installed {
+                installed,
+                data_backup_path,
+                daemon_restarted,
+                ..
+            } = outcome
+            {
+                println!("Installed HuntProxy {installed}; runtime and official plugins ready");
+                if let Some(path) = data_backup_path {
+                    println!("  restore point: {}", path.display());
+                }
+                if daemon_restarted {
+                    println!("  daemon restarted; saved projects are ready");
+                }
+            }
+            Ok(())
         }
         Commands::Mcp => {
             // MCP: logs to stderr only
@@ -344,10 +392,20 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     previous,
                     installed,
                     backup_path,
+                    data_backup_path,
+                    daemon_restarted,
                 } => {
                     println!("Updated HuntProxy {previous} -> {installed}");
                     println!("  rollback: {}", backup_path.display());
-                    println!("Restart/reconnect AI clients to use the new MCP binary.");
+                    if let Some(path) = data_backup_path {
+                        println!("  project restore point: {}", path.display());
+                        println!(
+                            "Managed runtime and plugins are ready; saved projects are preserved."
+                        );
+                    }
+                    if daemon_restarted {
+                        println!("HuntProxy restarted; continue using your connected client.");
+                    }
                 }
             }
             Ok(())
@@ -355,7 +413,16 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Project { cmd } => {
             init_logging("error");
             let cfg = Config::load(cli.data_dir)?;
-            ensure_daemon(&cfg).await?;
+            if matches!(
+                cmd,
+                ProjectCmd::Create { .. }
+                    | ProjectCmd::List
+                    | ProjectCmd::Rename { .. }
+                    | ProjectCmd::Delete { .. }
+                    | ProjectCmd::Usage { .. }
+            ) {
+                ensure_daemon(&cfg).await?;
+            }
             match cmd {
                 ProjectCmd::Create { name, target_url } => {
                     let body = serde_json::to_string(&CreateProjectRequest {
@@ -391,6 +458,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     println!("{value}");
                 }
                 ProjectCmd::Reconcile { id } => {
+                    let _maintenance = app::acquire_bootstrap_lock(&cfg).await?;
+                    app::recover_installation(&cfg, true).await?;
                     let db = huntproxy::storage::Db::open(&cfg).await?;
                     let project_ids = match id {
                         Some(id) => vec![huntproxy::domain::ProjectId(id)],
@@ -418,6 +487,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     include_secrets,
                     include_chromium_profile,
                 } => {
+                    let _maintenance = app::acquire_bootstrap_lock(&cfg).await?;
+                    app::recover_installation(&cfg, true).await?;
                     let db = huntproxy::storage::Db::open(&cfg).await?;
                     db.export_bundle(
                         &cfg,
@@ -436,6 +507,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     println!("Exported project {id} to {}", output.display());
                 }
                 ProjectCmd::Import { input } => {
+                    let _maintenance = app::acquire_bootstrap_lock(&cfg).await?;
+                    app::recover_installation(&cfg, true).await?;
                     let db = huntproxy::storage::Db::open(&cfg).await?;
                     let project = if input
                         .extension()
@@ -481,6 +554,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Backup { destination } => {
             init_logging("error");
             let cfg = Config::load(cli.data_dir)?;
+            let _maintenance = app::acquire_bootstrap_lock(&cfg).await?;
+            app::recover_installation(&cfg, true).await?;
             let db = huntproxy::storage::Db::open(&cfg).await?;
             let path = db.backup_to(destination).await?;
             println!("Backup written to {}", path.display());
@@ -489,6 +564,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
         Commands::Har { cmd } => {
             init_logging("error");
             let cfg = Config::load(cli.data_dir)?;
+            let _maintenance = app::acquire_bootstrap_lock(&cfg).await?;
+            app::recover_installation(&cfg, true).await?;
             let db = huntproxy::storage::Db::open(&cfg).await?;
             match cmd {
                 HarCmd::Export {

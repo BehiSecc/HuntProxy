@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TEST_ROOT: &str = "/tmp/artis/huntproxy-v020.58BmOq";
+const TEST_ROOT: &str = "/tmp/artis";
 
 struct Daemon {
     child: Child,
