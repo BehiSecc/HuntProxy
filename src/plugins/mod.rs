@@ -1222,6 +1222,7 @@ impl PluginService {
                 format!("plugin {plugin_id} is installed but disabled"),
             ));
         }
+        validate_host_plugin_compatibility(&plugin.manifest)?;
         if !plugin
             .manifest
             .actions
@@ -4387,6 +4388,50 @@ impl PluginService {
             .await?;
         Ok(())
     }
+}
+
+fn validate_host_plugin_compatibility(manifest: &PluginManifest) -> DomainResult<()> {
+    // Racer versions before 0.6.4 analyze the current host's explicit failed
+    // race observations as novel response signatures. Preserved or modified
+    // copies are not auto-upgraded, so fail before preview or execution rather
+    // than returning false findings.
+    if manifest.id != "racer" || compatible_racer_version(&manifest.version) {
+        return Ok(());
+    }
+    Err(DomainError::new(
+        ErrorCode::ProtocolIncompatible,
+        format!(
+            "Racer {} is incompatible with this HuntProxy host; update or restore the Racer plugin to version 0.6.4 or newer before previewing or running it",
+            manifest.version
+        ),
+    ))
+}
+
+fn compatible_racer_version(version: &str) -> bool {
+    let version = version.trim();
+    let core_and_prerelease = version.split_once('+').map_or(version, |(core, _)| core);
+    let (core, prerelease) = core_and_prerelease
+        .split_once('-')
+        .map_or((core_and_prerelease, false), |(core, _)| (core, true));
+    let mut components = core.split('.');
+    let parsed = components
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .zip(
+            components
+                .next()
+                .and_then(|minor| minor.parse::<u64>().ok()),
+        )
+        .zip(
+            components
+                .next()
+                .and_then(|patch| patch.parse::<u64>().ok()),
+        )
+        .map(|((major, minor), patch)| (major, minor, patch));
+    let Some(parsed) = parsed.filter(|_| components.next().is_none()) else {
+        return false;
+    };
+    parsed > (0, 6, 4) || (parsed == (0, 6, 4) && !prerelease)
 }
 
 fn validate_plan_preview(preview: Option<&PluginPlanPreview>) -> DomainResult<()> {
@@ -8657,6 +8702,36 @@ mod tests {
             load_plugin(&plugin).unwrap_err().code(),
             ErrorCode::ConfigInvalid
         );
+    }
+
+    #[test]
+    fn incompatible_preserved_racer_versions_are_blocked_before_use() {
+        let manifest = |id: &str, version: &str| {
+            serde_json::from_value::<PluginManifest>(json!({
+                "schema_version": 1,
+                "id": id,
+                "name": "Fixture",
+                "version": version,
+                "description": "test",
+                "enabled": true,
+                "entrypoint": "index.js",
+                "entrypoint_sha256": "0".repeat(64),
+                "capabilities": [],
+                "actions": [{"name":"run","description":"test","input_schema":{"type":"object"}}]
+            }))
+            .unwrap()
+        };
+
+        for version in ["0.6.3", "0.6.4-beta.1", "modified-copy"] {
+            let error =
+                validate_host_plugin_compatibility(&manifest("racer", version)).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::ProtocolIncompatible);
+            assert!(error.to_string().contains("version 0.6.4 or newer"));
+        }
+        for version in ["0.6.4", "0.6.4+local", "0.7.0", "1.0.0"] {
+            validate_host_plugin_compatibility(&manifest("racer", version)).unwrap();
+        }
+        validate_host_plugin_compatibility(&manifest("custom-racer", "0.1.0")).unwrap();
     }
 
     #[test]
