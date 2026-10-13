@@ -126,6 +126,51 @@ async fn dynamic_api_responses_are_never_browser_cached() {
 }
 
 #[tokio::test]
+async fn project_event_stream_ends_promptly_on_shutdown() {
+    let (_directory, state, project_id) = test_state().await;
+    let response = huntproxy::api::router(state.clone())
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}/events", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+
+    let mut body = response.into_body();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+        .await
+        .expect("ready event timed out")
+        .expect("event stream ended before ready")
+        .expect("ready event body failed");
+    let ready = std::str::from_utf8(ready.data_ref().expect("ready event was not data")).unwrap();
+    assert!(ready.contains("event: ready"));
+    assert!(ready.contains(&format!(r#"{{"project_id":{}}}"#, project_id.get())));
+
+    let next = body.frame();
+    tokio::pin!(next);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut next)
+            .await
+            .is_err(),
+        "idle event stream produced an unexpected frame"
+    );
+    state.shutdown.cancel();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), &mut next)
+        .await
+        .expect("event stream did not observe shutdown promptly");
+    assert!(
+        ended.is_none(),
+        "event stream emitted a frame after shutdown"
+    );
+}
+
+#[tokio::test]
 async fn ip_rotation_status_is_visible_and_blocks_project_deletion_until_cleanup() {
     let (_directory, state, project_id) = test_state().await;
     let app = huntproxy::api::router(state.clone());
