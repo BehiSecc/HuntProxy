@@ -1273,7 +1273,14 @@ impl PluginService {
         validate_action_base_exchange(&plugin.manifest, action_manifest, base_exchange_id)?;
         let started = Instant::now();
         let prepared = self
-            .prepare_plugin_plan(project_id, base_exchange_id, plugin.clone(), action, &input)
+            .prepare_plugin_plan(
+                project_id,
+                base_exchange_id,
+                plugin.clone(),
+                action,
+                &input,
+                None,
+            )
             .await?;
         let project = self.db.get_project(project_id).await?;
         let mut by_type = BTreeMap::<String, usize>::new();
@@ -1642,6 +1649,7 @@ impl PluginService {
         plugin: Arc<LoadedPlugin>,
         action: &str,
         input: &Value,
+        cancel: Option<CancellationToken>,
     ) -> DomainResult<PreparedPluginPlan> {
         self.db.get_project(project_id).await?;
         let privileged_identity = plugin
@@ -1687,7 +1695,9 @@ impl PluginService {
             "related_exchanges": related_exchanges,
             "resources": &*plugin.resources,
         });
-        let plan_value = run_js_stage(&plugin, "plan", input, &Value::Null, &context).await?;
+        let plan_value =
+            run_js_stage_with_timeout(&plugin, "plan", input, &Value::Null, &context, None, cancel)
+                .await?;
         let plan: PluginPlan = serde_json::from_value(plan_value)
             .map_err(|error| DomainError::invalid(format!("invalid plugin plan: {error}")))?;
         validate_plan_preview(plan.preview.as_ref())?;
@@ -1831,7 +1841,14 @@ impl PluginService {
             resolved_identities,
             planned_requests,
         } = self
-            .prepare_plugin_plan(project_id, base_exchange_id, plugin.clone(), action, input)
+            .prepare_plugin_plan(
+                project_id,
+                base_exchange_id,
+                plugin.clone(),
+                action,
+                input,
+                Some(job.cancel.clone()),
+            )
             .await?;
         job.view.write().operation_count = planned_requests;
         let mut execution_summary = PluginExecutionSummary {
@@ -6494,16 +6511,6 @@ fn validate_manifest(manifest: &PluginManifest) -> DomainResult<()> {
     Ok(())
 }
 
-async fn run_js_stage(
-    plugin: &LoadedPlugin,
-    stage: &'static str,
-    input: &Value,
-    observations: &Value,
-    context: &Value,
-) -> DomainResult<Value> {
-    run_js_stage_with_timeout(plugin, stage, input, observations, context, None, None).await
-}
-
 async fn run_js_stage_with_timeout(
     plugin: &LoadedPlugin,
     stage: &'static str,
@@ -7632,6 +7639,94 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cancelling_job_interrupts_javascript_planning_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().join("data"))).unwrap();
+        let db = Arc::new(crate::storage::Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "planning cancellation".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let plugin_directory = directory.path().join("plugins");
+        let package = plugin_directory.join("planning-cancel-test");
+        crate::config::create_private_dir(&package).unwrap();
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { while (true) {} },
+          analyze() { throw new Error("analysis must not run"); }
+        };"#;
+        std::fs::write(package.join("index.js"), script).unwrap();
+        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+        std::fs::write(
+            package.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":1,"id":"planning-cancel-test","name":"Planning Cancel Test","version":"1.0.0","description":"test","enabled":true,
+                "entrypoint":"index.js","entrypoint_sha256":digest,"capabilities":[],
+                "limits":{"timeout_ms":30000,"js_stage_timeout_ms":30000,"max_operations":1,"max_concurrency":1,"memory_mb":8},
+                "actions":[{"name":"run","description":"run","input_schema":{"type":"object"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let service = PluginService::load(plugin_directory, db, reply).unwrap();
+        let job = service
+            .run(project.id, "planning-cancel-test", "run", None, json!({}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = service.status(job.id).unwrap();
+                if status.phase == PluginJobPhase::Planning
+                    && status.state == PluginJobState::Running
+                {
+                    break;
+                }
+                fail_on_terminal_job(&status, "expected JavaScript planning to start");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        service.cancel(job.id).unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = service.status(job.id).unwrap();
+                if status.state == PluginJobState::Cancelled {
+                    break status;
+                }
+                fail_on_terminal_job(&status, "expected planning cancellation");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(cancelled.phase, PluginJobPhase::Finished);
+        assert_eq!(cancelled.operation_count, 0);
+        assert_eq!(cancelled.completed_operations, 0);
+        assert!(cancelled
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled")));
+        assert!(!service
+            .results(job.id, PluginResultView::Full, 0, 25)
+            .unwrap()["result_available"]
+            .as_bool()
+            .unwrap());
+    }
+
     #[test]
     fn effective_limits_expose_requested_fallback_and_host_ceiling() {
         let mut manifest: PluginManifest = serde_json::from_value(json!({
@@ -7925,12 +8020,12 @@ mod tests {
             .unwrap());
 
         let mut timeout_plugin = service.plugins.get("retry-test").unwrap().as_ref().clone();
-        timeout_plugin.manifest.limits.timeout_ms = Some(1000);
-        timeout_plugin.manifest.limits.js_stage_timeout_ms = Some(2000);
+        timeout_plugin.manifest.limits.timeout_ms = Some(5000);
+        timeout_plugin.manifest.limits.js_stage_timeout_ms = Some(10000);
         timeout_plugin.script = Arc::from(
             timeout_plugin
                 .script
-                .replace("Date.now() + 400", "Date.now() + 1500"),
+                .replace("Date.now() + 400", "Date.now() + 30000"),
         );
         let timeout_job = test_job(PluginJobState::Queued);
         {
@@ -7953,6 +8048,18 @@ mod tests {
                 )
                 .await;
         });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if timeout_job.analysis_checkpoint.lock().is_some() {
+                    break;
+                }
+                let status = service.status(timeout_id).unwrap();
+                fail_on_terminal_job(&status, "expected analysis checkpoint creation");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(10), running)
             .await
             .unwrap()
