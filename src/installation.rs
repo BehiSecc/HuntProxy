@@ -27,6 +27,7 @@ const MAX_NODE_EXPANDED_BYTES: u64 = 768 * 1024 * 1024;
 const MAX_NODE_ENTRIES: usize = 150_000;
 const MAX_PLUGIN_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
 const PLUGIN_SWAP_MARKER: &[u8] = b"HuntProxy plugin swap v1\n";
+const PLUGIN_SOURCE_MARKER: &str = ".huntproxy-first-party-source";
 
 const PLUGIN_CATALOG_ARCHIVE: &[u8] =
     include_bytes!("../resources/release/plugins-catalog.tar.zst");
@@ -942,6 +943,10 @@ fn reconcile_plugins(
         install_package_swap(&destination, &incoming, &backup, &marker)?;
     }
     preserved.sort();
+    write_private_file(
+        &plugin_dir.join(PLUGIN_SOURCE_MARKER),
+        format!("{}\n", catalog.current_commit).as_bytes(),
+    )?;
     Ok(preserved)
 }
 
@@ -1372,6 +1377,7 @@ mod tests {
             "custom",
             &[("plugin.json", b"custom"), ("index.js", b"custom")],
         );
+        fs::write(installed.join(PLUGIN_SOURCE_MARKER), b"old\n").unwrap();
         write_package(&source, "modified", &new);
         let catalog = PluginCatalog {
             schema_version: 1,
@@ -1414,6 +1420,10 @@ mod tests {
         assert_eq!(
             fs::read(installed.join("custom/index.js")).unwrap(),
             b"custom"
+        );
+        assert_eq!(
+            fs::read_to_string(installed.join(PLUGIN_SOURCE_MARKER)).unwrap(),
+            "new\n"
         );
         assert_eq!(
             reconcile_plugins(&catalog, &source, &installed).unwrap(),
