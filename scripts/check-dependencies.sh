@@ -46,7 +46,8 @@ else
 
   archive="$audit_dir/cargo-deny.tar.gz"
   cargo_deny="$audit_dir/cargo-deny"
-  curl --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+  curl --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 \
+    --retry 3 --retry-all-errors --retry-max-time 300 \
     --fail --location --silent --show-error "$CARGO_DENY_URL" --output "$archive"
   printf '%s  %s\n' "$CARGO_DENY_SHA256" "$archive" | sha256sum -c -
 

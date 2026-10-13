@@ -22,6 +22,7 @@ jobs:
   dependency-audit:
     name: Audit locked dependencies
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
