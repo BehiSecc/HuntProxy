@@ -1711,3 +1711,132 @@ async fn raw_reply_preserves_framing_and_collects_response_sequences() {
         .starts_with("HTTP/1.1 200 OK\r\n"));
     server.abort();
 }
+
+#[tokio::test]
+async fn identity_selectors_reject_misplaced_fields_before_dispatch() {
+    let (_directory, state, project_id) = test_state().await;
+    let selection = serde_json::json!({"mode":"anonymous"});
+    let template = serde_json::json!({
+        "draft":{"url":"http://127.0.0.1:1/?month=§month§"},
+        "insertion_points":[{"name":"month","location":"url"}],
+        "wordlists":[["october"]]
+    });
+    for (tool, args) in [
+        (
+            "reply_send",
+            serde_json::json!({"project_id":project_id,"identity":selection}),
+        ),
+        (
+            "reply_tabs",
+            serde_json::json!({"project_id":project_id,"action":"create","identity":selection}),
+        ),
+        (
+            "fuzz_start",
+            serde_json::json!({"project_id":project_id,"identity":selection,"template":template}),
+        ),
+        (
+            "fuzz_start",
+            serde_json::json!({"project_id":project_id,"template":{
+                "identity":selection,
+                "draft":{"url":"http://127.0.0.1:1/?month=§month§"},
+                "insertion_points":[{"name":"month","location":"url"}],
+                "wordlists":[["october"]]
+            }}),
+        ),
+    ] {
+        let error = huntproxy::mcp::call_tool(state.clone(), tool, args)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("under"));
+    }
+    let app = huntproxy::api::router(state.clone());
+    for (route, body) in [
+        ("reply-send", serde_json::json!({"identity":selection})),
+        (
+            "reply-tabs",
+            serde_json::json!({"name":"Monthly summary","draft":{},"identity":selection}),
+        ),
+        (
+            "fuzz-jobs",
+            serde_json::json!({"template":template,"identity":selection}),
+        ),
+        (
+            "fuzz-jobs",
+            serde_json::json!({"template":{
+                "draft":{},"identity":selection,"insertion_points":[]
+            }}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/projects/{}/{route}", project_id.get()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert!(state
+        .db
+        .list_fuzz_jobs(project_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(state
+        .db
+        .list_reply_tabs(project_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn raw_api_preserves_an_incomplete_response_as_error_evidence_without_retry() {
+    let (_directory, state, project_id) = test_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let received = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nok";
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 2048];
+        connection.read(&mut request).await.unwrap();
+        connection.write_all(received).await.unwrap();
+        connection.shutdown().await.unwrap();
+    });
+    let response = huntproxy::api::router(state.clone()).oneshot(
+        Request::post(format!("/api/v1/projects/{}/reply-send-raw",project_id.get()))
+            .header("content-type","application/json")
+            .body(Body::from(serde_json::json!({
+                "target_url":format!("http://{address}/"),
+                "request":format!("GET / HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
+            }).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = json_response(response).await;
+    assert_eq!(result["status_code"], 200);
+    assert_eq!(result["response_complete"], false);
+    assert_eq!(result["truncated"], true);
+    let id = ExchangeId(result["exchange_id"].as_i64().unwrap());
+    let detail = state
+        .db
+        .get_exchange_detail(
+            project_id,
+            id,
+            huntproxy::policy::PresentationOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.summary.completion, CompletionState::ProtocolError);
+    let body = state
+        .db
+        .load_raw_body(project_id, id, MessageSide::Response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(body, received);
+    server.await.unwrap();
+}

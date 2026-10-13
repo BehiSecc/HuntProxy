@@ -168,6 +168,10 @@ Different browser profiles can remain open together up to the project's browser 
 
 Use `browser_manage(project_id=PROJECT_ID, op="status")` at profile or control transitions to inspect active persistent sessions and browser resources. Resource capacity also counts temporary browsers used by tools and extensions; per-session control indicates whether the agent or a person through CDP owns that browser, and the CDP occupancy flag covers the shared port across projects. Reuse a valid matching session when capacity is full. Suspend only an unnecessary idle session you own, preserving its profile; keep simultaneous-account workflows and operator handoffs intact. Retain the result between transitions instead of checking status before every browser action.
 
+For an ordinary file input, use `browser_action` with `action: {type: "upload", locator: {css: "input[type=file]"}, files: ["/absolute/path/monthly-summary.csv"]}`. Set `via_chooser: true` and select the Browse button when the application opens a file chooser. Paths belong to the HuntProxy machine; files must be readable regular files, with at most 16 per action. The default upload timeout is 10 seconds and can be set up to 30 seconds. An empty file list clears a direct input. Selection uses the existing browser and normal UI/capture flow.
+
+`action: {type: "inspect"}` returns passive page readiness, recent resource metadata and diagnostic locations; add `locator` for element state. Its `data.content` contains JSON when `truncated` is false. Increase `max_bytes` from the 4096-byte default up to 65536 when more detail is needed. Console message text, storage and credentials are excluded. These actions retain session ownership and respect a person's CDP handoff.
+
 ### Test Hypotheses
 
 | Capability | What your agent can do |
@@ -176,6 +180,10 @@ Use `browser_manage(project_id=PROJECT_ID, op="status")` at profile or control t
 | **Fuzzer** | Run sniper, battering ram, pitchfork, or cluster bomb jobs with wordlists, number ranges, and regex-bypass payloads; group responses to spot meaningful differences. |
 | **Request rules** | Apply ordered URL, header, and body rewrites across Proxy, Browser, Reply, Fuzzer, the crawler, and semantic plugin requests. Raw transports stay byte-exact. |
 | **Compare & utilities** | Diff saved exchanges, transform encodings, inspect large bodies in pages, and copy requests as runnable cURL or Python. |
+
+Reply and Fuzzer drafts accept a request-local `identity`: `{mode: "named", profile: "member"}` selects a saved cookie profile, `{mode: "anonymous"}` removes credential headers, and omitted/null or `{mode: "default"}` keeps existing behavior. Named selection removes inherited credentials and credential rewrites; deliberate non-Cookie credential overrides remain. Cookie overrides conflict with named selection, while a Cookie tombstone suppresses its selected cookie. Missing, expired or non-applicable profiles fail without falling back. The browser and default jar are unchanged, and named Fuzzer jobs pin their cookie selection at launch. Verify the actor through normal application behavior; returned identity metadata describes the selection only.
+
+Raw HTTP/1 replies preserve received bytes and status after a later connection error. Inspect `response_complete`, `truncated`, `read_outcome` and optional `transport_error` alongside the saved exchange. A framed response can be complete while the connection still reports an error. Raw HTTP/2 operations retain decoded stream evidence and identify transport errors on affected streams. Incomplete/error records remain evidence rather than clean results; no automatic retry is introduced.
 
 ### Keep the Proof and Extend the Hunt
 

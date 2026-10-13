@@ -402,6 +402,11 @@
             <div><label for="replyProtocol">Protocol</label><select id="replyProtocol"><option value="auto">Auto</option><option value="h1">HTTP/1.1</option><option value="h2">HTTP/2</option></select></div>
           </div>
           <label for="replyUrl">URL</label><input id="replyUrl" placeholder="https://example.com/path" />
+          <div class="detail-grid">
+            <div><label for="replyIdentityMode">Request identity</label><select id="replyIdentityMode"><option value="default">Project default</option><option value="named">Named cookie profile</option><option value="anonymous">Anonymous</option></select></div>
+            <div id="replyIdentityProfileField" class="hidden"><label for="replyIdentityProfile">Cookie profile name</label><input id="replyIdentityProfile" placeholder="member" /></div>
+          </div>
+          <p class="small muted">Named profiles replace inherited credentials; explicit Authorization overrides remain. Anonymous removes credentials. Selection leaves the browser and project cookie jar unchanged.</p>
           <label for="replyBodyFormat">Body format</label>
           <select id="replyBodyFormat"><option value="raw">Raw</option><option value="json">JSON</option><option value="xml">XML</option><option value="form_urlencoded">x-www-form-urlencoded</option><option value="multipart">multipart/form-data</option></select>
           <p class="small muted">For form formats, enter one <code>name=value</code> field per line. Content-Type is updated automatically.</p>
@@ -1370,6 +1375,9 @@ test
       $('replyMethod').value = tab?.draft?.method || 'GET';
       $('replyUrl').value = tab?.draft?.url || '';
       $('replyProtocol').value = tab?.protocol || 'auto';
+      $('replyIdentityMode').value = tab?.draft?.identity?.mode || 'default';
+      $('replyIdentityProfile').value = tab?.draft?.identity?.profile || '';
+      $('replyIdentityProfileField').classList.toggle('hidden', $('replyIdentityMode').value !== 'named');
       $('replyHeaders').value = (tab?.draft?.header_overrides || []).map(h => `${h.name}: ${text(h.value)}`).join('\n');
       const format = tab?.draft?.body_format || 'raw';
       $('replyBodyFormat').value = format;
@@ -1400,7 +1408,8 @@ test
         method: $('replyMethod').value.trim() || null,
         url: $('replyUrl').value.trim() || null,
         header_overrides: overrides,
-        header_tombstones: [],
+        header_tombstones: [...(state.activeReplyTab?.draft?.header_tombstones || [])],
+        inheritance: state.activeReplyTab?.draft?.inheritance || 'full_request',
         body_override: null,
         body_text: null,
         body_json: null,
@@ -1408,6 +1417,14 @@ test
         body_params: [],
         body_cleared: clearBody,
       };
+      const identityMode = $('replyIdentityMode').value;
+      if (identityMode === 'named') {
+        const profile = $('replyIdentityProfile').value.trim();
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(profile)) throw new Error('Enter a cookie profile name using letters, numbers, underscores or hyphens');
+        draft.identity = { mode: 'named', profile };
+      } else if (identityMode === 'anonymous' || state.activeReplyTab?.draft?.identity?.mode === 'default') {
+        draft.identity = { mode: identityMode };
+      }
       if (clearBody) return draft;
       if (!bodyValue) {
         if (format === 'form_urlencoded') draft.body_format = format;
@@ -1439,6 +1456,7 @@ test
       await loadReplyTabs(tab.id);
       return tab;
     }
+    $('replyIdentityMode').onchange = () => $('replyIdentityProfileField').classList.toggle('hidden', $('replyIdentityMode').value !== 'named');
     $('saveReply').onclick = async () => {
       try { await saveReplyTab(); status('replyStatus', 'Tab saved', 'ok'); }
       catch (e) { status('replyStatus', e.message, 'err'); }

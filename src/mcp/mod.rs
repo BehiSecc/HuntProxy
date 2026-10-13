@@ -142,6 +142,14 @@ fn reply_draft_schema() -> Value {
         "properties": {
             "method": {"type": ["string", "null"]},
             "url": {"type": ["string", "null"]},
+            "identity": {
+                "description": "Optional request-local cookie identity. Omit or use default for existing project-cookie behavior. named selects a saved cookie profile without changing the default jar or browser and removes inherited credentials; explicit non-Cookie credential overrides remain deliberate. A Cookie override conflicts with named selection; a Cookie tombstone suppresses its cookie. anonymous removes all credential headers, including overrides and rules. Named selections are pinned when a fuzz job starts. Selection metadata does not verify the logged-in actor.",
+                "oneOf": [
+                    {"type":"null"},
+                    {"type":"object","properties":{"mode":{"type":"string","enum":["default","anonymous"]}},"required":["mode"],"additionalProperties":false},
+                    {"type":"object","properties":{"mode":{"type":"string","const":"named"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"}},"required":["mode","profile"],"additionalProperties":false}
+                ]
+            },
             "header_overrides": {
                 "type": "array",
                 "default": [],
@@ -195,12 +203,15 @@ fn locator_schema() -> Value {
 fn browser_action_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Action object. navigate requires url; click requires locator; fill/select require locator and value; press requires key and optional locator; wait requires for_what and value; snapshot accepts format and max_bytes.",
+        "description": "Action object. navigate requires url; click requires locator; fill/select require locator and value; upload requires locator and files on the HuntProxy machine, with via_chooser=true for a trusted Browse button; inspect returns passive bounded runtime/element metadata and accepts optional locator and max_bytes (1..65536). press requires key and optional locator; wait requires for_what and value; snapshot accepts format and max_bytes.",
         "properties": {
-            "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "press", "wait", "back", "forward", "close"]},
+            "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "press", "wait", "back", "forward", "close"]},
             "url": {"type": "string"},
             "locator": locator_schema(),
             "value": {"type": "string"},
+            "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Absolute paths to regular readable files on the HuntProxy machine. An empty array clears a direct file input; chooser uploads require at least one file."},
+            "via_chooser": {"type":"boolean","default":false,"description":"For upload, click locator as a trusted Browse/file-chooser trigger instead of setting an input directly."},
+            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Upload operation deadline, including file chooser and trusted click."},
             "key": {"type": "string"},
             "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"]},
             "format": {"type": "string", "enum": ["accessibility", "dom"]},
@@ -1522,6 +1533,11 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "reply_tabs" => {
             let project_id = require_project_id(&args)?;
+            if args.get("identity").is_some() {
+                return Err(DomainError::invalid(
+                    "put request field `identity` under `draft`",
+                ));
+            }
             let action = args
                 .get("action")
                 .and_then(|v| v.as_str())
@@ -1566,6 +1582,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         "reply_send" => {
             let project_id = require_project_id(&args)?;
             for field in [
+                "identity",
                 "url",
                 "method",
                 "headers",
@@ -1678,6 +1695,16 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "fuzz_start" => {
             let project_id = require_project_id(&args)?;
+            if args.get("identity").is_some()
+                || args
+                    .get("template")
+                    .and_then(|template| template.get("identity"))
+                    .is_some()
+            {
+                return Err(DomainError::invalid(
+                    "put request field `identity` under `template.draft`",
+                ));
+            }
             let template: FuzzTemplate = serde_json::from_value(
                 args.get("template")
                     .cloned()
@@ -2708,6 +2735,30 @@ mod tests {
         assert!(reply["inputSchema"]["properties"]["draft"]["properties"]
             .get("body_text")
             .is_some());
+        let identity = &reply["inputSchema"]["properties"]["draft"]["properties"]["identity"];
+        assert_eq!(identity["oneOf"][2]["required"], json!(["mode", "profile"]));
+        assert_eq!(identity["oneOf"][2]["additionalProperties"], false);
+        let fuzz = tools
+            .iter()
+            .find(|tool| tool["name"] == "fuzz_start")
+            .unwrap();
+        assert_eq!(
+            fuzz["inputSchema"]["properties"]["template"]["properties"]["draft"]["properties"]
+                ["identity"],
+            *identity
+        );
+        for selection in [
+            json!({"mode":"default"}),
+            json!({"mode":"anonymous"}),
+            json!({"mode":"named","profile":"member"}),
+        ] {
+            let draft: ReplyDraft = serde_json::from_value(json!({"identity":selection})).unwrap();
+            assert!(draft.identity.is_some());
+        }
+        assert!(serde_json::from_value::<ReplyDraft>(
+            json!({"identity":{"mode":"anonymous","profile":"member"}})
+        )
+        .is_err());
         let cookies = tools.iter().find(|tool| tool["name"] == "cookies").unwrap();
         let cookie_inputs = cookies["inputSchema"]["properties"]["cookie"]["oneOf"]
             .as_array()
@@ -2733,6 +2784,30 @@ mod tests {
                 .iter()
                 .any(|value| value == "navigate")
         );
+        let action = &browser["inputSchema"]["properties"]["action"]["properties"];
+        for name in ["upload", "inspect"] {
+            assert!(action["type"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == name));
+        }
+        assert_eq!(action["files"]["maxItems"], 16);
+        assert_eq!(action["timeout_ms"]["maximum"], 30000);
+        let upload: crate::browser::BrowserAction = serde_json::from_value(
+            json!({"type":"upload","locator":{"css":"input[type=file]"},"files":[]}),
+        )
+        .unwrap();
+        assert!(matches!(
+            upload,
+            crate::browser::BrowserAction::Upload { .. }
+        ));
+        let inspect: crate::browser::BrowserAction =
+            serde_json::from_value(json!({"type":"inspect"})).unwrap();
+        assert!(matches!(
+            inspect,
+            crate::browser::BrowserAction::Inspect { .. }
+        ));
         let browser_cdp = tools
             .iter()
             .find(|tool| tool["name"] == "browser_cdp")
