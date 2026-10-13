@@ -288,6 +288,14 @@ async fn connected_bridge_refreshes_tools_and_forwards_new_call_once() {
 
     cancel.cancel();
     server.await.unwrap().unwrap();
+    std::fs::remove_file(config.socket_path()).unwrap();
+    let while_stopped = bridge.rpc("tools/list", json!({})).await;
+    assert!(while_stopped.to_string().contains("new_action"));
+    assert!(!while_stopped.to_string().contains("existing_action"));
+    assert!(
+        !config.socket_path().exists(),
+        "catalog fallback must not auto-start the daemon"
+    );
 }
 
 #[tokio::test]

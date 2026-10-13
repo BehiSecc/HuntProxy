@@ -104,6 +104,15 @@ impl DaemonToolBackend {
         }
         Ok(Some(tools))
     }
+
+    async fn cached_definitions(&self) -> Value {
+        self.catalog
+            .read()
+            .await
+            .as_ref()
+            .map(|catalog| catalog.tools.clone())
+            .unwrap_or_else(tool_defs)
+    }
 }
 
 #[async_trait::async_trait]
@@ -139,7 +148,7 @@ impl ToolBackend for DaemonToolBackend {
     async fn definitions(&self) -> Value {
         match self.refresh_catalog().await {
             Ok(Some(tools)) => tools,
-            Ok(None) | Err(_) => tool_defs(),
+            Ok(None) | Err(_) => self.cached_definitions().await,
         }
     }
 
