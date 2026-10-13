@@ -1332,9 +1332,11 @@ mod tests {
     #[test]
     fn playwright_sdk_materialization_is_versioned_and_repeatable() {
         let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
-        let mut config = Config::default();
-        config.runtime_dir = temporary.path().join("runtime");
-        config.browser_playwright_core_path = None;
+        let config = Config {
+            runtime_dir: temporary.path().join("runtime"),
+            browser_playwright_core_path: None,
+            ..Config::default()
+        };
         let first = prepare_playwright(&config).unwrap();
         let second = prepare_playwright(&config).unwrap();
         assert_eq!(first, second);
@@ -1487,11 +1489,13 @@ mod tests {
     #[test]
     fn inspection_reads_only_a_complete_validated_installation() {
         let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
-        let mut config = Config::default();
-        config.data_dir = temporary.path().to_path_buf();
-        config.runtime_dir = temporary.path().join("runtime");
-        config.node_path = Some(temporary.path().join("node"));
-        config.browser_worker_path = Some(temporary.path().join("worker.js"));
+        let config = Config {
+            data_dir: temporary.path().to_path_buf(),
+            runtime_dir: temporary.path().join("runtime"),
+            node_path: Some(temporary.path().join("node")),
+            browser_worker_path: Some(temporary.path().join("worker.js")),
+            ..Config::default()
+        };
         fs::create_dir_all(&config.runtime_dir).unwrap();
         fs::write(config.node_path.as_ref().unwrap(), b"node").unwrap();
         fs::write(config.browser_worker_path.as_ref().unwrap(), b"worker").unwrap();
