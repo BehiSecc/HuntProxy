@@ -85,13 +85,15 @@ pub fn migrate(conn: &Connection) -> DomainResult<i32> {
         tracing::info!(migration = name, from = version, "applying migration");
         conn.execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| DomainError::new(ErrorCode::MigrationError, e.to_string()))?;
-        match conn.execute_batch(sql) {
-            Ok(()) => {
-                let next = version + 1;
-                conn.pragma_update(None, "user_version", next)
-                    .map_err(|e| DomainError::new(ErrorCode::MigrationError, e.to_string()))?;
-                conn.execute_batch("COMMIT;")
-                    .map_err(|e| DomainError::new(ErrorCode::MigrationError, e.to_string()))?;
+        let migration = (|| {
+            conn.execute_batch(sql)?;
+            let next = version + 1;
+            conn.pragma_update(None, "user_version", next)?;
+            conn.execute_batch("COMMIT;")?;
+            Ok::<_, rusqlite::Error>(next)
+        })();
+        match migration {
+            Ok(next) => {
                 version = next;
             }
             Err(e) => {
@@ -140,7 +142,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_browser_sessions_are_normalized_to_chromium() {
+    fn failed_migration_rolls_back_and_preserves_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, "NORMAL", 5000).unwrap();
+        for (index, (_, sql)) in MIGRATIONS.iter().take(14).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", index as i32 + 1)
+                .unwrap();
+        }
+        conn.execute(
+            "ALTER TABLE browser_sessions ADD COLUMN profile_name TEXT",
+            [],
+        )
+        .unwrap();
+
+        assert!(migrate(&conn).is_err());
+        assert_eq!(schema_version(&conn).unwrap(), 14);
+    }
+
+    #[test]
+    fn legacy_browser_sessions_are_normalized_without_inventing_profile_history() {
         let conn = Connection::open_in_memory().unwrap();
         configure_connection(&conn, "NORMAL", 5000).unwrap();
         conn.execute_batch(MIGRATIONS[0].1).unwrap();
@@ -157,7 +178,7 @@ mod tests {
         .unwrap();
 
         migrate(&conn).unwrap();
-        let values: (String, String, String, i64, String, String) = conn
+        let values: (String, String, String, i64, String, Option<String>) = conn
             .query_row(
                 "SELECT engine,engine_policy,state,fallback_used,checkpoint_status,profile_name FROM browser_sessions WHERE id=1",
                 [],
@@ -181,7 +202,7 @@ mod tests {
                 "interrupted".into(),
                 0,
                 "ok".into(),
-                "default".into(),
+                None,
             )
         );
     }

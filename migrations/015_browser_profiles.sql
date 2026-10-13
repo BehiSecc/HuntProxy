@@ -1,5 +1,6 @@
 -- Named persistent Chromium identities per project.
 ALTER TABLE browser_sessions ADD COLUMN profile_name TEXT;
 
--- Existing persistent browser history belongs to the legacy default profile.
-UPDATE browser_sessions SET profile_name='default' WHERE profile_name IS NULL;
+-- Historical sessions may have been ephemeral or persistent. Leave their
+-- profile unknown rather than inventing identity provenance; the legacy
+-- project-level state.json remains the persistent "default" profile state.
