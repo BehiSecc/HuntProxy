@@ -124,6 +124,8 @@ pub enum RawReadOutcome {
     Closed,
     Timeout,
     Limit,
+    /// The transport failed after response bytes had already been received.
+    Error,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -144,6 +146,11 @@ pub struct RawReplyResult {
     pub response_bytes: usize,
     pub truncated: bool,
     pub read_outcome: RawReadOutcome,
+    /// Whether the entire received transcript ends with a complete final response.
+    /// Transport errors are reported separately even when framing is complete.
+    pub response_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
     pub responses: Vec<RawResponseSummary>,
     /// Full wire response when capture scope excludes this exchange.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,9 +248,30 @@ impl ReplyService {
             response_to_head,
         )
         .await?;
+        let response_complete =
+            response_complete_at_end(&read.bytes, response_to_head, read.outcome);
+        let truncated = matches!(
+            read.outcome,
+            RawReadOutcome::Limit | RawReadOutcome::Timeout
+        ) || !response_complete;
+        let completion = match read.outcome {
+            RawReadOutcome::Error => CompletionState::ConnectionError,
+            RawReadOutcome::Timeout => CompletionState::Timeout,
+            RawReadOutcome::Limit => CompletionState::TruncatedByPolicy,
+            _ if !response_complete => CompletionState::ProtocolError,
+            _ => CompletionState::Complete,
+        };
+        let error_message = read.transport_error.clone().or_else(|| match read.outcome {
+            RawReadOutcome::Limit => {
+                Some("raw response transcript truncated by project body limit".into())
+            }
+            RawReadOutcome::Timeout => Some("raw response transcript ended at read timeout".into()),
+            _ if !response_complete => {
+                Some("raw transport ended before a complete response was received".into())
+            }
+            _ => None,
+        });
         let raw_response = read.bytes;
-        let truncated =
-            read.outcome == RawReadOutcome::Limit || read.outcome == RawReadOutcome::Timeout;
         let responses = parse_response_summaries_for(&raw_response, response_to_head);
         let parsed = parse_response(&raw_response);
         let method = parse_request_method(&request_bytes).unwrap_or_else(|| "RAW".into());
@@ -283,11 +311,7 @@ impl ReplyService {
                         query: target.query.clone(),
                         status_code: parsed.status_code,
                         mime,
-                        completion: if truncated {
-                            CompletionState::TruncatedByPolicy
-                        } else {
-                            CompletionState::Complete
-                        },
+                        completion,
                         capture_quality: CaptureQuality::WirePreserved,
                         header_representation: HeaderRepresentation::WirePreserved,
                         body_representation: BodyRepresentation::WireEncoded,
@@ -301,12 +325,7 @@ impl ReplyService {
                         duration_ms: Some(started.elapsed().as_millis() as i64),
                         lineage: context.lineage,
                         page_title,
-                        error_message: truncated.then(|| match read.outcome {
-                            RawReadOutcome::Limit => {
-                                "raw response transcript truncated by project body limit".into()
-                            }
-                            _ => "raw response transcript ended at read timeout".into(),
-                        }),
+                        error_message,
                     })
                     .await?,
             )
@@ -342,6 +361,8 @@ impl ReplyService {
             response_bytes: raw_response.len(),
             truncated,
             read_outcome: read.outcome,
+            response_complete,
+            transport_error: read.transport_error,
             responses,
             response_base64: (!should_capture).then(|| {
                 use base64::Engine;
@@ -683,12 +704,18 @@ async fn write_and_read_raw_request(
             response_to_head,
         )
         .await?;
-        if let Err(error) = write_raw_part(stream, &request[offset..]).await {
-            if early.bytes.is_empty() {
-                return Err(error);
-            }
+        if matches!(
+            early.outcome,
+            RawReadOutcome::Error | RawReadOutcome::Closed | RawReadOutcome::Limit
+        ) {
+            return Ok(early);
         }
-        finish_raw_write(stream, options.half_close_write).await?;
+        if let Err(error) = write_raw_part(stream, &request[offset..]).await {
+            return RawReadResult::after_error(early.bytes, error);
+        }
+        if let Err(error) = finish_raw_write(stream, options.half_close_write).await {
+            return RawReadResult::after_error(early.bytes, error);
+        }
         Some(early.bytes)
     } else {
         write_raw_request(stream, request, options).await?;
@@ -730,6 +757,33 @@ async fn finish_raw_write(
 struct RawReadResult {
     bytes: Vec<u8>,
     outcome: RawReadOutcome,
+    transport_error: Option<String>,
+}
+
+impl RawReadResult {
+    fn ended(bytes: Vec<u8>, outcome: RawReadOutcome) -> Self {
+        Self {
+            bytes,
+            outcome,
+            transport_error: None,
+        }
+    }
+
+    fn after_error(bytes: Vec<u8>, error: DomainError) -> DomainResult<Self> {
+        if bytes.is_empty() {
+            return Err(error);
+        }
+        let outcome = if error.code() == ErrorCode::Timeout {
+            RawReadOutcome::Timeout
+        } else {
+            RawReadOutcome::Error
+        };
+        Ok(Self {
+            bytes,
+            outcome,
+            transport_error: Some(error.to_string()),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -758,67 +812,43 @@ async fn read_raw_response_from(
         if options.response_mode == RawResponseMode::Auto
             && response_is_complete(&bytes, response_to_head)
         {
-            return Ok(RawReadResult {
-                bytes,
-                outcome: RawReadOutcome::Complete,
-            });
+            return Ok(RawReadResult::ended(bytes, RawReadOutcome::Complete));
         }
         if bytes.len() >= cap {
-            return Ok(RawReadResult {
-                bytes,
-                outcome: RawReadOutcome::Limit,
-            });
+            return Ok(RawReadResult::ended(bytes, RawReadOutcome::Limit));
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return if find_header_end(&bytes).is_some() {
-                Ok(RawReadResult {
-                    bytes,
-                    outcome: RawReadOutcome::Timeout,
-                })
-            } else {
-                Err(DomainError::new(
-                    ErrorCode::Timeout,
-                    "raw response timed out",
-                ))
-            };
+            return RawReadResult::after_error(
+                bytes,
+                DomainError::new(ErrorCode::Timeout, "raw response timed out"),
+            );
         }
         let read_len = chunk.len().min(cap - bytes.len());
         let at_response_boundary = transcript_ends_at_complete_response(&bytes, response_to_head);
-        let read_wait =
-            if options.response_mode == RawResponseMode::UntilIdle && at_response_boundary {
-                remaining.min(Duration::from_millis(options.idle_timeout_ms))
-            } else {
-                remaining
-            };
+        let idle_wait = Duration::from_millis(options.idle_timeout_ms);
+        let waiting_for_idle = options.response_mode == RawResponseMode::UntilIdle
+            && at_response_boundary
+            && idle_wait < remaining;
+        let read_wait = if waiting_for_idle {
+            idle_wait
+        } else {
+            remaining
+        };
         match tokio::time::timeout(read_wait, stream.read(&mut chunk[..read_len])).await {
             Ok(Ok(0)) => {
-                return Ok(RawReadResult {
-                    bytes,
-                    outcome: RawReadOutcome::Closed,
-                });
+                return Ok(RawReadResult::ended(bytes, RawReadOutcome::Closed));
             }
             Ok(Ok(n)) => bytes.extend_from_slice(&chunk[..n]),
-            Ok(Err(error)) => return Err(io_error(error)),
-            Err(_)
-                if options.response_mode == RawResponseMode::UntilIdle && at_response_boundary =>
-            {
-                return Ok(RawReadResult {
-                    bytes,
-                    outcome: RawReadOutcome::Idle,
-                });
-            }
-            Err(_) if find_header_end(&bytes).is_some() => {
-                return Ok(RawReadResult {
-                    bytes,
-                    outcome: RawReadOutcome::Timeout,
-                });
+            Ok(Err(error)) => return RawReadResult::after_error(bytes, io_error(error)),
+            Err(_) if waiting_for_idle => {
+                return Ok(RawReadResult::ended(bytes, RawReadOutcome::Idle));
             }
             Err(_) => {
-                return Err(DomainError::new(
-                    ErrorCode::Timeout,
-                    "raw response timed out",
-                ))
+                return RawReadResult::after_error(
+                    bytes,
+                    DomainError::new(ErrorCode::Timeout, "raw response timed out"),
+                );
             }
         }
     }
@@ -836,39 +866,24 @@ async fn read_during_split_pause(
     let mut chunk = [0u8; 16 * 1024];
     loop {
         if response_is_complete(&bytes, response_to_head) {
-            return Ok(RawReadResult {
-                bytes,
-                outcome: RawReadOutcome::Complete,
-            });
+            return Ok(RawReadResult::ended(bytes, RawReadOutcome::Complete));
         }
         if bytes.len() >= cap {
-            return Ok(RawReadResult {
-                bytes,
-                outcome: RawReadOutcome::Limit,
-            });
+            return Ok(RawReadResult::ended(bytes, RawReadOutcome::Limit));
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Ok(RawReadResult {
-                bytes,
-                outcome: RawReadOutcome::Timeout,
-            });
+            return Ok(RawReadResult::ended(bytes, RawReadOutcome::Timeout));
         }
         let read_len = chunk.len().min(cap - bytes.len());
         match tokio::time::timeout(remaining, stream.read(&mut chunk[..read_len])).await {
             Ok(Ok(0)) => {
-                return Ok(RawReadResult {
-                    bytes,
-                    outcome: RawReadOutcome::Closed,
-                })
+                return Ok(RawReadResult::ended(bytes, RawReadOutcome::Closed));
             }
             Ok(Ok(read)) => bytes.extend_from_slice(&chunk[..read]),
-            Ok(Err(error)) => return Err(io_error(error)),
+            Ok(Err(error)) => return RawReadResult::after_error(bytes, io_error(error)),
             Err(_) => {
-                return Ok(RawReadResult {
-                    bytes,
-                    outcome: RawReadOutcome::Timeout,
-                })
+                return Ok(RawReadResult::ended(bytes, RawReadOutcome::Timeout));
             }
         }
     }
@@ -992,16 +1007,59 @@ fn transcript_ends_at_complete_response(raw: &[u8], response_to_head: bool) -> b
         })
 }
 
+fn response_complete_at_end(raw: &[u8], response_to_head: bool, outcome: RawReadOutcome) -> bool {
+    if transcript_ends_at_complete_response(raw, response_to_head) {
+        return true;
+    }
+    if outcome != RawReadOutcome::Closed {
+        return false;
+    }
+    // Only a clean EOF can complete a close-delimited response. A reset or
+    // TLS error cannot establish that all of its body was received.
+    let mut remaining = raw;
+    loop {
+        let Some(status) = response_status(remaining) else {
+            return false;
+        };
+        let Some(header_end) = find_header_end(remaining) else {
+            return false;
+        };
+        if let Some(length) = response_message_length(remaining, response_to_head) {
+            let Some(rest) = remaining.get(length..) else {
+                return false;
+            };
+            if rest.is_empty() {
+                return status >= 200 || status == 101;
+            }
+            remaining = rest;
+            continue;
+        }
+        if status < 200 {
+            return false;
+        }
+        let headers = String::from_utf8_lossy(&remaining[..header_end]);
+        let transfer_encodings = header_values(&headers, "transfer-encoding");
+        if transfer_encodings
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains("chunked"))
+        {
+            return false;
+        }
+        return !transfer_encodings.is_empty()
+            || header_values(&headers, "content-length").is_empty();
+    }
+}
+
 fn response_status(bytes: &[u8]) -> Option<u16> {
-    let header_end = find_header_end(bytes)?;
-    std::str::from_utf8(&bytes[..header_end])
+    let line_end = find_bytes(bytes, b"\r\n")?;
+    let mut fields = std::str::from_utf8(&bytes[..line_end])
         .ok()?
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
+        .split_ascii_whitespace();
+    if !fields.next()?.starts_with("HTTP/") {
+        return None;
+    }
+    let status = fields.next()?.parse::<u16>().ok()?;
+    (100..=599).contains(&status).then_some(status)
 }
 
 /// Return the first response entity for normal presentation. New raw exchanges
@@ -1048,7 +1106,7 @@ fn parse_response(raw: &[u8]) -> ParsedResponse {
     let raw = first_final_response(raw);
     let Some(header_end) = find_header_end(raw) else {
         return ParsedResponse {
-            status_code: None,
+            status_code: response_status(raw),
             headers: Vec::new(),
             body: raw.to_vec(),
         };
@@ -1218,6 +1276,398 @@ pub fn redact_raw_request_headers(request: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    enum ReadEnding {
+        Error(io::ErrorKind),
+        Eof,
+        Pending,
+    }
+
+    struct ResponseFixture {
+        bytes: &'static [u8],
+        offset: usize,
+        ending: ReadEnding,
+        writes: usize,
+        write_error_after: Option<usize>,
+        flush_error_after: Option<usize>,
+        shutdown_error: bool,
+    }
+
+    impl ResponseFixture {
+        fn new(bytes: &'static [u8], ending: ReadEnding) -> Self {
+            Self {
+                bytes,
+                offset: 0,
+                ending,
+                writes: 0,
+                write_error_after: None,
+                flush_error_after: None,
+                shutdown_error: false,
+            }
+        }
+    }
+
+    impl AsyncRead for ResponseFixture {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.offset < self.bytes.len() {
+                let end = self
+                    .offset
+                    .saturating_add(buf.remaining())
+                    .min(self.bytes.len());
+                buf.put_slice(&self.bytes[self.offset..end]);
+                self.offset = end;
+                return Poll::Ready(Ok(()));
+            }
+            match self.ending {
+                ReadEnding::Error(kind) => {
+                    Poll::Ready(Err(io::Error::new(kind, "fixture connection ended")))
+                }
+                ReadEnding::Eof => Poll::Ready(Ok(())),
+                ReadEnding::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for ResponseFixture {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self
+                .write_error_after
+                .is_some_and(|count| self.writes >= count)
+            {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture continuation write failed",
+                )));
+            }
+            self.writes += 1;
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self
+                .flush_error_after
+                .is_some_and(|count| self.writes >= count)
+            {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture continuation flush failed",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.shutdown_error {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture shutdown failed",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const COMPLETE_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const PARTIAL_BODY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok";
+    const PARTIAL_HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Len";
+
+    #[tokio::test]
+    async fn raw_read_retains_bytes_and_observed_status_after_transport_errors() {
+        for bytes in [
+            COMPLETE_RESPONSE,
+            PARTIAL_BODY,
+            PARTIAL_HEADERS,
+            &b"HTTP/1.1 2"[..],
+        ] {
+            for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::UnexpectedEof] {
+                let mut stream: Pin<Box<dyn RawIo>> =
+                    Box::pin(ResponseFixture::new(bytes, ReadEnding::Error(kind)));
+                let read = read_raw_response(
+                    &mut stream,
+                    4096,
+                    &RawHttp1Options {
+                        response_mode: RawResponseMode::UntilClose,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(read.bytes, bytes);
+                assert_eq!(read.outcome, RawReadOutcome::Error);
+                assert!(read.transport_error.is_some());
+                assert_eq!(
+                    parse_response(&read.bytes).status_code,
+                    if bytes == b"HTTP/1.1 2" {
+                        None
+                    } else {
+                        Some(200)
+                    }
+                );
+                assert_eq!(
+                    response_complete_at_end(&read.bytes, false, read.outcome),
+                    bytes == COMPLETE_RESPONSE
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_read_preserves_partial_headers_on_timeout_and_rejects_zero_byte_failures() {
+        for bytes in [PARTIAL_HEADERS, PARTIAL_BODY] {
+            let mut stream: Pin<Box<dyn RawIo>> =
+                Box::pin(ResponseFixture::new(bytes, ReadEnding::Pending));
+            let read = read_raw_response(
+                &mut stream,
+                4096,
+                &RawHttp1Options {
+                    read_timeout_ms: 20,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(read.bytes, bytes);
+            assert_eq!(read.outcome, RawReadOutcome::Timeout);
+            assert!(!response_complete_at_end(&read.bytes, false, read.outcome));
+            assert!(read.transport_error.is_some());
+        }
+        for ending in [
+            ReadEnding::Error(io::ErrorKind::ConnectionReset),
+            ReadEnding::Pending,
+        ] {
+            let mut stream: Pin<Box<dyn RawIo>> = Box::pin(ResponseFixture::new(b"", ending));
+            assert!(read_raw_response(
+                &mut stream,
+                4096,
+                &RawHttp1Options {
+                    read_timeout_ms: 20,
+                    ..Default::default()
+                },
+                false
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(parse_response(b"").status_code, None);
+        assert_eq!(parse_response(b"HTTP/1.1 20").status_code, None);
+        assert_eq!(parse_response(b"message 200 OK\r\n").status_code, None);
+    }
+
+    #[tokio::test]
+    async fn raw_read_distinguishes_clean_close_incomplete_eof_and_limits() {
+        for (bytes, complete) in [
+            (COMPLETE_RESPONSE, true),
+            (PARTIAL_BODY, false),
+            (PARTIAL_HEADERS, false),
+            (&b"HTTP/1.1 200 OK\r\n\r\nok"[..], true),
+            (&b"HTTP/1.1 100 Continue\r\n\r\n"[..], false),
+        ] {
+            let mut stream: Pin<Box<dyn RawIo>> =
+                Box::pin(ResponseFixture::new(bytes, ReadEnding::Eof));
+            let read = read_raw_response(
+                &mut stream,
+                4096,
+                &RawHttp1Options {
+                    response_mode: RawResponseMode::UntilClose,
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(read.bytes, bytes);
+            assert_eq!(read.outcome, RawReadOutcome::Closed);
+            assert_eq!(
+                response_complete_at_end(&read.bytes, false, read.outcome),
+                complete
+            );
+            assert!(read.transport_error.is_none());
+        }
+        let mut stream: Pin<Box<dyn RawIo>> = Box::pin(ResponseFixture::new(
+            COMPLETE_RESPONSE,
+            ReadEnding::Error(io::ErrorKind::ConnectionReset),
+        ));
+        let read = read_raw_response(&mut stream, 8, &RawHttp1Options::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(read.bytes, b"HTTP/1.1");
+        assert_eq!(read.outcome, RawReadOutcome::Limit);
+        assert!(!response_complete_at_end(&read.bytes, false, read.outcome));
+    }
+
+    #[tokio::test]
+    async fn raw_read_reports_total_timeout_even_at_a_complete_response_boundary() {
+        let mut stream: Pin<Box<dyn RawIo>> =
+            Box::pin(ResponseFixture::new(COMPLETE_RESPONSE, ReadEnding::Pending));
+        let read = read_raw_response(
+            &mut stream,
+            4096,
+            &RawHttp1Options {
+                response_mode: RawResponseMode::UntilIdle,
+                read_timeout_ms: 20,
+                idle_timeout_ms: 100,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.bytes, COMPLETE_RESPONSE);
+        assert_eq!(read.outcome, RawReadOutcome::Timeout);
+        assert!(response_complete_at_end(&read.bytes, false, read.outcome));
+    }
+
+    #[test]
+    fn raw_completion_requires_a_complete_final_transcript_and_respects_clean_eof() {
+        let complete_pair = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+        assert!(response_complete_at_end(
+            complete_pair,
+            false,
+            RawReadOutcome::Error
+        ));
+        let partial_pair = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\n";
+        assert!(!response_complete_at_end(
+            partial_pair,
+            false,
+            RawReadOutcome::Closed
+        ));
+        let close_delimited = b"HTTP/1.1 200 OK\r\n\r\nok";
+        assert!(response_complete_at_end(
+            close_delimited,
+            false,
+            RawReadOutcome::Closed
+        ));
+        assert!(!response_complete_at_end(
+            close_delimited,
+            false,
+            RawReadOutcome::Error
+        ));
+        assert!(response_complete_at_end(
+            COMPLETE_RESPONSE,
+            false,
+            RawReadOutcome::Limit
+        ));
+        assert!(!response_complete_at_end(
+            b"",
+            false,
+            RawReadOutcome::Closed
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_pause_retains_read_errors_and_all_continuation_failures() {
+        let options = RawHttp1Options {
+            pause_at_byte: Some(3),
+            pause_ms: Some(20),
+            await_response_before_continue: true,
+            read_timeout_ms: 20,
+            ..Default::default()
+        };
+        let mut stream: Pin<Box<dyn RawIo>> = Box::pin(ResponseFixture::new(
+            PARTIAL_HEADERS,
+            ReadEnding::Error(io::ErrorKind::ConnectionReset),
+        ));
+        let read = write_and_read_raw_request(&mut stream, b"normal", 4096, &options, false)
+            .await
+            .unwrap();
+        assert_eq!(read.bytes, PARTIAL_HEADERS);
+        assert_eq!(read.outcome, RawReadOutcome::Error);
+        assert!(read.transport_error.is_some());
+        for stage in 0..3 {
+            let mut fixture = ResponseFixture::new(COMPLETE_RESPONSE, ReadEnding::Eof);
+            fixture.write_error_after = (stage == 0).then_some(1);
+            fixture.flush_error_after = (stage == 1).then_some(2);
+            fixture.shutdown_error = stage == 2;
+            let mut stream: Pin<Box<dyn RawIo>> = Box::pin(fixture);
+            let read = write_and_read_raw_request(
+                &mut stream,
+                b"normal",
+                4096,
+                &RawHttp1Options {
+                    half_close_write: stage == 2,
+                    ..options.clone()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(read.bytes, COMPLETE_RESPONSE);
+            assert_eq!(read.outcome, RawReadOutcome::Error);
+            assert!(read.transport_error.is_some());
+            assert!(response_complete_at_end(&read.bytes, false, read.outcome));
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_tls_read_retains_response_without_close_notify() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = certificate.cert.der().clone();
+        let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert_der.clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut tls = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config))
+                .accept(server_io)
+                .await
+                .unwrap();
+            tls.write_all(COMPLETE_RESPONSE).await.unwrap();
+            tls.flush().await.unwrap();
+            // Dropping without shutdown gives real rustls an abrupt TLS EOF.
+        });
+        let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config))
+            .connect(ServerName::try_from("localhost").unwrap(), client_io)
+            .await
+            .unwrap();
+        let mut stream: Pin<Box<dyn RawIo>> = Box::pin(tls);
+        let read = read_raw_response(
+            &mut stream,
+            4096,
+            &RawHttp1Options {
+                response_mode: RawResponseMode::UntilClose,
+                read_timeout_ms: 1000,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.bytes, COMPLETE_RESPONSE);
+        assert_eq!(read.outcome, RawReadOutcome::Error);
+        assert!(read.transport_error.is_some());
+        assert_eq!(parse_response(&read.bytes).status_code, Some(200));
+        server.await.unwrap();
+    }
 
     #[test]
     fn detects_content_length_and_chunked_completion() {

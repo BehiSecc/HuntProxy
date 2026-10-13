@@ -2990,7 +2990,11 @@ impl PluginService {
                     None => None,
                 };
                 let raw = plugin_raw_observation(&response, transcript)?;
-                Ok(json!({"id":request.id,"raw":raw}))
+                let mut observation = json!({"id":request.id,"raw":raw});
+                if let Some(error) = raw_response_error(&response) {
+                    observation["error"] = json!(error);
+                }
+                Ok(observation)
             }
             PluginOperation::RawHttp1Group(group) => {
                 validate_workflow_name(&group.id, "raw_http1_group id")?;
@@ -3097,7 +3101,11 @@ impl PluginService {
                                     Some(exchange_id) => service.db.load_raw_body(project_id, exchange_id, MessageSide::Response).await?,
                                     None => None,
                                 };
-                                json!({"id":member_id,"raw":plugin_raw_observation(&response, transcript)?})
+                                let mut observation = json!({"id":member_id,"raw":plugin_raw_observation(&response, transcript)?});
+                                if let Some(error) = raw_response_error(&response) {
+                                    observation["error"] = json!(error);
+                                }
+                                observation
                             }
                             Err(error) if error.code() == ErrorCode::Cancelled => return Err(error),
                             Err(error) => json!({"id":member_id,"error":{"code":error.code().as_str(),"message":error.to_string()}}),
@@ -3190,6 +3198,7 @@ impl PluginService {
                         "reset": stream.reset,
                         "complete": stream.complete,
                         "truncated": stream.truncated,
+                        "transport_error": stream.transport_error,
                     }));
                 }
                 Ok(json!({
@@ -3198,6 +3207,7 @@ impl PluginService {
                     "single_write_release": response.single_write_release,
                     "goaway": response.goaway,
                     "timed_out": response.timed_out,
+                    "transport_error": response.transport_error,
                     "streams": streams,
                 }))
             }
@@ -3921,7 +3931,7 @@ impl PluginService {
                 "complete": response.complete,
                 "truncated": response.truncated,
                 "reset": response.reset,
-                "error": Value::Null,
+                "error": response.transport_error,
             }));
         }
         Ok(json!({
@@ -3933,6 +3943,7 @@ impl PluginService {
             "responses": responses,
             "error": if result.timed_out { json!({"code":"timeout","message":"HTTP/2 race response timed out"}) } else { Value::Null },
             "goaway": result.goaway,
+            "transport_error": result.transport_error,
         }))
     }
 
@@ -3998,10 +4009,14 @@ impl PluginService {
                 )
                 .await?;
             }
-            let success = self
-                .evaluate_race_exchange(project_id, response.exchange_id, request.success.as_ref())
-                .await?;
-            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_bytes,"response_body_hash":Value::Null,"duration_ms":Value::Null,"success":success,"error":Value::Null}))
+            let error = raw_response_error(&response);
+            let success = if error.is_none() {
+                self.evaluate_race_exchange(project_id, response.exchange_id, request.success.as_ref())
+                    .await?
+            } else {
+                Value::Null
+            };
+            Ok::<_, DomainError>(json!({"id":request.id,"exchange_id":response.exchange_id,"status_code":response.status_code,"response_length":response.response_bytes,"response_body_hash":Value::Null,"duration_ms":Value::Null,"success":success,"response_complete":response.response_complete,"transport_error":response.transport_error,"error":error}))
         }.await;
         result.unwrap_or_else(|error| json!({"id":request.id,"error":error.to_string()}))
     }
@@ -4026,6 +4041,9 @@ impl PluginService {
                 crate::policy::PresentationOptions::default(),
             )
             .await?;
+        if detail.summary.completion != CompletionState::Complete {
+            return Ok(Value::Null);
+        }
         let headers = self
             .db
             .load_raw_headers(project_id, exchange_id, MessageSide::Response)
@@ -4790,6 +4808,13 @@ fn plugin_response_body(
         contains,
         search_complete: true,
     }
+}
+
+fn raw_response_error(response: &crate::reply::RawReplyResult) -> Option<String> {
+    response.transport_error.clone().or_else(|| {
+        (!response.response_complete || response.truncated)
+            .then(|| "raw response transcript is incomplete or truncated".into())
+    })
 }
 
 fn plugin_raw_observation(
@@ -8197,12 +8222,44 @@ mod tests {
             response_bytes: 2,
             truncated: false,
             read_outcome: crate::reply::RawReadOutcome::Complete,
+            response_complete: true,
+            transport_error: None,
             responses: vec![],
             response_base64: None,
         };
         let value = plugin_raw_observation(&response, Some(b"ok".to_vec())).unwrap();
         assert_eq!(value["response_transcript_base64"], "b2s=");
         assert_eq!(value["response_transcript_truncated"], false);
+        assert!(raw_response_error(&response).is_none());
+    }
+
+    #[test]
+    fn retained_raw_transport_failures_are_not_clean_plugin_observations() {
+        let mut response = crate::reply::RawReplyResult {
+            exchange_id: Some(ExchangeId(9)),
+            status_code: Some(200),
+            response_bytes: 2,
+            truncated: false,
+            read_outcome: crate::reply::RawReadOutcome::Error,
+            response_complete: true,
+            transport_error: Some("connection closed unexpectedly".into()),
+            responses: vec![],
+            response_base64: None,
+        };
+        let value = plugin_raw_observation(&response, Some(b"ok".to_vec())).unwrap();
+        assert_eq!(value["exchange_id"], 9);
+        assert_eq!(value["status_code"], 200);
+        assert_eq!(value["response_transcript_base64"], "b2s=");
+        assert_eq!(
+            raw_response_error(&response).as_deref(),
+            Some("connection closed unexpectedly")
+        );
+        response.transport_error = None;
+        response.response_complete = false;
+        assert!(raw_response_error(&response).is_some());
+        response.response_complete = true;
+        response.truncated = true;
+        assert!(raw_response_error(&response).is_some());
     }
 
     #[test]

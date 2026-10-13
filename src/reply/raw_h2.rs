@@ -73,6 +73,8 @@ pub struct RawHttp2StreamResult {
     pub reset: Option<String>,
     pub complete: bool,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -82,6 +84,8 @@ pub struct RawHttp2Result {
     pub single_write_release: bool,
     pub goaway: Option<String>,
     pub timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
 }
 
 struct PreparedStream {
@@ -153,108 +157,21 @@ impl ReplyService {
         let response_cap = usize::try_from(project.limits.max_body_bytes.saturating_add(64 * 1024))
             .unwrap_or(usize::MAX)
             .min(MAX_BODY_BYTES);
-        let mut received = BTreeMap::<u32, ReceivedStream>::new();
-        let mut goaway = None;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-        let mut timed_out = false;
-        let mut codec = http2::Codec::<_, Bytes>::new(io);
-        loop {
-            if expected.iter().all(|id| {
-                received
-                    .get(id)
-                    .is_some_and(|response| response.complete || response.reset.is_some())
-            }) {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                timed_out = true;
-                break;
-            }
-            let frame = match tokio::time::timeout(remaining, codec.next()).await {
-                Ok(Some(Ok(frame))) => frame,
-                Ok(Some(Err(error))) => {
-                    return Err(DomainError::new(
-                        ErrorCode::ProtocolError,
-                        format!("HTTP/2 response framing: {error}"),
-                    ))
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    timed_out = true;
-                    break;
-                }
-            };
-            match frame {
-                Frame::Settings(settings) if !settings.is_ack() => {
-                    codec.send(Settings::ack().into()).await.map_err(|error| {
-                        DomainError::new(
-                            ErrorCode::ProtocolError,
-                            format!("HTTP/2 SETTINGS acknowledgement: {error}"),
-                        )
-                    })?;
-                }
-                Frame::Headers(headers) => {
-                    let stream_id = u32::from(headers.stream_id());
-                    if !expected.contains(&stream_id) {
-                        continue;
-                    }
-                    let end_stream = headers.is_end_stream();
-                    let (pseudo, fields) = headers.into_parts();
-                    let response = received.entry(stream_id).or_default();
-                    if let Some(status) = pseudo.status {
-                        response.status = Some(status.as_u16());
-                    }
-                    let mut ordinal = response.headers.len() as u32;
-                    for name in fields.keys() {
-                        for value in fields.get_all(name) {
-                            response.headers.push(HeaderEntry {
-                                name: name.as_str().to_string(),
-                                value: value.as_bytes().to_vec(),
-                                ordinal,
-                            });
-                            ordinal += 1;
-                        }
-                    }
-                    response.complete |= end_stream;
-                }
-                Frame::Data(data) => {
-                    let stream_id = u32::from(data.stream_id());
-                    if !expected.contains(&stream_id) {
-                        continue;
-                    }
-                    let end_stream = data.is_end_stream();
-                    let response = received.entry(stream_id).or_default();
-                    if response.body.len() < response_cap {
-                        let remaining = response_cap - response.body.len();
-                        response.truncated |= data.payload().len() > remaining;
-                        response.body.extend_from_slice(
-                            &data.payload()[..data.payload().len().min(remaining)],
-                        );
-                    } else if !data.payload().is_empty() {
-                        response.truncated = true;
-                    }
-                    response.complete |= end_stream;
-                }
-                Frame::Reset(reset) => {
-                    let stream_id = u32::from(reset.stream_id());
-                    if expected.contains(&stream_id) {
-                        received.entry(stream_id).or_default().reset =
-                            Some(format!("{:?}", reset.reason()));
-                    }
-                }
-                Frame::GoAway(frame) => {
-                    goaway = Some(format!("{:?}", frame.reason()));
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let read = read_http2_responses(io, &expected, response_cap, timeout_ms).await?;
+        let Http2ReadResult {
+            mut received,
+            goaway,
+            timed_out,
+            transport_error,
+        } = read;
 
         let should_capture = crate::policy::url_is_in_scope(target_url, &project.scope)?;
         let mut results = Vec::with_capacity(prepared.len());
         for stream in prepared {
             let response = received.remove(&stream.stream_id).unwrap_or_default();
+            let stream_transport_error = (!response.complete && response.reset.is_none())
+                .then(|| transport_error.clone())
+                .flatten();
             let exchange_id = if should_capture {
                 let (method, path, query) = request_metadata(&stream.headers, &target);
                 let mime = response
@@ -279,8 +196,14 @@ impl ReplyService {
                             mime,
                             completion: if response.complete && !response.truncated {
                                 CompletionState::Complete
-                            } else {
+                            } else if timed_out && !response.truncated {
+                                CompletionState::Timeout
+                            } else if stream_transport_error.is_some() {
+                                CompletionState::ConnectionError
+                            } else if response.truncated {
                                 CompletionState::TruncatedByPolicy
+                            } else {
+                                CompletionState::ProtocolError
                             },
                             capture_quality: CaptureQuality::Mixed,
                             header_representation: HeaderRepresentation::Mixed,
@@ -308,16 +231,19 @@ impl ReplyService {
                             duration_ms: Some(started.elapsed().as_millis() as i64),
                             lineage: context.lineage.clone(),
                             page_title: None,
-                            error_message: response.reset.clone().or_else(|| {
-                                (!response.complete).then(|| {
-                                    if timed_out {
-                                        "raw HTTP/2 response timed out"
-                                    } else {
-                                        "raw HTTP/2 connection ended before END_STREAM"
-                                    }
-                                    .to_string()
-                                })
-                            }),
+                            error_message: stream_transport_error
+                                .clone()
+                                .or_else(|| response.reset.clone())
+                                .or_else(|| {
+                                    (!response.complete).then(|| {
+                                        if timed_out {
+                                            "raw HTTP/2 response timed out"
+                                        } else {
+                                            "raw HTTP/2 connection ended before END_STREAM"
+                                        }
+                                        .to_string()
+                                    })
+                                }),
                         })
                         .await?,
                 )
@@ -333,6 +259,7 @@ impl ReplyService {
                 reset: response.reset,
                 complete: response.complete,
                 truncated: response.truncated,
+                transport_error: stream_transport_error,
             });
         }
         Ok(RawHttp2Result {
@@ -341,8 +268,154 @@ impl ReplyService {
             single_write_release: options.final_data_together,
             goaway,
             timed_out,
+            transport_error,
         })
     }
+}
+
+struct Http2ReadResult {
+    received: BTreeMap<u32, ReceivedStream>,
+    goaway: Option<String>,
+    timed_out: bool,
+    transport_error: Option<String>,
+}
+
+async fn read_http2_responses(
+    io: Pin<Box<dyn RawIo>>,
+    expected: &HashSet<u32>,
+    response_cap: usize,
+    timeout_ms: u64,
+) -> DomainResult<Http2ReadResult> {
+    let mut received = BTreeMap::<u32, ReceivedStream>::new();
+    let mut goaway = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    let mut transport_error = None;
+    let mut codec = http2::Codec::<_, Bytes>::new(io);
+    loop {
+        if expected.iter().all(|id| {
+            received
+                .get(id)
+                .is_some_and(|response| response.complete || response.reset.is_some())
+        }) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        let frame = match tokio::time::timeout(remaining, codec.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(error))) => {
+                let error = DomainError::new(
+                    ErrorCode::ProtocolError,
+                    format!("HTTP/2 response framing: {error}"),
+                );
+                if received.is_empty() {
+                    return Err(error);
+                }
+                transport_error = Some(error.to_string());
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        };
+        match frame {
+            Frame::Settings(settings) if !settings.is_ack() => {
+                let ack = tokio::time::timeout(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    codec.send(Settings::ack().into()),
+                )
+                .await;
+                let error = match ack {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(DomainError::new(
+                        ErrorCode::ProtocolError,
+                        format!("HTTP/2 SETTINGS acknowledgement: {error}"),
+                    )),
+                    Err(_) => {
+                        timed_out = true;
+                        Some(DomainError::new(
+                            ErrorCode::Timeout,
+                            "HTTP/2 SETTINGS acknowledgement timed out",
+                        ))
+                    }
+                };
+                if let Some(error) = error {
+                    if received.is_empty() {
+                        return Err(error);
+                    }
+                    transport_error = Some(error.to_string());
+                    break;
+                }
+            }
+            Frame::Headers(headers) => {
+                let stream_id = u32::from(headers.stream_id());
+                if !expected.contains(&stream_id) {
+                    continue;
+                }
+                let end_stream = headers.is_end_stream();
+                let (pseudo, fields) = headers.into_parts();
+                let response = received.entry(stream_id).or_default();
+                if let Some(status) = pseudo.status {
+                    response.status = Some(status.as_u16());
+                }
+                let mut ordinal = response.headers.len() as u32;
+                for name in fields.keys() {
+                    for value in fields.get_all(name) {
+                        response.headers.push(HeaderEntry {
+                            name: name.as_str().to_string(),
+                            value: value.as_bytes().to_vec(),
+                            ordinal,
+                        });
+                        ordinal += 1;
+                    }
+                }
+                response.complete |= end_stream;
+            }
+            Frame::Data(data) => {
+                let stream_id = u32::from(data.stream_id());
+                if !expected.contains(&stream_id) {
+                    continue;
+                }
+                let end_stream = data.is_end_stream();
+                let response = received.entry(stream_id).or_default();
+                if response.body.len() < response_cap {
+                    let remaining = response_cap - response.body.len();
+                    response.truncated |= data.payload().len() > remaining;
+                    response
+                        .body
+                        .extend_from_slice(&data.payload()[..data.payload().len().min(remaining)]);
+                } else if !data.payload().is_empty() {
+                    response.truncated = true;
+                }
+                response.complete |= end_stream;
+            }
+            Frame::Reset(reset) => {
+                let stream_id = u32::from(reset.stream_id());
+                if expected.contains(&stream_id) {
+                    received.entry(stream_id).or_default().reset =
+                        Some(format!("{:?}", reset.reason()));
+                }
+            }
+            Frame::GoAway(frame) => {
+                goaway = Some(format!("{:?}", frame.reason()));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Http2ReadResult {
+        received,
+        goaway,
+        timed_out,
+        transport_error,
+    })
 }
 
 fn prepare_streams(
@@ -694,6 +767,210 @@ fn request_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    enum FixtureEnding {
+        Error,
+        Eof,
+        Pending,
+    }
+
+    struct ResponseFixture {
+        bytes: Vec<u8>,
+        offset: usize,
+        ending: FixtureEnding,
+        write_error: bool,
+    }
+
+    impl AsyncRead for ResponseFixture {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.offset < self.bytes.len() {
+                let end = self
+                    .offset
+                    .saturating_add(buf.remaining())
+                    .min(self.bytes.len());
+                buf.put_slice(&self.bytes[self.offset..end]);
+                self.offset = end;
+                return Poll::Ready(Ok(()));
+            }
+            match self.ending {
+                FixtureEnding::Error => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "fixture connection reset",
+                ))),
+                FixtureEnding::Eof => Poll::Ready(Ok(())),
+                FixtureEnding::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for ResponseFixture {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.write_error {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture acknowledgement write failed",
+                )));
+            }
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn response_fixture(
+        bytes: Vec<u8>,
+        ending: FixtureEnding,
+        write_error: bool,
+    ) -> Pin<Box<dyn RawIo>> {
+        Box::pin(ResponseFixture {
+            bytes,
+            offset: 0,
+            ending,
+            write_error,
+        })
+    }
+
+    fn append_ordinary_response(wire: &mut Vec<u8>, stream_id: u32, complete: bool) {
+        let mut headers = Vec::new();
+        encode_hpack_literal(&mut headers, b":status", b"200").unwrap();
+        encode_hpack_literal(&mut headers, b"content-type", b"text/plain").unwrap();
+        append_header_block_frames(wire, stream_id, &headers, false).unwrap();
+        append_data_frames(wire, stream_id, b"ok", complete).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http2_reader_retains_response_frames_after_connection_error() {
+        let mut wire = Vec::new();
+        append_ordinary_response(&mut wire, 1, false);
+        let read = read_http2_responses(
+            response_fixture(wire, FixtureEnding::Error, false),
+            &HashSet::from([1]),
+            4096,
+            100,
+        )
+        .await
+        .unwrap();
+        let response = read.received.get(&1).unwrap();
+        assert_eq!(response.status, Some(200));
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.body, b"ok");
+        assert!(!response.complete);
+        assert!(read.transport_error.is_some());
+        assert!(!read.timed_out);
+    }
+
+    #[tokio::test]
+    async fn http2_reader_retains_completed_sibling_and_bounded_partial_body() {
+        let mut wire = Vec::new();
+        append_ordinary_response(&mut wire, 1, true);
+        append_ordinary_response(&mut wire, 3, false);
+        let read = read_http2_responses(
+            response_fixture(wire, FixtureEnding::Error, false),
+            &HashSet::from([1, 3]),
+            1,
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.received.get(&1).unwrap().status, Some(200));
+        assert!(read.received.get(&1).unwrap().complete);
+        assert!(!read.received.get(&3).unwrap().complete);
+        for response in read.received.values() {
+            assert_eq!(response.body, b"o");
+            assert!(response.truncated);
+        }
+        assert!(read.transport_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn http2_reader_retains_responses_after_acknowledgement_write_failure() {
+        let mut wire = Vec::new();
+        append_ordinary_response(&mut wire, 1, false);
+        append_frame(&mut wire, 4, 0, 0, &[]).unwrap();
+        let read = read_http2_responses(
+            response_fixture(wire, FixtureEnding::Eof, true),
+            &HashSet::from([1]),
+            4096,
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.received.get(&1).unwrap().body, b"ok");
+        assert!(read
+            .transport_error
+            .as_deref()
+            .unwrap()
+            .contains("SETTINGS acknowledgement"));
+        let mut initial_settings = Vec::new();
+        append_frame(&mut initial_settings, 4, 0, 0, &[]).unwrap();
+        assert!(read_http2_responses(
+            response_fixture(initial_settings, FixtureEnding::Eof, true),
+            &HashSet::from([1]),
+            4096,
+            100
+        )
+        .await
+        .is_err());
+        assert!(read_http2_responses(
+            response_fixture(Vec::new(), FixtureEnding::Error, false),
+            &HashSet::from([1]),
+            4096,
+            100
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn http2_reader_preserves_ordinary_success_eof_and_timeout() {
+        let mut wire = Vec::new();
+        append_ordinary_response(&mut wire, 1, true);
+        let read = read_http2_responses(
+            response_fixture(wire, FixtureEnding::Error, false),
+            &HashSet::from([1]),
+            4096,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(read.received.get(&1).unwrap().complete);
+        assert!(read.transport_error.is_none());
+        for ending in [FixtureEnding::Eof, FixtureEnding::Pending] {
+            let pending = matches!(ending, FixtureEnding::Pending);
+            let mut wire = Vec::new();
+            append_ordinary_response(&mut wire, 1, false);
+            let read = read_http2_responses(
+                response_fixture(wire, ending, false),
+                &HashSet::from([1]),
+                4096,
+                20,
+            )
+            .await
+            .unwrap();
+            assert_eq!(read.received.get(&1).unwrap().status, Some(200));
+            assert_eq!(read.received.get(&1).unwrap().body, b"ok");
+            assert!(!read.received.get(&1).unwrap().complete);
+            assert_eq!(read.timed_out, pending);
+            assert!(read.transport_error.is_none());
+        }
+    }
 
     #[test]
     fn hpack_literals_preserve_order_and_crlf_values() {
