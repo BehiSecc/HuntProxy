@@ -98,11 +98,10 @@ TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/huntproxy-install.XXXXXX")"
 NEW_BIN=''; LOCK_DIR=''; LOCK_HELD=0; VERIFY_PID=''; NODE_BACKUP=''; WORKER_BACKUP=''; PLUGIN_DIR=''
 NODE_INCOMING=''; PLUGIN_INCOMING=''; PLUGIN_SOURCE_TEMP=''
 NODE_INSTALLED=0; NODE_REUSED=0; WORKER_TOUCHED=0; STATE_BACKED_UP=0; INSTALL_COMPLETE=0
-PLUGIN_STATE_BACKED_UP=0; PLUGIN_DIR_ORIGINALLY_EXISTED=0; CURRENT_RUNTIME=0
+CURRENT_RUNTIME=0
 NEW_PLUGIN_LIST="$TEMP_DIR/new-plugins"
 : >"$NEW_PLUGIN_LIST"
 STATE_BACKUP="$TEMP_DIR/state-backup"
-PLUGIN_STATE_BACKUP="$TEMP_DIR/plugin-state-backup"
 STATE_FILES=(config.toml huntproxy.db huntproxy.db-wal huntproxy.db-shm bb.db bb.db-wal bb.db-shm ca/ca.crt ca/ca.key placeholder.key .mcp-stop-guard)
 
 remove_managed_tree() {
@@ -130,14 +129,6 @@ cleanup() {
     while IFS= read -r plugin_path; do
       [[ -z "$plugin_path" ]] || remove_managed_tree "$plugin_path" "$PLUGIN_DIR"
     done <"$NEW_PLUGIN_LIST"
-    if [[ "$PLUGIN_STATE_BACKED_UP" -eq 1 ]]; then
-      remove_managed_tree "$PLUGIN_DIR" "${PLUGIN_DIR%/*}"
-      if [[ "$PLUGIN_DIR_ORIGINALLY_EXISTED" -eq 1 ]]; then
-        mkdir -p "$PLUGIN_DIR"
-        cp -pR "$PLUGIN_STATE_BACKUP/." "$PLUGIN_DIR/"
-        chmod 700 "$PLUGIN_DIR"
-      fi
-    fi
     if [[ "$STATE_BACKED_UP" -eq 1 ]]; then
       for relative in "${STATE_FILES[@]}"; do
         state_target="$DATA_DIR/$relative"
@@ -214,12 +205,13 @@ show_browser_smoke_error() {
 
 install_chromium_runtime_libraries() {
   local playwright_path=$1
+  local node_path=${2:-$MANAGED_NODE_DIR/bin/node}
   local package_list package
   local packages=() missing_packages=()
   for command_name in apt-get dpkg-query; do
     command -v "$command_name" >/dev/null 2>&1 || return 1
   done
-  package_list="$("$MANAGED_NODE_DIR/bin/node" -e '
+  package_list="$("$node_path" -e '
 const path = require("path");
 const root = process.argv[1];
 const platform = require(path.join(root, "lib/utils/hostPlatform.js"));
@@ -313,6 +305,7 @@ if version_at_least "$binary_version" "0.2.0"; then
   CURRENT_RUNTIME=1
 fi
 
+if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
 # Reuse the private managed runtime when it is already the pinned version.
 if node_runtime_ready "$MANAGED_NODE_DIR"; then
   STAGED_NODE=$MANAGED_NODE_DIR
@@ -345,14 +338,13 @@ else
   ok 'Node.js checksum and runtime verified'
 fi
 
-# HuntProxy 0.2+ embeds its immutable catalog. Legacy hosts receive the exact
-# plugin snapshot published alongside v0.1.1, never a moving branch.
-if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
-  PLUGIN_SHA=$LEGACY_PLUGIN_SHA
-  PLUGIN_ARCHIVE="$TEMP_DIR/plugins.tar.gz"
-  info "Downloading legacy first-party plugins at ${PLUGIN_SHA:0:12}"
-  curl_download "https://github.com/$PLUGIN_REPOSITORY/archive/$PLUGIN_SHA.tar.gz" "$PLUGIN_ARCHIVE" \
-    || die 'could not download the legacy first-party plugins'
+# Legacy hosts receive the exact plugin snapshot published alongside v0.1.1,
+# never a moving branch.
+PLUGIN_SHA=$LEGACY_PLUGIN_SHA
+PLUGIN_ARCHIVE="$TEMP_DIR/plugins.tar.gz"
+info "Downloading legacy first-party plugins at ${PLUGIN_SHA:0:12}"
+curl_download "https://github.com/$PLUGIN_REPOSITORY/archive/$PLUGIN_SHA.tar.gz" "$PLUGIN_ARCHIVE" \
+  || die 'could not download the legacy first-party plugins'
   plugin_members="$(tar -tzf "$PLUGIN_ARCHIVE")" || die 'the plugin archive could not be read'
   PLUGIN_ROOT=''
   while IFS= read -r member; do
@@ -382,8 +374,7 @@ if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
     sed -n '1,160p' "$TEMP_DIR/plugin-tests.log" >&2
     die 'the legacy first-party plugin validation suite failed'
   fi
-  ok "$plugin_count legacy first-party plugins validated"
-fi
+ok "$plugin_count legacy first-party plugins validated"
 
 # From this point on, serialize target changes and keep rollback copies.
 mkdir -p "$DATA_DIR" "$INSTALL_DIR"
@@ -401,7 +392,6 @@ if [[ -f "$DATA_DIR/config.toml" ]]; then
 fi
 [[ ! -L "$PLUGIN_DIR" ]] || die "refusing symlinked plugin directory: $PLUGIN_DIR"
 [[ ! -e "$PLUGIN_DIR" || -d "$PLUGIN_DIR" ]] || die "plugin path is not a directory: $PLUGIN_DIR"
-[[ ! -d "$PLUGIN_DIR" ]] || PLUGIN_DIR_ORIGINALLY_EXISTED=1
 mkdir -p "$PLUGIN_DIR"
 PLUGIN_DIR="$(cd "$PLUGIN_DIR" && pwd -P)"
 [[ -n "${PLUGIN_DIR%/*}" ]] || die 'configured plugin_dir is too broad for safe installation'
@@ -433,11 +423,6 @@ for relative in "${STATE_FILES[@]}"; do
   fi
 done
 STATE_BACKED_UP=1
-if [[ "$CURRENT_RUNTIME" -eq 1 ]]; then
-  mkdir -p "$PLUGIN_STATE_BACKUP"
-  cp -pR "$PLUGIN_DIR/." "$PLUGIN_STATE_BACKUP/"
-  PLUGIN_STATE_BACKED_UP=1
-fi
 STOP_GUARD_EXISTED=0
 [[ ! -f "$STATE_BACKUP/.mcp-stop-guard" ]] || STOP_GUARD_EXISTED=1
 
@@ -471,8 +456,7 @@ fi
 CA_CERT_HASH="$(sha256_file "$DATA_DIR/ca/ca.crt")"
 CA_KEY_HASH="$(sha256_file "$DATA_DIR/ca/ca.key")"
 
-if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
-  WORKER_DIR="$DATA_DIR/browser-worker-$binary_version"
+WORKER_DIR="$DATA_DIR/browser-worker-$binary_version"
   cat >"$TEMP_DIR/browser-smoke.ndjson" <<'EOF'
 {"jsonrpc":"2.0","id":1,"method":"hello"}
 {"jsonrpc":"2.0","id":2,"method":"session.start","params":{"session_id":1,"engine":"chromium","url":"about:blank","persistent":false}}
@@ -516,47 +500,11 @@ EOF
         die 'Chromium still could not launch after installing its system libraries'
       fi
     fi
-    ok 'Chromium launched successfully'
-  fi
-else
-  info 'Preparing the embedded browser runtime and first-party plugins'
-  if ! "$STAGED_BIN" --data-dir "$DATA_DIR" prepare-update >"$TEMP_DIR/prepare-update.log" 2>&1; then
-    linux_id=''
-    if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
-      linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
-    fi
-    stable_playwright="$DATA_DIR/runtime/playwright-core-1.49.1"
-    can_request_packages=0
-    if [[ "$(id -u)" == 0 ]] || { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
-      can_request_packages=1
-    fi
-    if [[ "$linux_id" =~ ^(ubuntu|debian)$ ]] \
-      && [[ "$can_request_packages" -eq 1 ]] \
-      && [[ -f "$stable_playwright/cli.js" ]] \
-      && grep -Eqi 'chromium|browser validation|browser worker' "$TEMP_DIR/prepare-update.log"; then
-      info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
-      if install_chromium_runtime_libraries "$stable_playwright" >"$TEMP_DIR/browser-deps.log" 2>&1 \
-        && "$STAGED_BIN" --data-dir "$DATA_DIR" prepare-update >>"$TEMP_DIR/prepare-update.log" 2>&1; then
-        :
-      else
-        sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
-        sed -n '1,160p' "$TEMP_DIR/prepare-update.log" >&2
-        die 'release runtime preparation failed'
-      fi
-    else
-      sed -n '1,160p' "$TEMP_DIR/prepare-update.log" >&2
-      die 'release runtime preparation failed'
-    fi
-  fi
-  if grep -q 'preserved customized first-party plugin packages' "$TEMP_DIR/prepare-update.log"; then
-    warn 'Customized first-party plugin packages were preserved and may require a compatibility update.'
-  fi
-  ok 'Release runtime and first-party plugins prepared'
+  ok 'Chromium launched successfully'
 fi
 
 installed_plugins=0; preserved_plugins=0
-if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
-  for plugin_source in "$PLUGIN_SOURCE/plugins/"*; do
+for plugin_source in "$PLUGIN_SOURCE/plugins/"*; do
     [[ -d "$plugin_source" ]] || continue
     plugin_name="${plugin_source##*/}"
     plugin_target="$PLUGIN_DIR/$plugin_name"
@@ -571,9 +519,8 @@ if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
     PLUGIN_INCOMING=''
     printf '%s\n' "$plugin_target" >>"$NEW_PLUGIN_LIST"
     installed_plugins=$((installed_plugins + 1))
-  done
-  ok "$installed_plugins legacy plugins installed; $preserved_plugins existing plugin folders preserved"
-fi
+done
+ok "$installed_plugins legacy plugins installed; $preserved_plugins existing plugin folders preserved"
 
 # Doctor output stays private: only concise assertions are surfaced.
 DOCTOR_OUTPUT="$("$STAGED_BIN" --data-dir "$DATA_DIR" doctor 2>&1)" || die 'HuntProxy doctor failed'
@@ -628,17 +575,70 @@ cp -- "$STAGED_BIN" "$NEW_BIN"; chmod 755 "$NEW_BIN"
 "$NEW_BIN" --version >/dev/null || die 'the installed executable failed its final check'
 mv -f -- "$NEW_BIN" "$INSTALL_DIR/HuntProxy"
 NEW_BIN=''; INSTALL_COMPLETE=1
-if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
-  if PLUGIN_SOURCE_TEMP="$(mktemp "$PLUGIN_DIR/.first-party-source.new.XXXXXX")" \
-    && printf '%s\n' "$PLUGIN_SHA" >"$PLUGIN_SOURCE_TEMP" \
-    && chmod 600 "$PLUGIN_SOURCE_TEMP" \
-    && mv -f -- "$PLUGIN_SOURCE_TEMP" "$PLUGIN_DIR/.huntproxy-first-party-source"; then
-    PLUGIN_SOURCE_TEMP=''
-  else
-    [[ -z "$PLUGIN_SOURCE_TEMP" || ! -f "$PLUGIN_SOURCE_TEMP" ]] || rm -f -- "$PLUGIN_SOURCE_TEMP"
-    PLUGIN_SOURCE_TEMP=''
-    warn 'Could not record the legacy first-party plugin source commit.'
+if PLUGIN_SOURCE_TEMP="$(mktemp "$PLUGIN_DIR/.first-party-source.new.XXXXXX")" \
+  && printf '%s\n' "$PLUGIN_SHA" >"$PLUGIN_SOURCE_TEMP" \
+  && chmod 600 "$PLUGIN_SOURCE_TEMP" \
+  && mv -f -- "$PLUGIN_SOURCE_TEMP" "$PLUGIN_DIR/.huntproxy-first-party-source"; then
+  PLUGIN_SOURCE_TEMP=''
+else
+  [[ -z "$PLUGIN_SOURCE_TEMP" || ! -f "$PLUGIN_SOURCE_TEMP" ]] || rm -f -- "$PLUGIN_SOURCE_TEMP"
+  PLUGIN_SOURCE_TEMP=''
+  warn 'Could not record the legacy first-party plugin source commit.'
+fi
+else
+  mkdir -p "$DATA_DIR" "$INSTALL_DIR"
+  chmod 700 "$DATA_DIR"
+  info 'Coordinating release preparation and activation'
+  if ! "$STAGED_BIN" install-release \
+    --executable "$INSTALL_DIR/HuntProxy" \
+    --data-dir "$DATA_DIR" >"$TEMP_DIR/install-release.log" 2>&1; then
+    linux_id=''
+    if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
+      linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
+    fi
+    stable_playwright="$DATA_DIR/runtime/playwright-core-1.49.1"
+    runtime_node=''
+    if [[ -f "$DATA_DIR/config.toml" ]]; then
+      runtime_node="$(sed -n 's/^node_path = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"
+    fi
+    if [[ ! -x "$runtime_node" ]]; then
+      runtime_node="$(command -v node 2>/dev/null || true)"
+    fi
+    if [[ ! -x "$runtime_node" && -x "$DATA_DIR/runtime/node-22.23.2/bin/node" ]]; then
+      runtime_node="$DATA_DIR/runtime/node-22.23.2/bin/node"
+    fi
+    can_request_packages=0
+    if [[ "$(id -u)" == 0 ]] || { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
+      can_request_packages=1
+    fi
+    if [[ "$linux_id" =~ ^(ubuntu|debian)$ ]] \
+      && [[ "$can_request_packages" -eq 1 ]] \
+      && [[ -n "$runtime_node" && -x "$runtime_node" ]] \
+      && [[ -f "$stable_playwright/cli.js" ]] \
+      && grep -Eqi 'chromium|browser validation|browser worker' "$TEMP_DIR/install-release.log"; then
+      info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
+      if install_chromium_runtime_libraries "$stable_playwright" "$runtime_node" >"$TEMP_DIR/browser-deps.log" 2>&1 \
+        && "$STAGED_BIN" install-release \
+          --executable "$INSTALL_DIR/HuntProxy" \
+          --data-dir "$DATA_DIR" >>"$TEMP_DIR/install-release.log" 2>&1; then
+        :
+      else
+        sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
+        sed -n '1,160p' "$TEMP_DIR/install-release.log" >&2
+        die 'coordinated release installation failed'
+      fi
+    else
+      sed -n '1,160p' "$TEMP_DIR/install-release.log" >&2
+      die 'coordinated release installation failed'
+    fi
   fi
+  INSTALL_COMPLETE=1
+  [[ -x "$INSTALL_DIR/HuntProxy" ]] || die 'coordinated installation did not create the executable'
+  installed_version="$("$INSTALL_DIR/HuntProxy" --version 2>/dev/null | awk '{print $NF}')" \
+    || die 'the installed executable failed its final check'
+  [[ "$installed_version" == "$binary_version" ]] \
+    || die "coordinated installation activated HuntProxy $installed_version instead of $binary_version"
+  ok 'Release runtime, data, plugins, and executable installed'
 fi
 
 configure_mcp_clients() {
