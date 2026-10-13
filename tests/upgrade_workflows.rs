@@ -21,6 +21,7 @@ const TEST_ROOT: &str = "/tmp/artis/huntproxy-v020.58BmOq";
 
 struct Daemon {
     child: Child,
+    binary: PathBuf,
 }
 
 impl Drop for Daemon {
@@ -204,17 +205,80 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     );
     assert!(bundle.is_file(), "legacy bundle was not created");
 
-    stop_daemon(&legacy, &data_dir, &mut daemon);
     write_custom_plugin(&data_dir);
 
-    let prepared = run(&current, &data_dir, &["prepare-update"]);
+    // Exercise the same coordinated installation transaction used by the
+    // upstream installer. Seed a realistic installation with the verified
+    // legacy executable while its daemon is still serving this data directory.
+    let install_dir = workspace.path().join("install");
+    fs::create_dir_all(&install_dir).unwrap();
+    let installed = install_dir.join("HuntProxy");
+    fs::copy(&legacy, &installed).unwrap();
+    fs::set_permissions(&installed, fs::metadata(&legacy).unwrap().permissions()).unwrap();
+    let legacy_hash = sha256_file(&legacy);
+
+    let installation = run(
+        &current,
+        &data_dir,
+        &[
+            "install-release",
+            "--executable",
+            installed.to_str().unwrap(),
+        ],
+    );
+    assert_success(&installation, "coordinated current release installation");
+    let installation_stdout = String::from_utf8_lossy(&installation.stdout);
+    assert!(
+        installation_stdout.contains("Installed HuntProxy 0.2.0"),
+        "unexpected installation output: {installation_stdout}"
+    );
+    assert!(
+        installation_stdout.contains("daemon restarted"),
+        "running legacy daemon was not restarted: {installation_stdout}"
+    );
+
+    let legacy_status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(10))
+        .expect("legacy daemon did not exit during coordinated installation");
+    assert!(
+        legacy_status.success(),
+        "legacy daemon exited with {legacy_status}"
+    );
+    let installed_version = run(&installed, &data_dir, &["--version"]);
+    assert_success(&installed_version, "installed release version");
+    assert_eq!(
+        String::from_utf8_lossy(&installed_version.stdout).trim(),
+        "HuntProxy 0.2.0"
+    );
+    assert_eq!(
+        sha256_file(&install_dir.join("HuntProxy.previous")),
+        legacy_hash,
+        "rollback binary must match the verified legacy executable"
+    );
+    let restore_points = fs::read_dir(data_dir.join("runtime/updates"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(restore_points.len(), 1, "keep one release restore point");
+    assert!(restore_points[0].join("restore.json").is_file());
+    assert!(!data_dir.join("runtime/update-journal.json").exists());
+
+    // The transaction restarts a managed daemon with the installed release.
+    // Stop it before continuing the foreground restart/import checks below.
+    assert_project_state(&client, &api_base, project_id, &fixture);
+    assert_success(
+        &run(&installed, &data_dir, &["stop"]),
+        "stop installed daemon after coordinated installation",
+    );
+
+    let prepared = run(&installed, &data_dir, &["prepare-update"]);
     assert_success(&prepared, "current prepare-update");
     let prepared_json: Value = serde_json::from_slice(&prepared.stdout).unwrap();
     assert_eq!(prepared_json["ok"], true);
     assert_eq!(prepared_json["version"], env!("CARGO_PKG_VERSION"));
     assert_latest_plugins_and_custom_plugin(&data_dir);
 
-    let mut daemon = start_daemon(&current, &data_dir);
+    let mut daemon = start_daemon(&installed, &data_dir);
     wait_for_health(&api_base, &mut daemon);
     assert_custom_plugin_loaded(&client, &api_base);
     assert_project_state(&client, &api_base, project_id, &fixture);
@@ -238,9 +302,9 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     );
     assert_browser_roundtrip(&client, &api_base, project_id, &fixture);
 
-    stop_daemon(&current, &data_dir, &mut daemon);
+    stop_daemon(&installed, &data_dir, &mut daemon);
     let imported = run(
-        &current,
+        &installed,
         &data_dir,
         &["project", "import", bundle.to_str().unwrap()],
     );
@@ -250,18 +314,22 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     // A repeated preparation/startup is the normal path after a restart and must
     // leave user-owned plugin content and already-migrated data unchanged.
     assert_success(
-        &run(&current, &data_dir, &["prepare-update"]),
+        &run(&installed, &data_dir, &["prepare-update"]),
         "second prepare-update",
     );
     assert_latest_plugins_and_custom_plugin(&data_dir);
-    let mut daemon = start_daemon(&current, &data_dir);
+    let mut daemon = start_daemon(&installed, &data_dir);
     wait_for_health(&api_base, &mut daemon);
     assert_custom_plugin_loaded(&client, &api_base);
     assert_project_state(&client, &api_base, project_id, &fixture);
     assert_project_state(&client, &api_base, imported_id, &fixture);
     let projects = request_json(&client, "GET", &format!("{api_base}/api/v1/projects"), None);
     assert_eq!(projects["projects"].as_array().unwrap().len(), 2);
-    stop_daemon(&current, &data_dir, &mut daemon);
+    stop_daemon(&installed, &data_dir, &mut daemon);
+}
+
+fn sha256_file(path: &Path) -> String {
+    hex::encode(Sha256::digest(fs::read(path).unwrap()))
 }
 
 fn required_legacy_binary() -> PathBuf {
@@ -310,20 +378,43 @@ fn start_daemon(binary: &Path, data_dir: &Path) -> Daemon {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    Daemon { child }
+    Daemon {
+        child,
+        binary: binary.to_path_buf(),
+    }
 }
 
 fn stop_daemon(binary: &Path, data_dir: &Path, daemon: &mut Daemon) {
-    assert_success(&run(binary, data_dir, &["stop"]), "stop daemon");
+    assert_success(
+        &run(binary, data_dir, &["stop"]),
+        &format!("stop daemon {}", binary.display()),
+    );
     let mut status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(10));
     if status.is_none() {
         // The private shutdown reply can race the foreground server's final
         // accept loop. A second normal stop exercises the supported retry path.
-        assert_success(&run(binary, data_dir, &["stop"]), "retry stop daemon");
+        assert_success(
+            &run(binary, data_dir, &["stop"]),
+            &format!("retry stop daemon {}", binary.display()),
+        );
         status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(10));
     }
-    let status = status.expect("daemon did not exit after two graceful stop requests");
-    assert!(status.success(), "daemon exited with {status}");
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "daemon {} did not exit after two graceful stop requests",
+            daemon.binary.display()
+        )
+    });
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = daemon.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        panic!(
+            "daemon {} exited with {status}:\nstderr:\n{stderr}",
+            daemon.binary.display()
+        );
+    }
 }
 
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
