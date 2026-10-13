@@ -332,6 +332,8 @@ HuntProxy plugins give the agent focused workflows for parameter discovery, auth
 
 Explore the maintained collection or learn how to build your own in [HuntProxy-Plugins](https://github.com/BehiSecc/HuntProxy-Plugins).
 
+Extension previews include a bounded `planning_summary` with the plugin's selection and exclusion details. Job results retain a host-owned `execution` summary in both compact and full views, including partial results after failure or cancellation. Its counts describe top-level planned, returned, skipped, and unobserved operations; error, not-tested, and evidence-limited counts can overlap. Compact results include `evidence_exchange_count`; full results retain the evidence IDs. Large planning details may be compacted or omitted to retain current execution evidence; `plan_result_omitted_reason` explains this. `observations_recorded` means observations returned, not that requests or controls were clean. Existing `operation_count` and `completed_operations` fields are request-weighted progress and do not count requests actually sent. Analysis retries preserve the execution summary without replaying operations.
+
 <a id="captcha-and-bot-checks"></a>
 
 ## 🛡️ Don't Be Afraid of CAPTCHAs
