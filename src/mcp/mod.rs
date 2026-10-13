@@ -226,39 +226,53 @@ fn locator_schema() -> Value {
 }
 
 fn browser_action_schema() -> Value {
+    let locator = locator_schema();
+    let file_list = json!({
+        "type":"array", "maxItems":16,
+        "items":{"type":"string","minLength":1,"maxLength":4096,"pattern":"^/"},
+        "description":"Absolute paths to regular readable files on the HuntProxy machine."
+    });
+    let event_kinds = json!({
+        "type":"array", "maxItems":10, "uniqueItems":true, "default":[],
+        "items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message"]}
+    });
+    let request_headers = json!({
+        "type":"array", "maxItems":64, "default":[],
+        "items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},
+        "description":"Request headers. Duplicate names and browser-managed or Fetch-forbidden headers are rejected."
+    });
     json!({
         "type": "object",
         "description": "Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. browser_cdp remains available for interactions these actions cannot express.",
-        "properties": {
-            "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "pages", "events", "scroll", "screenshot", "request", "press", "wait", "back", "forward", "close"]},
-            "url": {"type": "string", "description":"Required by navigate and request; optional for pages op=new. request must match the active page origin."},
-            "locator": locator_schema(),
-            "value": {"type": "string"},
-            "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Absolute paths to regular readable files on the HuntProxy machine. An empty array clears a direct file input; chooser uploads require at least one file."},
-            "via_chooser": {"type":"boolean","default":false,"description":"For upload, click locator as a trusted Browse/file-chooser trigger instead of setting an input directly."},
-            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"description":"Upload or request deadline. request requires at least 1000 ms and defaults to 15000."},
-            "key": {"type": "string"},
-            "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"]},
-            "format": {"type": "string", "enum": ["accessibility", "dom"]},
-            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"Bound for snapshot, inspect, or screenshot output."},
-            "op": {"type":"string","enum":["list","select","new","close"],"description":"Operation for pages."},
-            "page_id": {"type":"integer","minimum":1,"description":"Required with runtime_generation for pages select/close."},
-            "runtime_generation": {"type":"integer","minimum":1,"description":"Generation returned by pages/events or browser context. Required when reusing a page ID or nonzero event cursor."},
-            "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"For events, return observations after this sequence."},
-            "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Maximum browser events to return."},
-            "kinds": {"type":"array","maxItems":10,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message"]},"description":"Optional browser event filter."},
-            "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"For events, wait up to this long for a matching event."},
-            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal wheel delta for scroll."},
-            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical wheel delta for scroll."},
-            "full_page": {"type":"boolean","default":false,"description":"Capture the full page for screenshot; cannot be combined with locator."},
-            "method": {"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"],"description":"Required for request."},
-            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"Request headers. Duplicate names and browser-managed or Fetch-forbidden transport, identity, origin, host, length, proxy, Sec-*, and internal headers are rejected rather than silently changed."},
-            "body_text": {"type":"string","description":"Optional UTF-8 request body, up to 2 MiB; mutually exclusive with body_base64."},
-            "body_base64": {"type":"string","description":"Optional exact request body as base64, up to 2 MiB decoded; mutually exclusive with body_text."},
-            "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Maximum exact response preview bytes returned by request."}
-        },
-        "required": ["type"],
-        "additionalProperties": false
+        "oneOf": [
+            {"type":"object","properties":{"type":{"const":"navigate"},"url":{"type":"string","minLength":1}},"required":["type","url"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"snapshot"},"format":{"type":"string","enum":["accessibility","dom"],"default":"accessibility"},"max_bytes":{"type":"integer","minimum":1,"maximum":2000000,"default":200000}},"required":["type"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"click"},"locator":locator.clone()},"required":["type","locator"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"fill"},"locator":locator.clone(),"value":{"type":"string"}},"required":["type","locator","value"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"select"},"locator":locator.clone(),"value":{"type":"string"}},"required":["type","locator","value"],"additionalProperties":false},
+
+            {"type":"object","properties":{"type":{"const":"upload"},"locator":locator.clone(),"files":file_list.clone(),"via_chooser":{"const":false,"default":false},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000,"default":10000}},"required":["type","locator","files"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"upload"},"locator":locator.clone(),"files":{"allOf":[file_list.clone(),{"minItems":1}]},"via_chooser":{"const":true},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000,"default":10000}},"required":["type","locator","files","via_chooser"],"additionalProperties":false},
+
+            {"type":"object","properties":{"type":{"const":"inspect"},"locator":locator.clone(),"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":4096}},"required":["type"],"additionalProperties":false},
+
+            {"type":"object","properties":{"type":{"const":"pages"},"op":{"const":"list"}},"required":["type","op"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"pages"},"op":{"const":"new"},"url":{"type":"string","minLength":1}},"required":["type","op"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"pages"},"op":{"enum":["select","close"]},"page_id":{"type":"integer","minimum":1},"runtime_generation":{"type":"integer","minimum":1}},"required":["type","op","page_id","runtime_generation"],"additionalProperties":false},
+
+            {"type":"object","properties":{"type":{"const":"events"},"after_sequence":{"type":"integer","minimum":0,"maximum":0,"default":0},"runtime_generation":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":100,"default":50},"kinds":event_kinds.clone(),"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0}},"required":["type"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"events"},"after_sequence":{"type":"integer","minimum":1},"runtime_generation":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":100,"default":50},"kinds":event_kinds,"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0}},"required":["type","after_sequence","runtime_generation"],"additionalProperties":false},
+
+            {"type":"object","properties":{"type":{"const":"scroll"},"locator":locator.clone(),"delta_x":{"type":"integer","minimum":-100000,"maximum":100000,"default":0},"delta_y":{"type":"integer","minimum":-100000,"maximum":100000,"default":0}},"required":["type"],"anyOf":[{"required":["locator"]},{"required":["delta_x"],"properties":{"delta_x":{"not":{"const":0}}}},{"required":["delta_y"],"properties":{"delta_y":{"not":{"const":0}}}}],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"screenshot"},"locator":locator.clone(),"full_page":{"type":"boolean","default":false},"max_bytes":{"type":"integer","minimum":1,"maximum":8388608,"default":4194304}},"required":["type"],"not":{"required":["locator","full_page"],"properties":{"full_page":{"const":true}}},"additionalProperties":false},
+
+            {"type":"object","properties":{"type":{"const":"request"},"method":{"enum":["GET","HEAD"]},"url":{"type":"string","minLength":1},"headers":request_headers.clone(),"timeout_ms":{"type":"integer","minimum":1000,"maximum":30000,"default":15000},"max_response_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":4096}},"required":["type","method","url"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"request"},"method":{"enum":["POST","PUT","PATCH","DELETE","OPTIONS"]},"url":{"type":"string","minLength":1},"headers":request_headers,"body_text":{"type":"string","maxLength":2097152},"body_base64":{"type":"string","maxLength":2796204},"timeout_ms":{"type":"integer","minimum":1000,"maximum":30000,"default":15000},"max_response_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":4096}},"required":["type","method","url"],"not":{"required":["body_text","body_base64"]},"additionalProperties":false},
+
+            {"type":"object","properties":{"type":{"const":"press"},"locator":locator.clone(),"key":{"type":"string","minLength":1}},"required":["type","key"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"const":"wait"},"for_what":{"enum":["selector","text","url","timeout","load_state"]},"value":{"type":"string"}},"required":["type","for_what","value"],"additionalProperties":false},
+            {"type":"object","properties":{"type":{"enum":["back","forward","close"]}},"required":["type"],"additionalProperties":false}
+        ]
     })
 }
 
@@ -396,7 +410,7 @@ fn tool_defs() -> Value {
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. Repeated unchanged seeds preserve newer browser cookies; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Explicitly reimport the matching cookie_profile into this browser profile only."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
+        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
         {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on port 9222, inspect handoff status, or return control to the agent. While enabled, browser_action is paused. On a VPS, run the returned ssh_forward_command (ssh -N -L 9222:127.0.0.1:9222 <current-user>@<routed-host-ip>); its user and host are detected at runtime. Try hosted_devtools_url to avoid transferring the frontend through SSH; use devtools_url if the browser restricts the hosted frontend's local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; use the active browser session ID."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions and resources: per-project capacity including ephemeral sessions, verified profile ownership, and a global CDP busy flag. Reuse these observations until a lifecycle transition or browser error; capacity is not a reservation. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page in Chromium. A domain filter matches either the JavaScript host or its related page host, including subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
@@ -754,6 +768,10 @@ async fn fetch_page_analyzer_bundle(
         .reply
         .send_same_origin(project_id, &draft, source_url)
         .await?;
+    let effective_url = result.effective_url.clone();
+    if !crate::page_analyzer::same_origin_url(source_url, &effective_url) {
+        return Ok(None);
+    }
     if let Some(exchange_id) = result.exchange_id {
         emit_event(
             state,
@@ -764,8 +782,11 @@ async fn fetch_page_analyzer_bundle(
         let content =
             crate::page_analyzer::load_exchange_content(&state.db, project_id, exchange_id).await?;
         return Ok(Some(crate::page_analyzer::ScriptBundleContent {
+            source_url: content.source_url,
             body: content.body,
-            truncated: content.body_truncated,
+            status_code: content.status_code,
+            content_type: content.content_type,
+            completion: content.completion,
         }));
     }
     let Some(response) = result.response else {
@@ -773,8 +794,19 @@ async fn fetch_page_analyzer_bundle(
     };
     let (body, _, _) = crate::page_analyzer::decode_ephemeral_response(&response)?;
     Ok(Some(crate::page_analyzer::ScriptBundleContent {
+        source_url: effective_url,
         body,
-        truncated: response.body_truncated,
+        status_code: Some(response.status_code),
+        content_type: response
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+            .map(|header| header.value.clone()),
+        completion: if response.body_truncated {
+            crate::domain::CompletionState::TruncatedByPolicy
+        } else {
+            crate::domain::CompletionState::Complete
+        },
     }))
 }
 
@@ -794,7 +826,12 @@ async fn analyze_page_script_tree(
     .await
 }
 
-fn page_analysis_tree_fields(tree: crate::page_analyzer::ScriptTreeAnalysis) -> Value {
+fn page_analysis_tree_fields(
+    tree: crate::page_analyzer::ScriptTreeAnalysis,
+    root_incomplete: bool,
+) -> Value {
+    let analysis_incomplete =
+        root_incomplete || tree.js_bundles_truncated || tree.js_bundle_failures > 0;
     let analysis = tree.analysis;
     json!({
         "endpoints": analysis.endpoints,
@@ -805,6 +842,7 @@ fn page_analysis_tree_fields(tree: crate::page_analyzer::ScriptTreeAnalysis) -> 
         "js_bundles": tree.js_bundles,
         "js_bundles_truncated": tree.js_bundles_truncated,
         "js_bundle_failures": tree.js_bundle_failures,
+        "analysis_incomplete": analysis_incomplete,
     })
 }
 
@@ -1461,7 +1499,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         content.body,
                     )
                     .await;
-                    let mut output = page_analysis_tree_fields(tree);
+                    let mut output = page_analysis_tree_fields(tree, content.body_truncated);
                     let object = output.as_object_mut().expect("page analysis object");
                     object.insert("project_id".into(), json!(project_id));
                     object.insert("exchange_id".into(), json!(exchange_id));
@@ -1469,6 +1507,9 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     object.insert("decoded".into(), json!(content.decoded));
                     object.insert("content_encoding".into(), json!(content.content_encoding));
                     object.insert("body_truncated".into(), json!(content.body_truncated));
+                    object.insert("completion".into(), json!(content.completion));
+                    object.insert("status_code".into(), json!(content.status_code));
+                    object.insert("content_type".into(), json!(content.content_type));
                     Ok(output)
                 }
                 (None, Some(url)) => {
@@ -1492,44 +1533,66 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .await?;
                     let effective_url = result.effective_url.clone();
                     let exchange_id = result.exchange_id;
-                    let (effective_source_url, body, decoded, content_encoding, body_truncated) =
-                        if let Some(exchange_id) = exchange_id {
-                            emit_event(
-                                &state,
-                                project_id,
-                                "exchange",
-                                json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
-                            );
-                            let content = crate::page_analyzer::load_exchange_content(
-                                &state.db,
-                                project_id,
-                                exchange_id,
+                    let (
+                        effective_source_url,
+                        body,
+                        decoded,
+                        content_encoding,
+                        body_truncated,
+                        completion,
+                        status_code,
+                        content_type,
+                    ) = if let Some(exchange_id) = exchange_id {
+                        emit_event(
+                            &state,
+                            project_id,
+                            "exchange",
+                            json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
+                        );
+                        let content = crate::page_analyzer::load_exchange_content(
+                            &state.db,
+                            project_id,
+                            exchange_id,
+                        )
+                        .await?;
+                        (
+                            content.source_url,
+                            content.body,
+                            content.decoded,
+                            content.content_encoding,
+                            content.body_truncated,
+                            content.completion,
+                            content.status_code,
+                            content.content_type,
+                        )
+                    } else {
+                        let response = result.response.ok_or_else(|| {
+                            DomainError::new(
+                                ErrorCode::Internal,
+                                "URL analysis response body was unavailable",
                             )
-                            .await?;
-                            (
-                                content.source_url,
-                                content.body,
-                                content.decoded,
-                                content.content_encoding,
-                                content.body_truncated,
-                            )
-                        } else {
-                            let response = result.response.ok_or_else(|| {
-                                DomainError::new(
-                                    ErrorCode::Internal,
-                                    "URL analysis response body was unavailable",
-                                )
-                            })?;
-                            let (body, decoded, content_encoding) =
-                                crate::page_analyzer::decode_ephemeral_response(&response)?;
-                            (
-                                effective_url,
-                                body,
-                                decoded,
-                                content_encoding,
-                                response.body_truncated,
-                            )
-                        };
+                        })?;
+                        let (body, decoded, content_encoding) =
+                            crate::page_analyzer::decode_ephemeral_response(&response)?;
+                        (
+                            effective_url,
+                            body,
+                            decoded,
+                            content_encoding,
+                            response.body_truncated,
+                            if response.body_truncated {
+                                crate::domain::CompletionState::TruncatedByPolicy
+                            } else {
+                                crate::domain::CompletionState::Complete
+                            },
+                            Some(response.status_code),
+                            response
+                                .headers
+                                .iter()
+                                .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+                                .map(|header| header.value.clone()),
+                        )
+                    };
                     let tree = analyze_page_script_tree(
                         &state,
                         project_id,
@@ -1537,7 +1600,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         body,
                     )
                     .await;
-                    let mut output = page_analysis_tree_fields(tree);
+                    let mut output = page_analysis_tree_fields(tree, body_truncated);
                     let object = output.as_object_mut().expect("page analysis object");
                     object.insert("project_id".into(), json!(project_id));
                     object.insert("exchange_id".into(), json!(exchange_id));
@@ -1545,6 +1608,9 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     object.insert("decoded".into(), json!(decoded));
                     object.insert("content_encoding".into(), json!(content_encoding));
                     object.insert("body_truncated".into(), json!(body_truncated));
+                    object.insert("completion".into(), json!(completion));
+                    object.insert("status_code".into(), json!(status_code));
+                    object.insert("content_type".into(), json!(content_type));
                     Ok(output)
                 }
                 _ => Err(DomainError::invalid(
@@ -2730,12 +2796,45 @@ mod tests {
     #[test]
     fn browser_action_schema_advertises_structured_playwright_capabilities() {
         let schema = browser_action_schema();
-        let action_types = schema["properties"]["type"]["enum"].as_array().unwrap();
+        let branches = schema["oneOf"].as_array().unwrap();
+        let action_types = branches
+            .iter()
+            .flat_map(|branch| {
+                branch["properties"]["type"]["const"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .into_iter()
+                    .chain(
+                        branch["properties"]["type"]["enum"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|value| value.as_str().map(str::to_owned)),
+                    )
+            })
+            .collect::<Vec<_>>();
         for action in ["pages", "events", "scroll", "screenshot", "request"] {
-            assert!(action_types.contains(&json!(action)));
+            assert!(action_types.contains(&action.to_string()));
         }
+        let navigate = branches
+            .iter()
+            .find(|branch| branch["properties"]["type"]["const"] == "navigate")
+            .unwrap();
+        assert!(navigate["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("url")));
+        let request = branches
+            .iter()
+            .find(|branch| {
+                branch["properties"]["type"]["const"] == "request"
+                    && branch["properties"]["method"]["enum"]
+                        .as_array()
+                        .is_some_and(|methods| methods.contains(&json!("POST")))
+            })
+            .unwrap();
         assert_eq!(
-            schema["properties"]["max_response_bytes"]["maximum"],
+            request["properties"]["max_response_bytes"]["maximum"],
             65_536
         );
         assert!(schema["description"]
