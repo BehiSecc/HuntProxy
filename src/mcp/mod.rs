@@ -9,6 +9,7 @@ use crate::fuzzer::FuzzTemplate;
 use crate::history::{parse_text_query, query_error, HISTORY_QUERY_SYNTAX};
 use crate::policy::{is_sensitive_header, PresentationOptions};
 use crate::storage::CreateCaptureSession;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -19,6 +20,10 @@ use std::sync::Arc;
 #[async_trait::async_trait]
 trait ToolBackend: Send + Sync {
     async fn call(&self, name: &str, args: Value) -> DomainResult<Value>;
+
+    fn definitions(&self) -> Value {
+        tool_defs()
+    }
 }
 
 struct LocalToolBackend {
@@ -30,6 +35,10 @@ impl ToolBackend for LocalToolBackend {
     async fn call(&self, name: &str, args: Value) -> DomainResult<Value> {
         call_tool(self.state.clone(), name, args).await
     }
+
+    fn definitions(&self) -> Value {
+        local_tool_defs()
+    }
 }
 
 struct DaemonToolBackend {
@@ -39,14 +48,30 @@ struct DaemonToolBackend {
 #[async_trait::async_trait]
 impl ToolBackend for DaemonToolBackend {
     async fn call(&self, name: &str, args: Value) -> DomainResult<Value> {
+        if name == "huntproxy_restart" {
+            crate::app::restart_daemon(&self.config).await?;
+            clear_stop_guard(&self.config);
+            return Ok(json!({
+                "ok": true,
+                "message": "HuntProxy restarted; continue using this MCP connection. Saved projects and browser profiles are preserved. Resume browsers with browser_start; running jobs were interrupted.",
+                "running_jobs_interrupted": true,
+                "browser_resume_tool": "browser_start"
+            }));
+        }
+        if stop_guard_blocks_start(&self.config) {
+            return Err(DomainError::new(
+                ErrorCode::DaemonNotRunning,
+                "HuntProxy was explicitly stopped; call huntproxy_restart to continue in this session",
+            ));
+        }
+        // Recover before sending a new operation. Never retry a tool after it
+        // was dispatched: a lost response may still represent a completed send.
+        crate::app::ensure_daemon(&self.config).await?;
         let armed_stop_guard = name == "huntproxy_stop";
         if armed_stop_guard {
             arm_stop_guard(&self.config)?;
         }
         let result = call_daemon_tool(&self.config, name, args).await;
-        if armed_stop_guard && result.is_err() {
-            clear_stop_guard(&self.config);
-        }
         result
     }
 }
@@ -327,17 +352,18 @@ fn tool_defs() -> Value {
         {"name":"capture_sessions","description":"List proxy capture credentials, create a one-time credential, revoke one, or renew one. create returns the secret once; copy it immediately. revoke and renew require session_id. This does not start Chromium; use browser_start for browser traffic.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","revoke","renew"]},"session_id":{"type":"integer","description":"Required for revoke and renew."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set accepts a raw Cookie header or browser-export JSON cookie array, inline or from a UTF-8 file. Project cookies apply to HTTP tools and ephemeral sessions. Persistent browser jars change only with an explicit browser_start(cookie_profile=...). profile_name stores a reusable named cookie identity for extensions or browser_start(cookie_profile=...) without changing an already running browser.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Optional reusable identity name. Pass the same name as browser_start.cookie_profile to seed a persistent Chromium profile."},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array."},{"type":"array","description":"Browser-export or Playwright cookie array.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"path":{"type":"string"},"httpOnly":{"type":"boolean"},"secure":{"type":"boolean"},"sameSite":{"type":"string"},"session":{"type":"boolean"},"expirationDate":{"type":"number"},"expires":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file containing a raw Cookie header or JSON cookie array."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
-        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Comparisons attach directly to the field: status>=400 or time>2026-10-12T00:00:00Z. Supports AND/OR/NOT, parentheses, and quoted values. Query errors return repair guidance; correct q before retrying. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the saved format for precise cutoffs. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Bare words search summary fields. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"overview","description":"Summarize one project's saved activity: total exchanges and counts by source, captured replies sent, findings, distinct hosts, and last exchange time.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Comparisons attach directly to the field: status>=400 or time>2026-10-12T00:00:00Z. Supports AND/OR/NOT, parentheses, and quoted values. Query errors return repair guidance; correct q before retrying. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms. Search results identify exchanges but do not include full body content; use exchange_body with the matching exchange_id to read request or response bytes.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the saved format for precise cutoffs. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Bare words search summary fields. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Discover saved routes without oversized responses. Omit host for a lightweight list of hosts and route counts. Provide one exact host for its detailed route tree, optionally limited to a path subtree.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive. Omit for host summaries."},"path_prefix":{"type":"string","description":"Optional slash-boundary path subtree, such as /api. Requires host."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_compare","description":"Compare the saved request and response of two exchanges. Sensitive values stay redacted, while changes are still detected. Text body diffs are bounded.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"left_exchange_id":{"type":"integer"},"right_exchange_id":{"type":"integer"},"include_noisy_headers":{"type":"boolean","default":false}},"required":["project_id","left_exchange_id","right_exchange_id"],"additionalProperties":false}},
-        {"name":"page_analyzer","description":"Extract sorted, unique endpoints, absolute URLs, and emails from JavaScript or HTML without executing it. Provide exactly one saved exchange_id or absolute URL. URL mode sends a semantic GET with project cookies and analyzes the complete response; secrets are never scanned or returned.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer","description":"Saved exchange whose decoded response body should be analyzed."},"url":{"type":"string","description":"Absolute http/https URL to fetch and analyze."}},"required":["project_id"],"oneOf":[{"required":["exchange_id"]},{"required":["url"]}],"additionalProperties":false}},
+        {"name":"page_analyzer","description":"Extract sorted, unique endpoints, absolute URLs, emails, and request parameter names from JavaScript or HTML without executing it. Provide exactly one saved exchange_id or absolute URL. The tool analyzes that page and sequentially fetches bounded same-origin JavaScript bundles referenced by script tags or a Modern.js route manifest; URL mode first sends a semantic GET with project cookies. CSS and other non-JavaScript assets are skipped. Secrets are never scanned or returned.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer","description":"Saved exchange whose decoded response body and same-origin JavaScript bundles should be analyzed."},"url":{"type":"string","description":"Absolute http/https URL to fetch and analyze, including its same-origin JavaScript bundles."}},"required":["project_id"],"oneOf":[{"required":["exchange_id"]},{"required":["url"]}],"additionalProperties":false}},
         {"name":"copy_as","description":"Convert a saved request to cURL or Python requests. The output includes the original sensitive headers by default so it is immediately runnable; set include_secrets=false to produce a redacted copy.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"format":{"type":"string","enum":["curl","python_requests"]},"include_secrets":{"type":"boolean","default":true}},"required":["project_id","exchange_id","format"],"additionalProperties":false}},
-        {"name":"exchange_body","description":"Read a request or response body in pages. gzip/br/deflate responses are decoded by default; set raw=true for captured bytes. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576},"raw":{"type":"boolean","default":false}},"required":["project_id","exchange_id"]}},
+        {"name":"exchange_body","description":"Read a captured request or response body in pages up to 1 MiB per call. reply_send returns exchange_id and only a 4 KiB preview; pass that exchange_id here to read the full captured response without re-fetching it or using HTTP Range. Use side=request for the captured request body. available=false means that side has no captured body. UTF-8 output is lossy for arbitrary bytes; set encoding=base64 for exact page bytes. gzip/br/deflate responses are decoded by default; set raw=true to read captured response bytes before decoding. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"response"},"offset":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":4096},"raw":{"type":"boolean","default":false},"encoding":{"type":"string","enum":["utf8","base64"],"default":"utf8","description":"Representation of preview. utf8 is lossy for non-UTF-8 bytes; base64 preserves every byte in this page."}},"required":["project_id","exchange_id"],"additionalProperties":false}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. For the full captured response, pass the returned exchange_id to exchange_body with side=response; use its next_offset for further pages. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; use exchange_body to read the full response without replaying it. Continue case pages with next_before_case_index.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"],"additionalProperties":false}},
@@ -349,12 +375,27 @@ fn tool_defs() -> Value {
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions and resources: per-project capacity including ephemeral sessions, verified profile ownership, and a global CDP busy flag. Reuse these observations until a lifecycle transition or browser error; capacity is not a reservation. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page in Chromium. A domain filter matches either the JavaScript host or its related page host, including subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
         {"name":"get_words","description":"Build a sorted target-specific wordlist from saved request paths, parameter names, and textual responses. Related JavaScript files are included by default. Optionally filter by a domain and its subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"domain":{"type":"string","description":"Optional hostname, wildcard hostname, or HTTP URL."},"include_js":{"type":"boolean","default":true},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":5000}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Keeps this MCP connection available; call huntproxy_restart to continue later. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"huntproxy_restart","description":"Restart or recover HuntProxy without reconnecting the agent's MCP session. Preserves saved projects, traffic, findings, Reply/Fuzzer state, and browser profiles. Active browsers close and can be resumed using browser_start. Running jobs are interrupted; memory-only plugin results/checkpoints are lost. Use when the user asks to restart or to continue after HuntProxy has stopped.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply byte transforms, including gzip_decode/gunzip and brotli_decode","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string","enum":["utf8","base64","hex"]},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"project_transfer","description":"Import or export a project bundle or HAR through a local file. Sanitized export is the default; include_secrets must be explicitly true for credentials and browser state. Returns a summary/path, never archive bytes.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export","import"]},"format":{"type":"string","enum":["huntproxy","har"]},"project_id":{"type":"integer","description":"Required for export and HAR import."},"file_path":{"type":"string","description":"Required for import; optional export destination under the configured exports directory."},"include_secrets":{"type":"boolean","default":false},"include_chromium_profile":{"type":"boolean","default":false}},"required":["action","format"],"additionalProperties":false}},
         {"name":"exchange_annotate","description":"Set an exchange title, note, and labels","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
     ])
+}
+
+fn local_tool_defs() -> Value {
+    let mut definitions = tool_defs();
+    if let Some(tools) = definitions.as_array_mut() {
+        tools.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("huntproxy_restart"));
+        if let Some(stop) = tools
+            .iter_mut()
+            .find(|tool| tool["name"] == "huntproxy_stop")
+        {
+            stop["description"] = json!("Gracefully stop HuntProxy and all managed browsers. The in-process MCP server cannot restart itself; reconnect to continue. Use only when the user explicitly asks to stop HuntProxy.");
+        }
+    }
+    definitions
 }
 
 pub async fn run_stdio_mcp(state: Arc<AppState>) -> DomainResult<()> {
@@ -364,8 +405,13 @@ pub async fn run_stdio_mcp(state: Arc<AppState>) -> DomainResult<()> {
 
 /// Run the stdio MCP adapter as a thin client of the single daemon owner.
 pub async fn run_stdio_mcp_client(config: Config) -> DomainResult<()> {
-    let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_seconds);
-    run_stdio_backend(Arc::new(DaemonToolBackend { config }), idle_timeout).await
+    // The inexpensive bridge must outlive an idle/stopped daemon so restart
+    // and the next tool call remain available on the same client connection.
+    run_stdio_backend(
+        Arc::new(DaemonToolBackend { config }),
+        std::time::Duration::ZERO,
+    )
+    .await
 }
 
 pub async fn run_stdio(state: Arc<AppState>) -> DomainResult<()> {
@@ -431,7 +477,6 @@ async fn run_stdio_backend(
             }
         };
         let id = req.id.clone();
-        let stop_after_response = is_stop_request(&req);
         match handle_rpc(backend.clone(), &req).await {
             Ok(Some(value)) => {
                 write_response(JsonRpcResponse {
@@ -440,9 +485,6 @@ async fn run_stdio_backend(
                     result: Some(value),
                     error: None,
                 });
-                if stop_after_response {
-                    break;
-                }
             }
             Ok(None) => {}
             Err(e) => write_response(JsonRpcResponse {
@@ -462,11 +504,6 @@ async fn run_stdio_backend(
         }
     }
     Ok(())
-}
-
-fn is_stop_request(request: &JsonRpcRequest) -> bool {
-    request.method == "tools/call"
-        && request.params.get("name").and_then(Value::as_str) == Some("huntproxy_stop")
 }
 
 fn write_response(resp: JsonRpcResponse) {
@@ -563,7 +600,7 @@ async fn handle_rpc(
         }))),
         "notifications/initialized" | "initialized" => Ok(None),
         "ping" => Ok(Some(json!({}))),
-        "tools/list" => Ok(Some(json!({ "tools": tool_defs() }))),
+        "tools/list" => Ok(Some(json!({ "tools": backend.definitions() }))),
         "tools/call" => {
             let name = req
                 .params
@@ -622,6 +659,82 @@ fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
         .and_then(|v| v.as_i64())
         .ok_or_else(|| DomainError::invalid("project_id required"))?;
     Ok(ProjectId(id))
+}
+
+async fn fetch_page_analyzer_bundle(
+    state: &Arc<AppState>,
+    project_id: ProjectId,
+    source_url: &str,
+    bundle_url: String,
+) -> DomainResult<Option<Vec<u8>>> {
+    if !crate::page_analyzer::same_origin_url(source_url, &bundle_url) {
+        return Ok(None);
+    }
+
+    let parsed = url::Url::parse(&bundle_url)
+        .map_err(|error| DomainError::invalid(format!("invalid bundle URL: {error}")))?;
+    if !matches!(parsed.path().rsplit('/').next(), Some(name) if name.to_ascii_lowercase().ends_with(".js") || name.to_ascii_lowercase().ends_with(".mjs"))
+    {
+        return Ok(None);
+    }
+
+    let draft = ReplyDraft {
+        method: Some("GET".into()),
+        url: Some(bundle_url),
+        ..Default::default()
+    };
+    let result = state
+        .reply
+        .send_same_origin(project_id, &draft, source_url)
+        .await?;
+    if let Some(exchange_id) = result.exchange_id {
+        emit_event(
+            state,
+            project_id,
+            "exchange",
+            json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
+        );
+        return Ok(Some(
+            crate::page_analyzer::load_exchange_content(&state.db, project_id, exchange_id)
+                .await?
+                .body,
+        ));
+    }
+    let Some(response) = result.response else {
+        return Ok(None);
+    };
+    let (body, _, _) = crate::page_analyzer::decode_ephemeral_response(&response)?;
+    Ok(Some(body))
+}
+
+async fn analyze_page_script_tree(
+    state: &Arc<AppState>,
+    project_id: ProjectId,
+    source_url: String,
+    body: Vec<u8>,
+) -> crate::page_analyzer::ScriptTreeAnalysis {
+    let fetch_state = state.clone();
+    let fetch_source_url = source_url.clone();
+    crate::page_analyzer::analyze_script_tree(&source_url, &body, |bundle_url| {
+        let state = fetch_state.clone();
+        let source_url = fetch_source_url.clone();
+        async move { fetch_page_analyzer_bundle(&state, project_id, &source_url, bundle_url).await }
+    })
+    .await
+}
+
+fn page_analysis_tree_fields(tree: crate::page_analyzer::ScriptTreeAnalysis) -> Value {
+    let analysis = tree.analysis;
+    json!({
+        "endpoints": analysis.endpoints,
+        "urls": analysis.urls,
+        "emails": analysis.emails,
+        "parameters": analysis.parameters,
+        "stats": analysis.stats,
+        "js_bundles": tree.js_bundles,
+        "js_bundles_truncated": tree.js_bundles_truncated,
+        "js_bundle_failures": tree.js_bundle_failures,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -866,6 +979,10 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "action must be list|create|usage|set_scope",
                 )),
             }
+        }
+        "overview" => {
+            let project_id = require_project_id(&args)?;
+            Ok(json!(state.db.project_overview(project_id).await?))
         }
         "capture_sessions" => {
             let project_id = require_project_id(&args)?;
@@ -1258,10 +1375,31 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .map(ExchangeId);
             let url = args.get("url").and_then(Value::as_str);
             match (exchange_id, url) {
-                (Some(exchange_id), None) => Ok(json!(
-                    crate::page_analyzer::analyze_exchange(&state.db, project_id, exchange_id,)
-                        .await?
-                )),
+                (Some(exchange_id), None) => {
+                    let content = crate::page_analyzer::load_exchange_content(
+                        &state.db,
+                        project_id,
+                        exchange_id,
+                    )
+                    .await?;
+                    let source_url = content.source_url.clone();
+                    let tree = analyze_page_script_tree(
+                        &state,
+                        project_id,
+                        source_url.clone(),
+                        content.body,
+                    )
+                    .await;
+                    let mut output = page_analysis_tree_fields(tree);
+                    let object = output.as_object_mut().expect("page analysis object");
+                    object.insert("project_id".into(), json!(project_id));
+                    object.insert("exchange_id".into(), json!(exchange_id));
+                    object.insert("source_url".into(), json!(source_url));
+                    object.insert("decoded".into(), json!(content.decoded));
+                    object.insert("content_encoding".into(), json!(content.content_encoding));
+                    object.insert("body_truncated".into(), json!(content.body_truncated));
+                    Ok(output)
+                }
                 (None, Some(url)) => {
                     let parsed = url::Url::parse(url).map_err(|error| {
                         DomainError::invalid(format!("invalid analysis URL: {error}"))
@@ -1271,78 +1409,72 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             "analysis URL must be an absolute http or https URL",
                         ));
                     }
+                    let requested_url = parsed.to_string();
                     let draft = ReplyDraft {
                         method: Some("GET".into()),
-                        url: Some(parsed.to_string()),
+                        url: Some(requested_url),
                         ..Default::default()
                     };
                     let result = state
                         .reply
                         .send(project_id, None, None, &draft, ProtocolPreference::Auto, 0)
                         .await?;
-                    if let Some(exchange_id) = result.exchange_id {
-                        emit_event(
-                            &state,
-                            project_id,
-                            "exchange",
-                            json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
-                        );
-                        return Ok(json!(
-                            crate::page_analyzer::analyze_exchange(
+                    let effective_url = result.effective_url.clone();
+                    let exchange_id = result.exchange_id;
+                    let (effective_source_url, body, decoded, content_encoding, body_truncated) =
+                        if let Some(exchange_id) = exchange_id {
+                            emit_event(
+                                &state,
+                                project_id,
+                                "exchange",
+                                json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
+                            );
+                            let content = crate::page_analyzer::load_exchange_content(
                                 &state.db,
                                 project_id,
                                 exchange_id,
                             )
-                            .await?
-                        ));
-                    }
-
-                    let response = result.response.ok_or_else(|| {
-                        DomainError::new(
-                            ErrorCode::Internal,
-                            "URL analysis response body was unavailable",
-                        )
-                    })?;
-                    let mut body = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        response.body_base64.as_bytes(),
+                            .await?;
+                            (
+                                content.source_url,
+                                content.body,
+                                content.decoded,
+                                content.content_encoding,
+                                content.body_truncated,
+                            )
+                        } else {
+                            let response = result.response.ok_or_else(|| {
+                                DomainError::new(
+                                    ErrorCode::Internal,
+                                    "URL analysis response body was unavailable",
+                                )
+                            })?;
+                            let (body, decoded, content_encoding) =
+                                crate::page_analyzer::decode_ephemeral_response(&response)?;
+                            (
+                                effective_url,
+                                body,
+                                decoded,
+                                content_encoding,
+                                response.body_truncated,
+                            )
+                        };
+                    let tree = analyze_page_script_tree(
+                        &state,
+                        project_id,
+                        effective_source_url.clone(),
+                        body,
                     )
-                    .map_err(|error| {
-                        DomainError::new(
-                            ErrorCode::Internal,
-                            format!("invalid internal response body: {error}"),
-                        )
-                    })?;
-                    let encodings = response
-                        .headers
-                        .iter()
-                        .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
-                        .map(|header| header.value.trim().to_string())
-                        .filter(|encoding| {
-                            !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
-                        })
-                        .collect::<Vec<_>>();
-                    let content_encoding = (!encodings.is_empty()).then(|| encodings.join(", "));
-                    if let Some(encoding) = &content_encoding {
-                        body = crate::codec::decode_content_encodings(
-                            &body,
-                            encoding,
-                            crate::codec::MAX_DECODED_BODY_OUTPUT,
-                        )?;
-                    }
-                    let analysis = crate::page_analyzer::analyze_page(&body);
-                    Ok(json!({
-                        "project_id": project_id,
-                        "exchange_id": null,
-                        "source_url": parsed.to_string(),
-                        "decoded": content_encoding.is_some(),
-                        "content_encoding": content_encoding,
-                        "body_truncated": response.body_truncated,
-                        "endpoints": analysis.endpoints,
-                        "urls": analysis.urls,
-                        "emails": analysis.emails,
-                        "stats": analysis.stats,
-                    }))
+                    .await;
+                    let mut output = page_analysis_tree_fields(tree);
+                    let object = output.as_object_mut().expect("page analysis object");
+                    object.insert("project_id".into(), json!(project_id));
+                    object.insert("exchange_id".into(), json!(exchange_id));
+                    object.insert("source_url".into(), json!(effective_source_url));
+                    object.insert("decoded".into(), json!(decoded));
+                    object.insert("content_encoding".into(), json!(content_encoding));
+                    object.insert("body_truncated".into(), json!(body_truncated));
+                    Ok(output)
                 }
                 _ => Err(DomainError::invalid(
                     "provide exactly one of exchange_id or url",
@@ -1395,13 +1527,21 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("exchange_id")
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let encoding = args
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("utf8");
+            if !matches!(encoding, "utf8" | "base64") {
+                return Err(DomainError::invalid("encoding must be utf8|base64"));
+            }
             let side = match args
                 .get("side")
                 .and_then(|v| v.as_str())
                 .unwrap_or("response")
             {
                 "request" => MessageSide::Request,
-                _ => MessageSide::Response,
+                "response" => MessageSide::Response,
+                _ => return Err(DomainError::invalid("side must be request|response")),
             };
             let offset = args
                 .get("offset")
@@ -1413,11 +1553,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(|v| v.as_u64())
                 .unwrap_or(4096)
                 .clamp(1, 1024 * 1024) as usize;
-            let mut body = state
+            let stored_body = state
                 .db
                 .load_raw_body(project_id, ExchangeId(eid), side)
-                .await?
-                .unwrap_or_default();
+                .await?;
+            let available = stored_body.is_some();
+            let mut body = stored_body.unwrap_or_default();
             let raw_total = body.len();
             let mut content_encoding = None;
             let mut decoded = false;
@@ -1462,11 +1603,18 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             } else {
                 &body[offset..end]
             };
+            let preview = match encoding {
+                "utf8" => String::from_utf8_lossy(slice).into_owned(),
+                "base64" => base64::engine::general_purpose::STANDARD.encode(slice),
+                _ => unreachable!("encoding validated above"),
+            };
             Ok(json!({
+                "available": available,
                 "total": body.len(),
                 "offset": offset,
                 "length": slice.len(),
-                "preview": String::from_utf8_lossy(slice),
+                "preview": preview,
+                "encoding": encoding,
                 "truncated": end < body.len(),
                 "next_offset": (end < body.len()).then_some(end),
                 "decoded": decoded,
@@ -2642,13 +2790,35 @@ mod tests {
     }
 
     #[test]
-    fn successful_stop_calls_close_the_stdio_bridge_after_reply() {
-        let request = JsonRpcRequest {
-            id: Some(json!(1)),
-            method: "tools/call".into(),
-            params: json!({"name": "huntproxy_stop", "arguments": {}}),
-        };
-        assert!(is_stop_request(&request));
+    fn lifecycle_tools_describe_continuing_on_the_same_connection() {
+        let tools = tool_defs();
+        let tools = tools.as_array().unwrap();
+        for name in ["huntproxy_stop", "huntproxy_restart"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.contains("MCP"));
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn in_process_backend_does_not_advertise_daemon_restart() {
+        let tools = local_tool_defs();
+        assert!(!tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "huntproxy_restart"));
+        let stop = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "huntproxy_stop")
+            .unwrap();
+        assert!(stop["description"]
+            .as_str()
+            .unwrap()
+            .contains("cannot restart itself"));
     }
 
     #[test]
@@ -2896,5 +3066,37 @@ mod tests {
             .is_some());
         assert_eq!(sitemap["inputSchema"]["additionalProperties"], false);
         assert!(tools.iter().any(|tool| tool["name"] == "findings"));
+        let overview = tools
+            .iter()
+            .find(|tool| tool["name"] == "overview")
+            .unwrap();
+        assert_eq!(overview["inputSchema"]["required"], json!(["project_id"]));
+        assert!(overview["description"]
+            .as_str()
+            .unwrap()
+            .contains("captured replies sent"));
+        let body = tools
+            .iter()
+            .find(|tool| tool["name"] == "exchange_body")
+            .unwrap();
+        assert_eq!(
+            body["inputSchema"]["properties"]["encoding"]["enum"],
+            json!(["utf8", "base64"])
+        );
+        assert_eq!(
+            body["inputSchema"]["properties"]["max_bytes"]["maximum"],
+            1048576
+        );
+        assert!(body["description"]
+            .as_str()
+            .unwrap()
+            .contains("without re-fetching it or using HTTP Range"));
+        assert!(tools
+            .iter()
+            .find(|tool| tool["name"] == "reply_send")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .contains("pass the returned exchange_id to exchange_body"));
     }
 }
