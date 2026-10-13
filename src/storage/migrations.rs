@@ -68,6 +68,10 @@ pub fn schema_version(conn: &Connection) -> DomainResult<i32> {
         .map_err(|e| DomainError::new(ErrorCode::MigrationError, e.to_string()))
 }
 
+pub fn current_schema_version() -> i32 {
+    MIGRATIONS.len() as i32
+}
+
 pub fn migrate(conn: &Connection) -> DomainResult<i32> {
     let mut version = schema_version(conn)?;
     let target = MIGRATIONS.len() as i32;

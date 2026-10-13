@@ -258,6 +258,12 @@ impl Db {
                 .run_to_completion(128, std::time::Duration::from_millis(10), None)
                 .map_err(|error| storage_error(format!("database backup: {error}")))?;
             drop(backup);
+            target
+                .pragma_update(None, "journal_mode", "DELETE")
+                .map_err(|error| {
+                    storage_error(format!("finalize standalone database backup: {error}"))
+                })?;
+            drop(target);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -266,6 +272,9 @@ impl Db {
                         storage_error(format!("secure backup permissions: {error}"))
                     })?;
             }
+            std::fs::File::open(&destination)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| storage_error(format!("sync database backup: {error}")))?;
             Ok(destination)
         })
         .await
