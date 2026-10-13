@@ -19,8 +19,31 @@ env:
   PLUGIN_CATALOG_COMMIT: d4e1aa3f2907338d40361938deca8c4c711394e7
 
 jobs:
+  dependency-audit:
+    name: Audit locked dependencies
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.2"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+
+      - name: Audit Rust and browser worker dependencies
+        env:
+          HUNTPROXY_AUDIT_DIR: ${{ runner.temp }}/huntproxy-dependency-audit
+        run: scripts/check-dependencies.sh
+
   source-checks:
     name: Validate candidate source
+    needs: dependency-audit
     runs-on: ubuntu-22.04
     steps:
       - name: Check out repository
@@ -116,7 +139,7 @@ jobs:
 
   build:
     name: Build and smoke-test ${{ matrix.asset }}
-    needs: source-checks
+    needs: [dependency-audit, source-checks]
     strategy:
       fail-fast: false
       matrix:

@@ -18,11 +18,4 @@ node --check browser-worker/index.js
 echo "== build =="
 cargo build --release --locked
 
-if command -v cargo-deny >/dev/null 2>&1; then
-  echo "== deny =="
-  cargo deny check
-else
-  echo "== deny skipped (cargo-deny not installed) =="
-fi
-
 echo "OK"
