@@ -54,6 +54,162 @@ function trackJavascriptFiles(session, existing = new Map()) {
   });
 }
 
+function publicLocation(value) {
+  try {
+    const url = new URL(value);
+    if (!new Set(["http:", "https:", "about:"]).has(url.protocol)) return null;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().slice(0, 512);
+  } catch {
+    return null;
+  }
+}
+
+function trackRuntimeErrors(session) {
+  session.runtimeErrors = [];
+  session.runtimeErrorCount = 0;
+  const record = (event) => {
+    session.runtimeErrorCount += 1;
+    session.runtimeErrors.push(event);
+    if (session.runtimeErrors.length > 32) session.runtimeErrors.shift();
+  };
+  // Console/error text can contain application credentials. Retain only
+  // diagnostic type and source location, never message or stack contents.
+  session.page.on("console", (message) => {
+    if (!new Set(["error", "warning"]).has(message.type())) return;
+    const location = message.location();
+    record({ kind: "console", level: message.type(), url: publicLocation(location.url),
+      line: location.lineNumber, column: location.columnNumber });
+  });
+  session.page.on("pageerror", () => record({ kind: "page_error" }));
+}
+
+async function uploadFiles(session, action) {
+  const files = action.files;
+  const timeout = action.timeout_ms ?? 10_000;
+  if (!Array.isArray(files) || files.length > 16 || (action.via_chooser && !files.length)
+      || !Number.isInteger(timeout) || timeout < 1 || timeout > 30_000) {
+    throw rpcError(-32602, "upload requires at most 16 paths and timeout_ms in 1..30000; chooser requires files");
+  }
+  let totalBytes = 0;
+  for (const file of files) {
+    if (typeof file !== "string" || !path.isAbsolute(file) || Buffer.byteLength(file) > 4096 || file.includes("\0")) {
+      throw rpcError(-32602, "upload files must be absolute paths of at most 4096 bytes");
+    }
+    try {
+      const stat = fs.statSync(file);
+      if (!stat.isFile()) throw new Error("not a regular file");
+      fs.accessSync(file, fs.constants.R_OK);
+      totalBytes += stat.size;
+    } catch {
+      throw rpcError(-32602, "upload file is missing, unreadable, or not a regular file");
+    }
+  }
+  const locator = locatorFor(session.page, action.locator);
+  if (!action.via_chooser) {
+    await locator.setInputFiles(files, { timeout });
+  } else {
+    let chooser;
+    let timer;
+    let click;
+    let onChooser;
+    const started = Date.now();
+    const waiting = new Promise((resolve, reject) => {
+      onChooser = (event) => { chooser = event; resolve(event); };
+      session.page.once("filechooser", onChooser);
+      timer = setTimeout(() => reject(rpcError(-32000, "upload file chooser timed out")), timeout);
+    });
+    try {
+      click = locator.click({ timeout });
+      const [event] = await Promise.all([waiting, click]);
+      clearTimeout(timer);
+      const remaining = timeout - (Date.now() - started);
+      if (remaining <= 0) throw rpcError(-32000, "upload file chooser timed out");
+      await event.setFiles(files, { timeout: remaining });
+    } finally {
+      clearTimeout(timer);
+      session.page.off("filechooser", onChooser);
+      // Finish the bounded click before acknowledging failure; a pending click
+      // must not open a chooser after the next action takes ownership.
+      if (click) await Promise.allSettled([click]);
+      if (chooser) {
+        // Removing the final listener disables Playwright's intercepted chooser.
+        // No native dialog was opened. Do not clear an earlier file selection
+        // merely because this attempted replacement failed.
+        await chooser.element().dispose().catch(() => undefined);
+      }
+    }
+  }
+  return { message: files.length ? "files selected" : "file selection cleared",
+    data: { file_count: files.length, files: files.map((file) => path.basename(file)),
+      total_bytes: totalBytes, via_chooser: Boolean(action.via_chooser) } };
+}
+
+async function inspectRuntime(session, action) {
+  const maxBytes = action.max_bytes ?? 4096;
+  if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 65_536) {
+    throw rpcError(-32602, "inspect max_bytes must be 1..65536");
+  }
+  // The expression is fixed by HuntProxy. Callers cannot execute page code,
+  // dispatch requests, or inspect cookies, storage, input values, or globals.
+  const connection = await session.context.newCDPSession(session.page);
+  let result;
+  try {
+    const observed = await connection.send("Runtime.evaluate", {
+      expression: `(() => ({
+        ready_state: document.readyState,
+        visibility_state: document.visibilityState,
+        resources: performance.getEntriesByType("resource").slice(-20).map((entry) => ({
+          url: entry.name, initiator_type: entry.initiatorType,
+          duration_ms: Math.round(entry.duration), transfer_size: entry.transferSize,
+        })),
+      }))()`,
+      returnByValue: true, awaitPromise: false, timeout: 1000, disableBreaks: true,
+    });
+    if (observed.exceptionDetails || !observed.result.value) {
+      throw rpcError(-32000, "runtime inspection could not read page metadata");
+    }
+    result = observed.result.value;
+  } finally {
+    await connection.detach().catch(() => undefined);
+  }
+  result.url = publicLocation(session.page.url());
+  result.resources = result.resources.map((entry) => ({ ...entry, url: publicLocation(entry.url) }));
+  result.runtime_error_count = session.runtimeErrorCount || 0;
+  result.recent_errors = (session.runtimeErrors || []).slice(-16);
+  if (action.locator) {
+    const locator = locatorFor(session.page, action.locator);
+    const element = await locator.elementHandle({ timeout: 10_000 });
+    const elementConnection = await session.context.newCDPSession(session.page);
+    let termination;
+    const timer = setTimeout(() => {
+      termination = elementConnection.send("Runtime.terminateExecution").catch(() => undefined);
+    }, 1000);
+    try {
+      result.element = await element.evaluate((element) => ({
+        tag: element.tagName.toLowerCase(), role: element.getAttribute("role"),
+        type: element.getAttribute("type"), disabled: Boolean(element.disabled),
+        read_only: Boolean(element.readOnly), checked: typeof element.checked === "boolean" ? element.checked : null,
+        file_count: element.files?.length ?? null,
+      }));
+    } finally {
+      clearTimeout(timer);
+      if (termination) await termination;
+      await element.dispose().catch(() => undefined);
+      await elementConnection.detach().catch(() => undefined);
+    }
+    result.element.visible = await locator.isVisible();
+    result.element.enabled = await locator.isEnabled({ timeout: 10_000 });
+  }
+  const bytes = Buffer.from(JSON.stringify(result), "utf8");
+  const content = new TextDecoder().decode(bytes.subarray(0, maxBytes), { stream: bytes.length > maxBytes });
+  return { message: "runtime inspected", data: { format: "runtime", content,
+    truncated: bytes.length > maxBytes, total_bytes: bytes.length } };
+}
+
 function loadPlaywright() {
   const candidates = [];
   if (process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH || process.env.BB_PLAYWRIGHT_CORE_PATH) {
@@ -303,6 +459,7 @@ async function relaunchSession(session, cdpPort) {
       const restored = await launchSessionRuntime(session, null, currentUrl, sessionCookies, sessionStorage);
       Object.assign(session, restored.runtime, { cdp: null });
       trackJavascriptFiles(session);
+      trackRuntimeErrors(session);
     } catch (restoreError) {
       throw rpcError(
         -32000,
@@ -313,6 +470,7 @@ async function relaunchSession(session, cdpPort) {
   }
   Object.assign(session, launched.runtime, { cdp: launched.cdp });
   trackJavascriptFiles(session);
+  trackRuntimeErrors(session);
   return launched.cdp;
 }
 
@@ -538,6 +696,10 @@ async function executeAction(session, action = {}) {
     case "select":
       await locatorFor(session.page, action.locator).selectOption(action.value, { timeout: 30_000 });
       return { message: "option selected", data: null };
+    case "upload":
+      return uploadFiles(session, action);
+    case "inspect":
+      return inspectRuntime(session, action);
     case "press":
       if (action.locator) {
         await locatorFor(session.page, action.locator).press(action.key, { timeout: 30_000 });
@@ -636,6 +798,7 @@ async function handle(req) {
           cdp: null,
         };
         trackJavascriptFiles(session);
+        trackRuntimeErrors(session);
         sessions.set(sessionId, session);
         try {
           await restoreProjectState(session, params.restore_state);

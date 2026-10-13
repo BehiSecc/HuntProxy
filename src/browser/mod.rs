@@ -179,6 +179,19 @@ pub enum BrowserAction {
         locator: Locator,
         value: String,
     },
+    Upload {
+        locator: Locator,
+        files: Vec<String>,
+        #[serde(default)]
+        via_chooser: bool,
+        #[serde(default = "default_browser_action_timeout")]
+        timeout_ms: u64,
+    },
+    Inspect {
+        locator: Option<Locator>,
+        #[serde(default = "default_inspection_max_bytes")]
+        max_bytes: u64,
+    },
     Press {
         locator: Option<Locator>,
         key: String,
@@ -190,6 +203,14 @@ pub enum BrowserAction {
     Back,
     Forward,
     Close,
+}
+
+fn default_browser_action_timeout() -> u64 {
+    10_000
+}
+
+fn default_inspection_max_bytes() -> u64 {
+    4096
 }
 
 fn default_snapshot_format() -> String {
@@ -1647,6 +1668,34 @@ impl BrowserService {
         session_id: BrowserSessionId,
         action: BrowserAction,
     ) -> DomainResult<ActionResult> {
+        match &action {
+            BrowserAction::Upload {
+                files,
+                via_chooser,
+                timeout_ms,
+                ..
+            } => {
+                if files.len() > 16 || (*via_chooser && files.is_empty()) {
+                    return Err(DomainError::invalid(
+                        "upload accepts at most 16 files; chooser uploads require at least one",
+                    ));
+                }
+                if !(1..=30_000).contains(timeout_ms) {
+                    return Err(DomainError::invalid("upload timeout_ms must be 1..30000"));
+                }
+                if files.iter().any(|file| {
+                    file.len() > 4096 || file.contains('\0') || !Path::new(file).is_absolute()
+                }) {
+                    return Err(DomainError::invalid(
+                        "upload files must be absolute paths of at most 4096 bytes",
+                    ));
+                }
+            }
+            BrowserAction::Inspect { max_bytes, .. } if !(1..=65_536).contains(max_bytes) => {
+                return Err(DomainError::invalid("inspect max_bytes must be 1..65536"));
+            }
+            _ => {}
+        }
         if matches!(&action, BrowserAction::Close) {
             self.stop(project_id, session_id).await?;
             return Ok(ActionResult {

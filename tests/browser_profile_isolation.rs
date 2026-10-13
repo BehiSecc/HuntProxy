@@ -21,7 +21,34 @@ use tokio_tungstenite::tungstenite::Message;
 
 const APP: &str = r#"<!doctype html><html><head><title>Profile fixture</title></head>
 <body><button id="seed">Save identity</button><button id="read">Read state</button>
-<pre id="state">Loading</pre><script>
+<pre id="state">Loading</pre>
+<input id="direct-file" type="file" multiple>
+<input id="chooser-file" type="file" multiple hidden>
+<input id="single-file" type="file" hidden>
+<button id="browse" type="button">Browse</button>
+<button id="browse-single" type="button">Browse one document</button>
+<button id="no-chooser" type="button">Keep browsing</button>
+<button id="warning" type="button">Show diagnostic</button>
+<input id="slow-metadata" type="checkbox">
+<pre id="upload-state">No selection</pre><script>
+// A finite but slow application getter exercises the inspection watchdog.
+Object.defineProperty(document.getElementById('slow-metadata'), 'disabled', {
+  get() { const started = Date.now(); while (Date.now() - started < 2500) {} return false; }
+});
+document.getElementById('browse').onclick = () => document.getElementById('chooser-file').click();
+document.getElementById('browse-single').onclick = () => document.getElementById('single-file').click();
+document.getElementById('no-chooser').onclick = () => document.body.dataset.noChooserClicked = 'true';
+document.getElementById('warning').onclick = () => console.warn('Local fixture diagnostic');
+for (const id of ['direct-file', 'chooser-file']) {
+  document.getElementById(id).onchange = async event => {
+    const names = Array.from(event.target.files).map(file => file.name);
+    const form = new FormData();
+    for (const file of event.target.files) form.append('document', file);
+    const response = await fetch('/upload', {method: 'POST', body: form});
+    document.getElementById('upload-state').textContent = JSON.stringify({names, status: response.status});
+    document.getElementById('upload-state').dataset.ready = 'true';
+  };
+}
 const output = document.getElementById('state');
 const cookieIdentity = () => document.cookie.split('; ').find(v => v.startsWith('sid='))?.slice(4) || null;
 const database = new Promise((resolve, reject) => {
@@ -390,6 +417,501 @@ async fn browser_resource_status_preserves_profiles_at_capacity_and_reports_cdp_
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+fn css_locator(selector: &str) -> Locator {
+    Locator {
+        role: None,
+        name: None,
+        text: None,
+        test_id: None,
+        css: Some(selector.into()),
+        exact: None,
+    }
+}
+
+async fn runtime_inspection(
+    h: &Harness,
+    session: BrowserSessionId,
+    selector: Option<&str>,
+) -> Value {
+    let result = h
+        .service
+        .action(
+            h.project,
+            session,
+            BrowserAction::Inspect {
+                locator: selector.map(css_locator),
+                max_bytes: 65_536,
+            },
+        )
+        .await
+        .unwrap();
+    let data = result.data.unwrap();
+    assert_eq!(data["truncated"], false);
+    serde_json::from_str(data["content"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; uses only a local fixture"]
+async fn native_file_selection_and_passive_inspection_preserve_owned_profiles() {
+    let h = Harness::new_in(&std::env::temp_dir()).await;
+    let result = std::panic::AssertUnwindSafe(verify_native_file_selection(&h))
+        .catch_unwind()
+        .await;
+    h.service.force_stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; captures only a local fixture"]
+async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
+    let mut h = Harness::new_in(&std::env::temp_dir()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let directory = h._directory.path();
+    let config = Config {
+        data_dir: directory.to_path_buf(),
+        spool_dir: directory.join("spool"),
+        export_dir: directory.join("exports"),
+        runtime_dir: directory.join("runtime"),
+        plugin_dir: directory.join("plugins"),
+        proxy_listen: address,
+        browser_worker_path: Some(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("browser-worker/index.js"),
+        ),
+        ..Config::default()
+    };
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut parameters =
+        rcgen::CertificateParams::new(vec!["Local browser fixture CA".into()]).unwrap();
+    parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let certificate = parameters.self_signed(&key).unwrap();
+    huntproxy::config::write_private_file(&config.ca_cert_path(), certificate.pem().as_bytes())
+        .unwrap();
+    huntproxy::config::write_private_file(&config.ca_key_path(), key.serialize_pem().as_bytes())
+        .unwrap();
+    let state = huntproxy::app::bootstrap_state(config).await.unwrap();
+    h.service = BrowserService::new_with_proxy_and_ca(
+        state.db.clone(),
+        None,
+        Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("browser-worker/index.js")),
+        format!("http://{address}"),
+        None,
+        directory.join("profiles"),
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let proxy_cancel = cancel.clone();
+    let proxy = tokio::spawn(huntproxy::proxy::serve_proxy_listener(
+        state,
+        listener,
+        proxy_cancel,
+    ));
+    let result = std::panic::AssertUnwindSafe(async {
+        let session = h
+            .service
+            .start(h.project, h.fixture.url("localhost", "default"))
+            .await
+            .unwrap();
+        let capture_id = h
+            .service
+            .db
+            .list_capture_sessions(h.project)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|capture| capture.browser_session_id == Some(session.id))
+            .unwrap()
+            .id;
+        let file = h._directory.path().join("reading-list.csv");
+        std::fs::write(&file, "title\nAutumn edition\n").unwrap();
+        h.service
+            .action(
+                h.project,
+                session.id,
+                BrowserAction::Upload {
+                    locator: css_locator("#browse"),
+                    files: vec![file.display().to_string()],
+                    via_chooser: true,
+                    timeout_ms: 5000,
+                },
+            )
+            .await
+            .unwrap();
+        h.service
+            .action(
+                h.project,
+                session.id,
+                BrowserAction::Wait {
+                    for_what: "selector".into(),
+                    value: "#upload-state[data-ready='true']".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let filter = huntproxy::history::parse_text_query("method:POST path:/upload").unwrap();
+        let (history, _) = h
+            .service
+            .db
+            .list_history_filtered(h.project, Some(filter), 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        let exchange = h
+            .service
+            .db
+            .get_exchange_detail(h.project, history[0].exchange_id, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(exchange.summary.status_code, Some(200));
+        assert_eq!(exchange.lineage.browser_session_id, Some(session.id));
+        assert_eq!(exchange.lineage.capture_session_id, Some(capture_id));
+        assert!(exchange.summary.request_length.unwrap_or_default() > 20);
+        let body = h
+            .service
+            .db
+            .load_raw_body(
+                h.project,
+                history[0].exchange_id,
+                huntproxy::domain::MessageSide::Request,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("reading-list.csv"));
+        assert!(body.contains("Autumn edition"));
+    })
+    .catch_unwind()
+    .await;
+    h.service.force_stop_all().await;
+    cancel.cancel();
+    proxy.await.unwrap().unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn verify_native_file_selection(h: &Harness) {
+    h.seed("default", "localhost").await;
+    h.seed("acc2", "localhost").await;
+    let first = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            h.fixture.url("localhost", "default"),
+            "default",
+            Some("default"),
+        )
+        .await
+        .unwrap();
+    let second = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            h.fixture.url("localhost", "acc2"),
+            "acc2",
+            Some("acc2"),
+        )
+        .await
+        .unwrap();
+    let captures = h
+        .service
+        .db
+        .list_capture_sessions(h.project)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|capture| capture.id)
+        .collect::<Vec<_>>();
+    let file = h._directory.path().join("catalog.csv");
+    std::fs::write(&file, "title,author\nSpring edition,Alex River\n").unwrap();
+    let upload = |selector: &str, chooser, timeout| BrowserAction::Upload {
+        locator: css_locator(selector),
+        files: vec![file.display().to_string()],
+        via_chooser: chooser,
+        timeout_ms: timeout,
+    };
+    let direct = h
+        .service
+        .action(h.project, first.id, upload("#direct-file", false, 5000))
+        .await
+        .unwrap();
+    assert_eq!(direct.data.unwrap()["files"], json!(["catalog.csv"]));
+    assert_eq!(
+        runtime_inspection(h, first.id, Some("#direct-file")).await["element"]["file_count"],
+        1
+    );
+    assert_eq!(
+        runtime_inspection(h, second.id, Some("#direct-file")).await["element"]["file_count"],
+        0
+    );
+    h.service
+        .action(h.project, second.id, upload("#browse", true, 5000))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_inspection(h, second.id, Some("#chooser-file")).await["element"]["file_count"],
+        1
+    );
+    h.service
+        .action(
+            h.project,
+            second.id,
+            BrowserAction::Wait {
+                for_what: "selector".into(),
+                value: "#upload-state[data-ready='true']".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let missing = BrowserAction::Upload {
+        locator: css_locator("#no-chooser"),
+        files: vec![h
+            ._directory
+            .path()
+            .join("missing.csv")
+            .display()
+            .to_string()],
+        via_chooser: true,
+        timeout_ms: 100,
+    };
+    assert_eq!(
+        h.service
+            .action(h.project, first.id, missing)
+            .await
+            .unwrap_err()
+            .code(),
+        huntproxy::domain::ErrorCode::InvalidArgument
+    );
+    let before = h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Snapshot {
+                format: "dom".into(),
+                max_bytes: 200_000,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!before.data.unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .contains("data-no-chooser-clicked"));
+    assert!(h
+        .service
+        .action(h.project, first.id, upload("#no-chooser", true, 100))
+        .await
+        .is_err());
+    // A timed-out chooser listener must not steal the next legitimate chooser.
+    h.service
+        .action(h.project, first.id, upload("#browse", true, 5000))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_inspection(h, first.id, Some("#chooser-file")).await["element"]["file_count"],
+        1
+    );
+    let other_file = h._directory.path().join("notes.txt");
+    std::fs::write(&other_file, "Autumn reading notes\n").unwrap();
+    assert!(h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Upload {
+                locator: css_locator("#browse-single"),
+                files: vec![file.display().to_string(), other_file.display().to_string()],
+                via_chooser: true,
+                timeout_ms: 5000,
+            }
+        )
+        .await
+        .is_err());
+    let started = std::time::Instant::now();
+    assert!(h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Inspect {
+                locator: Some(css_locator("#slow-metadata")),
+                max_bytes: 4096,
+            }
+        )
+        .await
+        .is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(
+        runtime_inspection(h, second.id, None).await["ready_state"],
+        "complete"
+    );
+    // An actual chooser rejected for a single-file input is cleared as well.
+    h.service
+        .action(h.project, first.id, upload("#browse-single", true, 5000))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_inspection(h, first.id, Some("#single-file")).await["element"]["file_count"],
+        1
+    );
+    assert!(h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Upload {
+                locator: css_locator("#browse-single"),
+                files: vec![file.display().to_string(), other_file.display().to_string()],
+                via_chooser: true,
+                timeout_ms: 5000,
+            }
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        runtime_inspection(h, first.id, Some("#single-file")).await["element"]["file_count"],
+        1,
+        "A canceled replacement must preserve the previous selection"
+    );
+    h.service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Upload {
+                locator: css_locator("#direct-file"),
+                files: vec![],
+                via_chooser: false,
+                timeout_ms: 5000,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_inspection(h, first.id, Some("#direct-file")).await["element"]["file_count"],
+        0
+    );
+
+    h.service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Click {
+                locator: css_locator("#warning"),
+            },
+        )
+        .await
+        .unwrap();
+    let inspection = runtime_inspection(h, first.id, None).await;
+    assert!(inspection["runtime_error_count"].as_u64().unwrap() >= 1);
+    assert!(!inspection.to_string().contains("Local fixture diagnostic"));
+    assert!(!inspection["url"].as_str().unwrap().contains('?'));
+    let short = h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Inspect {
+                locator: None,
+                max_bytes: 30,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(short["truncated"], true);
+    assert!(short["content"].as_str().unwrap().len() <= 30);
+    assert!(h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Inspect {
+                locator: Some(css_locator("#absent")),
+                max_bytes: 4096,
+            }
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        h.service
+            .session_status(h.project, first.id)
+            .await
+            .unwrap()
+            .state,
+        huntproxy::domain::BrowserSessionState::Ready
+    );
+
+    let foreign = h
+        .service
+        .db
+        .create_project(CreateProjectRequest {
+            name: "Other local browser owner".into(),
+            target_url: h.fixture.url("localhost", "other"),
+            advanced: None,
+        })
+        .await
+        .unwrap();
+    assert!(h
+        .service
+        .action(foreign.id, first.id, upload("#direct-file", false, 5000))
+        .await
+        .is_err());
+    h.service.enable_cdp(h.project, first.id).await.unwrap();
+    for action in [
+        upload("#browse", true, 5000),
+        BrowserAction::Inspect {
+            locator: None,
+            max_bytes: 4096,
+        },
+    ] {
+        assert_eq!(
+            h.service
+                .action(h.project, first.id, action)
+                .await
+                .unwrap_err()
+                .code(),
+            huntproxy::domain::ErrorCode::Conflict
+        );
+    }
+    h.service.disable_cdp(h.project, first.id).await.unwrap();
+    assert_eq!(
+        runtime_inspection(h, first.id, None).await["ready_state"],
+        "complete"
+    );
+    assert_eq!(
+        h.service
+            .session_status(h.project, second.id)
+            .await
+            .unwrap()
+            .active_profile
+            .as_deref(),
+        Some("acc2")
+    );
+    assert_eq!(
+        h.service
+            .db
+            .list_capture_sessions(h.project)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|capture| capture.id)
+            .collect::<Vec<_>>(),
+        captures
+    );
+    h.service.stop(h.project, first.id).await.unwrap();
+    let resumed = h
+        .service
+        .start_with_profile(h.project, "about:blank".into(), "default")
+        .await
+        .unwrap();
+    assert_eq!(h.state(resumed.id).await["cookie"], "default");
 }
 
 async fn verify_browser_resources(h: &Harness) {
