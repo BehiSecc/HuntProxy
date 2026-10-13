@@ -172,6 +172,12 @@ For an ordinary file input, use `browser_action` with `action: {type: "upload", 
 
 `action: {type: "inspect"}` returns passive page readiness, recent resource metadata and diagnostic locations; add `locator` for element state. Its `data.content` contains JSON when `truncated` is false. Increase `max_bytes` from the 4096-byte default up to 65536 when more detail is needed. Console message text, storage and credentials are excluded. These actions retain session ownership and respect a person's CDP handoff.
 
+Agents can keep routine browser work inside `browser_action`. Use `pages` to list, open, select, or close tabs; reuse a returned `page_id` only with its `runtime_generation`. Closing the last tab creates a clean `about:blank` page. Use `events` with its sequence cursor to observe bounded popup, navigation, dialog, request, response, console-error, and window-message metadata. Event payloads exclude message contents, headers, bodies, cookies, and storage. `scroll` accepts a locator or bounded wheel deltas. `screenshot` captures a viewport, element, or bounded full page; MCP clients receive the PNG as an image content block.
+
+`action: {type: "request", method: "POST", url: "https://target.example/api/items", body_text: "..."}` sends one request from a reusable isolated world on the active page. The URL must have that page's exact HTTP(S) origin, and HuntProxy rechecks the effective URL after request rules. The request uses the live browser cookie jar and normal browser CSP, service-worker, Origin, Referer, proxy, and capture behavior. Redirects and retries are disabled. Request bodies are limited to 2 MiB, response previews to 64 KiB, and Fetch-managed or duplicate headers are rejected instead of being silently changed. A completed response is drained so History can retain its normal full captured evidence even when the returned preview is short; a timeout is never retried and can leave explicitly incomplete evidence.
+
+`browser_cdp` remains available for operator handoff and for unusual interactions that the structured actions cannot express. While a CDP handoff is active, `browser_action` pauses as before. Returning control creates a new runtime generation, so list pages and restart event cursors before continuing.
+
 ### Test Hypotheses
 
 | Capability | What your agent can do |

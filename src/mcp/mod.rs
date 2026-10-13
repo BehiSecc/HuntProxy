@@ -228,19 +228,34 @@ fn locator_schema() -> Value {
 fn browser_action_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Action object. navigate requires url; click requires locator; fill/select require locator and value; upload requires locator and files on the HuntProxy machine, with via_chooser=true for a trusted Browse button; inspect returns passive bounded runtime/element metadata and accepts optional locator and max_bytes (1..65536). press requires key and optional locator; wait requires for_what and value; snapshot accepts format and max_bytes.",
+        "description": "Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. browser_cdp remains available for interactions these actions cannot express.",
         "properties": {
-            "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "press", "wait", "back", "forward", "close"]},
-            "url": {"type": "string"},
+            "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "pages", "events", "scroll", "screenshot", "request", "press", "wait", "back", "forward", "close"]},
+            "url": {"type": "string", "description":"Required by navigate and request; optional for pages op=new. request must match the active page origin."},
             "locator": locator_schema(),
             "value": {"type": "string"},
             "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Absolute paths to regular readable files on the HuntProxy machine. An empty array clears a direct file input; chooser uploads require at least one file."},
             "via_chooser": {"type":"boolean","default":false,"description":"For upload, click locator as a trusted Browse/file-chooser trigger instead of setting an input directly."},
-            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Upload operation deadline, including file chooser and trusted click."},
+            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"description":"Upload or request deadline. request requires at least 1000 ms and defaults to 15000."},
             "key": {"type": "string"},
             "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"]},
             "format": {"type": "string", "enum": ["accessibility", "dom"]},
-            "max_bytes": {"type": "integer", "minimum": 1}
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"Bound for snapshot, inspect, or screenshot output."},
+            "op": {"type":"string","enum":["list","select","new","close"],"description":"Operation for pages."},
+            "page_id": {"type":"integer","minimum":1,"description":"Required with runtime_generation for pages select/close."},
+            "runtime_generation": {"type":"integer","minimum":1,"description":"Generation returned by pages/events or browser context. Required when reusing a page ID or nonzero event cursor."},
+            "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"For events, return observations after this sequence."},
+            "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Maximum browser events to return."},
+            "kinds": {"type":"array","maxItems":10,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message"]},"description":"Optional browser event filter."},
+            "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"For events, wait up to this long for a matching event."},
+            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal wheel delta for scroll."},
+            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical wheel delta for scroll."},
+            "full_page": {"type":"boolean","default":false,"description":"Capture the full page for screenshot; cannot be combined with locator."},
+            "method": {"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"],"description":"Required for request."},
+            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"Request headers. Duplicate names and browser-managed or Fetch-forbidden transport, identity, origin, host, length, proxy, Sec-*, and internal headers are rejected rather than silently changed."},
+            "body_text": {"type":"string","description":"Optional UTF-8 request body, up to 2 MiB; mutually exclusive with body_base64."},
+            "body_base64": {"type":"string","description":"Optional exact request body as base64, up to 2 MiB decoded; mutually exclusive with body_text."},
+            "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Maximum exact response preview bytes returned by request."}
         },
         "required": ["type"],
         "additionalProperties": false
@@ -630,12 +645,7 @@ async fn handle_rpc(
                 }
                 Err(error) => return Err(error),
             };
-            let structured_content = object_structured_content(&result);
-            Ok(Some(json!({
-                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                "structuredContent": structured_content,
-                "isError": is_error
-            })))
+            Ok(Some(tool_call_result(name, result, is_error)))
         }
         other => Err(DomainError::invalid(format!("unknown method {other}"))),
     }
@@ -662,6 +672,52 @@ fn object_structured_content(result: &Value) -> Value {
     } else {
         json!({ "result": result })
     }
+}
+
+fn tool_call_result(name: &str, result: Value, is_error: bool) -> Value {
+    let mut structured_content = object_structured_content(&result);
+    let image = if name == "browser_action" && !is_error {
+        let encoded = structured_content
+            .pointer("/data/image_base64")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mime_type = structured_content
+            .pointer("/data/mime_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        encoded.zip(mime_type)
+    } else {
+        None
+    };
+    let mut content = Vec::new();
+    if let Some((encoded, mime_type)) = image {
+        if let Some(data) = structured_content
+            .get_mut("data")
+            .and_then(Value::as_object_mut)
+        {
+            data.remove("image_base64");
+            data.insert("image_in_content".into(), Value::Bool(true));
+        }
+        content.push(json!({
+            "type": "text",
+            "text": serde_json::to_string_pretty(&structured_content).unwrap_or_default()
+        }));
+        content.push(json!({
+            "type": "image",
+            "data": encoded,
+            "mimeType": mime_type
+        }));
+    } else {
+        content.push(json!({
+            "type": "text",
+            "text": serde_json::to_string_pretty(&result).unwrap_or_default()
+        }));
+    }
+    json!({
+        "content": content,
+        "structuredContent": structured_content,
+        "isError": is_error
+    })
 }
 
 fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
@@ -2635,6 +2691,57 @@ mod tests {
             method: "tools/call".into(),
             params: json!({"name": "history_search", "arguments": arguments}),
         }
+    }
+
+    #[test]
+    fn browser_screenshot_uses_an_mcp_image_without_duplicating_base64() {
+        let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+        let result = tool_call_result(
+            "browser_action",
+            json!({
+                "ok": true,
+                "untrusted": true,
+                "message": "browser screenshot captured",
+                "data": {
+                    "mime_type": "image/png",
+                    "byte_length": 24,
+                    "image_base64": encoded
+                }
+            }),
+            false,
+        );
+        assert_eq!(result["content"].as_array().unwrap().len(), 2);
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["mimeType"], "image/png");
+        assert_eq!(result["content"][1]["data"], encoded);
+        assert_eq!(
+            result["structuredContent"]["data"]["image_in_content"],
+            true
+        );
+        assert!(result["structuredContent"]["data"]
+            .get("image_base64")
+            .is_none());
+        assert!(!result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(encoded));
+    }
+
+    #[test]
+    fn browser_action_schema_advertises_structured_playwright_capabilities() {
+        let schema = browser_action_schema();
+        let action_types = schema["properties"]["type"]["enum"].as_array().unwrap();
+        for action in ["pages", "events", "scroll", "screenshot", "request"] {
+            assert!(action_types.contains(&json!(action)));
+        }
+        assert_eq!(
+            schema["properties"]["max_response_bytes"]["maximum"],
+            65_536
+        );
+        assert!(schema["description"]
+            .as_str()
+            .unwrap()
+            .contains("browser_cdp remains available"));
     }
 
     #[cfg(unix)]

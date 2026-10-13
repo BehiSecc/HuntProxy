@@ -14,6 +14,10 @@ import { fileURLToPath } from "node:url";
 
 const PROTOCOL = 1;
 const sessions = new Map();
+const MAX_SESSION_EVENTS = 256;
+const MAX_SESSION_EVENT_BYTES = 256 * 1024;
+const MAX_SCREENSHOT_PIXELS = 16 * 1024 * 1024;
+const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
 
 function javascriptFile(response, fallbackPageUrl) {
   let parsed;
@@ -46,10 +50,9 @@ function javascriptFile(response, fallbackPageUrl) {
   };
 }
 
-function trackJavascriptFiles(session, existing = new Map()) {
-  session.javascriptFiles = existing;
-  session.page.on("response", (response) => {
-    const file = javascriptFile(response, session.page.url());
+function trackJavascriptFiles(session, page) {
+  page.on("response", (response) => {
+    const file = javascriptFile(response, page.url());
     if (file) session.javascriptFiles.set(file.url, file);
   });
 }
@@ -68,9 +71,39 @@ function publicLocation(value) {
   }
 }
 
-function trackRuntimeErrors(session) {
-  session.runtimeErrors = [];
-  session.runtimeErrorCount = 0;
+function recordSessionEvent(session, kind, details = {}, page = null) {
+  if (!session.events) return;
+  const pageId = page ? session.pageIds?.get(page) ?? null : null;
+  const event = {
+    sequence: ++session.eventSequence,
+    runtime_generation: session.runtimeGeneration,
+    kind,
+    page_id: pageId,
+    observed_at: new Date().toISOString(),
+    ...details,
+  };
+  const bytes = Buffer.byteLength(JSON.stringify(event));
+  if (bytes > MAX_SESSION_EVENT_BYTES) return;
+  session.events.push({ event, bytes });
+  session.eventBytes += bytes;
+  while (session.events.length > MAX_SESSION_EVENTS
+      || session.eventBytes > MAX_SESSION_EVENT_BYTES) {
+    const removed = session.events.shift();
+    session.eventBytes -= removed?.bytes || 0;
+    session.eventsDropped += 1;
+  }
+}
+
+function pageIdFor(session, page) {
+  const existing = session.pageIds.get(page);
+  if (existing) return existing;
+  const pageId = session.nextPageId++;
+  session.pageIds.set(page, pageId);
+  session.pages.set(pageId, page);
+  return pageId;
+}
+
+function trackRuntimeErrors(session, page) {
   const record = (event) => {
     session.runtimeErrorCount += 1;
     session.runtimeErrors.push(event);
@@ -78,13 +111,182 @@ function trackRuntimeErrors(session) {
   };
   // Console/error text can contain application credentials. Retain only
   // diagnostic type and source location, never message or stack contents.
-  session.page.on("console", (message) => {
+  page.on("console", (message) => {
     if (!new Set(["error", "warning"]).has(message.type())) return;
     const location = message.location();
-    record({ kind: "console", level: message.type(), url: publicLocation(location.url),
-      line: location.lineNumber, column: location.columnNumber });
+    const event = { kind: "console", level: message.type(), url: publicLocation(location.url),
+      line: location.lineNumber, column: location.columnNumber };
+    record(event);
+    recordSessionEvent(session, "console", {
+      level: event.level, url: event.url, line: event.line, column: event.column,
+    }, page);
   });
-  session.page.on("pageerror", () => record({ kind: "page_error" }));
+  page.on("pageerror", () => {
+    record({ kind: "page_error" });
+    recordSessionEvent(session, "page_error", {}, page);
+  });
+}
+
+function trackPage(session, page, initial = false) {
+  if (session.trackedPages.has(page)) return pageIdFor(session, page);
+  session.trackedPages.add(page);
+  const pageId = pageIdFor(session, page);
+  trackJavascriptFiles(session, page);
+  trackRuntimeErrors(session, page);
+  page.on("framenavigated", (frame) => {
+    if (frame !== page.mainFrame()) return;
+    recordSessionEvent(session, "navigation", { url: publicLocation(frame.url()) }, page);
+  });
+  page.on("dialog", (dialog) => {
+    recordSessionEvent(session, "dialog", {
+      dialog_type: dialog.type(),
+      message_length: Buffer.byteLength(dialog.message() || ""),
+      default_value_length: Buffer.byteLength(dialog.defaultValue() || ""),
+      disposition: "dismissed",
+    }, page);
+    void dialog.dismiss().catch(() => undefined);
+  });
+  page.on("request", (request) => recordSessionEvent(session, "request", {
+    method: request.method(),
+    url: publicLocation(request.url()),
+    resource_type: request.resourceType(),
+    navigation: request.isNavigationRequest(),
+  }, page));
+  page.on("response", (response) => recordSessionEvent(session, "response", {
+    status: response.status(),
+    url: publicLocation(response.url()),
+    resource_type: response.request().resourceType(),
+    navigation: response.request().isNavigationRequest(),
+  }, page));
+  page.on("requestfailed", (request) => recordSessionEvent(session, "request_failed", {
+    method: request.method(),
+    url: publicLocation(request.url()),
+    resource_type: request.resourceType(),
+    navigation: request.isNavigationRequest(),
+  }, page));
+  page.on("close", () => {
+    recordSessionEvent(session, "page", { action: "closed" }, page);
+    session.pages.delete(pageId);
+    if (session.page === page) {
+      session.page = [...session.pages.values()].find((candidate) => !candidate.isClosed()) || null;
+    }
+  });
+  if (!initial) {
+    void page.opener().then((opener) => {
+      recordSessionEvent(session, opener ? "popup" : "page", {
+        action: "opened",
+        opener_page_id: opener ? pageIdFor(session, opener) : null,
+        url: publicLocation(page.url()),
+      }, page);
+    }).catch(() => recordSessionEvent(session, "page", {
+      action: "opened", url: publicLocation(page.url()),
+    }, page));
+  }
+  return pageId;
+}
+
+function installWindowMessageObserver(observerKey) {
+  if (Object.hasOwn(window, observerKey)) return;
+  const messages = [];
+  const append = Array.prototype.push.bind(messages);
+  const drain = Array.prototype.splice.bind(messages, 0, 128);
+  const discardFirst = Array.prototype.shift.bind(messages);
+  Object.defineProperty(window, observerKey, {
+    value: drain,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  window.addEventListener("message", (event) => {
+    let dataType = event.data === null ? "null" : typeof event.data;
+    let dataSize = null;
+    if (typeof event.data === "string") {
+      dataSize = new TextEncoder().encode(event.data).byteLength;
+    } else if (event.data instanceof ArrayBuffer) {
+      dataType = "array_buffer";
+      dataSize = event.data.byteLength;
+    } else if (ArrayBuffer.isView(event.data)) {
+      dataType = "typed_array";
+      dataSize = event.data.byteLength;
+    } else if (Array.isArray(event.data)) {
+      dataType = "array";
+      dataSize = event.data.length;
+    }
+    append(Object.freeze({
+      origin: String(event.origin || "").slice(0, 512),
+      source_relation: event.source === window ? "same_window" : event.source ? "other_window" : "none",
+      data_type: dataType,
+      data_size: Number.isSafeInteger(dataSize) && dataSize >= 0 ? dataSize : null,
+    }));
+    if (messages.length > 128) discardFirst();
+  });
+}
+
+async function drainWindowMessages(session) {
+  for (const page of [...session.pages.values()]) {
+    if (page.isClosed()) continue;
+    const messages = await page.evaluate((observerKey) => {
+      const drain = window[observerKey];
+      return typeof drain === "function" ? drain() : [];
+    }, session.messageObserverKey).catch(() => []);
+    if (!Array.isArray(messages)) continue;
+    for (const message of messages.slice(0, 128)) {
+      if (!message || typeof message !== "object") continue;
+      recordSessionEvent(session, "window_message", {
+        origin: publicLocation(message.origin),
+        source_relation: ["same_window", "other_window", "none"].includes(message.source_relation)
+          ? message.source_relation : "none",
+        data_type: String(message.data_type || "unknown").slice(0, 32),
+        data_size: Number.isSafeInteger(message.data_size) && message.data_size >= 0
+          ? message.data_size : null,
+      }, page);
+    }
+  }
+}
+
+async function initializeSessionTracking(session, existingJavascriptFiles = new Map(), generation = 1) {
+  session.javascriptFiles = existingJavascriptFiles;
+  session.runtimeErrors = [];
+  session.runtimeErrorCount = 0;
+  session.runtimeGeneration = generation;
+  session.nextPageId = 1;
+  session.pages = new Map();
+  session.pageIds = new WeakMap();
+  session.trackedPages = new WeakSet();
+  session.events = [];
+  session.eventSequence = 0;
+  session.eventBytes = 0;
+  session.eventsDropped = 0;
+  session.messageObserverKey = `__huntproxy_messages_${generation}_${Date.now()}__`;
+  session.context.on("page", (page) => trackPage(session, page, false));
+  for (const page of session.context.pages()) trackPage(session, page, true);
+  await session.context.addInitScript(installWindowMessageObserver, session.messageObserverKey);
+  for (const page of session.context.pages()) {
+    await page.evaluate(installWindowMessageObserver, session.messageObserverKey).catch(() => undefined);
+  }
+}
+
+async function activePage(session) {
+  if (session.page && !session.page.isClosed() && session.context.pages().includes(session.page)) {
+    trackPage(session, session.page, true);
+    return session.page;
+  }
+  session.page = [...session.pages.values()].find((page) => !page.isClosed()) || null;
+  if (!session.page) {
+    session.page = await session.context.newPage();
+    trackPage(session, session.page, false);
+  }
+  return session.page;
+}
+
+async function browserActionContext(sessionId, session) {
+  const page = await activePage(session);
+  return {
+    session_id: sessionId,
+    profile: session.profile || null,
+    runtime_generation: session.runtimeGeneration,
+    page_id: pageIdFor(session, page),
+  };
 }
 
 async function uploadFiles(session, action) {
@@ -443,7 +645,10 @@ async function relaunchSession(session, cdpPort) {
   if (!session.persistent || !session.profileDir) {
     throw rpcError(-32602, "CDP handoff requires a persistent project browser");
   }
-  const currentUrl = session.page?.url() || "about:blank";
+  const currentPage = await activePage(session);
+  const currentUrl = currentPage.url() || "about:blank";
+  const existingJavascriptFiles = new Map(session.javascriptFiles || []);
+  const nextGeneration = Number(session.runtimeGeneration || 0) + 1;
   const sessionCookies = await session.context.cookies()
     .then((cookies) => cookies.filter(isSessionCookie));
   const checkpoint = await extractCheckpoint(session);
@@ -458,8 +663,7 @@ async function relaunchSession(session, cdpPort) {
     try {
       const restored = await launchSessionRuntime(session, null, currentUrl, sessionCookies, sessionStorage);
       Object.assign(session, restored.runtime, { cdp: null });
-      trackJavascriptFiles(session);
-      trackRuntimeErrors(session);
+      await initializeSessionTracking(session, existingJavascriptFiles, nextGeneration);
     } catch (restoreError) {
       throw rpcError(
         -32000,
@@ -469,8 +673,7 @@ async function relaunchSession(session, cdpPort) {
     throw error;
   }
   Object.assign(session, launched.runtime, { cdp: launched.cdp });
-  trackJavascriptFiles(session);
-  trackRuntimeErrors(session);
+  await initializeSessionTracking(session, existingJavascriptFiles, nextGeneration);
   return launched.cdp;
 }
 
@@ -568,8 +771,9 @@ async function reconcileCurrentOriginStorage(session) {
 }
 
 async function extractCheckpoint(session) {
-  const url = session.page.url();
-  const title = await session.page.title().catch(() => "");
+  const page = await activePage(session);
+  const url = page.url();
+  const title = await page.title().catch(() => "");
   const origin = (() => {
     try {
       const parsed = new URL(url);
@@ -579,7 +783,7 @@ async function extractCheckpoint(session) {
     }
   })();
   const cookies = await session.context.cookies();
-  const storage = await session.page
+  const storage = await page
     .evaluate(() => {
       const collect = (source) => {
         const output = {};
@@ -656,24 +860,343 @@ async function performWait(page, forWhat, value) {
   }
 }
 
+async function pageSummaries(session) {
+  const active = await activePage(session);
+  const summaries = [];
+  for (const [pageId, page] of session.pages.entries()) {
+    if (page.isClosed()) continue;
+    const title = await page.title().catch(() => "");
+    summaries.push({
+      page_id: pageId,
+      active: page === active,
+      url: publicLocation(page.url()),
+      title: title ? title.slice(0, 256) : null,
+    });
+  }
+  return summaries.sort((left, right) => left.page_id - right.page_id);
+}
+
+function requireRuntimeGeneration(session, value) {
+  if (!Number.isSafeInteger(value) || value !== session.runtimeGeneration) {
+    throw rpcError(-32001, "page or event cursor belongs to a stale browser runtime; list pages again");
+  }
+}
+
+async function performPages(session, action) {
+  const op = String(action.op || "");
+  if (op === "list") {
+    return { message: "browser pages listed", data: {
+      runtime_generation: session.runtimeGeneration,
+      pages: await pageSummaries(session),
+    } };
+  }
+  if (op === "new") {
+    const page = await session.context.newPage();
+    trackPage(session, page, false);
+    session.page = page;
+    if (action.url && action.url !== "about:blank") {
+      await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await reconcileCurrentOriginStorage(session);
+    }
+    return { message: "browser page opened", data: {
+      runtime_generation: session.runtimeGeneration,
+      page_id: pageIdFor(session, page),
+      pages: await pageSummaries(session),
+    } };
+  }
+  if (!new Set(["select", "close"]).has(op)) {
+    throw rpcError(-32602, "pages op must be list|select|new|close");
+  }
+  requireRuntimeGeneration(session, Number(action.runtime_generation));
+  const pageId = Number(action.page_id);
+  if (!Number.isSafeInteger(pageId) || pageId <= 0) {
+    throw rpcError(-32602, "page_id must be a positive integer");
+  }
+  const page = session.pages.get(pageId);
+  if (!page || page.isClosed()) throw rpcError(-32001, "page is no longer active");
+  if (op === "select") {
+    session.page = page;
+    await page.bringToFront();
+    return { message: "browser page selected", data: {
+      runtime_generation: session.runtimeGeneration,
+      page_id: pageId,
+      pages: await pageSummaries(session),
+    } };
+  }
+  if (session.pages.size <= 1) {
+    const replacement = await session.context.newPage();
+    trackPage(session, replacement, false);
+    session.page = replacement;
+  } else if (session.page === page) {
+    session.page = [...session.pages.values()].find((candidate) => candidate !== page && !candidate.isClosed()) || null;
+  }
+  await page.close({ runBeforeUnload: false });
+  await activePage(session);
+  return { message: "browser page closed", data: {
+    runtime_generation: session.runtimeGeneration,
+    closed_page_id: pageId,
+    pages: await pageSummaries(session),
+  } };
+}
+
+async function performEvents(session, action) {
+  const generation = action.runtime_generation == null
+    ? session.runtimeGeneration : Number(action.runtime_generation);
+  requireRuntimeGeneration(session, generation);
+  const after = Number(action.after_sequence || 0);
+  const limit = Number(action.limit || 50);
+  const waitMs = Number(action.wait_ms || 0);
+  const kinds = new Set(Array.isArray(action.kinds) ? action.kinds : []);
+  const matching = () => session.events
+    .map((entry) => entry.event)
+    .filter((event) => event.sequence > after && (!kinds.size || kinds.has(event.kind)))
+    .slice(0, limit);
+  const deadline = Date.now() + waitMs;
+  let events;
+  do {
+    await drainWindowMessages(session);
+    events = matching();
+    if (events.length || Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now())));
+  } while (Date.now() < deadline);
+  const oldestSequence = session.events[0]?.event.sequence ?? session.eventSequence + 1;
+  return { message: "browser events read", data: {
+    runtime_generation: session.runtimeGeneration,
+    events,
+    next_sequence: events.length ? events[events.length - 1].sequence : after,
+    latest_sequence: session.eventSequence,
+    oldest_sequence: oldestSequence,
+    cursor_expired: after > 0 && after < oldestSequence - 1,
+    dropped_events: session.eventsDropped,
+  } };
+}
+
+async function performScroll(session, action) {
+  const page = await activePage(session);
+  if (action.locator) {
+    await locatorFor(page, action.locator).scrollIntoViewIfNeeded({ timeout: 30_000 });
+  }
+  const deltaX = Number(action.delta_x || 0);
+  const deltaY = Number(action.delta_y || 0);
+  if (deltaX || deltaY) await page.mouse.wheel(deltaX, deltaY);
+  const position = await page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+  return { message: "browser page scrolled", data: position };
+}
+
+async function performScreenshot(session, action) {
+  const page = await activePage(session);
+  let target = page;
+  let dimensions;
+  if (action.locator) {
+    target = locatorFor(page, action.locator);
+    await target.waitFor({ state: "visible", timeout: 30_000 });
+    const box = await target.boundingBox();
+    if (!box) throw rpcError(-32000, "screenshot element is not visible");
+    dimensions = { width: Math.ceil(box.width), height: Math.ceil(box.height) };
+  } else if (action.full_page) {
+    dimensions = await page.evaluate(() => ({
+      width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+      height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
+    }));
+  } else {
+    dimensions = page.viewportSize() || await page.evaluate(() => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+    }));
+  }
+  const width = Math.max(0, Math.ceil(Number(dimensions.width || 0)));
+  const height = Math.max(0, Math.ceil(Number(dimensions.height || 0)));
+  if (!width || !height || width > 16_384 || height > 16_384
+      || width * height > MAX_SCREENSHOT_PIXELS) {
+    throw rpcError(-32602, "screenshot dimensions exceed the 16-megapixel limit");
+  }
+  const buffer = action.locator
+    ? await target.screenshot({ type: "png", scale: "css", timeout: 30_000 })
+    : await page.screenshot({
+      type: "png", scale: "css", fullPage: Boolean(action.full_page), timeout: 30_000,
+    });
+  const maxBytes = Number(action.max_bytes || 4 * 1024 * 1024);
+  if (buffer.length > maxBytes || buffer.length > MAX_SCREENSHOT_BYTES) {
+    throw rpcError(-32000, `screenshot is ${buffer.length} bytes and exceeds max_bytes`);
+  }
+  return { message: "browser screenshot captured", data: {
+    mime_type: "image/png",
+    width,
+    height,
+    byte_length: buffer.length,
+    sha256: createHash("sha256").update(buffer).digest("hex"),
+    image_base64: buffer.toString("base64"),
+  } };
+}
+
+async function browserRequestInIsolatedWorld(request) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), request.timeout_ms);
+    const started = performance.now();
+    const decodeBase64 = (value) => {
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+      return bytes;
+    };
+    const encodeBase64 = (bytes) => {
+      let binary = "";
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+      }
+      return btoa(binary);
+    };
+    try {
+      const options = {
+        method: request.method,
+        headers: request.headers,
+        credentials: "include",
+        redirect: "error",
+        signal: controller.signal,
+      };
+      if (request.body_text !== null) options.body = request.body_text;
+      if (request.body_base64 !== null) options.body = decodeBase64(request.body_base64);
+      const response = await fetch(request.url, options);
+      const chunks = [];
+      let kept = 0;
+      let received = 0;
+      let truncated = false;
+      const reader = response.body?.getReader();
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value?.byteLength || 0;
+        const remaining = request.max_response_bytes - kept;
+        if (remaining > 0 && value?.byteLength) {
+          const part = value.subarray(0, remaining);
+          chunks.push(part);
+          kept += part.byteLength;
+        }
+        if (value?.byteLength > remaining) truncated = true;
+      }
+      truncated ||= received > kept;
+      const body = new Uint8Array(kept);
+      let cursor = 0;
+      for (const chunk of chunks) {
+        body.set(chunk, cursor);
+        cursor += chunk.byteLength;
+      }
+      const sensitive = /(?:authorization|cookie|token|secret|api[-_]?key)/i;
+      const responseHeaders = [];
+      for (const [name, value] of response.headers.entries()) {
+        if (responseHeaders.length >= 64) break;
+        responseHeaders.push({
+          name,
+          value: sensitive.test(name) ? "[redacted]" : String(value).slice(0, 4096),
+        });
+      }
+      return {
+        method: request.method,
+        requested_url: request.url,
+        final_url: response.url,
+        status: response.status,
+        status_text: response.statusText,
+        response_headers: responseHeaders,
+        response_body_base64: encodeBase64(body),
+        response_body_bytes: kept,
+        received_body_bytes: received,
+        response_truncated: truncated,
+        duration_ms: Math.round(performance.now() - started),
+      };
+    } catch (error) {
+      return {
+        huntproxy_error: error?.name === "AbortError" ? "timeout" : "network",
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+}
+
+async function performBrowserRequest(session, action) {
+  const page = await activePage(session);
+  let pageOrigin;
+  let target;
+  try {
+    pageOrigin = new URL(page.url()).origin;
+    target = new URL(String(action.url || ""));
+  } catch {
+    throw rpcError(-32602, "request requires an absolute HTTP(S) URL and an active HTTP(S) page");
+  }
+  if (!new Set(["http:", "https:"]).has(target.protocol)
+      || !new Set(["http:", "https:"]).has(new URL(page.url()).protocol)
+      || target.origin !== pageOrigin) {
+    throw rpcError(-32602, "request URL must have the active page origin");
+  }
+  const method = String(action.method || "").toUpperCase();
+  const headers = (Array.isArray(action.headers) ? action.headers : [])
+    .map((header) => [String(header.name), String(header.value)]);
+  headers.push(["x-huntproxy-browser-origin", pageOrigin]);
+  const timeoutMs = Number(action.timeout_ms || 15_000);
+  const maxResponseBytes = Number(action.max_response_bytes || 4096);
+  const payload = {
+    url: target.href,
+    method,
+    headers,
+    body_text: action.body_text ?? null,
+    body_base64: action.body_base64 ?? null,
+    timeout_ms: timeoutMs,
+    max_response_bytes: maxResponseBytes,
+  };
+  const connection = await session.context.newCDPSession(page);
+  let result;
+  try {
+    await connection.send("Page.enable");
+    // The isolated world keeps native web APIs even when target JavaScript has
+    // replaced window.fetch. Browser CSP and service-worker behavior remain in
+    // force so this action observes the same browser policies as the page.
+    const frameTree = await connection.send("Page.getFrameTree");
+    const world = await connection.send("Page.createIsolatedWorld", {
+      frameId: frameTree.frameTree.frame.id,
+      worldName: "huntproxy-request",
+      grantUniveralAccess: false,
+    });
+    const evaluation = await connection.send("Runtime.callFunctionOn", {
+      functionDeclaration: browserRequestInIsolatedWorld.toString(),
+      executionContextId: world.executionContextId,
+      arguments: [{ value: payload }],
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (evaluation.exceptionDetails || !evaluation.result?.value) {
+      throw rpcError(-32000, "browser request failed in its isolated page context");
+    }
+    result = evaluation.result.value;
+  } finally {
+    await connection.detach().catch(() => undefined);
+  }
+  if (result.huntproxy_error === "timeout") {
+    throw rpcError(-32000, "browser request timed out; it was not retried");
+  }
+  if (result.huntproxy_error) {
+    throw rpcError(-32000, "browser request failed; redirects are disabled and it was not retried");
+  }
+  return { message: "browser request completed", data: result };
+}
+
 async function executeAction(session, action = {}) {
+  const page = await activePage(session);
   switch (action.type) {
     case "navigate": {
-      await session.page.goto(action.url, {
+      await page.goto(action.url, {
         waitUntil: "domcontentloaded",
         timeout: action.timeout_ms || 30_000,
       });
       await reconcileCurrentOriginStorage(session);
-      return { message: "navigation completed", data: { url: session.page.url() } };
+      return { message: "navigation completed", data: { url: page.url() } };
     }
     case "snapshot": {
       let content;
       if (action.format === "dom") {
-        content = await session.page.content();
-      } else if (typeof session.page.locator("body").ariaSnapshot === "function") {
-        content = await session.page.locator("body").ariaSnapshot();
+        content = await page.content();
+      } else if (typeof page.locator("body").ariaSnapshot === "function") {
+        content = await page.locator("body").ariaSnapshot();
       } else {
-        content = await session.page.content();
+        content = await page.content();
       }
       const maxBytes = Math.max(0, Math.min(Number(action.max_bytes || 200_000), 2_000_000));
       const bytes = Buffer.from(String(content), "utf8");
@@ -688,38 +1211,48 @@ async function executeAction(session, action = {}) {
       };
     }
     case "click":
-      await locatorFor(session.page, action.locator).click({ timeout: 30_000 });
-      return { message: "element clicked", data: { url: session.page.url() } };
+      await locatorFor(page, action.locator).click({ timeout: 30_000 });
+      return { message: "element clicked", data: { url: page.url() } };
     case "fill":
-      await locatorFor(session.page, action.locator).fill(action.value ?? "", { timeout: 30_000 });
+      await locatorFor(page, action.locator).fill(action.value ?? "", { timeout: 30_000 });
       return { message: "field filled", data: null };
     case "select":
-      await locatorFor(session.page, action.locator).selectOption(action.value, { timeout: 30_000 });
+      await locatorFor(page, action.locator).selectOption(action.value, { timeout: 30_000 });
       return { message: "option selected", data: null };
     case "upload":
       return uploadFiles(session, action);
     case "inspect":
       return inspectRuntime(session, action);
+    case "pages":
+      return performPages(session, action);
+    case "events":
+      return performEvents(session, action);
+    case "scroll":
+      return performScroll(session, action);
+    case "screenshot":
+      return performScreenshot(session, action);
+    case "request":
+      return performBrowserRequest(session, action);
     case "press":
       if (action.locator) {
-        await locatorFor(session.page, action.locator).press(action.key, { timeout: 30_000 });
+        await locatorFor(page, action.locator).press(action.key, { timeout: 30_000 });
       } else {
-        await session.page.keyboard.press(action.key);
+        await page.keyboard.press(action.key);
       }
       return { message: "key pressed", data: null };
     case "wait":
       return {
         message: "wait completed",
-        data: await performWait(session.page, action.for_what, action.value),
+        data: await performWait(page, action.for_what, action.value),
       };
     case "back":
-      await session.page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
       await reconcileCurrentOriginStorage(session);
-      return { message: "went back", data: { url: session.page.url() } };
+      return { message: "went back", data: { url: page.url() } };
     case "forward":
-      await session.page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });
       await reconcileCurrentOriginStorage(session);
-      return { message: "went forward", data: { url: session.page.url() } };
+      return { message: "went forward", data: { url: page.url() } };
     default:
       throw rpcError(-32602, `unsupported browser action: ${action.type || "missing"}`);
   }
@@ -757,7 +1290,10 @@ async function handle(req) {
         return respond(id, {
           protocol: PROTOCOL,
           engines: ["chromium"],
-          capabilities: ["actions", "checkpoints", "cdp_handoff", "profile_isolation"],
+          capabilities: [
+            "actions", "checkpoints", "cdp_handoff", "profile_isolation",
+            "pages", "events", "scroll", "screenshots", "same_origin_requests",
+          ],
         });
       case "session.start": {
         const sessionId = Number(params.session_id);
@@ -797,10 +1333,9 @@ async function handle(req) {
           preferProfileState: Boolean(params.prefer_profile_state),
           cdp: null,
         };
-        trackJavascriptFiles(session);
-        trackRuntimeErrors(session);
         sessions.set(sessionId, session);
         try {
+          await initializeSessionTracking(session);
           await restoreProjectState(session, params.restore_state);
           await clearCookieIdentities(session.context, params.clear_cookies, "clear_cookies");
           if (Array.isArray(params.cookies) && params.cookies.length) {
@@ -824,10 +1359,10 @@ async function handle(req) {
       case "session.status": {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
-        if (!session || session.page.isClosed()
-            || !session.context.pages().includes(session.page)) {
+        if (!session) {
           throw rpcError(-32001, "requested browser profile is not active");
         }
+        await activePage(session);
         return respond(id, sessionIdentity(sessionId, session));
       }
       case "session.action": {
@@ -843,6 +1378,7 @@ async function handle(req) {
           untrusted: true,
           message: result.message,
           data: result.data,
+          browser: await browserActionContext(sessionId, session),
           checkpoint,
           engine: session.engine,
         });
@@ -1021,14 +1557,17 @@ async function handle(req) {
           return respond(id, { used: false, cookie_count: 0 });
         }
         const cookies = await session.context.cookies([target.href]);
-        const status = await session.page.evaluate(async (url) => {
+        const status = await session.page.evaluate(async ({ url, origin }) => {
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), 15_000);
           try {
             const response = await fetch(url, {
               credentials: "include",
               redirect: "follow",
-              headers: { "x-huntproxy-internal-crawler": "1" },
+              headers: {
+                "x-huntproxy-internal-crawler": "1",
+                "x-huntproxy-browser-origin": origin,
+              },
               signal: controller.signal,
             });
             const reader = response.body?.getReader();
@@ -1048,7 +1587,7 @@ async function handle(req) {
           } finally {
             clearTimeout(timeout);
           }
-        }, target.href);
+        }, { url: target.href, origin: pageOrigin });
         return respond(id, {
           used: true,
           cookie_count: cookies.length,

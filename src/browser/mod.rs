@@ -4,6 +4,7 @@ use crate::config::{create_private_dir, write_private_file, Config};
 use crate::cookies::{CookiePair, StoredCookieProfile};
 use crate::domain::*;
 use crate::storage::{CreateCaptureSession, Db};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -23,6 +24,9 @@ const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
 const BROWSER_CDP_PORT: u16 = 9222;
 const DEFAULT_BROWSER_PROFILE: &str = "default";
 const MAX_PERSISTENT_PROFILE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_BROWSER_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BROWSER_REQUEST_RESPONSE_BYTES: u64 = 65_536;
+const MAX_BROWSER_SCREENSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const EMBEDDED_WORKER: &str = include_str!("../../browser-worker/index.js");
 const EMBEDDED_WORKER_PACKAGE: &str = include_str!("../../browser-worker/package.json");
 const EMBEDDED_WORKER_LOCK: &str = include_str!("../../browser-worker/package-lock.json");
@@ -192,6 +196,49 @@ pub enum BrowserAction {
         #[serde(default = "default_inspection_max_bytes")]
         max_bytes: u64,
     },
+    Pages {
+        op: String,
+        page_id: Option<u64>,
+        runtime_generation: Option<u64>,
+        url: Option<String>,
+    },
+    Events {
+        #[serde(default)]
+        after_sequence: u64,
+        runtime_generation: Option<u64>,
+        #[serde(default = "default_browser_event_limit")]
+        limit: u64,
+        #[serde(default)]
+        kinds: Vec<String>,
+        #[serde(default)]
+        wait_ms: u64,
+    },
+    Scroll {
+        locator: Option<Locator>,
+        #[serde(default)]
+        delta_x: i64,
+        #[serde(default)]
+        delta_y: i64,
+    },
+    Screenshot {
+        locator: Option<Locator>,
+        #[serde(default)]
+        full_page: bool,
+        #[serde(default = "default_screenshot_max_bytes")]
+        max_bytes: u64,
+    },
+    Request {
+        method: String,
+        url: String,
+        #[serde(default)]
+        headers: Vec<BrowserRequestHeader>,
+        body_text: Option<String>,
+        body_base64: Option<String>,
+        #[serde(default = "default_browser_request_timeout")]
+        timeout_ms: u64,
+        #[serde(default = "default_browser_request_response_bytes")]
+        max_response_bytes: u64,
+    },
     Press {
         locator: Option<Locator>,
         key: String,
@@ -213,12 +260,329 @@ fn default_inspection_max_bytes() -> u64 {
     4096
 }
 
+fn default_browser_event_limit() -> u64 {
+    50
+}
+
+fn default_browser_request_timeout() -> u64 {
+    15_000
+}
+
+fn default_browser_request_response_bytes() -> u64 {
+    4096
+}
+
+fn default_screenshot_max_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
 fn default_snapshot_format() -> String {
     "accessibility".into()
 }
 
 fn default_snapshot_max_bytes() -> u64 {
     200_000
+}
+
+fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
+    match action {
+        BrowserAction::Upload {
+            files,
+            via_chooser,
+            timeout_ms,
+            ..
+        } => {
+            if files.len() > 16 || (*via_chooser && files.is_empty()) {
+                return Err(DomainError::invalid(
+                    "upload accepts at most 16 files; chooser uploads require at least one",
+                ));
+            }
+            if !(1..=30_000).contains(timeout_ms) {
+                return Err(DomainError::invalid("upload timeout_ms must be 1..30000"));
+            }
+            if files.iter().any(|file| {
+                file.len() > 4096 || file.contains('\0') || !Path::new(file).is_absolute()
+            }) {
+                return Err(DomainError::invalid(
+                    "upload files must be absolute paths of at most 4096 bytes",
+                ));
+            }
+        }
+        BrowserAction::Inspect { max_bytes, .. } if !(1..=65_536).contains(max_bytes) => {
+            return Err(DomainError::invalid("inspect max_bytes must be 1..65536"));
+        }
+        BrowserAction::Pages {
+            op,
+            page_id,
+            runtime_generation,
+            url,
+        } => match op.as_str() {
+            "list" if page_id.is_none() && runtime_generation.is_none() && url.is_none() => {}
+            "new" if page_id.is_none() && runtime_generation.is_none() => {
+                if let Some(url) = url {
+                    validate_browser_page_url(url)?;
+                }
+            }
+            "select" | "close"
+                if page_id.is_some_and(|value| value > 0)
+                    && runtime_generation.is_some_and(|value| value > 0)
+                    && url.is_none() => {}
+            "list" => {
+                return Err(DomainError::invalid(
+                    "pages list does not accept page_id, runtime_generation, or url",
+                ));
+            }
+            "new" => {
+                return Err(DomainError::invalid(
+                    "pages new accepts only an optional url",
+                ));
+            }
+            "select" | "close" => {
+                return Err(DomainError::invalid(
+                    "pages select/close require page_id and runtime_generation",
+                ));
+            }
+            _ => {
+                return Err(DomainError::invalid(
+                    "pages op must be list|select|new|close",
+                ));
+            }
+        },
+        BrowserAction::Events {
+            after_sequence,
+            runtime_generation,
+            limit,
+            kinds,
+            wait_ms,
+        } => {
+            if !(1..=100).contains(limit) {
+                return Err(DomainError::invalid("events limit must be 1..100"));
+            }
+            if *wait_ms > 30_000 {
+                return Err(DomainError::invalid("events wait_ms must be 0..30000"));
+            }
+            if *after_sequence > 0 && runtime_generation.is_none() {
+                return Err(DomainError::invalid(
+                    "events runtime_generation is required with after_sequence",
+                ));
+            }
+            if runtime_generation.is_some_and(|value| value == 0) {
+                return Err(DomainError::invalid(
+                    "events runtime_generation must be a positive integer",
+                ));
+            }
+            const KINDS: &[&str] = &[
+                "page",
+                "popup",
+                "navigation",
+                "dialog",
+                "console",
+                "page_error",
+                "request",
+                "response",
+                "request_failed",
+                "window_message",
+            ];
+            if kinds.len() > KINDS.len() || kinds.iter().any(|kind| !KINDS.contains(&kind.as_str()))
+            {
+                return Err(DomainError::invalid("events contains an unsupported kind"));
+            }
+        }
+        BrowserAction::Scroll {
+            locator,
+            delta_x,
+            delta_y,
+        } => {
+            if delta_x.unsigned_abs() > 100_000 || delta_y.unsigned_abs() > 100_000 {
+                return Err(DomainError::invalid(
+                    "scroll deltas must be between -100000 and 100000",
+                ));
+            }
+            if locator.is_none() && *delta_x == 0 && *delta_y == 0 {
+                return Err(DomainError::invalid(
+                    "scroll requires a locator or a non-zero delta",
+                ));
+            }
+        }
+        BrowserAction::Screenshot {
+            locator,
+            full_page,
+            max_bytes,
+        } => {
+            if !(1..=MAX_BROWSER_SCREENSHOT_BYTES).contains(max_bytes) {
+                return Err(DomainError::invalid(
+                    "screenshot max_bytes must be 1..8388608",
+                ));
+            }
+            if *full_page && locator.is_some() {
+                return Err(DomainError::invalid(
+                    "screenshot full_page cannot be combined with a locator",
+                ));
+            }
+        }
+        BrowserAction::Request {
+            method,
+            url,
+            headers,
+            body_text,
+            body_base64,
+            timeout_ms,
+            max_response_bytes,
+        } => {
+            let method = method.to_ascii_uppercase();
+            if !matches!(
+                method.as_str(),
+                "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+            ) {
+                return Err(DomainError::invalid(
+                    "request method must be GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS",
+                ));
+            }
+            let parsed = url::Url::parse(url)
+                .map_err(|error| DomainError::invalid(format!("invalid request URL: {error}")))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(DomainError::invalid("request URL must use HTTP or HTTPS"));
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(DomainError::invalid(
+                    "request URL must not contain credentials",
+                ));
+            }
+            if !(1_000..=30_000).contains(timeout_ms) {
+                return Err(DomainError::invalid(
+                    "request timeout_ms must be 1000..30000",
+                ));
+            }
+            if !(1..=MAX_BROWSER_REQUEST_RESPONSE_BYTES).contains(max_response_bytes) {
+                return Err(DomainError::invalid(
+                    "request max_response_bytes must be 1..65536",
+                ));
+            }
+            if body_text.is_some() && body_base64.is_some() {
+                return Err(DomainError::invalid(
+                    "request accepts only one of body_text or body_base64",
+                ));
+            }
+            let body_len = if let Some(body) = body_text {
+                body.len()
+            } else if let Some(body) = body_base64 {
+                if body.len() > MAX_BROWSER_REQUEST_BODY_BYTES.div_ceil(3) * 4 {
+                    return Err(DomainError::new(
+                        ErrorCode::BodyTooLarge,
+                        "request body exceeds 2 MiB",
+                    ));
+                }
+                base64::engine::general_purpose::STANDARD
+                    .decode(body)
+                    .map_err(|_| DomainError::invalid("request body_base64 is invalid base64"))?
+                    .len()
+            } else {
+                0
+            };
+            if body_len > MAX_BROWSER_REQUEST_BODY_BYTES {
+                return Err(DomainError::new(
+                    ErrorCode::BodyTooLarge,
+                    "request body exceeds 2 MiB",
+                ));
+            }
+            if matches!(method.as_str(), "GET" | "HEAD")
+                && (body_text.is_some() || body_base64.is_some())
+            {
+                return Err(DomainError::invalid(
+                    "GET and HEAD browser requests cannot include a body",
+                ));
+            }
+            if headers.len() > 64 {
+                return Err(DomainError::invalid("request accepts at most 64 headers"));
+            }
+            let mut header_bytes = 0usize;
+            let mut header_names = HashSet::new();
+            for header in headers {
+                let name = http::header::HeaderName::from_bytes(header.name.as_bytes())
+                    .map_err(|_| DomainError::invalid("request contains an invalid header name"))?;
+                http::header::HeaderValue::from_bytes(header.value.as_bytes()).map_err(|_| {
+                    DomainError::invalid("request contains an invalid header value")
+                })?;
+                let name = name.as_str();
+                if browser_managed_request_header(name, &header.value) {
+                    return Err(DomainError::invalid(format!(
+                        "request header {name} is browser-managed"
+                    )));
+                }
+                if !header_names.insert(name.to_string()) {
+                    return Err(DomainError::invalid(format!(
+                        "request header {name} is duplicated; browser fetch would combine its values"
+                    )));
+                }
+                header_bytes = header_bytes
+                    .saturating_add(header.name.len())
+                    .saturating_add(header.value.len());
+            }
+            if header_bytes > 65_536 {
+                return Err(DomainError::invalid(
+                    "request header names and values exceed 65536 bytes",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn browser_managed_request_header(name: &str, value: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "accept-charset",
+        "accept-encoding",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "connection",
+        "content-length",
+        "cookie",
+        "cookie2",
+        "date",
+        "dnt",
+        "expect",
+        "host",
+        "keep-alive",
+        "origin",
+        "permissions-policy",
+        "referer",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "user-agent",
+        "via",
+        "x-huntproxy-browser-origin",
+        "x-huntproxy-internal-crawler",
+    ];
+    if EXACT.contains(&name) || name.starts_with("proxy-") || name.starts_with("sec-") {
+        return true;
+    }
+    matches!(
+        name,
+        "x-http-method" | "x-http-method-override" | "x-method-override"
+    ) && value.split(',').any(|method| {
+        matches!(
+            method.trim().to_ascii_uppercase().as_str(),
+            "CONNECT" | "TRACE" | "TRACK"
+        )
+    })
+}
+
+fn validate_browser_page_url(value: &str) -> DomainResult<()> {
+    if value == "about:blank" {
+        return Ok(());
+    }
+    let url = url::Url::parse(value)
+        .map_err(|error| DomainError::invalid(format!("invalid page URL: {error}")))?;
+    if matches!(url.scheme(), "http" | "https") {
+        Ok(())
+    } else {
+        Err(DomainError::invalid(
+            "page URL must be about:blank, HTTP, or HTTPS",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,11 +596,28 @@ pub struct Locator {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserActionContext {
+    pub session_id: BrowserSessionId,
+    pub profile: Option<String>,
+    pub runtime_generation: u64,
+    pub page_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionResult {
     pub ok: bool,
     pub untrusted: bool,
     pub message: String,
     pub data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserActionContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
 }
@@ -1621,6 +2002,8 @@ impl BrowserService {
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(DomainError::invalid("crawler URL must use HTTP or HTTPS"));
         }
+        let operation_lock = self.session_operation_lock(session_id).await;
+        let _operation_guard = operation_lock.lock().await;
         let active = self
             .runtime_sessions
             .lock()
@@ -1630,8 +2013,6 @@ impl BrowserService {
         if !active {
             return Ok(false);
         }
-        let operation_lock = self.session_operation_lock(session_id).await;
-        let _operation_guard = operation_lock.lock().await;
         let result = self
             .call_worker(
                 "session.authenticated_fetch",
@@ -1668,34 +2049,7 @@ impl BrowserService {
         session_id: BrowserSessionId,
         action: BrowserAction,
     ) -> DomainResult<ActionResult> {
-        match &action {
-            BrowserAction::Upload {
-                files,
-                via_chooser,
-                timeout_ms,
-                ..
-            } => {
-                if files.len() > 16 || (*via_chooser && files.is_empty()) {
-                    return Err(DomainError::invalid(
-                        "upload accepts at most 16 files; chooser uploads require at least one",
-                    ));
-                }
-                if !(1..=30_000).contains(timeout_ms) {
-                    return Err(DomainError::invalid("upload timeout_ms must be 1..30000"));
-                }
-                if files.iter().any(|file| {
-                    file.len() > 4096 || file.contains('\0') || !Path::new(file).is_absolute()
-                }) {
-                    return Err(DomainError::invalid(
-                        "upload files must be absolute paths of at most 4096 bytes",
-                    ));
-                }
-            }
-            BrowserAction::Inspect { max_bytes, .. } if !(1..=65_536).contains(max_bytes) => {
-                return Err(DomainError::invalid("inspect max_bytes must be 1..65536"));
-            }
-            _ => {}
-        }
+        validate_browser_action(&action)?;
         if matches!(&action, BrowserAction::Close) {
             self.stop(project_id, session_id).await?;
             return Ok(ActionResult {
@@ -1703,6 +2057,7 @@ impl BrowserService {
                 untrusted: false,
                 message: "session closed".into(),
                 data: None,
+                browser: None,
                 error_code: None,
             });
         }
@@ -1738,7 +2093,6 @@ impl BrowserService {
                 "browser control is handed off through CDP; disable the CDP handoff before running agent browser actions",
             ));
         }
-
         session.state = BrowserSessionState::Busy;
         self.db.update_browser_session(&session).await?;
         let worker_result = self
@@ -1803,6 +2157,17 @@ impl BrowserService {
                 .unwrap_or("browser action completed")
                 .to_string(),
             data: result.get("data").cloned().filter(|value| !value.is_null()),
+            browser: result
+                .get("browser")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| {
+                    DomainError::new(
+                        ErrorCode::ProtocolError,
+                        format!("invalid browser action context: {error}"),
+                    )
+                })?,
             error_code: result
                 .get("error_code")
                 .and_then(Value::as_str)
@@ -3297,6 +3662,78 @@ mod tests {
             }
             _ => panic!("wrong browser action"),
         }
+    }
+
+    #[test]
+    fn structured_browser_actions_have_bounded_defaults() {
+        let request: BrowserAction = serde_json::from_value(json!({
+            "type": "request",
+            "method": "POST",
+            "url": "https://example.com/api/items"
+        }))
+        .unwrap();
+        match &request {
+            BrowserAction::Request {
+                headers,
+                timeout_ms,
+                max_response_bytes,
+                ..
+            } => {
+                assert!(headers.is_empty());
+                assert_eq!(*timeout_ms, 15_000);
+                assert_eq!(*max_response_bytes, 4096);
+            }
+            _ => panic!("wrong browser action"),
+        }
+        validate_browser_action(&request).unwrap();
+
+        let events: BrowserAction = serde_json::from_value(json!({"type":"events"})).unwrap();
+        match &events {
+            BrowserAction::Events {
+                after_sequence,
+                limit,
+                wait_ms,
+                ..
+            } => {
+                assert_eq!(*after_sequence, 0);
+                assert_eq!(*limit, 50);
+                assert_eq!(*wait_ms, 0);
+            }
+            _ => panic!("wrong browser action"),
+        }
+        validate_browser_action(&events).unwrap();
+    }
+
+    #[test]
+    fn structured_browser_actions_reject_ambiguous_or_unsafe_inputs() {
+        for value in [
+            json!({"type":"pages","op":"select","page_id":0,"runtime_generation":1}),
+            json!({"type":"pages","op":"new","url":"file:///etc/passwd"}),
+            json!({"type":"events","after_sequence":1}),
+            json!({"type":"events","runtime_generation":0}),
+            json!({"type":"scroll"}),
+            json!({"type":"screenshot","full_page":true,"locator":{"css":"main"}}),
+            json!({"type":"request","method":"GET","url":"https://example.com/","body_text":"data"}),
+            json!({"type":"request","method":"GET","url":"https://example.com/","body_text":""}),
+            json!({"type":"request","method":"POST","url":"https://user@example.com/"}),
+            json!({"type":"request","method":"POST","url":"https://example.com/","body_text":"a","body_base64":"Yg=="}),
+            json!({"type":"request","method":"POST","url":"https://example.com/","body_base64":"not base64"}),
+            json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"Cookie","value":"sid=1"}]}),
+            json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"Connection","value":"close"}]}),
+            json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"Sec-Fetch-Site","value":"same-origin"}]}),
+            json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"X-HTTP-Method-Override","value":"PATCH, TRACE"}]}),
+            json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"x-note","value":"one"},{"name":"X-Note","value":"two"}]}),
+        ] {
+            let action: BrowserAction = serde_json::from_value(value).unwrap();
+            assert!(validate_browser_action(&action).is_err());
+        }
+        assert!(serde_json::from_value::<BrowserAction>(json!({
+            "type":"request",
+            "method":"POST",
+            "url":"https://example.com/",
+            "headers":[{"name":"x-test","value":"ok","extra":true}]
+        }))
+        .is_err());
     }
 
     #[test]

@@ -155,9 +155,12 @@ async fn forward_request(
     let (mut parts, incoming) = request.into_parts();
     let internal_crawler_request =
         take_internal_crawler_marker(&mut parts.headers, session.is_browser_bound);
+    let browser_origin = take_browser_origin_marker(&mut parts.headers, session.is_browser_bound)?;
     let mut url = request_url(&parts, forced_scheme)?;
+    enforce_browser_request_origin(browser_origin.as_deref(), &url, false)?;
     let mut applied_rules =
         crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut url).await?;
+    enforce_browser_request_origin(browser_origin.as_deref(), &url, true)?;
     let target = TargetRef::from_url(&url)?;
     let rotation = state
         .db
@@ -481,6 +484,61 @@ fn take_internal_crawler_marker(headers: &mut http::HeaderMap, browser_bound: bo
             .is_some_and(|value| value.as_bytes() == b"1");
     headers.remove("x-huntproxy-internal-crawler");
     marked
+}
+
+fn take_browser_origin_marker(
+    headers: &mut http::HeaderMap,
+    browser_bound: bool,
+) -> DomainResult<Option<String>> {
+    // The marker is private proxy metadata. Strip it for every credential and
+    // only trust it on browser-bound capture sessions.
+    let values = headers
+        .get_all("x-huntproxy-browser-origin")
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    headers.remove("x-huntproxy-browser-origin");
+    if !browser_bound || values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 1 {
+        return Err(DomainError::invalid(
+            "browser origin marker must have exactly one value",
+        ));
+    }
+    let raw = values[0]
+        .to_str()
+        .map_err(|_| DomainError::invalid("browser origin marker is not valid text"))?;
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| DomainError::invalid("browser origin marker is not a valid HTTP origin"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(DomainError::invalid(
+            "browser origin marker is not a valid HTTP origin",
+        ));
+    }
+    Ok(Some(parsed.origin().ascii_serialization()))
+}
+
+fn enforce_browser_request_origin(
+    origin: Option<&str>,
+    url: &str,
+    after_request_rules: bool,
+) -> DomainResult<()> {
+    if origin.is_some_and(|origin| !crate::page_analyzer::same_origin_url(origin, url)) {
+        let message = if after_request_rules {
+            "request rules moved a browser request outside its active page origin"
+        } else {
+            "browser request does not match its active page origin"
+        };
+        return Err(DomainError::scope_denied(message));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1447,6 +1505,76 @@ mod tests {
         external_headers.insert("x-huntproxy-internal-crawler", "1".parse().unwrap());
         assert!(!take_internal_crawler_marker(&mut external_headers, false));
         assert!(!external_headers.contains_key("x-huntproxy-internal-crawler"));
+    }
+
+    #[test]
+    fn browser_origin_marker_is_private_validated_and_browser_bound() {
+        let mut browser_headers = http::HeaderMap::new();
+        browser_headers.insert(
+            "x-huntproxy-browser-origin",
+            "https://example.com".parse().unwrap(),
+        );
+        assert_eq!(
+            take_browser_origin_marker(&mut browser_headers, true).unwrap(),
+            Some("https://example.com".into())
+        );
+        assert!(!browser_headers.contains_key("x-huntproxy-browser-origin"));
+
+        let mut external_headers = http::HeaderMap::new();
+        external_headers.insert(
+            "x-huntproxy-browser-origin",
+            "not an origin".parse().unwrap(),
+        );
+        assert_eq!(
+            take_browser_origin_marker(&mut external_headers, false).unwrap(),
+            None
+        );
+        assert!(!external_headers.contains_key("x-huntproxy-browser-origin"));
+
+        for invalid in [
+            "file:///tmp/page",
+            "https://user@example.com",
+            "https://example.com/path",
+            "https://example.com/?query=1",
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-huntproxy-browser-origin", invalid.parse().unwrap());
+            assert!(take_browser_origin_marker(&mut headers, true).is_err());
+            assert!(!headers.contains_key("x-huntproxy-browser-origin"));
+        }
+    }
+
+    #[test]
+    fn browser_origin_constraint_survives_url_rewrites() {
+        assert!(enforce_browser_request_origin(
+            Some("https://example.com"),
+            "https://example.com/api/items",
+            false,
+        )
+        .is_ok());
+        assert!(enforce_browser_request_origin(
+            Some("https://example.com"),
+            "https://example.com/rewritten",
+            true,
+        )
+        .is_ok());
+        let original_error = enforce_browser_request_origin(
+            Some("https://example.com"),
+            "https://other.example/api/items",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(original_error.code(), ErrorCode::ScopeDenied);
+        let rewritten_error = enforce_browser_request_origin(
+            Some("https://example.com"),
+            "http://example.com/rewritten",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(rewritten_error.code(), ErrorCode::ScopeDenied);
+        assert!(
+            enforce_browser_request_origin(None, "https://other.example/api/items", true,).is_ok()
+        );
     }
 
     #[tokio::test]

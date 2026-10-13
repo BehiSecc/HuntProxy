@@ -4,14 +4,19 @@
 //! Run with an installed browser runtime:
 //! `cargo test --test browser_profile_isolation -- --ignored --nocapture`
 
+use base64::Engine as _;
 use futures::{FutureExt, SinkExt, StreamExt};
-use huntproxy::browser::{BrowserAction, BrowserService, Locator};
+use huntproxy::browser::{BrowserAction, BrowserRequestHeader, BrowserService, Locator};
 use huntproxy::config::Config;
 use huntproxy::cookies::{validate_cookie_profile, validate_named_cookie_profile};
 use huntproxy::domain::{BrowserSessionId, CreateProjectRequest, ProjectId};
+use huntproxy::request_rules::{
+    RequestRuleInput, RequestRuleMatchKind, RequestRuleOperation, RequestRuleTarget,
+};
 use huntproxy::storage::Db;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +26,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 const APP: &str = r#"<!doctype html><html><head><title>Profile fixture</title></head>
 <body><button id="seed">Save identity</button><button id="read">Read state</button>
+<button id="popup" type="button">Open details</button>
+<button id="dialog" type="button">Show dialog</button>
+<button id="message" type="button">Send message</button>
 <pre id="state">Loading</pre>
 <input id="direct-file" type="file" multiple>
 <input id="chooser-file" type="file" multiple hidden>
@@ -30,6 +38,7 @@ const APP: &str = r#"<!doctype html><html><head><title>Profile fixture</title></
 <button id="no-chooser" type="button">Keep browsing</button>
 <button id="warning" type="button">Show diagnostic</button>
 <input id="slow-metadata" type="checkbox">
+<div id="page-end" style="margin-top:3000px">End of fixture</div>
 <pre id="upload-state">No selection</pre><script>
 // A finite but slow application getter exercises the inspection watchdog.
 Object.defineProperty(document.getElementById('slow-metadata'), 'disabled', {
@@ -39,6 +48,9 @@ document.getElementById('browse').onclick = () => document.getElementById('choos
 document.getElementById('browse-single').onclick = () => document.getElementById('single-file').click();
 document.getElementById('no-chooser').onclick = () => document.body.dataset.noChooserClicked = 'true';
 document.getElementById('warning').onclick = () => console.warn('Local fixture diagnostic');
+document.getElementById('popup').onclick = () => window.open('/popup', 'fixture-details');
+document.getElementById('dialog').onclick = () => alert('Local fixture dialog');
+document.getElementById('message').onclick = () => window.postMessage({kind: 'fixture'}, location.origin);
 for (const id of ['direct-file', 'chooser-file']) {
   document.getElementById(id).onchange = async event => {
     const names = Array.from(event.target.files).map(file => file.name);
@@ -114,25 +126,32 @@ read().catch(failure);
 struct LocalFixture {
     port: u16,
     task: JoinHandle<()>,
+    mutations: Arc<AtomicUsize>,
 }
 
 impl LocalFixture {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let mutation_counter = mutations.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.unwrap();
-                        connections.spawn(serve_connection(stream));
+                        connections.spawn(serve_connection(stream, mutation_counter.clone()));
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
         });
-        Self { port, task }
+        Self {
+            port,
+            task,
+            mutations,
+        }
     }
 
     fn url(&self, host: &str, profile: &str) -> String {
@@ -142,6 +161,10 @@ impl LocalFixture {
     fn proxy(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
+
+    fn mutation_count(&self) -> usize {
+        self.mutations.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for LocalFixture {
@@ -150,7 +173,7 @@ impl Drop for LocalFixture {
     }
 }
 
-async fn serve_connection(mut stream: TcpStream) {
+async fn serve_connection(mut stream: TcpStream, mutations: Arc<AtomicUsize>) {
     // Peeking preserves the HTTP upgrade for tungstenite's normal handshake.
     let mut peek = vec![0_u8; 16 * 1024];
     let request = loop {
@@ -161,7 +184,8 @@ async fn serve_connection(mut stream: TcpStream) {
             return;
         }
         let text = String::from_utf8_lossy(&peek[..count]);
-        if text.contains("\r\n\r\n") {
+        if let Some(header_end) = text.find("\r\n\r\n") {
+            let header_bytes = header_end + 4;
             // Chromium tunnels WebSockets through its authenticated HTTP proxy,
             // even when the WebSocket itself uses plain ws://. Keep that local
             // tunnel on this socket and handle its following upgrade normally.
@@ -177,7 +201,7 @@ async fn serve_connection(mut stream: TcpStream) {
                 let allowed = ["localhost", "www.localhost", "127.0.0.1"]
                     .iter()
                     .any(|host| destination == format!("{host}:{port}"));
-                let mut consumed = vec![0_u8; count];
+                let mut consumed = vec![0_u8; header_bytes];
                 if stream.read_exact(&mut consumed).await.is_err() {
                     return;
                 }
@@ -194,7 +218,7 @@ async fn serve_connection(mut stream: TcpStream) {
                 }
                 continue;
             }
-            break text.into_owned();
+            break text[..header_bytes].to_owned();
         }
         tokio::task::yield_now().await;
     };
@@ -247,23 +271,66 @@ async fn serve_connection(mut stream: TcpStream) {
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
+    let method = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or("GET");
     let path = if target.starts_with("http://") {
         url::Url::parse(target).unwrap().path().to_owned()
     } else {
         target.split('?').next().unwrap_or("/").to_owned()
     };
-    let (mime, body) = if path == "/sw.js" {
-        ("application/javascript", "self.addEventListener('install', event => event.waitUntil(self.skipWaiting())); self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));")
-    } else if path == "/app" {
-        ("text/html", APP)
-    } else {
-        ("text/plain", "Local profile fixture")
-    };
-    let mut consumed = vec![0_u8; request.len()];
+    let content_length = header("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut consumed = vec![0_u8; request.len() + content_length];
     if stream.read_exact(&mut consumed).await.is_err() {
         return;
     }
-    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+    let cookie = header("cookie").unwrap_or_default();
+    let (status, mime, body) = if path == "/sw.js" {
+        ("200 OK", "application/javascript", "self.addEventListener('install', event => event.waitUntil(self.skipWaiting())); self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));".to_owned())
+    } else if path == "/app" {
+        ("200 OK", "text/html", APP.to_owned())
+    } else if path == "/popup" {
+        (
+            "200 OK",
+            "text/html",
+            "<!doctype html><title>Fixture details</title><main>Details ready</main>".to_owned(),
+        )
+    } else if path == "/api/mutate" {
+        mutations.fetch_add(1, Ordering::SeqCst);
+        (
+            "200 OK",
+            "application/json",
+            json!({
+                "method": method,
+                "cookie": cookie,
+                "request_body_bytes": content_length,
+            })
+            .to_string(),
+        )
+    } else if path == "/api/slow-mutate" {
+        mutations.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        (
+            "200 OK",
+            "application/json",
+            json!({"method": method, "cookie": cookie}).to_string(),
+        )
+    } else if path == "/api/large" {
+        ("200 OK", "application/octet-stream", "x".repeat(16 * 1024))
+    } else if path == "/api/redirect" {
+        (
+            "302 Found\r\nLocation: /api/mutate",
+            "text/plain",
+            "Redirect".to_owned(),
+        )
+    } else {
+        ("200 OK", "text/plain", "Local profile fixture".to_owned())
+    };
+    let response = format!("HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
@@ -417,6 +484,449 @@ async fn browser_resource_status_preserves_profiles_at_capacity_and_reports_cdp_
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; uses only a local fixture"]
+async fn structured_playwright_actions_cover_live_browser_workflows() {
+    let h = Harness::new_in(&std::env::temp_dir()).await;
+    let result = std::panic::AssertUnwindSafe(verify_structured_playwright_actions(&h))
+        .catch_unwind()
+        .await;
+    h.service.force_stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn verify_structured_playwright_actions(h: &Harness) {
+    h.seed("default", "localhost").await;
+    let session = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            h.fixture.url("localhost", "default"),
+            "default",
+            Some("default"),
+        )
+        .await
+        .unwrap();
+    let events = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Events {
+                after_sequence: 0,
+                runtime_generation: None,
+                limit: 100,
+                kinds: vec![],
+                wait_ms: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let context = events.browser.unwrap();
+    assert_eq!(context.session_id, session.id);
+    assert_eq!(context.profile.as_deref(), Some("default"));
+    let generation = context.runtime_generation;
+    let original_page_id = context.page_id;
+    let event_cursor = events.data.unwrap()["latest_sequence"].as_u64().unwrap();
+
+    let screenshot = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Screenshot {
+                locator: Some(css_locator("#state")),
+                full_page: false,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(screenshot["image_base64"].as_str().unwrap())
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        screenshot["byte_length"].as_u64().unwrap(),
+        png.len() as u64
+    );
+
+    let scrolled = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Scroll {
+                locator: Some(css_locator("#page-end")),
+                delta_x: 0,
+                delta_y: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert!(scrolled["y"].as_f64().unwrap() > 0.0);
+
+    let mutation = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Request {
+                method: "POST".into(),
+                url: format!("http://localhost:{}/api/mutate", h.fixture.port),
+                headers: vec![BrowserRequestHeader {
+                    name: "content-type".into(),
+                    value: "text/plain".into(),
+                }],
+                body_text: Some("reading-list".into()),
+                body_base64: None,
+                timeout_ms: 5000,
+                max_response_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(mutation["status"], 200);
+    assert_eq!(h.fixture.mutation_count(), 1);
+    let mutation_body = base64::engine::general_purpose::STANDARD
+        .decode(mutation["response_body_base64"].as_str().unwrap())
+        .unwrap();
+    let mutation_body: Value = serde_json::from_slice(&mutation_body).unwrap();
+    assert_eq!(mutation_body["method"], "POST");
+    assert!(mutation_body["cookie"]
+        .as_str()
+        .unwrap()
+        .contains("sid=default"));
+    assert_eq!(mutation_body["request_body_bytes"], 12);
+
+    let large = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Request {
+                method: "GET".into(),
+                url: format!("http://localhost:{}/api/large", h.fixture.port),
+                headers: vec![],
+                body_text: None,
+                body_base64: None,
+                timeout_ms: 5000,
+                max_response_bytes: 32,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(large["response_truncated"], true);
+    assert_eq!(large["response_body_bytes"], 32);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(large["response_body_base64"].as_str().unwrap())
+            .unwrap()
+            .len(),
+        32
+    );
+
+    assert!(h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Request {
+                method: "GET".into(),
+                url: format!("http://localhost:{}/api/redirect", h.fixture.port),
+                headers: vec![],
+                body_text: None,
+                body_base64: None,
+                timeout_ms: 5000,
+                max_response_bytes: 4096,
+            },
+        )
+        .await
+        .is_err());
+    assert_eq!(h.fixture.mutation_count(), 1, "request followed a redirect");
+
+    assert!(h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Request {
+                method: "POST".into(),
+                url: format!("http://localhost:{}/api/slow-mutate", h.fixture.port),
+                headers: vec![],
+                body_text: Some("single-attempt".into()),
+                body_base64: None,
+                timeout_ms: 1000,
+                max_response_bytes: 4096,
+            },
+        )
+        .await
+        .is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
+    assert_eq!(
+        h.fixture.mutation_count(),
+        2,
+        "timed-out mutation was retried"
+    );
+
+    h.service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Click {
+                locator: css_locator("#popup"),
+            },
+        )
+        .await
+        .unwrap();
+    let popup_events = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Events {
+                after_sequence: event_cursor,
+                runtime_generation: Some(generation),
+                limit: 100,
+                kinds: vec!["popup".into()],
+                wait_ms: 3000,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(popup_events["events"].as_array().unwrap().len(), 1);
+
+    let popup_cursor = popup_events["latest_sequence"].as_u64().unwrap();
+    h.service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Click {
+                locator: css_locator("#dialog"),
+            },
+        )
+        .await
+        .unwrap();
+    let dialog_events = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Events {
+                after_sequence: popup_cursor,
+                runtime_generation: Some(generation),
+                limit: 10,
+                kinds: vec!["dialog".into()],
+                wait_ms: 3000,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    let dialog = &dialog_events["events"][0];
+    assert_eq!(dialog["disposition"], "dismissed");
+    assert!(dialog["message_length"].as_u64().unwrap() > 0);
+    assert!(dialog.get("message").is_none());
+
+    let dialog_cursor = dialog_events["latest_sequence"].as_u64().unwrap();
+    h.service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Click {
+                locator: css_locator("#message"),
+            },
+        )
+        .await
+        .unwrap();
+    let message_events = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Events {
+                after_sequence: dialog_cursor,
+                runtime_generation: Some(generation),
+                limit: 10,
+                kinds: vec!["window_message".into()],
+                wait_ms: 3000,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(message_events["events"][0]["data_type"], "object");
+    assert_eq!(
+        message_events["events"][0]["source_relation"],
+        "same_window"
+    );
+    assert!(message_events["events"][0].get("data").is_none());
+
+    let pages = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Pages {
+                op: "list".into(),
+                page_id: None,
+                runtime_generation: None,
+                url: None,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(pages["pages"].as_array().unwrap().len(), 2);
+    let popup_id = pages["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|page| page["title"] == "Fixture details")
+        .unwrap()["page_id"]
+        .as_u64()
+        .unwrap();
+    h.service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Pages {
+                op: "select".into(),
+                page_id: Some(popup_id),
+                runtime_generation: Some(generation),
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
+    let popup = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Snapshot {
+                format: "dom".into(),
+                max_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert!(popup["content"].as_str().unwrap().contains("Details ready"));
+    h.service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Pages {
+                op: "close".into(),
+                page_id: Some(popup_id),
+                runtime_generation: Some(generation),
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    h.service.enable_cdp(h.project, session.id).await.unwrap();
+    assert_eq!(
+        h.service
+            .action(
+                h.project,
+                session.id,
+                BrowserAction::Pages {
+                    op: "list".into(),
+                    page_id: None,
+                    runtime_generation: None,
+                    url: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        huntproxy::domain::ErrorCode::Conflict
+    );
+    h.service.disable_cdp(h.project, session.id).await.unwrap();
+    let resumed = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Pages {
+                op: "list".into(),
+                page_id: None,
+                runtime_generation: None,
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
+    let resumed_context = resumed.browser.unwrap();
+    assert!(resumed_context.runtime_generation > generation);
+    assert!(h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Pages {
+                op: "select".into(),
+                page_id: Some(original_page_id),
+                runtime_generation: Some(generation),
+                url: None,
+            },
+        )
+        .await
+        .is_err());
+    assert!(h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Events {
+                after_sequence: event_cursor,
+                runtime_generation: Some(generation),
+                limit: 10,
+                kinds: vec![],
+                wait_ms: 0,
+            },
+        )
+        .await
+        .is_err());
+    let closed = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Pages {
+                op: "close".into(),
+                page_id: Some(resumed_context.page_id),
+                runtime_generation: Some(resumed_context.runtime_generation),
+                url: None,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(closed["pages"].as_array().unwrap().len(), 1);
+    assert_eq!(closed["pages"][0]["url"], "about:blank");
 }
 
 fn css_locator(selector: &str) -> Locator {
@@ -583,6 +1093,134 @@ async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
         let body = String::from_utf8(body).unwrap();
         assert!(body.contains("reading-list.csv"));
         assert!(body.contains("Autumn edition"));
+
+        let request = h
+            .service
+            .action(
+                h.project,
+                session.id,
+                BrowserAction::Request {
+                    method: "POST".into(),
+                    url: format!("http://localhost:{}/api/mutate", h.fixture.port),
+                    headers: vec![BrowserRequestHeader {
+                        name: "content-type".into(),
+                        value: "text/plain".into(),
+                    }],
+                    body_text: Some("catalog-entry".into()),
+                    body_base64: None,
+                    timeout_ms: 5000,
+                    max_response_bytes: 4096,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.data.unwrap()["status"], 200);
+        let filter = huntproxy::history::parse_text_query("method:POST path:/api/mutate").unwrap();
+        let (history, _) = h
+            .service
+            .db
+            .list_history_filtered(h.project, Some(filter), 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        let exchange = h
+            .service
+            .db
+            .get_exchange_detail(h.project, history[0].exchange_id, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(exchange.summary.status_code, Some(200));
+        assert_eq!(exchange.lineage.browser_session_id, Some(session.id));
+        assert_eq!(exchange.lineage.capture_session_id, Some(capture_id));
+        assert!(exchange.request_headers.iter().all(|header| !header
+            .name
+            .eq_ignore_ascii_case("x-huntproxy-browser-origin")));
+
+        let large = h
+            .service
+            .action(
+                h.project,
+                session.id,
+                BrowserAction::Request {
+                    method: "GET".into(),
+                    url: format!("http://localhost:{}/api/large", h.fixture.port),
+                    headers: vec![],
+                    body_text: None,
+                    body_base64: None,
+                    timeout_ms: 5000,
+                    max_response_bytes: 32,
+                },
+            )
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(large["response_body_bytes"], 32);
+        assert_eq!(large["received_body_bytes"], 16 * 1024);
+        assert_eq!(large["response_truncated"], true);
+        let filter = huntproxy::history::parse_text_query("method:GET path:/api/large").unwrap();
+        let (history, _) = h
+            .service
+            .db
+            .list_history_filtered(h.project, Some(filter), 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        let saved_body = h
+            .service
+            .db
+            .load_raw_body(
+                h.project,
+                history[0].exchange_id,
+                huntproxy::domain::MessageSide::Response,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_body.len(), 16 * 1024);
+
+        h.service
+            .db
+            .create_request_rule(
+                h.project,
+                RequestRuleInput {
+                    name: "Local cross-origin regression".into(),
+                    enabled: true,
+                    position: 0,
+                    host_pattern: Some("localhost".into()),
+                    target: RequestRuleTarget::Url,
+                    operation: RequestRuleOperation::Replace,
+                    header_name: None,
+                    match_kind: RequestRuleMatchKind::Literal,
+                    pattern: format!("http://localhost:{}/api/blocked", h.fixture.port),
+                    replacement: Some(format!("http://127.0.0.1:{}/api/mutate", h.fixture.port)),
+                    replace_all: true,
+                },
+            )
+            .await
+            .unwrap();
+        let before = h.fixture.mutation_count();
+        let blocked = h
+            .service
+            .action(
+                h.project,
+                session.id,
+                BrowserAction::Request {
+                    method: "POST".into(),
+                    url: format!("http://localhost:{}/api/blocked", h.fixture.port),
+                    headers: vec![],
+                    body_text: Some("stay-local".into()),
+                    body_base64: None,
+                    timeout_ms: 5000,
+                    max_response_bytes: 4096,
+                },
+            )
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(blocked["status"], 403);
+        assert_eq!(h.fixture.mutation_count(), before);
     })
     .catch_unwind()
     .await;
