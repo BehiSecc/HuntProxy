@@ -382,6 +382,7 @@ fn private_router(state: Arc<AppState>) -> Router {
                 "/internal/mcp/call",
                 post(internal_mcp_call).layer(DefaultBodyLimit::max(payload_body_limit)),
             )
+            .route("/internal/mcp/tools", get(internal_mcp_tools))
             .route("/internal/shutdown", post(internal_shutdown))
             .with_state(state),
     )
@@ -399,6 +400,14 @@ fn api_payload_body_limit(max_body_bytes: u64) -> usize {
 async fn internal_shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.shutdown.cancel();
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn internal_mcp_tools() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": crate::INTERNAL_PROTOCOL_VERSION,
+        "tools": crate::mcp::tool_defs(),
+    }))
 }
 
 #[derive(Deserialize)]

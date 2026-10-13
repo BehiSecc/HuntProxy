@@ -21,8 +21,18 @@ use std::sync::Arc;
 trait ToolBackend: Send + Sync {
     async fn call(&self, name: &str, args: Value) -> DomainResult<Value>;
 
-    fn definitions(&self) -> Value {
+    async fn definitions(&self) -> Value {
         tool_defs()
+    }
+
+    async fn definitions_changed(&self) -> bool {
+        false
+    }
+
+    async fn reset_definitions_changed(&self) {}
+
+    fn supports_list_changed(&self) -> bool {
+        false
     }
 }
 
@@ -36,13 +46,64 @@ impl ToolBackend for LocalToolBackend {
         call_tool(self.state.clone(), name, args).await
     }
 
-    fn definitions(&self) -> Value {
+    async fn definitions(&self) -> Value {
         local_tool_defs()
     }
 }
 
 struct DaemonToolBackend {
     config: Config,
+    catalog: tokio::sync::RwLock<Option<DaemonToolCatalog>>,
+    catalog_change_pending: tokio::sync::Mutex<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DaemonToolCatalog {
+    version: String,
+    protocol: u32,
+    tools: Value,
+}
+
+impl DaemonToolBackend {
+    fn new(config: Config) -> Self {
+        Self {
+            config,
+            catalog: tokio::sync::RwLock::new(Some(DaemonToolCatalog {
+                version: SERVER_VERSION.to_string(),
+                protocol: crate::INTERNAL_PROTOCOL_VERSION,
+                tools: tool_defs(),
+            })),
+            catalog_change_pending: tokio::sync::Mutex::new(false),
+        }
+    }
+
+    async fn refresh_catalog(&self) -> DomainResult<Option<Value>> {
+        let Some(catalog) = fetch_daemon_tool_catalog(&self.config).await? else {
+            return Ok(None);
+        };
+        if catalog.version.is_empty()
+            || catalog.version.len() > 128
+            || catalog.protocol == 0
+            || !catalog.tools.is_array()
+        {
+            return Err(DomainError::new(
+                ErrorCode::ProtocolError,
+                "daemon returned an invalid MCP tool catalog",
+            ));
+        }
+
+        let tools = catalog.tools.clone();
+        let mut current = self.catalog.write().await;
+        let changed = current.as_ref().is_some_and(|previous| {
+            previous.version != catalog.version || previous.protocol != catalog.protocol
+        });
+        *current = Some(catalog);
+        drop(current);
+        if changed {
+            *self.catalog_change_pending.lock().await = true;
+        }
+        Ok(Some(tools))
+    }
 }
 
 #[async_trait::async_trait]
@@ -73,6 +134,29 @@ impl ToolBackend for DaemonToolBackend {
         }
         let result = call_daemon_tool(&self.config, name, args).await;
         result
+    }
+
+    async fn definitions(&self) -> Value {
+        match self.refresh_catalog().await {
+            Ok(Some(tools)) => tools,
+            Ok(None) | Err(_) => tool_defs(),
+        }
+    }
+
+    async fn definitions_changed(&self) -> bool {
+        if self.refresh_catalog().await.is_err() {
+            return false;
+        }
+        let mut pending = self.catalog_change_pending.lock().await;
+        std::mem::take(&mut *pending)
+    }
+
+    async fn reset_definitions_changed(&self) {
+        *self.catalog_change_pending.lock().await = false;
+    }
+
+    fn supports_list_changed(&self) -> bool {
+        true
     }
 }
 
@@ -378,7 +462,7 @@ fn request_rules_tool_def() -> Value {
     }"#).expect("request rules tool schema is valid JSON")
 }
 
-fn tool_defs() -> Value {
+pub(crate) fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List projects, create one, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope"],"description":"list needs no project_id; create needs name and target_url; usage needs project_id; set_scope needs project_id and scope."},"project_id":{"type":"integer","description":"Required for usage and set_scope."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List compact installed-extension summaries and any rejected packages. Use extension_describe for schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -448,7 +532,7 @@ pub async fn run_stdio_mcp_client(config: Config) -> DomainResult<()> {
     // The inexpensive bridge must outlive an idle/stopped daemon so restart
     // and the next tool call remain available on the same client connection.
     run_stdio_backend(
-        Arc::new(DaemonToolBackend { config }),
+        Arc::new(DaemonToolBackend::new(config)),
         std::time::Duration::ZERO,
     )
     .await
@@ -476,8 +560,24 @@ async fn run_stdio_backend(
         }
     });
 
+    let poll_period = std::time::Duration::from_secs(5);
+    let mut catalog_poll =
+        tokio::time::interval_at(tokio::time::Instant::now() + poll_period, poll_period);
+    catalog_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut initialized = false;
+
     loop {
-        let next_line = if idle_timeout.is_zero() {
+        let next_line = if backend.supports_list_changed() && initialized {
+            tokio::select! {
+                line = lines.recv() => line,
+                _ = catalog_poll.tick() => {
+                    if backend.definitions_changed().await {
+                        write_notification("notifications/tools/list_changed");
+                    }
+                    continue;
+                }
+            }
+        } else if idle_timeout.is_zero() {
             lines.recv().await
         } else {
             match tokio::time::timeout(idle_timeout, lines.recv()).await {
@@ -517,6 +617,10 @@ async fn run_stdio_backend(
             }
         };
         let id = req.id.clone();
+        if req.method == "initialize" {
+            // Establish a catalog baseline before notifications become legal.
+            let _ = backend.definitions().await;
+        }
         match handle_rpc(backend.clone(), &req).await {
             Ok(Some(value)) => {
                 write_response(JsonRpcResponse {
@@ -542,6 +646,15 @@ async fn run_stdio_backend(
                 }),
             }),
         }
+        if matches!(
+            req.method.as_str(),
+            "notifications/initialized" | "initialized"
+        ) {
+            // Catalog differences observed before initialization are already
+            // reflected in the client's first tools/list response.
+            backend.reset_definitions_changed().await;
+            initialized = true;
+        }
     }
     Ok(())
 }
@@ -550,6 +663,15 @@ fn write_response(resp: JsonRpcResponse) {
     let mut out = std::io::stdout().lock();
     if let Ok(s) = serde_json::to_string(&resp) {
         let _ = writeln!(out, "{s}");
+        let _ = out.flush();
+    }
+}
+
+fn write_notification(method: &str) {
+    let mut out = std::io::stdout().lock();
+    let notification = json!({ "jsonrpc": "2.0", "method": method });
+    if let Ok(serialized) = serde_json::to_string(&notification) {
+        let _ = writeln!(out, "{serialized}");
         let _ = out.flush();
     }
 }
@@ -620,6 +742,65 @@ async fn call_daemon_tool(config: &Config, name: &str, args: Value) -> DomainRes
     ))
 }
 
+#[cfg(unix)]
+async fn fetch_daemon_tool_catalog(config: &Config) -> DomainResult<Option<DaemonToolCatalog>> {
+    const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full, Limited};
+    use hyper::client::conn::http1;
+    use hyper::{Request, StatusCode};
+    use hyper_util::rt::TokioIo;
+
+    let fetch = async {
+        let stream = match tokio::net::UnixStream::connect(config.socket_path()).await {
+            Ok(stream) => stream,
+            Err(_) => return Ok(None),
+        };
+        let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "MCP catalog connection closed");
+            }
+        });
+        let request = Request::get("/internal/mcp/tools")
+            .header(hyper::header::HOST, "localhost")
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|error| DomainError::new(ErrorCode::Unavailable, error.to_string()))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                format!("daemon tool catalog returned HTTP {}", response.status()),
+            ));
+        }
+        let bytes = Limited::new(response.into_body(), MAX_CATALOG_BYTES)
+            .collect()
+            .await
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?
+            .to_bytes();
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), fetch)
+        .await
+        .map_err(|_| DomainError::new(ErrorCode::Timeout, "daemon tool catalog timed out"))?
+}
+
+#[cfg(not(unix))]
+async fn fetch_daemon_tool_catalog(_config: &Config) -> DomainResult<Option<DaemonToolCatalog>> {
+    Ok(None)
+}
+
 #[cfg(not(unix))]
 async fn call_daemon_tool(_config: &Config, _name: &str, _args: Value) -> DomainResult<Value> {
     Err(DomainError::new(
@@ -635,12 +816,12 @@ async fn handle_rpc(
     match req.method.as_str() {
         "initialize" => Ok(Some(json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
+            "capabilities": { "tools": { "listChanged": backend.supports_list_changed() } },
             "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
         }))),
         "notifications/initialized" | "initialized" => Ok(None),
         "ping" => Ok(Some(json!({}))),
-        "tools/list" => Ok(Some(json!({ "tools": backend.definitions() }))),
+        "tools/list" => Ok(Some(json!({ "tools": backend.definitions().await }))),
         "tools/call" => {
             let name = req
                 .params
@@ -2874,7 +3055,7 @@ mod tests {
         ));
         for backend in [
             Arc::new(LocalToolBackend { state }) as Arc<dyn ToolBackend>,
-            Arc::new(DaemonToolBackend { config }) as Arc<dyn ToolBackend>,
+            Arc::new(DaemonToolBackend::new(config)) as Arc<dyn ToolBackend>,
         ] {
             for query in [json!("time:>1970-01-01T00:00:00Z"), json!(100)] {
                 let request = history_call(json!({"project_id": project.id.get(), "q": query}));
