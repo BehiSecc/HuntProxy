@@ -1675,6 +1675,7 @@ async fn list_reply_tabs(State(state): State<Arc<AppState>>, Path(id): Path<i64>
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpsertTab {
     id: Option<i64>,
     name: String,
@@ -1852,6 +1853,7 @@ async fn list_fuzz_jobs(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartFuzzBody {
     template: FuzzTemplate,
     confirm: Option<bool>,

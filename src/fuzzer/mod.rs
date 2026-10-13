@@ -89,6 +89,7 @@ pub struct InsertionPoint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FuzzTemplate {
     #[serde(default)]
     pub base_exchange_id: Option<ExchangeId>,
@@ -382,6 +383,13 @@ impl FuzzerService {
                 format!("estimated {estimated} exceeds max_fuzz_cases"),
             ));
         }
+        // Keep explicitly selected credentials stable for all cases; never
+        // serialize the snapshot into the saved template or job state.
+        let identity = self
+            .reply
+            .resolve_named_identity(project_id, &template.draft)
+            .await?
+            .map(Arc::new);
         let limiter = self.project_limiter(&project)?;
 
         let template_json = serde_json::to_string(&template)
@@ -419,6 +427,7 @@ impl FuzzerService {
                 max_concurrency,
                 limiter,
                 cancel.clone(),
+                identity,
             )
             .await;
             if let Err(error) = result {
@@ -938,6 +947,7 @@ async fn load_wordlist_files(template: &mut FuzzTemplate) -> DomainResult<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     db: Arc<Db>,
     reply: Arc<ReplyService>,
@@ -947,6 +957,7 @@ async fn run_job(
     max_concurrency: usize,
     limiter: Arc<ProjectFuzzLimiter>,
     cancel: CancellationToken,
+    identity: Option<Arc<crate::cookies::StoredCookieProfile>>,
 ) -> DomainResult<()> {
     db.set_fuzz_job_state(project_id, job_id, FuzzJobState::Running, None)
         .await?;
@@ -974,9 +985,10 @@ async fn run_job(
             let template = template.clone();
             let limiter = limiter.clone();
             let cancel = cancel.clone();
+            let identity = identity.clone();
             running.push(tokio::spawn(async move {
                 execute_case(
-                    db, reply, project_id, job_id, template, case, limiter, cancel,
+                    db, reply, project_id, job_id, template, case, limiter, cancel, identity,
                 )
                 .await
             }));
@@ -1047,6 +1059,7 @@ async fn execute_case(
     case: FuzzCasePayloads,
     limiter: Arc<ProjectFuzzLimiter>,
     cancel: CancellationToken,
+    identity: Option<Arc<crate::cookies::StoredCookieProfile>>,
 ) -> DomainResult<()> {
     let mut prepared = prepare_case(&template, &case);
     let payloads = match &mut prepared {
@@ -1126,13 +1139,13 @@ async fn execute_case(
             .await;
     }
     let result = reply
-        .send_with_context(
+        .send_with_context_and_pinned_identity(
             project_id,
             template.base_exchange_id,
             &prepared.draft,
             ProtocolPreference::Auto,
-            0,
             ReplySendContext::fuzzer(template.base_exchange_id, job_id, persisted.id),
+            identity.as_deref(),
         )
         .await;
     match result {
@@ -1871,6 +1884,7 @@ mod tests {
             1,
             test_limiter(1, 1_000.0),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1971,6 +1985,7 @@ mod tests {
             3,
             test_limiter(3, 1_000.0),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -2047,6 +2062,7 @@ mod tests {
             1,
             test_limiter(1, 1_000.0),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
