@@ -6590,8 +6590,12 @@ fn run_js_sync(
     let interrupted_handler = interrupted.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_handler = cancelled.clone();
+    let interrupt_cancel = cancel.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        if interrupt_cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
             cancelled_handler.store(true, Ordering::Relaxed);
             return true;
         }
@@ -6652,20 +6656,14 @@ fn run_js_sync(
             .transpose()?
             .ok_or_else(|| "plugin returned undefined".to_string())
     });
-    if cancelled.load(Ordering::Relaxed) {
-        return Err(DomainError::new(
-            ErrorCode::Cancelled,
-            "plugin JavaScript stage cancelled",
-        ));
-    }
-    if interrupted.load(Ordering::Relaxed) {
-        return Err(DomainError::new(
-            ErrorCode::Timeout,
-            format!(
-                "plugin JavaScript stage exceeded {} ms",
-                stage_timeout.as_millis()
-            ),
-        ));
+    if let Some(error) = javascript_stage_terminal_error(
+        cancelled.load(Ordering::Relaxed),
+        interrupted.load(Ordering::Relaxed),
+        cancel.as_ref(),
+        deadline,
+        stage_timeout,
+    ) {
+        return Err(error);
     }
     let output = output.map_err(|error| {
         DomainError::new(
@@ -6679,6 +6677,31 @@ fn run_js_sync(
             format!("plugin {stage} returned invalid JSON: {error}"),
         )
     })
+}
+
+fn javascript_stage_terminal_error(
+    interrupted_cancel: bool,
+    interrupted_timeout: bool,
+    cancel: Option<&CancellationToken>,
+    deadline: Instant,
+    stage_timeout: Duration,
+) -> Option<DomainError> {
+    if interrupted_cancel || cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Some(DomainError::new(
+            ErrorCode::Cancelled,
+            "plugin JavaScript stage cancelled",
+        ));
+    }
+    if interrupted_timeout || Instant::now() >= deadline {
+        return Some(DomainError::new(
+            ErrorCode::Timeout,
+            format!(
+                "plugin JavaScript stage exceeded {} ms",
+                stage_timeout.as_millis()
+            ),
+        ));
+    }
+    None
 }
 
 fn bounded_javascript_error(mut message: String) -> String {
@@ -6747,6 +6770,18 @@ mod tests {
             cancel: CancellationToken::new(),
             analysis_checkpoint: parking_lot::Mutex::new(None),
         })
+    }
+
+    fn fail_on_terminal_job(status: &PluginJobView, expectation: &str) {
+        assert!(
+            !matches!(
+                status.state,
+                PluginJobState::Completed | PluginJobState::Failed | PluginJobState::Cancelled
+            ),
+            "{expectation}, reached {:?}: {:?}",
+            status.state,
+            status.error
+        );
     }
 
     #[test]
@@ -7275,6 +7310,55 @@ mod tests {
     }
 
     #[test]
+    fn javascript_short_stage_honors_zero_timeout() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { return {operations: []}; }, analyze() { return {}; }
+        };"#;
+        for (stage, observations) in [("plan", "null"), ("analyze", "[]")] {
+            let error = run_js_sync(
+                script,
+                stage,
+                "{}",
+                observations,
+                "{}",
+                4 * 1024 * 1024,
+                Duration::ZERO,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Timeout, "stage {stage}");
+        }
+    }
+
+    #[test]
+    fn javascript_stage_checks_elapsed_deadline_after_execution() {
+        let error = javascript_stage_terminal_error(
+            false,
+            false,
+            None,
+            Instant::now() - Duration::from_millis(1),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(error.code(), ErrorCode::Timeout);
+    }
+
+    #[test]
+    fn javascript_stage_rechecks_cancellation_after_execution() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = javascript_stage_terminal_error(
+            false,
+            false,
+            Some(&cancel),
+            Instant::now() - Duration::from_millis(1),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+    }
+
+    #[test]
     fn required_base_exchange_is_rejected_before_plugin_planning() {
         let manifest = PluginManifest {
             schema_version: PLUGIN_API_VERSION,
@@ -7526,6 +7610,29 @@ mod tests {
     }
 
     #[test]
+    fn javascript_short_stage_gives_pre_cancelled_token_precedence() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { return {operations: []}; }, analyze() { return {}; }
+        };"#;
+        for (stage, observations) in [("plan", "null"), ("analyze", "[]")] {
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let error = run_js_sync(
+                script,
+                stage,
+                "{}",
+                observations,
+                "{}",
+                4 * 1024 * 1024,
+                Duration::ZERO,
+                Some(cancel),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Cancelled, "stage {stage}");
+        }
+    }
+
+    #[test]
     fn effective_limits_expose_requested_fallback_and_host_ceiling() {
         let mut manifest: PluginManifest = serde_json::from_value(json!({
             "schema_version":1,"id":"test","name":"Test","version":"1.0.0","description":"test","enabled":true,
@@ -7636,6 +7743,7 @@ mod tests {
                 if status.state == PluginJobState::Failed {
                     break status;
                 }
+                fail_on_terminal_job(&status, "expected initial analysis to fail");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7659,6 +7767,7 @@ mod tests {
                 if status.state == PluginJobState::Completed {
                     break status;
                 }
+                fail_on_terminal_job(&status, "expected resumed analysis to complete");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7694,13 +7803,11 @@ mod tests {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service
-                    .status(cancelled_job.id)
-                    .unwrap()
-                    .analysis_resume_available
-                {
+                let status = service.status(cancelled_job.id).unwrap();
+                if status.analysis_resume_available {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected resumable failed analysis");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7717,6 +7824,7 @@ mod tests {
                 if status.state == PluginJobState::Cancelled {
                     break status;
                 }
+                fail_on_terminal_job(&status, "expected resumed analysis cancellation");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7749,10 +7857,11 @@ mod tests {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service.status(failed_operation_job.id).unwrap().state == PluginJobState::Failed
-                {
+                let status = service.status(failed_operation_job.id).unwrap();
+                if status.state == PluginJobState::Failed {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected operation failure");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7782,9 +7891,11 @@ mod tests {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service.status(interrupted.id).unwrap().completed_operations == 1 {
+                let status = service.status(interrupted.id).unwrap();
+                if status.completed_operations == 1 {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected first operation before cancellation");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7793,9 +7904,11 @@ mod tests {
         service.cancel(interrupted.id).unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service.status(interrupted.id).unwrap().state == PluginJobState::Cancelled {
+                let status = service.status(interrupted.id).unwrap();
+                if status.state == PluginJobState::Cancelled {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected interrupted job cancellation");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7840,21 +7953,6 @@ mod tests {
                 )
                 .await;
         });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if service
-                    .status(timeout_id)
-                    .unwrap()
-                    .analysis_checkpoint_status
-                    == "retained"
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
         tokio::time::timeout(Duration::from_secs(10), running)
             .await
             .unwrap()
