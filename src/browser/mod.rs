@@ -1046,6 +1046,22 @@ impl BrowserService {
         }
     }
 
+    /// Apply paths verified by the release installer without process-wide
+    /// environment changes or changing an existing browser profile.
+    pub(crate) fn with_runtime_paths(
+        mut self,
+        playwright_core_path: Option<PathBuf>,
+        chromium_path: Option<PathBuf>,
+    ) -> Self {
+        if let Some(path) = playwright_core_path.filter(|path| path.is_dir()) {
+            self.playwright_core_path = Some(path);
+        }
+        if let Some(path) = chromium_path.filter(|path| path.is_file()) {
+            self.chromium_path = Some(path);
+        }
+        self
+    }
+
     pub fn status(&self) -> BrowserInstallStatus {
         browser_install_status(
             self.node_path.as_deref(),
@@ -2095,17 +2111,44 @@ impl BrowserService {
         }
         session.state = BrowserSessionState::Busy;
         self.db.update_browser_session(&session).await?;
-        let worker_result = self
-            .call_worker(
-                "session.action",
-                json!({
-                    "session_id": session_id.get(),
-                    "action": serde_json::to_value(&action).map_err(|error| {
-                        DomainError::new(ErrorCode::InvalidArgument, error.to_string())
-                    })?,
-                }),
-            )
-            .await;
+        let event_wait_ms = match &action {
+            BrowserAction::Events { wait_ms, .. } => *wait_ms,
+            _ => 0,
+        };
+        let mut worker_action = serde_json::to_value(&action)
+            .map_err(|error| DomainError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        // A worker RPC is serialized behind one shared stdin/stdout stream. Keep
+        // long-poll timing here so an empty event wait does not monopolize that
+        // stream and block independent browser sessions.
+        if event_wait_ms > 0 {
+            worker_action["wait_ms"] = json!(0);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(event_wait_ms);
+        let worker_result = loop {
+            let result = self
+                .call_worker(
+                    "session.action",
+                    json!({
+                        "session_id": session_id.get(),
+                        "action": worker_action.clone(),
+                    }),
+                )
+                .await;
+            let should_wait = event_wait_ms > 0
+                && result.as_ref().is_ok_and(|value| {
+                    value
+                        .get("data")
+                        .and_then(|data| data.get("events"))
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                })
+                && tokio::time::Instant::now() < deadline;
+            if !should_wait {
+                break result;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+        };
         let result = match worker_result {
             Ok(result) => result,
             Err(error) => {
