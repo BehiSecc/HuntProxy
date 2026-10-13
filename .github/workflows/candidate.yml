@@ -1,6 +1,9 @@
 name: Build release candidate
 
 on:
+  push:
+    branches:
+      - "release/v*"
   workflow_dispatch:
 
 concurrency:

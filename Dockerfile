@@ -8,6 +8,7 @@ COPY src ./src
 COPY migrations ./migrations
 COPY web ./web
 COPY browser-worker ./browser-worker
+COPY resources ./resources
 RUN cargo build --release --locked --bin HuntProxy
 
 FROM node:20-bookworm-slim AS browser
@@ -34,6 +35,7 @@ RUN apt-get update \
 
 COPY --from=build /src/target/release/HuntProxy /usr/local/bin/HuntProxy
 COPY --from=browser --chown=huntproxy:huntproxy /browser-worker /opt/huntproxy/browser-worker
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/huntproxy/
 
 ENV HUNTPROXY_DATA_DIR=/data \
     HUNTPROXY_BROWSER_WORKER_PATH=/opt/huntproxy/browser-worker/index.js \

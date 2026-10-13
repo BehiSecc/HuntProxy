@@ -94,6 +94,8 @@ Connect your AI agent to the running container:
 
 The MCP bridge connects to the HuntProxy daemon already running inside the container.
 
+For Docker updates, rebuild the image and recreate the container with the same `huntproxy-data` volume. Reconnect MCP clients that use `docker exec` after recreating the container.
+
 Optionally, open the web interface at [http://127.0.0.1:17890](http://127.0.0.1:17890).
 
 > [!NOTE]
@@ -177,6 +179,8 @@ Agents can keep routine browser work inside `browser_action`. Use `pages` to lis
 `action: {type: "request", method: "POST", url: "https://target.example/api/items", body_text: "..."}` sends one request from a reusable isolated world on the active page. The URL must have that page's exact HTTP(S) origin, and HuntProxy rechecks the effective URL after request rules. The request uses the live browser cookie jar and normal browser CSP, service-worker, Origin, Referer, proxy, and capture behavior. Redirects and retries are disabled. Request bodies are limited to 2 MiB, response previews to 64 KiB, and Fetch-managed or duplicate headers are rejected instead of being silently changed. A completed response is drained so History can retain its normal full captured evidence even when the returned preview is short; a timeout is never retried and can leave explicitly incomplete evidence.
 
 `browser_cdp` remains available for operator handoff and for unusual interactions that the structured actions cannot express. While a CDP handoff is active, `browser_action` pauses as before. Returning control creates a new runtime generation, so list pages and restart event cursors before continuing.
+
+CDP handoff preserves every open tab, the selected tab, and each tab's session storage. Waiting for browser events releases the worker between polls so other sessions can keep working.
 
 ### Test Hypotheses
 
@@ -493,7 +497,17 @@ Update HuntProxy to the latest release:
 HuntProxy update
 ```
 
-`HuntProxy backup` copies only SQLite; it omits configuration, the CA, plugins, and browser profiles. For full recovery, stop HuntProxy and copy its data directory plus any configured external paths. The installer leaves that data untouched.
+For native installations from v0.2 onward, the updater prepares the matching browser runtime and official plugins, preserves project data, and restarts the daemon if it was running. Existing projects open normally; there is no re-export or conversion step. Older `.huntproxy` bundles are upgraded during ordinary import. Customized and third-party plugin folders are preserved; an incompatible preserved Racer package returns a clear compatibility error.
+
+The v0.2 MCP bridge refreshes the daemon's tool catalog after later updates and sends the standard `tools/list_changed` notification, so clients that support it can discover new features on the same connection. It keeps the last validated catalog while the daemon is idle or stopped.
+
+**Upgrading from v0.1.1:** its already-published updater requires `HuntProxy stop` and an MCP client reconnect after `HuntProxy update`. The new executable prepares its runtime and plugins automatically on first startup. This one-time limitation belongs to the old updater; subsequent updates use the coordinated workflow.
+
+Updates keep a private database/configuration/plugin restore point and the previous executable. Failed preparation or activation restores the previous installation. Interrupted v0.2 updates recover before opening project data. A schema migration also keeps a private copy of the earlier database. Active browsers and jobs stop during replacement; saved projects, history, identities, and browser profile storage remain available.
+
+`HuntProxy backup` copies only SQLite; it omits configuration, the CA, plugins, and browser profiles. Update restore points also omit browser profiles and the CA because the updater preserves those in place. For a complete independent backup, stop HuntProxy and copy its data directory plus any configured external paths.
+
+See the [v0.2.0 release notes](docs/releases/v0.2.0.md) for the compatibility changes.
 
 ### Uninstall
 
