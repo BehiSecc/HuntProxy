@@ -7,16 +7,16 @@ echo "== fmt =="
 cargo fmt --check
 
 echo "== clippy =="
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 
 echo "== test =="
-cargo test --all-targets
+cargo test --locked --all-targets
 
 echo "== browser worker syntax =="
 node --check browser-worker/index.js
 
 echo "== build =="
-cargo build --release
+cargo build --release --locked
 
 if command -v cargo-deny >/dev/null 2>&1; then
   echo "== deny =="

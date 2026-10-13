@@ -39,11 +39,13 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup override set "$RUST_VERSION"
 
-      - name: Run tests
-        run: cargo test --locked --all-targets
+      - name: Run repository checks
+        env:
+          HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-release-default
+        run: scripts/check.sh
 
   build:
     name: Build ${{ matrix.asset }}
@@ -122,9 +124,10 @@ jobs:
           package_dir="${RUNNER_TEMP}/huntproxy-package"
           mkdir -p "$package_dir"
           cp "target/${{ matrix.target }}/release/HuntProxy" "$package_dir/HuntProxy"
-          cp LICENSE "$package_dir/LICENSE"
+          cat LICENSE THIRD_PARTY_NOTICES.md > "$package_dir/LICENSE"
           chmod 755 "$package_dir/HuntProxy"
           tar -czf "${{ matrix.asset }}" -C "$package_dir" HuntProxy LICENSE
+          [[ "$(tar -tzf "${{ matrix.asset }}" | LC_ALL=C sort | tr '\n' ' ')" == "HuntProxy LICENSE " ]]
 
       - name: Upload release archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -135,7 +138,7 @@ jobs:
           retention-days: 7
 
   release:
-    name: Publish GitHub Release
+    name: Create draft GitHub Release
     needs: build
     runs-on: ubuntu-22.04
     permissions:
@@ -151,7 +154,7 @@ jobs:
         working-directory: dist
         run: sha256sum huntproxy-*.tar.gz | sort > SHA256SUMS
 
-      - name: Publish release
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -174,5 +177,4 @@ jobs:
             --generate-notes \
             --draft \
             --title "HuntProxy $GITHUB_REF_NAME"
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
           created=0

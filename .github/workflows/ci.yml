@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.88.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Format, lint, test, and build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup override set "$RUST_VERSION"
+
+      - name: Run repository checks
+        env:
+          HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-ci-default
+        run: scripts/check.sh
+
+  browser:
+    name: Pinned Chromium integration tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    concurrency:
+      group: huntproxy-browser-cdp-9222
+      cancel-in-progress: false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config
+
+      - name: Install pinned Chromium system dependencies
+        run: npx --yes playwright@1.49.1 install-deps chromium
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+
+      - name: Build HuntProxy
+        run: cargo build --locked --bin HuntProxy
+
+      - name: Provision the embedded browser runtime
+        id: runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          data_dir="${RUNNER_TEMP}/huntproxy-browser-ci"
+          target/debug/HuntProxy --data-dir "$data_dir" prepare-update
+          python3 - "$data_dir/runtime/browser-validation.json" "$GITHUB_ENV" "$GITHUB_PATH" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          marker = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          values = {
+              "HUNTPROXY_PLAYWRIGHT_CORE_PATH": marker["playwright_core"]["path"],
+              "HUNTPROXY_CHROME_EXECUTABLE": marker["chromium"]["path"],
+          }
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          node_dir = pathlib.Path(marker["node"]["path"]).parent
+          with pathlib.Path(sys.argv[3]).open("a", encoding="utf-8") as output:
+              output.write(f"{node_dir}\n")
+          PY
+
+      - name: Run serialized live-browser tests
+        env:
+          HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-browser-default
+          TMPDIR: ${{ runner.temp }}
+        run: cargo test --locked --test browser_profile_isolation -- --ignored --test-threads=1

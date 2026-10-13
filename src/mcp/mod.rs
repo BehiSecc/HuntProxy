@@ -3157,23 +3157,30 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "browser_action")
             .unwrap();
-        assert!(
-            browser["inputSchema"]["properties"]["action"]["properties"]["type"]["enum"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "navigate")
-        );
-        let action = &browser["inputSchema"]["properties"]["action"]["properties"];
+        let actions = browser["inputSchema"]["properties"]["action"]["oneOf"]
+            .as_array()
+            .unwrap();
+        let advertises = |name: &str| {
+            actions.iter().any(|action| {
+                action["properties"]["type"]["const"] == name
+                    || action["properties"]["type"]["enum"]
+                        .as_array()
+                        .is_some_and(|values| values.iter().any(|value| value == name))
+            })
+        };
+        assert!(advertises("navigate"));
         for name in ["upload", "inspect"] {
-            assert!(action["type"]["enum"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == name));
+            assert!(advertises(name));
         }
-        assert_eq!(action["files"]["maxItems"], 16);
-        assert_eq!(action["timeout_ms"]["maximum"], 30000);
+        let direct_upload = actions
+            .iter()
+            .find(|action| {
+                action["properties"]["type"]["const"] == "upload"
+                    && action["properties"]["via_chooser"]["const"] == false
+            })
+            .unwrap();
+        assert_eq!(direct_upload["properties"]["files"]["maxItems"], 16);
+        assert_eq!(direct_upload["properties"]["timeout_ms"]["maximum"], 30000);
         let upload: crate::browser::BrowserAction = serde_json::from_value(
             json!({"type":"upload","locator":{"css":"input[type=file]"},"files":[]}),
         )
