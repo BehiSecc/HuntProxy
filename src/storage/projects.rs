@@ -3,7 +3,22 @@
 use crate::domain::*;
 use crate::storage::{write_transaction, Db};
 use rusqlite::params;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectOverview {
+    pub project_id: ProjectId,
+    pub name: String,
+    pub target_url: String,
+    pub total_exchanges: u64,
+    pub replies_sent: u64,
+    pub findings: u64,
+    pub unique_hosts: u64,
+    pub exchanges_by_source: BTreeMap<String, u64>,
+    pub last_activity_at: Option<String>,
+}
 
 pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
@@ -17,6 +32,94 @@ pub fn parse_time(s: &str) -> OffsetDateTime {
 }
 
 impl Db {
+    pub async fn project_overview(&self, id: ProjectId) -> DomainResult<ProjectOverview> {
+        self.with_conn(move |conn| {
+            let (name, target_url): (String, String) = conn
+                .query_row(
+                    "SELECT name, target_url FROM projects WHERE id=?1",
+                    params![id.get()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        DomainError::not_found(format!("project {}", id.get()))
+                    }
+                    other => DomainError::new(ErrorCode::StorageError, other.to_string()),
+                })?;
+
+            let mut exchanges_by_source = BTreeMap::from([
+                ("browser".to_string(), 0),
+                ("fuzzer".to_string(), 0),
+                ("imported".to_string(), 0),
+                ("plugin".to_string(), 0),
+                ("proxy".to_string(), 0),
+                ("reply".to_string(), 0),
+            ]);
+            let mut statement = conn
+                .prepare(
+                    "SELECT source, COUNT(*) FROM exchanges
+                     WHERE project_id=?1 GROUP BY source",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map(params![id.get()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(storage_error)?;
+            for row in rows {
+                let (source, count) = row.map_err(storage_error)?;
+                let count = u64::try_from(count).map_err(|_| {
+                    DomainError::new(ErrorCode::StorageError, "negative exchange count")
+                })?;
+                *exchanges_by_source.entry(source).or_default() = count;
+            }
+
+            let total_exchanges = exchanges_by_source.values().sum();
+            let replies_sent = exchanges_by_source
+                .get("reply")
+                .copied()
+                .unwrap_or_default();
+            let findings: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM findings WHERE project_id=?1",
+                    params![id.get()],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            let unique_hosts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT lower(host)) FROM exchanges WHERE project_id=?1",
+                    params![id.get()],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            let last_activity_at: Option<String> = conn
+                .query_row(
+                    "SELECT MAX(started_at) FROM exchanges WHERE project_id=?1",
+                    params![id.get()],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            let findings = u64::try_from(findings)
+                .map_err(|_| DomainError::new(ErrorCode::StorageError, "negative finding count"))?;
+            let unique_hosts = u64::try_from(unique_hosts)
+                .map_err(|_| DomainError::new(ErrorCode::StorageError, "negative host count"))?;
+
+            Ok(ProjectOverview {
+                project_id: id,
+                name,
+                target_url,
+                total_exchanges,
+                replies_sent,
+                findings,
+                unique_hosts,
+                exchanges_by_source,
+                last_activity_at,
+            })
+        })
+        .await
+    }
+
     pub async fn create_project(&self, req: CreateProjectRequest) -> DomainResult<Project> {
         // The initial target remains required, but does not silently become a
         // capture restriction. Scope is an explicit, optional capture filter.
@@ -251,4 +354,8 @@ impl Db {
         })
         .await
     }
+}
+
+fn storage_error(error: rusqlite::Error) -> DomainError {
+    DomainError::new(ErrorCode::StorageError, error.to_string())
 }

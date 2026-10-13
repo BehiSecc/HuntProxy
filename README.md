@@ -161,7 +161,7 @@ HuntProxy gives agents a complete hunting loop: build context → investigate �
 | **Capture proxy & History** | Record HTTP/HTTPS traffic and search it by host, path, method, status, source, labels, request content, and Boolean expressions. |
 | **Persistent browser profiles** | Run separate named Chromium identities in one project for cross-account testing. Each profile keeps its own cookies and site storage across restarts. |
 | **Sitemap** | Turn saved traffic into a host-and-route tree with methods, statuses, parameters, content types, and exchange counts. |
-| **JavaScript & page discovery** | Find JavaScript and the pages that loaded it, extract endpoints, URLs, and emails, and build target-specific wordlists. |
+| **JavaScript & page discovery** | Find JavaScript and the pages that loaded it, extract endpoints, URLs, emails, and request parameter names, and build target-specific wordlists. Page analysis follows same-origin JavaScript bundles listed in HTML script tags and Modern.js route manifests. |
 | **WebSockets** | Inspect captured connections and messages, then inject text or binary frames into a live connection. |
 
 Different browser profiles can remain open together up to the project's browser limit (two by default). Browser commands share one worker queue, and only one session can be handed to CDP at a time.
@@ -277,6 +277,10 @@ Pass a query in `history_search`'s `q` argument. Keep each field, operator, and 
 
 `duration` is milliseconds; `request_size` and `response_size` are body bytes. `time` compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the stored format for precise cutoffs. Use the tool schema's field names, and narrow full request searches with summary filters when practical. A query error is not an empty result: follow its returned repair guidance and rerun the corrected query before drawing conclusions.
 
+Search results identify exchanges but do not include full bodies. `reply_send` returns an `exchange_id` and a 4 KiB response preview; pass that ID to `exchange_body` with `side: "response"` to read the captured response, or `side: "request"` to read the captured request. Each call returns up to 1 MiB; continue at `next_offset` while `truncated` is true. The default UTF-8 preview replaces invalid byte sequences, so use `encoding: "base64"` when exact page bytes matter. Response bodies are decoded by default; set `raw: true` to read the captured response bytes before content decoding. This reads saved evidence and avoids replaying the request or fetching byte ranges from the target.
+
+Call `overview` with a `project_id` for exchange counts by source, captured replies sent, findings, distinct hosts, and the last exchange time.
+
 ## 💻 CLI Reference
 
 Most projects begin with a prompt, not a terminal command. MCP handles day-to-day hunting; the CLI handles setup, diagnostics, project maintenance and data transfer.
@@ -289,6 +293,7 @@ Most projects begin with a prompt, not a terminal command. MCP handles day-to-da
 | `HuntProxy doctor` | Check paths, browser dependencies, daemon state, and recent startup diagnostics. |
 | `HuntProxy status` | Show whether the daemon is running. |
 | `HuntProxy stop` | Gracefully stop HuntProxy and its managed browsers. |
+| `HuntProxy restart` | Restart or recover the daemon while preserving saved testing state. |
 | `HuntProxy project …` | Create, list, rename, export, import, view usage, reconcile, or delete projects. |
 | `HuntProxy har …` | Import or export HAR 1.2 HTTP history. |
 | `HuntProxy backup <file>` | Create a consistent SQLite backup. |
@@ -329,7 +334,7 @@ Explore the maintained collection or learn how to build your own in [HuntProxy-P
 
 CAPTCHAs and bot checks are common when hunting from a VPS because datacenter IP addresses are easier to recognize. Routing HuntProxy through a reputable residential proxy is usually the most effective fix.
 
-Choose one configuration and add it to `~/.huntproxy/config.toml`. Then run `HuntProxy stop`, restart/reconnect your AI client, and verify with `HuntProxy doctor`.
+Choose one configuration and add it to `~/.huntproxy/config.toml`. Then run `HuntProxy restart` (or call `huntproxy_restart` from the connected agent) and verify with `HuntProxy doctor`.
 
 For all traffic:
 
@@ -409,14 +414,14 @@ Yes. Run HuntProxy and your agent on a VPS, connect from your phone with [Tailsc
 <details>
 <summary><strong>Do I need to keep HuntProxy running?</strong></summary>
 
-Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an inactive MCP bridge exits after one hour, and an MCP-started daemon also shuts down after one hour without MCP or UI control activity. Compatible clients can relaunch the bridge when needed. Run `HuntProxy serve` when you want the workbench to stay active until explicitly stopped.
+Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an MCP-started daemon shuts down after one hour without MCP or UI control activity, while the inexpensive MCP bridge stays connected. The next tool call automatically recovers an idle or unexpectedly terminated daemon. After an explicit `huntproxy_stop`, call `huntproxy_restart` on the same connection. Run `HuntProxy serve` when you want the workbench to stay active until explicitly stopped.
 
 </details>
 
 <details>
 <summary><strong>What survives between sessions?</strong></summary>
 
-Projects, captured traffic, findings, managed cookies, Reply and Fuzzer state, and every named Chromium profile's cookies and site storage are persisted locally. Starting a profile again resumes its saved workspace. Plugin-generated History entries and saved findings also persist, but plugin job status, result summaries, and resumable analysis checkpoints should be collected before restarting HuntProxy.
+Projects, captured traffic, findings, managed cookies, Reply and Fuzzer state, and every named Chromium profile's cookies and site storage are persisted locally. Starting a profile again resumes its saved workspace. Active browsers and running Fuzzer/plugin jobs are interrupted by a restart; memory-only plugin results and analysis checkpoints are lost, so collect those first. Plugin-generated History and saved findings remain available.
 
 </details>
 

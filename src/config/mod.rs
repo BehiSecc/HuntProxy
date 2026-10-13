@@ -41,7 +41,8 @@ pub struct Config {
     /// integrity-pinned `plugin.json` package.
     pub plugin_dir: PathBuf,
     pub auto_start_daemon: bool,
-    /// Stop an inactive MCP bridge/daemon and its browsers. Zero disables it.
+    /// Stop an inactive auto-started daemon and its browsers. The MCP bridge
+    /// stays connected and can recover the daemon. Zero disables idle shutdown.
     pub idle_timeout_seconds: u64,
     /// Optional default and host-specific upstream proxies for outbound requests.
     pub upstream_proxies: UpstreamProxyConfig,

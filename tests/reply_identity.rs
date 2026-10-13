@@ -7,9 +7,11 @@ use huntproxy::transport::{OutboundRequest, OutboundResponse, SemanticTransport}
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+type RecordedRequest = (String, Vec<(String, Vec<u8>)>);
+
 #[derive(Default)]
 struct Recorder {
-    requests: Mutex<Vec<(String, Vec<(String, Vec<u8>)>)>>,
+    requests: Mutex<Vec<RecordedRequest>>,
     hold_first: std::sync::atomic::AtomicBool,
     first_seen: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -95,8 +97,10 @@ impl Fixture {
             .await
             .unwrap()
             .id;
-        let mut limits = ProjectLimits::default();
-        limits.max_concurrent_requests = 1;
+        let limits = ProjectLimits {
+            max_concurrent_requests: 1,
+            ..ProjectLimits::default()
+        };
         db.update_project_scope(project, ScopePolicy::default(), Some(limits))
             .await
             .unwrap();
@@ -432,11 +436,12 @@ async fn identity_checks_effective_destination_after_url_rules() {
     f.send(draft(Some(ReplyIdentity::Anonymous {})), None)
         .await
         .unwrap();
-    let requests = f.recorder.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].0, "http://127.0.0.2/");
-    assert!(header(&requests[0].1, "Cookie").is_none());
-    drop(requests);
+    {
+        let requests = f.recorder.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "http://127.0.0.2/");
+        assert!(header(&requests[0].1, "Cookie").is_none());
+    }
     assert!(f
         .send(
             ReplyDraft {

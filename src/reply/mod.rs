@@ -605,6 +605,9 @@ pub struct ReplyBodyPreview {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReplySendResult {
+    /// Effective logical URL after project request rules, before any transport
+    /// route substitutes a wire destination.
+    pub effective_url: String,
     pub exchange_id: Option<ExchangeId>,
     pub diff: Option<ResponseDiff>,
     /// Present only when capture scope excludes the exchange.
@@ -720,6 +723,7 @@ impl ReplyService {
             ReplySendContext::reply(base_exchange_id, tab_id),
             upstream_proxy,
             None,
+            None,
         )
         .await
     }
@@ -740,6 +744,7 @@ impl ReplyService {
             protocol,
             follow_redirects,
             context,
+            None,
             None,
             None,
         )
@@ -765,6 +770,31 @@ impl ReplyService {
             context,
             None,
             identity,
+            None,
+        )
+        .await
+    }
+
+    /// Send a semantic request while requiring the URL that remains after the
+    /// actual request-rule pass to keep the expected origin. This is used by
+    /// bounded automatic discovery, where a rule must not turn a passive
+    /// same-origin fetch into cross-origin egress.
+    pub async fn send_same_origin(
+        &self,
+        project_id: ProjectId,
+        draft: &ReplyDraft,
+        expected_origin: &str,
+    ) -> DomainResult<ReplySendResult> {
+        self.send_with_context_and_proxy(
+            project_id,
+            None,
+            draft,
+            ProtocolPreference::Auto,
+            0,
+            ReplySendContext::reply(None, None),
+            None,
+            None,
+            Some(expected_origin),
         )
         .await
     }
@@ -780,6 +810,7 @@ impl ReplyService {
         context: ReplySendContext,
         upstream_proxy_override: Option<&str>,
         pinned_identity: Option<&crate::cookies::StoredCookieProfile>,
+        expected_origin: Option<&str>,
     ) -> DomainResult<ReplySendResult> {
         let project = self.db.get_project(project_id).await?;
         let named_identity = match pinned_identity {
@@ -819,6 +850,11 @@ impl ReplyService {
                     "named or anonymous identity cannot be combined with URL credentials",
                 ));
             }
+        }
+        if expected_origin.is_some_and(|origin| origins_differ(origin, &mat.url)) {
+            return Err(DomainError::scope_denied(
+                "request URL changed origin after applying request rules",
+            ));
         }
         if let Some(target_host) = context.plugin_target_host.as_deref() {
             if !url_is_in_scope(&mat.url, &project.scope)? {
@@ -929,6 +965,7 @@ impl ReplyService {
         }
 
         // Scope controls persistence only; it never blocks egress.
+        let effective_url = mat.url.clone();
         let should_capture = url_is_in_scope(&mat.url, &project.scope)?;
         let target = TargetRef::from_url(&mat.url)?;
         let rotation = self.db.next_ip_rotation_route(project_id, &mat.url).await?;
@@ -1235,6 +1272,7 @@ impl ReplyService {
         }
 
         Ok(ReplySendResult {
+            effective_url,
             exchange_id,
             diff,
             response: ephemeral_response,
@@ -1312,6 +1350,58 @@ mod tests {
         fn provenance(&self) -> TransportProvenance {
             TransportProvenance::GenericUnprofiled
         }
+    }
+
+    #[tokio::test]
+    async fn automatic_same_origin_send_rejects_cross_origin_url_rewrite() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "page analysis".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        db.create_request_rule(
+            project.id,
+            crate::request_rules::RequestRuleInput {
+                name: "alternate asset host".into(),
+                enabled: true,
+                position: 0,
+                host_pattern: Some("example.com".into()),
+                target: crate::request_rules::RequestRuleTarget::Url,
+                operation: crate::request_rules::RequestRuleOperation::Replace,
+                header_name: None,
+                match_kind: crate::request_rules::RequestRuleMatchKind::Literal,
+                pattern: "https://example.com/".into(),
+                replacement: Some("https://static.example.net/".into()),
+                replace_all: true,
+            },
+        )
+        .await
+        .unwrap();
+        let service = ReplyService {
+            db,
+            transport: Arc::new(CannedTransport),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
+        };
+
+        let error = service
+            .send_same_origin(
+                project.id,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("https://example.com/static/app.js".into()),
+                    ..Default::default()
+                },
+                "https://example.com/page",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::ScopeDenied);
+        assert!(error.to_string().contains("changed origin"));
     }
 
     struct GzipTransport;

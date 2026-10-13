@@ -6,9 +6,7 @@ use huntproxy::config::Config;
 use huntproxy::domain::{CreateProjectRequest, DomainError, DomainResult, ErrorCode};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
@@ -45,6 +43,8 @@ enum Commands {
     Status,
     /// Graceful stop.
     Stop,
+    /// Restart or recover the daemon while preserving saved project state.
+    Restart,
     /// Check for or install a verified GitHub Release binary.
     Update {
         /// Check whether another release is available without changing files.
@@ -229,13 +229,9 @@ async fn run(cli: Cli) -> DomainResult<()> {
             // MCP: logs to stderr only
             init_logging_stderr("warn");
             let cfg = Config::load(cli.data_dir.clone())?;
-            if huntproxy::mcp::stop_guard_blocks_start(&cfg) {
-                return Err(DomainError::new(
-                    ErrorCode::DaemonNotRunning,
-                    "HuntProxy was explicitly stopped for this MCP client; restart the client to use it again",
-                ));
-            }
-            ensure_daemon(&cfg).await?;
+            // Initialize the client connection even if the daemon is stopped
+            // or cannot start, so huntproxy_restart remains available. The
+            // backend ensures readiness before dispatching each operation.
             huntproxy::mcp::run_stdio_mcp_client(cfg).await
         }
         Commands::Doctor => {
@@ -316,6 +312,14 @@ async fn run(cli: Cli) -> DomainResult<()> {
             let cfg = Config::load(cli.data_dir)?;
             app::stop_daemon(&cfg).await?;
             println!("daemon stopped");
+            Ok(())
+        }
+        Commands::Restart => {
+            init_logging_stderr("error");
+            let cfg = Config::load(cli.data_dir)?;
+            app::restart_daemon(&cfg).await?;
+            huntproxy::mcp::clear_stop_guard(&cfg);
+            println!("daemon restarted; saved project state and browser profiles preserved");
             Ok(())
         }
         Commands::Update { check, version } => {
@@ -793,103 +797,8 @@ fn ensure_ca(cfg: &Config) -> DomainResult<()> {
 }
 
 async fn ensure_daemon(cfg: &Config) -> DomainResult<()> {
-    if cfg.socket_path().exists() && daemon_get(cfg, "/api/v1/health").await.is_ok() {
-        return Ok(());
-    }
-    if !cfg.auto_start_daemon {
-        return Err(DomainError::new(
-            ErrorCode::DaemonNotRunning,
-            "daemon not running; start with HuntProxy serve",
-        ));
-    }
-    // Serialize auto-start attempts. Re-check health after acquiring the lock:
-    // another CLI may have started the daemon while this process was waiting.
-    let boot = cfg.bootstrap_lock_path();
-    let boot_file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&boot)
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    #[cfg(unix)]
-    let _bootstrap_lock = tokio::task::spawn_blocking(move || {
-        nix::fcntl::Flock::lock(boot_file, nix::fcntl::FlockArg::LockExclusive)
-            .map_err(|(_, error)| error)
-    })
-    .await
-    .map_err(|e| DomainError::new(ErrorCode::Internal, format!("bootstrap lock task: {e}")))?
-    .map_err(|e| DomainError::new(ErrorCode::StorageError, format!("bootstrap lock: {e}")))?;
-    #[cfg(not(unix))]
-    let _bootstrap_lock = boot_file;
-
-    if daemon_get(cfg, "/api/v1/health").await.is_ok() {
-        return Ok(());
-    }
-
-    let bin = std::env::current_exe()
-        .map_err(|e| DomainError::new(ErrorCode::Internal, e.to_string()))?;
-    let startup_log_path = cfg.daemon_startup_log_path();
-    let mut startup_options = OpenOptions::new();
-    startup_options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        startup_options.mode(0o600);
-    }
-    let startup_stdout = startup_options.open(&startup_log_path).map_err(|error| {
-        DomainError::new(
-            ErrorCode::StorageError,
-            format!("startup log {}: {error}", startup_log_path.display()),
-        )
-    })?;
-    let startup_stderr = startup_stdout.try_clone().map_err(|error| {
-        DomainError::new(ErrorCode::StorageError, format!("startup log: {error}"))
-    })?;
-    let mut cmd = std::process::Command::new(bin);
-    cmd.arg("serve")
-        .arg("--data-dir")
-        .arg(&cfg.data_dir)
-        .env("HUNTPROXY_DAEMONIZED", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(startup_stdout))
-        .stderr(Stdio::from(startup_stderr));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| DomainError::new(ErrorCode::Unavailable, format!("auto-start failed: {e}")))?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if daemon_get(cfg, "/api/v1/health").await.is_ok() {
-            return Ok(());
-        }
-    }
-    let detail = read_log_tail(&startup_log_path, 4 * 1024)
-        .filter(|output| !output.trim().is_empty())
-        .map(|output| format!("\nlast startup output:\n{}", output.trim_end()))
-        .unwrap_or_default();
-    Err(DomainError::new(
-        ErrorCode::Unavailable,
-        format!(
-            "daemon did not become ready; check {}{detail}",
-            startup_log_path.display()
-        ),
-    ))
+    app::ensure_daemon(cfg).await
 }
-
 async fn daemon_get(cfg: &Config, path: &str) -> DomainResult<String> {
     let url = format!("http://{}{path}", cfg.api_listen);
     let client = reqwest_get(&url).await?;

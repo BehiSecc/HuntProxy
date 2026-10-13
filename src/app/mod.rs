@@ -342,6 +342,161 @@ fn cleanup_daemon_files(config: &Config) {
     let _ = std::fs::remove_file(config.daemon_lock_path());
 }
 
+/// Ensure the configured daemon is ready before a new operation is dispatched.
+pub async fn ensure_daemon(config: &Config) -> DomainResult<()> {
+    if daemon_health(config).await.is_ok() {
+        return Ok(());
+    }
+    if !config.auto_start_daemon {
+        return Err(DomainError::new(
+            ErrorCode::DaemonNotRunning,
+            "daemon not running; call huntproxy_restart or start with HuntProxy serve",
+        ));
+    }
+    let _bootstrap_lock = acquire_bootstrap_lock(config).await?;
+    start_daemon_locked(config).await
+}
+
+/// Explicit restart also works after a crash, idle shutdown, or explicit stop.
+/// Serializing the whole stop/start sequence prevents another bridge from
+/// creating a replacement daemon while this operation is still stopping it.
+pub async fn restart_daemon(config: &Config) -> DomainResult<()> {
+    let _bootstrap_lock = acquire_bootstrap_lock(config).await?;
+    match stop_daemon(config).await {
+        Ok(()) => {}
+        Err(error) if error.code() == ErrorCode::DaemonNotRunning => {}
+        Err(error) => return Err(error),
+    }
+    start_daemon_locked(config).await
+}
+
+async fn acquire_bootstrap_lock(config: &Config) -> DomainResult<DaemonLock> {
+    config.ensure_layout()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(config.bootstrap_lock_path())
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+    #[cfg(unix)]
+    let file = tokio::task::spawn_blocking(move || {
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, error)| error)
+    })
+    .await
+    .map_err(|error| {
+        DomainError::new(ErrorCode::Internal, format!("bootstrap lock task: {error}"))
+    })?
+    .map_err(|error| {
+        DomainError::new(ErrorCode::StorageError, format!("bootstrap lock: {error}"))
+    })?;
+    Ok(DaemonLock { _file: file })
+}
+
+async fn start_daemon_locked(config: &Config) -> DomainResult<()> {
+    if daemon_health(config).await.is_ok() {
+        return Ok(());
+    }
+    let binary = std::env::current_exe()
+        .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?;
+    let startup_log_path = config.daemon_startup_log_path();
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let startup_stdout = options.open(&startup_log_path).map_err(|error| {
+        DomainError::new(
+            ErrorCode::StorageError,
+            format!("startup log {}: {error}", startup_log_path.display()),
+        )
+    })?;
+    let startup_stderr = startup_stdout.try_clone().map_err(|error| {
+        DomainError::new(ErrorCode::StorageError, format!("startup log: {error}"))
+    })?;
+    let mut command = std::process::Command::new(binary);
+    command
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(&config.data_dir)
+        .env("HUNTPROXY_DAEMONIZED", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(startup_stdout))
+        .stderr(std::process::Stdio::from(startup_stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn().map_err(|error| {
+        DomainError::new(
+            ErrorCode::Unavailable,
+            format!("auto-start failed: {error}"),
+        )
+    })?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if daemon_health(config).await.is_ok() {
+            return Ok(());
+        }
+    }
+    let detail = std::fs::read(&startup_log_path)
+        .ok()
+        .map(|bytes| {
+            let start = bytes.len().saturating_sub(4096);
+            String::from_utf8_lossy(&bytes[start..]).into_owned()
+        })
+        .filter(|output| !output.trim().is_empty())
+        .map(|output| format!("\nlast startup output:\n{}", output.trim_end()))
+        .unwrap_or_default();
+    Err(DomainError::new(
+        ErrorCode::Unavailable,
+        format!(
+            "daemon did not become ready; check {}{detail}",
+            startup_log_path.display()
+        ),
+    ))
+}
+
+async fn daemon_health(config: &Config) -> DomainResult<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let health = async {
+        #[cfg(unix)]
+        let mut stream = tokio::net::UnixStream::connect(config.socket_path()).await?;
+        #[cfg(not(unix))]
+        let mut stream = tokio::net::TcpStream::connect(config.api_listen).await?;
+        stream
+            .write_all(
+                b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
+        let mut response = Vec::new();
+        (&mut stream).take(4096).read_to_end(&mut response).await?;
+        if response.starts_with(b"HTTP/1.1 2") || response.starts_with(b"HTTP/1.0 2") {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("daemon health check failed"))
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(1), health)
+        .await
+        .map_err(|_| DomainError::new(ErrorCode::Timeout, "daemon health check timed out"))?
+        .map_err(|error| DomainError::new(ErrorCode::DaemonNotRunning, error.to_string()))
+}
+
 pub async fn stop_daemon(config: &Config) -> DomainResult<()> {
     #[cfg(unix)]
     if request_private_shutdown(config).await.is_ok() {
