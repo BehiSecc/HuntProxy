@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -853,7 +853,7 @@ async fn validate_browser_once(
         return Ok(());
     }
     validate_browser(prepared).await?;
-    write_private_file(&marker, &identity)
+    write_durable_private_file(&marker, &identity)
 }
 
 fn file_identity(path: &Path) -> DomainResult<serde_json::Value> {
@@ -934,16 +934,19 @@ fn reconcile_plugins(
                 continue;
             }
         }
-        write_private_file(&marker, PLUGIN_SWAP_MARKER)?;
+        write_durable_private_file(&marker, PLUGIN_SWAP_MARKER)?;
         if let Err(error) = copy_package(&source.join(name), &incoming) {
-            let _ = fs::remove_dir_all(&incoming);
-            let _ = fs::remove_file(&marker);
+            if incoming.exists() {
+                fs::remove_dir_all(&incoming).map_err(storage_error)?;
+            }
+            fs::remove_file(&marker).map_err(storage_error)?;
+            sync_directory(plugin_dir)?;
             return Err(error);
         }
         install_package_swap(&destination, &incoming, &backup, &marker)?;
     }
     preserved.sort();
-    write_private_file(
+    write_durable_private_file(
         &plugin_dir.join(PLUGIN_SOURCE_MARKER),
         format!("{}\n", catalog.current_commit).as_bytes(),
     )?;
@@ -1055,7 +1058,8 @@ fn copy_package(source: &Path, destination: &Path) -> DomainResult<()> {
         fs::remove_dir_all(destination).map_err(storage_error)?;
     }
     create_private_dir(destination)?;
-    copy_tree(source, source, destination)
+    copy_tree(source, source, destination)?;
+    sync_tree(destination)
 }
 
 fn copy_tree(root: &Path, directory: &Path, destination: &Path) -> DomainResult<()> {
@@ -1094,6 +1098,9 @@ fn recover_package_swap(
     backup: &Path,
     marker: &Path,
 ) -> DomainResult<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| install_error("plugin installation path has no parent"))?;
     if !marker.exists() {
         if incoming.exists() || backup.exists() {
             return Err(install_error(
@@ -1109,14 +1116,17 @@ fn recover_package_swap(
     }
     if backup.exists() && !destination.exists() {
         fs::rename(backup, destination).map_err(storage_error)?;
+        sync_directory(parent)?;
     } else if backup.exists() {
         fs::remove_dir_all(backup).map_err(storage_error)?;
+        sync_directory(parent)?;
     }
     if incoming.exists() {
         fs::remove_dir_all(incoming).map_err(storage_error)?;
+        sync_directory(parent)?;
     }
     fs::remove_file(marker).map_err(storage_error)?;
-    Ok(())
+    sync_directory(parent)
 }
 
 fn install_package_swap(
@@ -1125,50 +1135,126 @@ fn install_package_swap(
     backup: &Path,
     marker: &Path,
 ) -> DomainResult<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| install_error("plugin installation path has no parent"))?;
     if destination.exists() {
         fs::rename(destination, backup).map_err(storage_error)?;
+        sync_directory(parent)?;
     }
     if let Err(error) = fs::rename(incoming, destination) {
         if backup.exists() && !destination.exists() {
             let _ = fs::rename(backup, destination);
+            let _ = sync_directory(parent);
         }
         let _ = fs::remove_dir_all(incoming);
         let _ = fs::remove_file(marker);
+        let _ = sync_directory(parent);
         return Err(storage_error(error));
     }
+    sync_directory(parent)?;
     if backup.exists() {
         fs::remove_dir_all(backup).map_err(storage_error)?;
+        sync_directory(parent)?;
     }
     fs::remove_file(marker).map_err(storage_error)?;
-    Ok(())
+    sync_directory(parent)
 }
 
 fn replace_directory(staging: &Path, destination: &Path) -> DomainResult<()> {
     recover_directory_replace(destination)?;
+    sync_tree(staging)?;
     let backup = directory_backup_path(destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| install_error("installation path has no parent"))?;
     if destination.exists() {
         fs::rename(destination, &backup).map_err(storage_error)?;
+        sync_directory(parent)?;
     }
     if let Err(error) = fs::rename(staging, destination) {
         if backup.exists() && !destination.exists() {
             let _ = fs::rename(&backup, destination);
+            let _ = sync_directory(parent);
         }
         return Err(storage_error(error));
     }
+    sync_directory(parent)?;
     if backup.exists() {
         fs::remove_dir_all(backup).map_err(storage_error)?;
+        sync_directory(parent)?;
     }
     Ok(())
 }
 
 fn recover_directory_replace(destination: &Path) -> DomainResult<()> {
     let backup = directory_backup_path(destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| install_error("installation path has no parent"))?;
     if backup.exists() && !destination.exists() {
         fs::rename(&backup, destination).map_err(storage_error)?;
+        sync_directory(parent)?;
     } else if backup.exists() {
         fs::remove_dir_all(&backup).map_err(storage_error)?;
+        sync_directory(parent)?;
     }
     Ok(())
+}
+
+fn write_durable_private_file(path: &Path, data: &[u8]) -> DomainResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| install_error("installation marker has no parent"))?;
+    create_private_dir(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| install_error("installation marker has an invalid name"))?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(storage_error)?;
+        file.write_all(data).map_err(storage_error)?;
+        file.sync_all().map_err(storage_error)?;
+        fs::rename(&temporary, path).map_err(storage_error)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn sync_tree(path: &Path) -> DomainResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(storage_error)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_file() {
+        return File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(storage_error);
+    }
+    if !metadata.is_dir() {
+        return Err(install_error("installation tree contains a special file"));
+    }
+    for entry in fs::read_dir(path).map_err(storage_error)? {
+        sync_tree(&entry.map_err(storage_error)?.path())?;
+    }
+    sync_directory(path)
+}
+
+fn sync_directory(path: &Path) -> DomainResult<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(storage_error)
 }
 
 fn directory_backup_path(destination: &Path) -> DomainResult<PathBuf> {
@@ -1457,6 +1543,26 @@ mod tests {
         fs::write(&marker, PLUGIN_SWAP_MARKER).unwrap();
         recover_package_swap(&destination, &incoming, &backup, &marker).unwrap();
         assert_eq!(fs::read(destination.join("index.js")).unwrap(), b"trusted");
+        assert!(!incoming.exists());
+        assert!(!backup.exists());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn completed_package_swap_recovery_keeps_the_new_package() {
+        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let destination = temporary.path().join("plugin");
+        let incoming = temporary.path().join("incoming");
+        let backup = temporary.path().join("backup");
+        let marker = temporary.path().join("swap");
+        write_package(temporary.path(), "plugin", &[("index.js", b"current")]);
+        write_package(temporary.path(), "backup", &[("index.js", b"previous")]);
+        write_package(temporary.path(), "incoming", &[("index.js", b"unused")]);
+        write_durable_private_file(&marker, PLUGIN_SWAP_MARKER).unwrap();
+
+        recover_package_swap(&destination, &incoming, &backup, &marker).unwrap();
+
+        assert_eq!(fs::read(destination.join("index.js")).unwrap(), b"current");
         assert!(!incoming.exists());
         assert!(!backup.exists());
         assert!(!marker.exists());

@@ -257,8 +257,6 @@ case "$os_name/$arch_name" in
   Linux/*|Darwin/*) die "unsupported CPU architecture: $arch_name" ;;
   *) die "unsupported operating system: $os_name" ;;
 esac
-MANAGED_NODE_DIR="$DATA_DIR/runtime/node"
-
 # Resolve and verify the HuntProxy release before touching its destination.
 DOWNLOAD_DIR="$TEMP_DIR/release"; mkdir -p "$DOWNLOAD_DIR"
 if [[ "$REQUESTED_VERSION" == latest ]]; then
@@ -304,6 +302,17 @@ binary_version="$("$STAGED_BIN" --version 2>/dev/null | awk '{print $NF}')" || d
 if version_at_least "$binary_version" "0.2.0"; then
   CURRENT_RUNTIME=1
 fi
+
+# Persist absolute paths in generated configuration and MCP registrations. A
+# relative installer path would otherwise be resolved against each client's
+# working directory rather than the directory where this script was invoked.
+mkdir -p "$DATA_DIR" "$INSTALL_DIR"
+DATA_DIR="$(cd "$DATA_DIR" && pwd -P)"
+INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
+HOME_CANON="$(cd "$HOME" && pwd -P)"
+[[ "$DATA_DIR" != / && "$DATA_DIR" != "$HOME_CANON" ]] \
+  || die 'data directory is too broad'
+MANAGED_NODE_DIR="$DATA_DIR/runtime/node"
 
 if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
 # Reuse the private managed runtime when it is already the pinned version.
