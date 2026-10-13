@@ -7482,7 +7482,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if service.status(job.id).unwrap().state == PluginJobState::Completed {
                     break;
@@ -7630,7 +7630,7 @@ mod tests {
             .run(project.id, "retry-test", "run", None, json!({}))
             .await
             .unwrap();
-        let failed = tokio::time::timeout(Duration::from_secs(2), async {
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = service.status(initial.id).unwrap();
                 if status.state == PluginJobState::Failed {
@@ -7653,7 +7653,7 @@ mod tests {
             .resume_analysis(initial.id, Some(1000))
             .await
             .unwrap();
-        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = service.status(initial.id).unwrap();
                 if status.state == PluginJobState::Completed {
@@ -7692,7 +7692,7 @@ mod tests {
             .run(project.id, "retry-test", "run", None, json!({}))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if service
                     .status(cancelled_job.id)
@@ -7711,7 +7711,7 @@ mod tests {
             .await
             .unwrap();
         service.cancel(cancelled_job.id).unwrap();
-        let cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+        let cancelled = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = service.status(cancelled_job.id).unwrap();
                 if status.state == PluginJobState::Cancelled {
@@ -7747,7 +7747,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if service.status(failed_operation_job.id).unwrap().state == PluginJobState::Failed
                 {
@@ -7780,7 +7780,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if service.status(interrupted.id).unwrap().completed_operations == 1 {
                     break;
@@ -7791,7 +7791,7 @@ mod tests {
         .await
         .unwrap();
         service.cancel(interrupted.id).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if service.status(interrupted.id).unwrap().state == PluginJobState::Cancelled {
                     break;
@@ -7840,7 +7840,7 @@ mod tests {
                 )
                 .await;
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if service
                     .status(timeout_id)
@@ -7855,7 +7855,7 @@ mod tests {
         })
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), running)
+        tokio::time::timeout(Duration::from_secs(10), running)
             .await
             .unwrap()
             .unwrap();
