@@ -27,7 +27,7 @@ NODE_ASSETS = (
     "node-v22.23.2-darwin-x64.tar.gz",
     "node-v22.23.2-darwin-arm64.tar.gz",
 )
-EXCLUDED_PACKAGE_FILES = {".gitignore", "aws-credentials.toml", ".env"}
+EXCLUDED_PACKAGE_FILES = {"aws-credentials.toml", ".env"}
 
 
 def run(repo: Path, *args: str, text: bool = False) -> bytes | str:

@@ -1415,6 +1415,27 @@ mod tests {
             .iter()
             .find(|snapshot| snapshot.commit == catalog.current_commit)
             .unwrap();
+        let published = catalog
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.commit == "95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32")
+            .unwrap();
+        assert_eq!(
+            published.packages["ip-rotate"]
+                .get(".gitignore")
+                .map(String::as_str),
+            Some("cf2dc1d166ad2fc4c4d4bc26e62d0589fe3c4e0c553a847e3e95bfa743e7b565")
+        );
+        for snapshot in &catalog.snapshots {
+            for files in snapshot.packages.values() {
+                assert!(files.keys().all(|path| {
+                    !matches!(
+                        Path::new(path).file_name().and_then(|name| name.to_str()),
+                        Some("aws-credentials.toml" | ".env")
+                    )
+                }));
+            }
+        }
         for (name, files) in &current.packages {
             assert!(directory_matches(&plugins.join("plugins").join(name), files).unwrap());
         }
