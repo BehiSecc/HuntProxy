@@ -88,13 +88,26 @@ impl Agent {
         config.ensure_layout().unwrap();
         config.write_default_config().unwrap();
         drop((api, proxy));
+        let browser = local_browser_fixture();
+        // Prepare the installation before measuring lifecycle RPC responses.
+        // Fresh Node provisioning and browser validation have their own limits.
+        let prepared = Command::new(env!("CARGO_BIN_EXE_HuntProxy"))
+            .args(["prepare-update", "--data-dir"])
+            .arg(directory.path())
+            .env("HUNTPROXY_CHROME_EXECUTABLE", &browser)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .expect("prepare local runtime fixture");
+        assert!(prepared.success(), "local runtime fixture did not prepare");
         let mut command = Command::new(env!("CARGO_BIN_EXE_HuntProxy"));
         command
             .args(["mcp", "--data-dir"])
             .arg(directory.path())
             // Lifecycle coverage should not include a managed-browser download.
             // CI and developer hosts provide this maintained browser fixture.
-            .env("HUNTPROXY_CHROME_EXECUTABLE", local_browser_fixture())
+            .env("HUNTPROXY_CHROME_EXECUTABLE", browser)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
