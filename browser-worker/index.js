@@ -465,24 +465,24 @@ function rpcError(code, message) {
 }
 
 function existingChromiumExecutable() {
-  const candidates = [
+  const configured = [
     process.env.HUNTPROXY_CHROME_EXECUTABLE,
     process.env.BB_CHROME_EXECUTABLE,
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
-    "/usr/bin/google-chrome-stable",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  ].filter(Boolean);
+  ].find(Boolean);
+  if (configured) {
+    if (!fs.existsSync(configured)) {
+      throw rpcError(-32003, `configured Chromium executable does not exist: ${configured}`);
+    }
+    return configured;
+  }
   try {
     const bundled = chromium.executablePath();
-    if (bundled) candidates.unshift(bundled);
+    if (bundled && fs.existsSync(bundled)) return bundled;
   } catch {
     // playwright-core commonly has no downloaded browser.
   }
-  return candidates.find((candidate) => fs.existsSync(candidate));
+  return undefined;
 }
 
 function chromiumProxy(proxy) {
@@ -495,7 +495,7 @@ function chromiumProxy(proxy) {
   };
 }
 
-function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
+function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null, executablePath = null) {
   const args = [
     "--disable-quic",
     "--disk-cache-size=52428800",
@@ -512,7 +512,7 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
     );
   }
   return {
-    executablePath: existingChromiumExecutable(),
+    executablePath,
     headless: true,
     proxy: chromiumProxy(proxy),
     ignoreHTTPSErrors: Boolean(caCertPath),
@@ -526,10 +526,10 @@ async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = nu
   if (!executablePath) {
     throw rpcError(
       -32003,
-      "Chromium executable not found; install Chromium or set HUNTPROXY_CHROME_EXECUTABLE",
+      "managed Chromium executable not found; prepare the browser runtime or set HUNTPROXY_CHROME_EXECUTABLE",
     );
   }
-  const options = chromiumLaunchOptions(proxy, caCertPath, cdpPort);
+  const options = chromiumLaunchOptions(proxy, caCertPath, cdpPort, executablePath);
   options.serviceWorkers = profileDir ? "allow" : "block";
   if (profileDir) {
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });

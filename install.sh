@@ -206,38 +206,8 @@ show_browser_smoke_error() {
 install_chromium_runtime_libraries() {
   local playwright_path=$1
   local node_path=${2:-$MANAGED_NODE_DIR/bin/node}
-  local package_list package
-  local packages=() missing_packages=()
-  for command_name in apt-get dpkg-query; do
-    command -v "$command_name" >/dev/null 2>&1 || return 1
-  done
-  package_list="$("$node_path" -e '
-const path = require("path");
-const root = process.argv[1];
-const platform = require(path.join(root, "lib/utils/hostPlatform.js"));
-const native = require(path.join(root, "lib/server/registry/nativeDeps.js"));
-const packages = platform.isOfficiallySupportedPlatform && native.deps[platform.hostPlatform]?.chromium;
-if (!Array.isArray(packages) || !packages.length) process.exit(1);
-process.stdout.write(packages.join("\n"));
-' "$playwright_path")" || return 1
-  while IFS= read -r package; do
-    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
-    packages+=("$package")
-  done <<<"$package_list"
-  ((${#packages[@]})) || return 1
-  for package in "${packages[@]}"; do
-    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
-      missing_packages+=("$package")
-    fi
-  done
-  ((${#missing_packages[@]})) || return 1
-  if [[ "$(id -u)" == 0 ]]; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
-  else
-    sudo apt-get update
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
-  fi
+  [[ -x "$node_path" && -f "$playwright_path/cli.js" ]] || return 1
+  "$node_path" "$playwright_path/cli.js" install-deps chromium
 }
 
 os_name="$(uname -s)"; arch_name="$(uname -m)"
@@ -605,7 +575,7 @@ else
     if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
       linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
     fi
-    stable_playwright="$DATA_DIR/runtime/playwright-core-1.49.1"
+    stable_playwright="$DATA_DIR/runtime/playwright-core-1.64.0"
     runtime_node=''
     if [[ -f "$DATA_DIR/config.toml" ]]; then
       runtime_node="$(sed -n 's/^node_path = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"

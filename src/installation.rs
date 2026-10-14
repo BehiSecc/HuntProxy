@@ -15,9 +15,10 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-const PLAYWRIGHT_VERSION: &str = "1.49.1";
+const PLAYWRIGHT_VERSION: &str = "1.64.0";
 const NODE_VERSION: &str = "22.23.2";
-const CHROMIUM_REVISION: &str = "1148";
+const CHROMIUM_REVISION: &str = "1248";
+const CHROMIUM_VERSION: &str = "156.0.8078.4";
 const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PLUGIN_ENTRIES: usize = 20_000;
 const MAX_PLAYWRIGHT_BYTES: u64 = 64 * 1024 * 1024;
@@ -31,7 +32,7 @@ const PLUGIN_SOURCE_MARKER: &str = ".huntproxy-first-party-source";
 
 const PLUGIN_CATALOG_ARCHIVE: &[u8] =
     include_bytes!("../resources/release/plugins-catalog.tar.zst");
-const PLAYWRIGHT_ARCHIVE: &[u8] = include_bytes!("../resources/release/playwright-core-1.49.1.tgz");
+const PLAYWRIGHT_ARCHIVE: &[u8] = include_bytes!("../resources/release/playwright-core-1.64.0.tgz");
 const PLAYWRIGHT_MANIFEST: &[u8] = include_bytes!("../resources/release/playwright-core.json");
 const NODE_MANIFEST: &[u8] = include_bytes!("../resources/release/node-runtimes.json");
 
@@ -90,31 +91,46 @@ pub fn inspect(config: &Config) -> Option<PreparedInstallation> {
         .filter(|path| path.is_file())?
         .canonicalize()
         .ok()?;
-    let playwright_core_path = std::env::var_os("HUNTPROXY_PLAYWRIGHT_CORE_PATH")
+    let explicit_playwright = std::env::var_os("HUNTPROXY_PLAYWRIGHT_CORE_PATH")
         .or_else(|| std::env::var_os("BB_PLAYWRIGHT_CORE_PATH"))
         .map(PathBuf::from)
-        .or_else(|| config.browser_playwright_core_path.clone())
-        .unwrap_or_else(|| {
-            config
-                .runtime_dir
-                .join(format!("playwright-core-{PLAYWRIGHT_VERSION}"))
-        });
-    if validate_playwright_directory(&playwright_core_path, None).is_err() {
-        return None;
-    }
+        .or_else(|| config.browser_playwright_core_path.clone());
+    let playwright_core_path = explicit_playwright.clone().unwrap_or_else(|| {
+        config
+            .runtime_dir
+            .join(format!("playwright-core-{PLAYWRIGHT_VERSION}"))
+    });
+    let expected_playwright = explicit_playwright.is_none().then_some(PLAYWRIGHT_VERSION);
+    let playwright_runtime =
+        validate_playwright_directory(&playwright_core_path, expected_playwright).ok()?;
     let playwright_core_path = playwright_core_path.canonicalize().ok()?;
-    let chromium_path = [
+    let explicit_chromium = [
         "HUNTPROXY_CHROME_EXECUTABLE",
         "BB_CHROME_EXECUTABLE",
         "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
     ]
     .into_iter()
     .find_map(|name| std::env::var_os(name).map(PathBuf::from))
-    .or_else(|| config.browser_chromium_path.clone())
-    .or_else(|| marker_path("chromium"))
-    .filter(|path| path.is_file())?
-    .canonicalize()
-    .ok()?;
+    .or_else(|| config.browser_chromium_path.clone());
+    let marker_matches_runtime = marker.get("playwright").and_then(|value| value.as_str())
+        == Some(playwright_runtime.version.as_str())
+        && marker
+            .get("chromium_revision")
+            .and_then(|value| value.as_str())
+            == Some(playwright_runtime.chromium_revision.as_str())
+        && marker
+            .get("chromium_version")
+            .and_then(|value| value.as_str())
+            == Some(playwright_runtime.chromium_version.as_str());
+    let chromium_path = explicit_chromium
+        .or_else(|| {
+            marker_matches_runtime
+                .then(|| marker_path("chromium"))
+                .flatten()
+        })
+        .filter(|path| path.is_file())?
+        .canonicalize()
+        .ok()?;
     Some(PreparedInstallation {
         node_path,
         worker_path,
@@ -175,6 +191,15 @@ struct PlaywrightManifest {
     schema_version: u32,
     version: String,
     sha512: String,
+    chromium_revision: String,
+    chromium_version: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PlaywrightRuntime {
+    version: String,
+    chromium_revision: String,
+    chromium_version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +304,8 @@ fn prepare_playwright(config: &Config) -> DomainResult<PathBuf> {
     if manifest.schema_version != 1
         || manifest.version != PLAYWRIGHT_VERSION
         || manifest.sha512 != hex::encode(Sha512::digest(PLAYWRIGHT_ARCHIVE))
+        || manifest.chromium_revision != CHROMIUM_REVISION
+        || manifest.chromium_version != CHROMIUM_VERSION
     {
         return Err(install_error(
             "embedded Playwright archive integrity mismatch",
@@ -431,8 +458,8 @@ async fn validate_node(path: &Path, exact: Option<&str>) -> DomainResult<()> {
             .and_then(|value| value.split('.').next())
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
-        if major < 18 {
-            return Err(install_error("Node.js 18 or newer is required"));
+        if major < 20 {
+            return Err(install_error("Node.js 20 or newer is required"));
         }
     }
     Ok(())
@@ -524,18 +551,68 @@ fn extract_playwright_archive(encoded: &[u8], destination: &Path) -> DomainResul
     Ok(())
 }
 
-fn validate_playwright_directory(path: &Path, exact: Option<&str>) -> DomainResult<()> {
+fn validate_playwright_directory(
+    path: &Path,
+    exact: Option<&str>,
+) -> DomainResult<PlaywrightRuntime> {
     let package: serde_json::Value =
         serde_json::from_slice(&fs::read(path.join("package.json")).map_err(storage_error)?)
             .map_err(|error| install_error(format!("read Playwright package metadata: {error}")))?;
+    let version = package
+        .get("version")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
     if package.get("name").and_then(|v| v.as_str()) != Some("playwright-core")
-        || exact
-            .is_some_and(|version| package.get("version").and_then(|v| v.as_str()) != Some(version))
+        || version.is_empty()
+        || exact.is_some_and(|expected| version != expected)
         || !path.join("cli.js").is_file()
     {
         return Err(install_error("Playwright SDK directory is invalid"));
     }
-    Ok(())
+    let browsers_path = path.join("browsers.json");
+    let metadata = fs::metadata(&browsers_path).map_err(storage_error)?;
+    if metadata.len() > 64 * 1024 {
+        return Err(install_error("Playwright browser metadata is too large"));
+    }
+    let browsers: serde_json::Value =
+        serde_json::from_slice(&fs::read(browsers_path).map_err(storage_error)?)
+            .map_err(|error| install_error(format!("read Playwright browser metadata: {error}")))?;
+    let chromium = browsers
+        .get("browsers")
+        .and_then(|value| value.as_array())
+        .and_then(|browsers| {
+            let mut matching = browsers.iter().filter(|browser| {
+                browser.get("name").and_then(|value| value.as_str()) == Some("chromium")
+                    && browser
+                        .get("installByDefault")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+            });
+            let browser = matching.next()?;
+            matching.next().is_none().then_some(browser)
+        })
+        .ok_or_else(|| install_error("Playwright browser metadata has no default Chromium"))?;
+    let chromium_revision = chromium
+        .get("revision")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let chromium_version = chromium
+        .get("browserVersion")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if chromium_revision.is_empty()
+        || chromium_revision.len() > 16
+        || !chromium_revision.bytes().all(|byte| byte.is_ascii_digit())
+        || chromium_version.is_empty()
+        || chromium_version.len() > 64
+    {
+        return Err(install_error("Playwright Chromium metadata is invalid"));
+    }
+    Ok(PlaywrightRuntime {
+        version: version.to_owned(),
+        chromium_revision: chromium_revision.to_owned(),
+        chromium_version: chromium_version.to_owned(),
+    })
 }
 
 async fn prepare_chromium(
@@ -555,31 +632,12 @@ async fn prepare_chromium(
     if let Some(path) = config.browser_chromium_path.as_deref() {
         return canonical_regular_file(path, "configured Chromium");
     }
+    let runtime = validate_playwright_directory(playwright, None)?;
+    if runtime.version == PLAYWRIGHT_VERSION {
+        require_supported_managed_browser_platform().await?;
+    }
     let local_browsers = playwright.join(".local-browsers");
-    if let Some(path) = find_chromium_binary(&local_browsers, 8) {
-        return path.canonicalize().map_err(storage_error);
-    }
-
-    // v0.1.1 installed Playwright beside the worker. Reuse its pinned Chromium
-    // without moving or changing that installation.
-    if let Ok(entries) = fs::read_dir(&config.data_dir) {
-        let mut directories = entries.filter_map(Result::ok).collect::<Vec<_>>();
-        directories.sort_by_key(|entry| entry.file_name());
-        for entry in directories {
-            let name = entry.file_name();
-            if !name.to_string_lossy().starts_with("browser-worker-") {
-                continue;
-            }
-            let root = entry
-                .path()
-                .join("node_modules/playwright-core/.local-browsers")
-                .join(format!("chromium-{CHROMIUM_REVISION}"));
-            if let Some(path) = find_chromium_binary(&root, 8) {
-                return path.canonicalize().map_err(storage_error);
-            }
-        }
-    }
-    if let Some(path) = find_external_chromium(playwright) {
+    if let Some(path) = managed_chromium_binary(playwright, &runtime.chromium_revision) {
         return path.canonicalize().map_err(storage_error);
     }
 
@@ -605,46 +663,51 @@ async fn prepare_chromium(
             bounded_text(&output.stderr, 4096)
         )));
     }
-    find_chromium_binary(&local_browsers, 8)
+    managed_chromium_binary(playwright, &runtime.chromium_revision)
         .ok_or_else(|| install_error("Chromium installer completed without a browser executable"))?
         .canonicalize()
         .map_err(storage_error)
 }
 
-fn find_external_chromium(playwright: &Path) -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(path) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
-        if path != "0" {
-            roots.push(PathBuf::from(path));
-        }
+#[cfg(target_os = "macos")]
+async fn require_supported_managed_browser_platform() -> DomainResult<()> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output(),
+    )
+    .await
+    .map_err(|_| install_error("macOS version check timed out"))?
+    .map_err(|error| install_error(format!("check macOS version: {error}")))?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok());
+    if !output.status.success() || major.is_none() {
+        return Err(install_error("could not determine the macOS version"));
     }
-    if let Some(parent) = playwright.parent() {
-        roots.push(parent.join(".local-browsers"));
+    if major.is_some_and(|value| value < 14) {
+        return Err(install_error(format!(
+            "managed Chromium requires macOS 14 or newer (found macOS {version}); upgrade macOS or configure browser_chromium_path to an explicitly supported browser"
+        )));
     }
-    for root in roots {
-        if let Some(path) =
-            find_chromium_binary(&root.join(format!("chromium-{CHROMIUM_REVISION}")), 8)
-        {
-            return Some(path);
-        }
-    }
-    [
-        "google-chrome-stable",
-        "google-chrome",
-        "chromium",
-        "chromium-browser",
-    ]
-    .into_iter()
-    .find_map(which)
-    .or_else(|| {
-        [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-    })
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn require_supported_managed_browser_platform() -> DomainResult<()> {
+    Ok(())
+}
+
+fn managed_chromium_binary(playwright: &Path, revision: &str) -> Option<PathBuf> {
+    find_chromium_binary(
+        &playwright
+            .join(".local-browsers")
+            .join(format!("chromium-{revision}")),
+        8,
+    )
 }
 
 fn find_chromium_binary(directory: &Path, depth: usize) -> Option<PathBuf> {
@@ -661,7 +724,9 @@ fn find_chromium_binary(directory: &Path, depth: usize) -> Option<PathBuf> {
         if path.is_file()
             && matches!(
                 entry.file_name().to_str(),
-                Some("chrome" | "chromium" | "chrome.exe" | "Chromium")
+                Some(
+                    "chrome" | "chromium" | "chrome.exe" | "Chromium" | "Google Chrome for Testing"
+                )
             )
         {
             return Some(path);
@@ -672,14 +737,6 @@ fn find_chromium_binary(directory: &Path, depth: usize) -> Option<PathBuf> {
         path.is_dir()
             .then(|| find_chromium_binary(&path, depth - 1))
             .flatten()
-    })
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|directory| directory.join(name))
-            .find(|path| path.is_file())
     })
 }
 
@@ -841,11 +898,14 @@ async fn validate_browser_once(
     prepared: &PreparedInstallation,
 ) -> DomainResult<()> {
     let marker = config.runtime_dir.join("browser-validation.json");
+    let playwright = validate_playwright_directory(&prepared.playwright_core_path, None)?;
     let identity = serde_json::to_vec(&serde_json::json!({
         "schema_version": 1,
         "node": file_identity(&prepared.node_path)?,
         "worker": file_identity(&prepared.worker_path)?,
-        "playwright": PLAYWRIGHT_VERSION,
+        "playwright": playwright.version,
+        "chromium_revision": playwright.chromium_revision,
+        "chromium_version": playwright.chromium_version,
         "chromium": file_identity(&prepared.chromium_path)?,
     }))
     .map_err(|error| install_error(format!("encode browser validation marker: {error}")))?;
@@ -1403,7 +1463,9 @@ mod tests {
         let sdk = temporary.path().join("sdk");
         fs::create_dir(&sdk).unwrap();
         extract_playwright_archive(PLAYWRIGHT_ARCHIVE, &sdk).unwrap();
-        validate_playwright_directory(&sdk, Some(PLAYWRIGHT_VERSION)).unwrap();
+        let runtime = validate_playwright_directory(&sdk, Some(PLAYWRIGHT_VERSION)).unwrap();
+        assert_eq!(runtime.chromium_revision, CHROMIUM_REVISION);
+        assert_eq!(runtime.chromium_version, CHROMIUM_VERSION);
 
         let plugins = temporary.path().join("plugins");
         fs::create_dir(&plugins).unwrap();
@@ -1454,7 +1516,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first.file_name().and_then(|value| value.to_str()),
-            Some("playwright-core-1.49.1")
+            Some("playwright-core-1.64.0")
         );
     }
 
@@ -1592,7 +1654,7 @@ mod tests {
     #[test]
     fn interrupted_runtime_swap_restores_the_previous_directory() {
         let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
-        let destination = temporary.path().join("playwright-core-1.49.1");
+        let destination = temporary.path().join("playwright-core-1.64.0");
         let backup = directory_backup_path(&destination).unwrap();
         fs::create_dir(&backup).unwrap();
         fs::write(backup.join("package.json"), b"previous").unwrap();
@@ -1649,11 +1711,27 @@ mod tests {
         .unwrap();
         fs::write(sdk.join("cli.js"), b"cli").unwrap();
         fs::write(
+            sdk.join("browsers.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "browsers": [{
+                    "name": "chromium",
+                    "revision": CHROMIUM_REVISION,
+                    "installByDefault": true,
+                    "browserVersion": CHROMIUM_VERSION,
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
             config.runtime_dir.join("browser-validation.json"),
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
                 "node": {"path": config.node_path.clone()},
                 "worker": {"path": config.browser_worker_path.clone()},
+                "playwright": PLAYWRIGHT_VERSION,
+                "chromium_revision": CHROMIUM_REVISION,
+                "chromium_version": CHROMIUM_VERSION,
                 "chromium": {"path": chromium},
             }))
             .unwrap(),
@@ -1664,5 +1742,51 @@ mod tests {
         assert_eq!(found.playwright_core_path, sdk.canonicalize().unwrap());
         fs::remove_file(found.chromium_path).unwrap();
         assert!(inspect(&config).is_none());
+    }
+
+    #[test]
+    fn managed_chromium_lookup_requires_the_release_revision() {
+        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let playwright = temporary.path().join("playwright-core");
+        let obsolete = playwright.join(".local-browsers/chromium-1148/chrome-linux/chrome");
+        fs::create_dir_all(obsolete.parent().unwrap()).unwrap();
+        fs::write(&obsolete, b"obsolete").unwrap();
+        assert!(managed_chromium_binary(&playwright, CHROMIUM_REVISION).is_none());
+
+        let current = playwright
+            .join(format!(".local-browsers/chromium-{CHROMIUM_REVISION}"))
+            .join("chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(&current, b"current").unwrap();
+        assert_eq!(
+            managed_chromium_binary(&playwright, CHROMIUM_REVISION),
+            Some(current)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_sdk_uses_its_declared_chromium_revision() {
+        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let sdk = temporary.path().join("playwright-core");
+        fs::create_dir_all(&sdk).unwrap();
+        fs::write(
+            sdk.join("package.json"),
+            br#"{"name":"playwright-core","version":"1.49.1"}"#,
+        )
+        .unwrap();
+        fs::write(sdk.join("cli.js"), b"cli").unwrap();
+        fs::write(
+            sdk.join("browsers.json"),
+            br#"{"browsers":[{"name":"chromium","revision":"1148","installByDefault":true,"browserVersion":"131.0.6778.33"}]}"#,
+        )
+        .unwrap();
+        let executable = sdk.join(".local-browsers/chromium-1148/chrome-linux/chrome");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"browser").unwrap();
+
+        let prepared = prepare_chromium(&Config::default(), Path::new("unused-node"), &sdk)
+            .await
+            .unwrap();
+        assert_eq!(prepared, executable.canonicalize().unwrap());
     }
 }

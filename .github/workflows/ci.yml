@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - "release/v*"
   pull_request:
   workflow_dispatch:
 
@@ -84,7 +85,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config
 
       - name: Install pinned Chromium system dependencies
-        run: npx --yes playwright@1.49.1 install-deps chromium
+        run: npx --yes playwright@1.64.0 install-deps chromium
 
       - name: Install Rust
         run: |

@@ -17,7 +17,7 @@ import tempfile
 import urllib.request
 
 
-PLAYWRIGHT_VERSION = "1.49.1"
+PLAYWRIGHT_VERSION = "1.64.0"
 NODE_VERSION = "22.23.2"
 PUBLISHED_PLUGIN_COMMIT = "95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32"
 NODE_CHECKSUMS_URL = f"https://nodejs.org/dist/v{NODE_VERSION}/SHASUMS256.txt"
@@ -132,18 +132,37 @@ def tar_bytes(
     return output.getvalue()
 
 
-def verify_playwright(tgz: Path, lock: Path) -> str:
+def verify_playwright(tgz: Path, lock: Path) -> tuple[str, str, str]:
     lock_data = json.loads(lock.read_text(encoding="utf-8"))
     package = lock_data["packages"]["node_modules/playwright-core"]
     if package["version"] != PLAYWRIGHT_VERSION:
-        raise ValueError("package-lock does not pin playwright-core 1.49.1")
+        raise ValueError(f"package-lock does not pin playwright-core {PLAYWRIGHT_VERSION}")
     algorithm, encoded = package["integrity"].split("-", 1)
     if algorithm != "sha512":
         raise ValueError("playwright-core lock integrity must use SHA-512")
     actual = hashlib.sha512(tgz.read_bytes()).digest()
     if actual != base64.b64decode(encoded, validate=True):
         raise ValueError("playwright-core archive does not match package-lock integrity")
-    return hashlib.sha512(tgz.read_bytes()).hexdigest()
+    with tarfile.open(tgz, mode="r:gz") as archive:
+        metadata_entry = archive.getmember("package/browsers.json")
+        if metadata_entry.size > 64 * 1024:
+            raise ValueError("playwright-core browser metadata is unexpectedly large")
+        metadata_file = archive.extractfile(metadata_entry)
+        if metadata_file is None:
+            raise ValueError("playwright-core archive is missing browser metadata")
+        metadata = json.load(metadata_file)
+    chromium = [
+        browser
+        for browser in metadata.get("browsers", [])
+        if browser.get("name") == "chromium" and browser.get("installByDefault") is True
+    ]
+    if len(chromium) != 1:
+        raise ValueError("playwright-core archive has invalid Chromium metadata")
+    revision = str(chromium[0].get("revision", ""))
+    browser_version = str(chromium[0].get("browserVersion", ""))
+    if not revision.isdecimal() or not browser_version:
+        raise ValueError("playwright-core archive has incomplete Chromium metadata")
+    return hashlib.sha512(tgz.read_bytes()).hexdigest(), revision, browser_version
 
 
 def node_manifest(checksums_path: Path | None) -> dict[str, object]:
@@ -290,7 +309,9 @@ def main() -> None:
     playwright_lock = args.playwright_lock
     if playwright_lock is None:
         playwright_lock = args.playwright_tgz.parent / "pinned-worker" / "package-lock.json"
-    playwright_sha512 = verify_playwright(args.playwright_tgz, playwright_lock)
+    playwright_sha512, chromium_revision, chromium_version = verify_playwright(
+        args.playwright_tgz, playwright_lock
+    )
     atomic_write(output / f"playwright-core-{PLAYWRIGHT_VERSION}.tgz", args.playwright_tgz.read_bytes())
     atomic_write(
         output / "playwright-core.json",
@@ -300,6 +321,8 @@ def main() -> None:
                     "schema_version": 1,
                     "version": PLAYWRIGHT_VERSION,
                     "sha512": playwright_sha512,
+                    "chromium_revision": chromium_revision,
+                    "chromium_version": chromium_version,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -312,7 +335,10 @@ def main() -> None:
         (json.dumps(node_manifest(args.node_checksums), sort_keys=True, separators=(",", ":")) + "\n").encode(),
     )
     print(f"plugins {current_commit} (trusted prior {prior_commit})")
-    print(f"playwright-core {PLAYWRIGHT_VERSION} sha512 {playwright_sha512}")
+    print(
+        f"playwright-core {PLAYWRIGHT_VERSION} sha512 {playwright_sha512}; "
+        f"Chromium {chromium_version} revision {chromium_revision}"
+    )
     print(f"wrote release assets to {output}")
 
 

@@ -5,16 +5,16 @@ trusted root certificate data. The
 corresponding license and notice files are retained in the embedded archives and
 in the source repositories identified below.
 
-## Playwright Core 1.49.1
+## Playwright Core 1.64.0
 
 HuntProxy embeds the unmodified npm distribution archive for
-`playwright-core@1.49.1`, verified against the package lock integrity value at
+`playwright-core@1.64.0`, verified against the package lock integrity value at
 release preparation time.
 
 - Project: [Microsoft Playwright](https://github.com/microsoft/playwright)
 - Copyright: Microsoft Corporation
 - License: Apache License 2.0
-- Source version: `playwright-core` 1.49.1
+- Source version: `playwright-core` 1.64.0
 
 Playwright includes code derived from the
 [Puppeteer](https://github.com/puppeteer/puppeteer) project, also available

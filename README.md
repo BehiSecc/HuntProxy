@@ -53,7 +53,7 @@ HuntProxy supports Linux and macOS:
 curl -fsSL https://raw.githubusercontent.com/BehiSecc/HuntProxy/master/install.sh | bash
 ```
 
-The installer sets up HuntProxy, its browser runtime, and a private data directory at `~/.huntproxy`.
+The installer sets up HuntProxy, its browser runtime, and a private data directory at `~/.huntproxy`. The managed browser supports Debian 12/13, Ubuntu 22.04/24.04/26.04, and macOS 14+ on Intel or ARM64.
 
 The normal HuntProxy workflow begins inside your AI agent. Connect HuntProxy through MCP, then start hunting with a prompt.
 

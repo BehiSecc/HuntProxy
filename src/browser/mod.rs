@@ -3564,7 +3564,7 @@ fn find_chromium_binary(directory: &Path, remaining_depth: usize) -> Option<Path
         let name = entry.file_name();
         if matches!(
             name.to_str(),
-            Some("chrome" | "chromium" | "chrome.exe" | "Chromium")
+            Some("chrome" | "chromium" | "chrome.exe" | "Chromium" | "Google Chrome for Testing")
         ) {
             return Some(path);
         }
@@ -4743,7 +4743,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory
             .path()
-            .join("chromium-1148/chrome-mac/Chromium.app/Contents/MacOS/Chromium");
+            .join("chromium-1248/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing");
         std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
         std::fs::write(&executable, "browser").unwrap();
         assert_eq!(find_chromium_binary(directory.path(), 8), Some(executable));
