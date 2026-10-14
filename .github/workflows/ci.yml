@@ -55,7 +55,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config zstd
 
       - name: Install Rust
         run: |

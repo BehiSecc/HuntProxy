@@ -28,6 +28,8 @@ NODE_ASSETS = (
     "node-v22.23.2-darwin-arm64.tar.gz",
 )
 EXCLUDED_PACKAGE_FILES = {"aws-credentials.toml", ".env"}
+MAX_PLUGIN_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_PLUGIN_EXPANDED_BYTES = 64 * 1024 * 1024
 
 
 def run(repo: Path, *args: str, text: bool = False) -> bytes | str:
@@ -211,6 +213,32 @@ def atomic_write(path: Path, content: bytes) -> None:
     os.replace(temporary, path)
 
 
+def asset_payload(path: Path) -> bytes:
+    if path.name != "plugins-catalog.tar.zst":
+        return path.read_bytes()
+    if path.stat().st_size > MAX_PLUGIN_ARCHIVE_BYTES:
+        raise SystemExit(f"release asset exceeds the encoded size limit: {path.name}")
+    # Zstd versions can encode the same tar differently. Verify the exact tar,
+    # including its catalog fingerprints and metadata, instead of encoder bytes.
+    with subprocess.Popen(
+        ["zstd", "-q", "-d", "-c", str(path)], stdout=subprocess.PIPE
+    ) as decoder:
+        assert decoder.stdout is not None
+        content = decoder.stdout.read(MAX_PLUGIN_EXPANDED_BYTES + 1)
+        if len(content) > MAX_PLUGIN_EXPANDED_BYTES:
+            decoder.kill()
+            decoder.wait()
+            raise SystemExit(f"release asset expands beyond the size limit: {path.name}")
+        if decoder.wait() != 0:
+            raise SystemExit(f"release asset cannot be decoded: {path.name}")
+    return content
+
+
+def verify_asset(existing: Path, candidate: Path) -> None:
+    if asset_payload(existing) != asset_payload(candidate):
+        raise SystemExit(f"release asset differs from generated output: {existing.name}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("plugin_repo", type=Path)
@@ -265,8 +293,7 @@ def main() -> None:
             for name in sorted(expected_names):
                 existing = args.output_dir / name
                 candidate = generated / name
-                if existing.read_bytes() != candidate.read_bytes():
-                    raise SystemExit(f"release asset differs from generated output: {name}")
+                verify_asset(existing, candidate)
         print(f"verified release assets in {args.output_dir.resolve()}")
         return
 

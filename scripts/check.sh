@@ -9,6 +9,9 @@ cargo fmt --check
 echo "== Rust dependency notices =="
 python3 scripts/prepare-rust-notices.py --check
 
+echo "== release asset validation =="
+python3 scripts/test-prepare-release-assets.py
+
 echo "== clippy =="
 cargo clippy --locked --all-targets -- -D warnings
 
