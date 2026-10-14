@@ -106,9 +106,13 @@ jobs:
           import pathlib
           import sys
 
-          marker = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          marker_path = pathlib.Path(sys.argv[1])
+          marker = json.loads(marker_path.read_text(encoding="utf-8"))
+          playwright_path = marker_path.parent / f"playwright-core-{marker['playwright']}"
+          if not (playwright_path / "cli.js").is_file():
+              raise RuntimeError(f"prepared Playwright SDK is missing: {playwright_path}")
           values = {
-              "HUNTPROXY_PLAYWRIGHT_CORE_PATH": marker["playwright_core"]["path"],
+              "HUNTPROXY_PLAYWRIGHT_CORE_PATH": str(playwright_path),
               "HUNTPROXY_CHROME_EXECUTABLE": marker["chromium"]["path"],
           }
           with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
