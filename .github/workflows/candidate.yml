@@ -17,6 +17,7 @@ env:
   RUST_VERSION: "1.88.0"
   CARGO_TERM_COLOR: always
   PLUGIN_CATALOG_COMMIT: d4e1aa3f2907338d40361938deca8c4c711394e7
+  PLUGIN_CATALOG_PRIOR_COMMIT: 95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32
 
 jobs:
   dependency-audit:
@@ -72,8 +73,8 @@ jobs:
           plugin_repo="${RUNNER_TEMP}/huntproxy-plugins"
           git init "$plugin_repo"
           git -C "$plugin_repo" remote add origin https://github.com/BehiSecc/HuntProxy-Plugins.git
-          git -C "$plugin_repo" fetch --depth=1 origin "$PLUGIN_CATALOG_COMMIT"
-          git -C "$plugin_repo" checkout --detach FETCH_HEAD
+          git -C "$plugin_repo" fetch --depth=1 origin "$PLUGIN_CATALOG_COMMIT" "$PLUGIN_CATALOG_PRIOR_COMMIT"
+          git -C "$plugin_repo" checkout --detach "$PLUGIN_CATALOG_COMMIT"
           [[ "$(git -C "$plugin_repo" rev-parse HEAD)" == "$PLUGIN_CATALOG_COMMIT" ]]
 
       - name: Verify embedded release assets
@@ -84,12 +85,13 @@ jobs:
             "${RUNNER_TEMP}/huntproxy-plugins" \
             --output-dir resources/release \
             --current-commit "$PLUGIN_CATALOG_COMMIT" \
-            --playwright-tgz resources/release/playwright-core-1.49.1.tgz \
+            --prior-commit "$PLUGIN_CATALOG_PRIOR_COMMIT" \
+            --playwright-tgz resources/release/playwright-core-1.64.0.tgz \
             --playwright-lock browser-worker/package-lock.json \
             --check
 
       - name: Install pinned Chromium system dependencies
-        run: npx --yes playwright@1.49.1 install-deps chromium
+        run: npx --yes playwright@1.64.0 install-deps chromium
 
       - name: Provision candidate browser runtime
         shell: bash
@@ -181,7 +183,7 @@ jobs:
 
       - name: Install pinned Chromium system dependencies
         if: matrix.platform == 'linux'
-        run: npx --yes playwright@1.49.1 install-deps chromium
+        run: npx --yes playwright@1.64.0 install-deps chromium
 
       - name: Install macOS build dependencies
         if: matrix.platform == 'macos'
@@ -262,7 +264,7 @@ jobs:
           }
           trap cleanup EXIT
 
-          for attempt in {1..60}; do
+          for _ in {1..60}; do
             status="$("$binary" --data-dir "$data_dir" status)"
             if grep -q '^daemon: running$' <<<"$status"; then
               break
@@ -276,11 +278,14 @@ jobs:
           grep -q '^daemon: running$' <<<"$("$binary" --data-dir "$data_dir" status)"
           api_address="$(python3 - "$data_dir/config.toml" <<'PY'
           import pathlib
+          import re
           import sys
-          import tomllib
 
-          config = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-          print(config["api_listen"])
+          config = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          address = re.search(r'^api_listen = "([^"]+)"$', config, re.MULTILINE)
+          if address is None:
+              raise RuntimeError("generated config is missing api_listen")
+          print(address.group(1))
           PY
           )"
           curl --fail --silent --show-error "http://${api_address}/api/v1/extensions" \

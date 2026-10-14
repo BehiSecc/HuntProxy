@@ -35,7 +35,7 @@ RUN apt-get update \
 
 COPY --from=build /src/target/release/HuntProxy /usr/local/bin/HuntProxy
 COPY --from=browser --chown=huntproxy:huntproxy /browser-worker /opt/huntproxy/browser-worker
-COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/huntproxy/
+COPY LICENSE THIRD_PARTY_NOTICES.md RUST_THIRD_PARTY_NOTICES.txt /usr/share/doc/huntproxy/
 
 ENV HUNTPROXY_DATA_DIR=/data \
     HUNTPROXY_BROWSER_WORKER_PATH=/opt/huntproxy/browser-worker/index.js \
