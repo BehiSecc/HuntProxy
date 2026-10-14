@@ -56,6 +56,6 @@ Confirm the approved candidate is on the intended default branch, the version is
 
 After explicit approval, create and push `v0.2.0` at that validated commit. The tag workflow validates its version, rebuilds four binaries, verifies the two-member archive contract, and creates a **draft** GitHub release. Compare its assets with the validated candidate, verify `SHA256SUMS`, add the reviewed release notes, then publish the draft only within the approved scope.
 
-Never add a third member to an archive: v0.1.1 rejects it. The packaged `LICENSE` concatenates the project license and `THIRD_PARTY_NOTICES.md`. Keep the existing v0.1.1 release and assets available.
+Never add a third member to an archive: v0.1.1 rejects it. The packaged `LICENSE` concatenates the project license, embedded-asset notices, and `RUST_THIRD_PARTY_NOTICES.txt`. Regenerate the Rust notices with `python3 scripts/prepare-rust-notices.py` after any `Cargo.lock` change; `scripts/check.sh` rejects stale or incomplete notices. Keep the combined file below 1 MiB so v0.1.1 can still extract it. Keep the existing v0.1.1 release and assets available.
 
 For rollback after migration, restore the matching database/configuration/plugin snapshot together with the previous executable while the daemon is stopped. The CA and browser profiles are preserved in place and are not included in that snapshot. A complete independent backup must include the data directory and any configured external paths.

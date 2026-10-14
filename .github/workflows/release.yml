@@ -148,7 +148,8 @@ jobs:
           package_dir="${RUNNER_TEMP}/huntproxy-package"
           mkdir -p "$package_dir"
           cp "target/${{ matrix.target }}/release/HuntProxy" "$package_dir/HuntProxy"
-          cat LICENSE THIRD_PARTY_NOTICES.md > "$package_dir/LICENSE"
+          cat LICENSE THIRD_PARTY_NOTICES.md RUST_THIRD_PARTY_NOTICES.txt > "$package_dir/LICENSE"
+          [[ "$(wc -c < "$package_dir/LICENSE")" -le 1048576 ]]
           chmod 755 "$package_dir/HuntProxy"
           tar -czf "${{ matrix.asset }}" -C "$package_dir" HuntProxy LICENSE
           [[ "$(tar -tzf "${{ matrix.asset }}" | LC_ALL=C sort | tr '\n' ' ')" == "HuntProxy LICENSE " ]]

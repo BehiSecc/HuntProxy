@@ -6,6 +6,9 @@ cd "$(dirname "$0")/.."
 echo "== fmt =="
 cargo fmt --check
 
+echo "== Rust dependency notices =="
+python3 scripts/prepare-rust-notices.py --check
+
 echo "== clippy =="
 cargo clippy --locked --all-targets -- -D warnings
 
