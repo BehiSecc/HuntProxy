@@ -1432,6 +1432,15 @@ fn storage_error(error: impl std::fmt::Display) -> DomainError {
 mod tests {
     use super::*;
 
+    fn temporary_directory() -> tempfile::TempDir {
+        let root = Path::new("/tmp/artis");
+        fs::create_dir_all(root).unwrap();
+        tempfile::Builder::new()
+            .prefix("huntproxy-installation-test-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
     fn hashes(files: &[(&str, &[u8])]) -> BTreeMap<String, String> {
         files
             .iter()
@@ -1459,7 +1468,7 @@ mod tests {
         tampered[0] ^= 1;
         assert_ne!(manifest.sha512, hex::encode(Sha512::digest(&tampered)));
 
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let sdk = temporary.path().join("sdk");
         fs::create_dir(&sdk).unwrap();
         extract_playwright_archive(PLAYWRIGHT_ARCHIVE, &sdk).unwrap();
@@ -1505,7 +1514,7 @@ mod tests {
 
     #[test]
     fn playwright_sdk_materialization_is_versioned_and_repeatable() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let config = Config {
             runtime_dir: temporary.path().join("runtime"),
             browser_playwright_core_path: None,
@@ -1522,7 +1531,7 @@ mod tests {
 
     #[test]
     fn plugin_reconciliation_upgrades_only_trusted_packages() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let source = temporary.path().join("source");
         let installed = temporary.path().join("installed");
         let old = [
@@ -1616,7 +1625,7 @@ mod tests {
 
     #[test]
     fn interrupted_package_swap_is_restored_before_reconciliation() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let destination = temporary.path().join("plugin");
         let incoming = temporary.path().join("incoming");
         let backup = temporary.path().join("backup");
@@ -1633,7 +1642,7 @@ mod tests {
 
     #[test]
     fn completed_package_swap_recovery_keeps_the_new_package() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let destination = temporary.path().join("plugin");
         let incoming = temporary.path().join("incoming");
         let backup = temporary.path().join("backup");
@@ -1653,7 +1662,7 @@ mod tests {
 
     #[test]
     fn interrupted_runtime_swap_restores_the_previous_directory() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let destination = temporary.path().join("playwright-core-1.64.0");
         let backup = directory_backup_path(&destination).unwrap();
         fs::create_dir(&backup).unwrap();
@@ -1668,7 +1677,7 @@ mod tests {
 
     #[test]
     fn unowned_plugin_staging_paths_are_never_removed() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let destination = temporary.path().join("plugin");
         let incoming = temporary.path().join("incoming");
         let backup = temporary.path().join("backup");
@@ -1687,7 +1696,7 @@ mod tests {
 
     #[test]
     fn inspection_reads_only_a_complete_validated_installation() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let config = Config {
             data_dir: temporary.path().to_path_buf(),
             runtime_dir: temporary.path().join("runtime"),
@@ -1746,7 +1755,7 @@ mod tests {
 
     #[test]
     fn managed_chromium_lookup_requires_the_release_revision() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let playwright = temporary.path().join("playwright-core");
         let obsolete = playwright.join(".local-browsers/chromium-1148/chrome-linux/chrome");
         fs::create_dir_all(obsolete.parent().unwrap()).unwrap();
@@ -1766,7 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_sdk_uses_its_declared_chromium_revision() {
-        let temporary = tempfile::tempdir_in("/tmp/artis/huntproxy-v020.58BmOq").unwrap();
+        let temporary = temporary_directory();
         let sdk = temporary.path().join("playwright-core");
         fs::create_dir_all(&sdk).unwrap();
         fs::write(

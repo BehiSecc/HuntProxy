@@ -590,7 +590,7 @@ mod tests {
     fn test_root() -> &'static Path {
         static ROOT: OnceLock<PathBuf> = OnceLock::new();
         ROOT.get_or_init(|| {
-            let root = PathBuf::from("/tmp/artis/huntproxy-v020.58BmOq/update-journal-tests");
+            let root = PathBuf::from("/tmp/artis/huntproxy-update-journal-tests");
             fs::create_dir_all(&root).unwrap();
             root
         })
