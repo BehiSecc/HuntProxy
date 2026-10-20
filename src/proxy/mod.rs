@@ -10,7 +10,9 @@ use crate::app::AppState;
 use crate::domain::*;
 use crate::policy::scope::{resolve_validated_dial, url_is_in_scope, TargetRef};
 use crate::storage::{extract_proxy_token, NewExchange};
-use crate::transport::{OutboundBody, OutboundRequest, ProtocolMode, StreamingOutboundResponse};
+use crate::transport::{
+    OutboundBody, OutboundRequest, ProtocolMode, StreamingOutboundResponse, TransportIdentity,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
@@ -254,6 +256,7 @@ async fn forward_request(
         .send_stream(
             &dial,
             OutboundRequest {
+                identity: TransportIdentity::for_capture(&session),
                 method: method.clone(),
                 url: wire_url,
                 headers: wire_headers,
@@ -1150,6 +1153,7 @@ mod tests {
             db: db.clone(),
             config,
             transport,
+            transport_status: crate::app::TransportStatus::for_browser_version(Some("149.0.0.0")),
             reply,
             fuzzer,
             browser,
@@ -1433,7 +1437,27 @@ mod tests {
         let target_addr = target.local_addr().unwrap();
         let echo = tokio::spawn(async move {
             let (socket, _) = target.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                socket,
+                |request: &http::Request<()>, mut response: http::Response<()>| {
+                    assert_eq!(
+                        request.headers()["sec-websocket-key"],
+                        "dGhlIHNhbXBsZSBub25jZQ=="
+                    );
+                    assert_eq!(
+                        request.headers()["sec-websocket-protocol"],
+                        "updates, events"
+                    );
+                    assert!(!request.headers().contains_key("proxy-authorization"));
+                    assert!(!request.headers().contains_key("sec-websocket-extensions"));
+                    response
+                        .headers_mut()
+                        .insert("sec-websocket-protocol", "updates".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
             while let Some(message) = websocket.next().await {
                 let message = message.unwrap();
                 let closed = matches!(message, Message::Close(_));
@@ -1456,14 +1480,26 @@ mod tests {
         let url = format!("ws://{target_addr}/events");
         let mut request = url.clone().into_client_request().unwrap();
         request.headers_mut().insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "updates, events".parse().unwrap());
+        request.headers_mut().insert(
+            "sec-websocket-extensions",
+            "permessage-deflate".parse().unwrap(),
+        );
+        request.headers_mut().insert(
             "proxy-authorization",
             format!("Bearer {}", session.token_once.as_deref().unwrap())
                 .parse()
                 .unwrap(),
         );
-        let (mut client, _) = tokio_tungstenite::client_async(request, stream)
+        let (mut client, response) = tokio_tungstenite::client_async(request, stream)
             .await
             .unwrap();
+        assert_eq!(response.headers()["sec-websocket-protocol"], "updates");
         client.send(Message::Text("hello".into())).await.unwrap();
         assert_eq!(
             client.next().await.unwrap().unwrap().into_text().unwrap(),
@@ -1528,6 +1564,51 @@ mod tests {
         );
         cancel.cancel();
         proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_websocket_handshakes_preserve_origin_evidence() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (origin_response, expected_status, expected_completion, expected_body) in [
+            ("HTTP/1.1 403 Forbidden\r\nContent-Length: 12\r\nConnection: close\r\n\r\nplease retry", 403, CompletionState::Complete, Some(b"please retry".as_slice())),
+            ("HTTP/1.1 403 Forbidden\r\nContent-Length: 30\r\nConnection: close\r\n\r\nplease retry", 403, CompletionState::ProtocolError, Some(b"please retry".as_slice())),
+            ("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: incorrect\r\n\r\n", 101, CompletionState::ProtocolError, None),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (state, project, session) = proxy_test_fixture(&directory).await;
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_addr = target.local_addr().unwrap();
+            let origin = tokio::spawn(async move {
+                let (mut socket, _) = target.accept().await.unwrap();
+                let mut raw = Vec::new();
+                loop {
+                    let mut byte = [0]; socket.read_exact(&mut byte).await.unwrap(); raw.push(byte[0]);
+                    if raw.ends_with(b"\r\n\r\n") { break; }
+                }
+                socket.write_all(origin_response.as_bytes()).await.unwrap();
+            });
+            let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            let proxy_addr = listener.local_addr().unwrap();
+            let cancel = CancellationToken::new();
+            let proxy = tokio::spawn(serve_proxy_listener(state.clone(), listener, cancel.clone()));
+            let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+            client.write_all(format!("GET http://{target_addr}/events HTTP/1.1\r\nHost: {target_addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nProxy-Authorization: Bearer {}\r\n\r\n", session.token_once.as_deref().unwrap()).as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            loop {
+                let mut byte = [0]; client.read_exact(&mut byte).await.unwrap(); raw.push(byte[0]);
+                if raw.ends_with(b"\r\n\r\n") { break; }
+            }
+            let status = if expected_status == 101 { 502 } else { expected_status };
+            assert!(String::from_utf8(raw).unwrap().starts_with(&format!("HTTP/1.1 {status} ")));
+            let detail = wait_for_exchange(&state, project.id).await;
+            assert_eq!(detail.summary.status_code, Some(expected_status));
+            assert_eq!(detail.summary.completion, expected_completion);
+            assert_eq!(detail.summary.capture_quality, CaptureQuality::Semantic);
+            assert_eq!(state.db.load_raw_body(project.id, detail.summary.exchange_id, MessageSide::Response).await.unwrap().as_deref(), expected_body);
+            assert!(state.db.list_websocket_connections(project.id, 10).await.unwrap().is_empty());
+            origin.await.unwrap();
+            cancel.cancel(); proxy.await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

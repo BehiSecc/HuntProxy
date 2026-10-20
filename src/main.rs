@@ -284,12 +284,29 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     .as_deref()
                     .unwrap_or("unknown"),
             );
+            let transport = huntproxy::app::TransportStatus::for_browser_version(
+                browser.chromium_version.as_deref(),
+            );
+            println!("  transport:  {}", transport.profile);
+            if let Some(warning) = &transport.warning {
+                println!("  transport:  {warning}");
+            }
             if let Some(hint) = &browser.install_hint {
                 println!("  browser:    {hint}");
             }
             if cfg.socket_path().exists() {
                 match daemon_get(&cfg, "/api/v1/doctor").await {
-                    Ok(_) => println!("  daemon:     running"),
+                    Ok(status) => {
+                        println!("  daemon:     running");
+                        if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status) {
+                            if let Some(profile) = status["transport"]["profile"].as_str() {
+                                println!("  active transport: {profile}");
+                            }
+                            if let Some(warning) = status["transport"]["warning"].as_str() {
+                                println!("  active transport: {warning}");
+                            }
+                        }
+                    }
                     Err(e) => println!("  daemon:     socket present but unhealthy: {e}"),
                 }
             } else {

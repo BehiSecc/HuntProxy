@@ -2120,6 +2120,7 @@ async fn browser_status(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
     match state.browser.active_status(ProjectId(id)).await {
         Ok(status) => Json(serde_json::json!({
             "runtime": state.browser.status(),
+            "transport": state.transport_status,
             "sessions": status.sessions,
             "resources": status.resources,
         }))
@@ -2337,6 +2338,7 @@ async fn doctor(State(state): State<Arc<AppState>>) -> Response {
         "idle_timeout_seconds": state.config.idle_timeout_seconds,
         "ca_cert": state.config.ca_cert_path().exists(),
         "browser": browser,
+        "transport": state.transport_status,
         "daemon_log": daemon_log,
         "daemon_log_tail": read_file_tail(&daemon_log, 4096),
         "last_startup_output": read_file_tail(&startup_log, 4096),

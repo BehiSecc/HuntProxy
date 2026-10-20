@@ -14,7 +14,9 @@ use crate::policy::{
 };
 use crate::policy::{resolve_validated_dial, url_is_in_scope, TargetRef};
 use crate::storage::{Db, NewExchange};
-use crate::transport::{OutboundBody, OutboundRequest, ProtocolMode, SemanticTransport};
+use crate::transport::{
+    OutboundBody, OutboundRequest, ProtocolMode, SemanticTransport, TransportIdentity,
+};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -1005,6 +1007,7 @@ impl ReplyService {
             .send(
                 &dial,
                 OutboundRequest {
+                    identity: TransportIdentity::for_reply(project_id, &wire_headers),
                     method,
                     url: wire_url,
                     headers: wire_headers,

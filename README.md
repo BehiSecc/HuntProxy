@@ -340,6 +340,12 @@ Extension previews include a bounded `planning_summary` with the plugin's select
 
 ### How Can I Reduce CAPTCHAs and Bot Detection?
 
+HuntProxy keeps HTTPS capture in its MITM proxy. Origins therefore see the proxy's TLS and HTTP behavior, even when the browser uses a different engine. Semantic HTTP requests and secure WebSocket handshakes use the same Chrome transport profile, and connection pools are separated by project and browser session or replay credentials. Browser headers retain their values and intentional omissions. For GET navigations with standard browser headers, HuntProxy uses ordering measured from Chromium directly and through an authenticated proxy.
+
+Use `HuntProxy browser install` for the paired Chromium runtime. Startup selects a supported Chrome transport profile from the browser's major version (146 or 149); other versions retain the Chrome149 profile and report a mismatch in `HuntProxy doctor` and browser status. A matching version label is an emulation choice, not a guarantee of an identical TLS fingerprint or access to a protected site.
+
+Window-message observation runs in a separate JavaScript world without changing page HTML or CSP. Normal console and page-error events remain available; observer failures appear as diagnostics. The first inline script in a newly opened popup can run before its observer attaches.
+
 CAPTCHAs and bot checks are common when hunting from a VPS because datacenter IP addresses are easier to recognize. Routing HuntProxy through a reputable residential proxy is usually the most effective fix.
 
 Choose one configuration and add it to `~/.huntproxy/config.toml`. Then run `HuntProxy restart` (or call `huntproxy_restart` from the connected agent) and verify with `HuntProxy doctor`.

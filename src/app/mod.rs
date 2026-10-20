@@ -7,7 +7,7 @@ use crate::domain::*;
 use crate::fuzzer::FuzzerService;
 use crate::reply::{PlaceholderKey, ReplyService};
 use crate::storage::Db;
-use crate::transport::{build_default_transport, SemanticTransport};
+use crate::transport::{SemanticTransport, WreqTransport};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -27,6 +27,7 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub config: Config,
     pub transport: Arc<dyn SemanticTransport>,
+    pub transport_status: TransportStatus,
     pub reply: Arc<ReplyService>,
     pub fuzzer: Arc<FuzzerService>,
     pub browser: Arc<BrowserService>,
@@ -36,6 +37,47 @@ pub struct AppState {
     pub events: broadcast::Sender<AppEvent>,
     pub shutdown: CancellationToken,
     pub activity: ActivityTracker,
+}
+
+/// The configured emulation is an approximation, not proof of a wire-identical
+/// browser handshake. Keep a custom browser's version mismatch visible.
+#[derive(Clone, Debug, Serialize)]
+pub struct TransportStatus {
+    pub profile: String,
+    pub chrome_major: u32,
+    pub browser_major: Option<u32>,
+    pub browser_major_matches_profile: bool,
+    pub warning: Option<String>,
+}
+
+impl TransportStatus {
+    pub fn for_browser_version(version: Option<&str>) -> Self {
+        let browser_major = version
+            .and_then(|version| version.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok());
+        let chrome_major = match browser_major {
+            Some(146) => 146,
+            _ => 149,
+        };
+        let browser_major_matches_profile = browser_major == Some(chrome_major);
+        let warning = if browser_major_matches_profile {
+            None
+        } else {
+            Some(match browser_major {
+                Some(major) => format!(
+                    "Chromium {major} has no tested transport profile; using Chrome149. Use the paired browser installed by `HuntProxy browser install` for a matching major."
+                ),
+                None => "Browser version unavailable; using the Chrome149 transport profile.".into(),
+            })
+        };
+        Self {
+            profile: format!("wreq_chrome{chrome_major}_protocol_profile"),
+            chrome_major,
+            browser_major,
+            browser_major_matches_profile,
+            warning,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -231,7 +273,27 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         tracing::warn!(count = interrupted_fuzz, "marked fuzz jobs interrupted");
     }
 
-    let transport = build_default_transport(config.max_body_bytes);
+    let managed_worker = config.browser_worker_path.clone().or_else(|| {
+        crate::browser::prepare_browser_worker_installation(&config.data_dir)
+            .ok()
+            .map(|directory| directory.join("index.js"))
+    });
+    let browser = Arc::new(BrowserService::new_with_proxy_and_ca(
+        db.clone(),
+        config.node_path.clone(),
+        managed_worker,
+        format!("http://{}", config.proxy_listen),
+        Some(config.ca_cert_path()),
+        config.browser_profiles_dir(),
+    ));
+    let transport_status =
+        TransportStatus::for_browser_version(browser.status().chromium_version.as_deref());
+    if let Some(warning) = &transport_status.warning {
+        tracing::warn!(%warning, "browser and upstream transport profile differ");
+    }
+    let transport: Arc<dyn SemanticTransport> = Arc::new(WreqTransport::with_chrome_major(
+        transport_status.chrome_major,
+    )?);
     let key_bytes = std::fs::read(config.placeholder_key_path()).unwrap_or_else(|_| {
         let key = PlaceholderKey::load_or_create(&config.placeholder_key_path())
             .map(|_| ())
@@ -256,19 +318,6 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         reply.clone(),
         PlaceholderKey::from_bytes(key_bytes),
     ));
-    let managed_worker = config.browser_worker_path.clone().or_else(|| {
-        crate::browser::prepare_browser_worker_installation(&config.data_dir)
-            .ok()
-            .map(|directory| directory.join("index.js"))
-    });
-    let browser = Arc::new(BrowserService::new_with_proxy_and_ca(
-        db.clone(),
-        config.node_path.clone(),
-        managed_worker,
-        format!("http://{}", config.proxy_listen),
-        Some(config.ca_cert_path()),
-        config.browser_profiles_dir(),
-    ));
     let plugins = Arc::new(crate::plugins::PluginService::load_with_browser(
         config.plugin_dir.clone(),
         db.clone(),
@@ -287,6 +336,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         db,
         config,
         transport,
+        transport_status,
         reply,
         fuzzer,
         browser,
@@ -679,6 +729,23 @@ pub fn daemon_status(config: &Config) -> DomainResult<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_profile_tracks_supported_browser_and_reports_fallbacks() {
+        for major in [146, 149] {
+            let status = TransportStatus::for_browser_version(Some(&format!("{major}.0.1.2")));
+            assert_eq!(status.chrome_major, major);
+            assert!(status.browser_major_matches_profile);
+            assert!(status.warning.is_none());
+            assert!(WreqTransport::with_chrome_major(status.chrome_major).is_ok());
+        }
+        for version in [None, Some("unavailable"), Some("153.0.1.2")] {
+            let status = TransportStatus::for_browser_version(version);
+            assert_eq!(status.chrome_major, 149);
+            assert!(!status.browser_major_matches_profile);
+            assert!(status.warning.is_some());
+        }
+    }
 
     #[test]
     fn daemon_lock_is_exclusive_and_reusable() {

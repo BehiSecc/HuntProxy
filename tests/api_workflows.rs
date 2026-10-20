@@ -401,7 +401,12 @@ async fn browser_resource_status_is_additive_in_mcp_and_api() {
     .unwrap();
     assert_eq!(
         mcp,
-        serde_json::json!({"sessions": [], "resources": expected})
+        serde_json::json!({
+            "runtime": state.browser.status(),
+            "transport": state.transport_status,
+            "sessions": [],
+            "resources": expected,
+        })
     );
 
     let app = huntproxy::api::router(state.clone());
@@ -424,6 +429,7 @@ async fn browser_resource_status_is_additive_in_mcp_and_api() {
         api["runtime"],
         serde_json::to_value(state.browser.status()).unwrap()
     );
+    assert_eq!(api["transport"], mcp["transport"]);
 
     // Single-session status retains its existing BrowserSession payload,
     // including historical stopped sessions, without a resources envelope.

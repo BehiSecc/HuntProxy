@@ -2269,7 +2269,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 }));
             }
             if op == "status" && args.get("session_id").and_then(Value::as_i64).is_none() {
-                return Ok(json!(state.browser.active_status(project_id).await?));
+                let status = state.browser.active_status(project_id).await?;
+                return Ok(json!({
+                    "runtime": state.browser.status(),
+                    "transport": state.transport_status,
+                    "sessions": status.sessions,
+                    "resources": status.resources,
+                }));
             }
             let sid = args
                 .get("session_id")

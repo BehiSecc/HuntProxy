@@ -1,22 +1,26 @@
 //! Semantic outbound HTTP transport.
 //!
 //! The primary path uses Wreq's pinned Chrome-compatible protocol profile.
-//! Short-lived clients reuse connections only while the approved address set
+//! Identity-scoped clients reuse connections only while the approved address set
 //! and policy epoch remain unchanged; the resolver never performs a hidden
 //! second DNS lookup.
 
-use crate::domain::{DomainError, DomainResult, ErrorCode, TransportProvenance, ValidatedDial};
+use crate::domain::{
+    CaptureSession, DomainError, DomainResult, ErrorCode, ProjectId, TransportProvenance,
+    ValidatedDial,
+};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio_util::io::ReaderStream;
 use wreq::dns::Resolve;
 use wreq_util::Emulation;
@@ -26,6 +30,60 @@ pub enum TransportProfile {
     Chrome,
     TransportOnly,
     GenericUnprofiled,
+}
+
+/// Separate connection pools and TLS session tickets for independent identities.
+/// Browser action capture tokens change frequently, so browser traffic uses its
+/// stable workspace session instead of the short-lived capture session token.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TransportIdentity {
+    Browser {
+        project_id: ProjectId,
+        session_id: i64,
+    },
+    Capture {
+        project_id: ProjectId,
+        session_id: i64,
+    },
+    Reply {
+        project_id: ProjectId,
+        credential_digest: [u8; 32],
+    },
+}
+
+impl TransportIdentity {
+    pub fn for_capture(session: &CaptureSession) -> Self {
+        match session.browser_session_id {
+            Some(browser) => Self::Browser {
+                project_id: session.project_id,
+                session_id: browser.get(),
+            },
+            None => Self::Capture {
+                project_id: session.project_id,
+                session_id: session.id.get(),
+            },
+        }
+    }
+
+    pub fn for_reply(project_id: ProjectId, headers: &[(String, Vec<u8>)]) -> Self {
+        let mut credentials = headers
+            .iter()
+            .filter(|(name, _)| crate::policy::is_sensitive_header(name))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value))
+            .collect::<Vec<_>>();
+        credentials.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut digest = Sha256::new();
+        for (name, value) in credentials {
+            digest.update((name.len() as u64).to_be_bytes());
+            digest.update(name.as_bytes());
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        Self::Reply {
+            project_id,
+            credential_digest: digest.finalize().into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +105,7 @@ impl OutboundBody {
 
 #[derive(Debug, Clone)]
 pub struct OutboundRequest {
+    pub identity: TransportIdentity,
     pub method: Method,
     pub url: String,
     pub headers: Vec<(String, Vec<u8>)>,
@@ -93,6 +152,23 @@ pub struct StreamingOutboundResponse {
     pub transport_profile: String,
 }
 
+pub trait TransportSocket: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TransportSocket for T {}
+
+/// An HTTP/1 upgrade keeps the same profiled TLS connection and preserves any
+/// bytes received immediately after the response headers.
+pub struct OutboundUpgradeResponse {
+    pub status: StatusCode,
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub body: Bytes,
+    pub body_truncated: bool,
+    /// Preserve a received response head and partial body on read/upgrade failure.
+    pub error: Option<DomainError>,
+    pub upgraded: Option<Box<dyn TransportSocket>>,
+    pub transport_provenance: TransportProvenance,
+    pub transport_profile: String,
+}
+
 #[async_trait]
 pub trait SemanticTransport: Send + Sync {
     async fn send(
@@ -100,6 +176,17 @@ pub trait SemanticTransport: Send + Sync {
         dial: &ValidatedDial,
         req: OutboundRequest,
     ) -> DomainResult<OutboundResponse>;
+
+    async fn send_upgrade(
+        &self,
+        _dial: &ValidatedDial,
+        _req: OutboundRequest,
+    ) -> DomainResult<OutboundUpgradeResponse> {
+        Err(DomainError::new(
+            ErrorCode::ProtocolError,
+            "transport does not support HTTP upgrades",
+        ))
+    }
 
     async fn send_stream(
         &self,
@@ -160,12 +247,14 @@ impl Resolve for ApprovedResolver {
     }
 }
 
-const CLIENT_CACHE_TTL: Duration = Duration::from_secs(30);
+const CLIENT_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_CACHED_CLIENTS: usize = 64;
 const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ClientKey {
+    identity: TransportIdentity,
+    url_credentials: Option<[u8; 32]>,
     hostname: String,
     port: u16,
     scheme: String,
@@ -183,6 +272,19 @@ impl ClientKey {
         addresses.sort_unstable();
         addresses.dedup();
         Self {
+            identity: req.identity.clone(),
+            // Wreq may synthesize Basic authentication from URL userinfo after
+            // the caller supplied its headers. It must also partition pools.
+            url_credentials: url::Url::parse(&req.url).ok().and_then(|url| {
+                if url.username().is_empty() && url.password().is_none() {
+                    return None;
+                }
+                let mut digest = Sha256::new();
+                digest.update((url.username().len() as u64).to_be_bytes());
+                digest.update(url.username().as_bytes());
+                digest.update(url.password().unwrap_or_default().as_bytes());
+                Some(digest.finalize().into())
+            }),
             hostname: dial.hostname.trim_end_matches('.').to_ascii_lowercase(),
             port: dial.port,
             scheme: dial.scheme.to_ascii_lowercase(),
@@ -207,21 +309,46 @@ impl ClientKey {
 struct CachedClient {
     client: wreq::Client,
     created_at: Instant,
+    last_used_at: Instant,
     expires_at: Instant,
 }
 
-/// Chrome-profiled semantic egress with a small, short-lived connection pool.
+/// Chrome-profiled semantic egress with a small connection pool and bounded idle lifetime.
 /// Cache entries are pinned to the validated DNS answer and policy epoch.
 /// A changed answer or policy immediately drops older clients for that origin.
 pub struct WreqTransport {
     clients: Mutex<HashMap<ClientKey, CachedClient>>,
+    emulation: wreq_util::Profile,
+    profile_name: String,
+    #[cfg(test)]
+    test_cert_store: Option<wreq::tls::trust::CertStore>,
 }
 
 impl WreqTransport {
     pub fn new() -> Self {
-        Self {
+        Self::with_chrome_major(149).expect("pinned Chrome149 transport profile")
+    }
+
+    pub fn with_chrome_major(major: u32) -> DomainResult<Self> {
+        let emulation = match major {
+            146 => Emulation::Chrome146,
+            149 => Emulation::Chrome149,
+            _ => {
+                return Err(DomainError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!(
+                        "no tested transport profile for Chromium {major}; supported: 146, 149"
+                    ),
+                ))
+            }
+        };
+        Ok(Self {
             clients: Mutex::new(HashMap::new()),
-        }
+            emulation,
+            profile_name: format!("wreq_chrome{major}_protocol_profile"),
+            #[cfg(test)]
+            test_cert_store: None,
+        })
     }
 
     fn client_for(
@@ -232,17 +359,25 @@ impl WreqTransport {
         let resolver = ApprovedResolver::new(dial)?;
         let key = ClientKey::new(dial, req);
         let now = Instant::now();
-        let dns_ttl = (dial.expires_at - time::OffsetDateTime::now_utc())
-            .try_into()
-            .unwrap_or(Duration::ZERO);
-        let ttl = CLIENT_CACHE_TTL.min(dns_ttl);
+        // An idle TLS session may outlive the previous DNS approval, but each
+        // use must supply a fresh approval with the identical address set and
+        // policy epoch. Never let a cached client authorize an expired dial.
+        if dial.expires_at <= time::OffsetDateTime::now_utc() {
+            return Err(DomainError::scope_denied(
+                "DNS approval expired; resolve destination again",
+            ));
+        }
+        let ttl = CLIENT_CACHE_TTL;
         let mut clients = self.clients.lock();
         clients.retain(|cached_key, cached| {
             cached.expires_at > now
-                && (!cached_key.same_origin(&key)
-                    || (!ttl.is_zero() && cached_key.same_resolution_and_policy(&key)))
+                && (!cached_key.same_origin(&key) || cached_key.same_resolution_and_policy(&key))
         });
-        if let Some(cached) = clients.get(&key) {
+        if let Some(cached) = clients.get_mut(&key) {
+            // Only fresh matching validation can extend an active identity's
+            // pool lifetime. Unused identities expire after the bounded idle time.
+            cached.last_used_at = now;
+            cached.expires_at = now + ttl;
             return Ok(cached.client.clone());
         }
 
@@ -251,11 +386,15 @@ impl WreqTransport {
             .redirect(wreq::redirect::Policy::none())
             .connect_timeout(req.connect_timeout)
             .timeout(req.total_timeout)
-            .pool_idle_timeout(ttl.max(Duration::from_millis(1)))
+            .pool_idle_timeout(ttl)
             .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .pool_max_size(MAX_CACHED_CLIENTS)
-            // Match browser-worker's pinned Playwright 1.61.1 / Chromium 149 pair.
-            .emulation(Emulation::Chrome149);
+            .emulation(self.emulation);
+
+        #[cfg(test)]
+        if let Some(store) = &self.test_cert_store {
+            builder = builder.tls_cert_store(store.clone());
+        }
 
         if let Some(proxy_url) = &req.upstream_proxy {
             let proxy = wreq::Proxy::all(proxy_url).map_err(|_| {
@@ -278,26 +417,61 @@ impl WreqTransport {
             )
         })?;
 
-        if !ttl.is_zero() {
-            if clients.len() >= MAX_CACHED_CLIENTS {
-                if let Some(oldest) = clients
-                    .iter()
-                    .min_by_key(|(_, cached)| cached.created_at)
-                    .map(|(key, _)| key.clone())
-                {
-                    clients.remove(&oldest);
-                }
+        if clients.len() >= MAX_CACHED_CLIENTS {
+            if let Some(oldest) = clients
+                .iter()
+                .min_by_key(|(_, cached)| (cached.last_used_at, cached.created_at))
+                .map(|(key, _)| key.clone())
+            {
+                clients.remove(&oldest);
             }
-            clients.insert(
-                key,
-                CachedClient {
-                    client: client.clone(),
-                    created_at: now,
-                    expires_at: now + ttl,
-                },
-            );
         }
+        clients.insert(
+            key,
+            CachedClient {
+                client: client.clone(),
+                created_at: now,
+                last_used_at: now,
+                expires_at: now + ttl,
+            },
+        );
         Ok(client)
+    }
+
+    async fn execute(
+        &self,
+        dial: &ValidatedDial,
+        req: OutboundRequest,
+    ) -> DomainResult<wreq::Response> {
+        let client = self.client_for(dial, &req)?;
+
+        let mut request = client
+            .request(req.method.clone(), &req.url)
+            .default_headers(!req.preserve_identity_headers);
+        let body_len = req.body.len();
+        let headers = canonical_headers(&req.headers, body_len)?;
+        if let Some(order) = measured_navigation_header_order(&req, &headers) {
+            request = request.orig_headers(order);
+        }
+        request = request.headers(headers);
+        match req.body {
+            OutboundBody::Empty => {}
+            OutboundBody::Bytes(body) => {
+                request = request.body(wreq::Body::from(body));
+            }
+            OutboundBody::Spool { path, len } => {
+                let file = tokio::fs::File::open(&path).await.map_err(|error| {
+                    DomainError::new(
+                        ErrorCode::StorageError,
+                        format!("open request spool {}: {error}", path.display()),
+                    )
+                })?;
+                let stream = ReaderStream::new(file.take(len));
+                request = request.body(wreq::Body::wrap_stream(stream));
+            }
+        }
+
+        request.send().await.map_err(map_wreq_error)
     }
 }
 
@@ -335,32 +509,7 @@ impl SemanticTransport for WreqTransport {
         dial: &ValidatedDial,
         req: OutboundRequest,
     ) -> DomainResult<StreamingOutboundResponse> {
-        let client = self.client_for(dial, &req)?;
-
-        let mut request = client
-            .request(req.method.clone(), &req.url)
-            .default_headers(!req.preserve_identity_headers);
-        let body_len = req.body.len();
-        let headers = canonical_headers(&req.headers, body_len)?;
-        request = request.headers(headers);
-        match req.body {
-            OutboundBody::Empty => {}
-            OutboundBody::Bytes(body) => {
-                request = request.body(wreq::Body::from(body));
-            }
-            OutboundBody::Spool { path, len } => {
-                let file = tokio::fs::File::open(&path).await.map_err(|error| {
-                    DomainError::new(
-                        ErrorCode::StorageError,
-                        format!("open request spool {}: {error}", path.display()),
-                    )
-                })?;
-                let stream = ReaderStream::new(file.take(len));
-                request = request.body(wreq::Body::wrap_stream(stream));
-            }
-        }
-
-        let response = request.send().await.map_err(map_wreq_error)?;
+        let response = self.execute(dial, req).await?;
         let status = StatusCode::from_u16(response.status().as_u16())
             .map_err(|e| DomainError::new(ErrorCode::ProtocolError, e.to_string()))?;
         let protocol = match response.version() {
@@ -386,12 +535,60 @@ impl SemanticTransport for WreqTransport {
             body,
             protocol,
             transport_provenance: TransportProvenance::ProtocolProfileOnly,
-            transport_profile: "wreq_chrome149_protocol_profile".into(),
+            transport_profile: self.profile_name.clone(),
+        })
+    }
+
+    async fn send_upgrade(
+        &self,
+        dial: &ValidatedDial,
+        mut req: OutboundRequest,
+    ) -> DomainResult<OutboundUpgradeResponse> {
+        // Traditional browser WebSocket upgrades use HTTP/1.1. Negotiate the
+        // corresponding ALPN through the same TLS profile used for HTTPS.
+        req.protocol = ProtocolMode::Http1;
+        let max_body_bytes = req.max_body_bytes;
+        let response = self.execute(dial, req).await?;
+        let status = response.status();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect();
+        let (body, body_truncated, upgraded, error) = if status == StatusCode::SWITCHING_PROTOCOLS {
+            match response.upgrade().await {
+                Ok(socket) => (
+                    Bytes::new(),
+                    false,
+                    Some(Box::new(socket) as Box<dyn TransportSocket>),
+                    None,
+                ),
+                Err(error) => (Bytes::new(), false, None, Some(map_wreq_error(error))),
+            }
+        } else {
+            let stream = Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(map_wreq_error)),
+            );
+            let (body, truncated, error) =
+                collect_stream_body_partial(stream, max_body_bytes).await;
+            (body, truncated, None, error)
+        };
+        Ok(OutboundUpgradeResponse {
+            status,
+            headers,
+            body,
+            body_truncated,
+            error,
+            upgraded,
+            transport_provenance: self.provenance(),
+            transport_profile: self.profile_name.clone(),
         })
     }
 
     fn profile_name(&self) -> &str {
-        "wreq_chrome149_protocol_profile"
+        &self.profile_name
     }
 
     fn provenance(&self) -> TransportProvenance {
@@ -400,15 +597,28 @@ impl SemanticTransport for WreqTransport {
 }
 
 async fn collect_stream_body(
-    mut stream: OutboundByteStream,
+    stream: OutboundByteStream,
     max_body_bytes: u64,
 ) -> DomainResult<(Bytes, bool)> {
+    let (body, truncated, error) = collect_stream_body_partial(stream, max_body_bytes).await;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok((body, truncated))
+}
+
+async fn collect_stream_body_partial(
+    mut stream: OutboundByteStream,
+    max_body_bytes: u64,
+) -> (Bytes, bool, Option<DomainError>) {
     let cap = usize::try_from(max_body_bytes).unwrap_or(usize::MAX);
     let mut out = BytesMut::with_capacity(cap.min(64 * 1024));
     let mut truncated = false;
-
     while let Some(next) = stream.next().await {
-        let chunk = next?;
+        let chunk = match next {
+            Ok(chunk) => chunk,
+            Err(error) => return (out.freeze(), truncated, Some(error)),
+        };
         let room = cap.saturating_sub(out.len());
         if chunk.len() > room {
             out.extend_from_slice(&chunk[..room]);
@@ -417,16 +627,18 @@ async fn collect_stream_body(
         }
         out.extend_from_slice(&chunk);
         if out.len() == cap {
-            // If no Content-Length was available, one more frame is required to
-            // distinguish an exact-cap body from a truncated stream.
+            // Read one more frame to distinguish an exact-cap body from a
+            // truncated stream, retaining partial evidence on read failure.
             if let Some(next) = stream.next().await {
-                let next = next?;
-                truncated |= !next.is_empty();
+                match next {
+                    Ok(chunk) => truncated |= !chunk.is_empty(),
+                    Err(error) => return (out.freeze(), truncated, Some(error)),
+                }
             }
             break;
         }
     }
-    Ok((out.freeze(), truncated))
+    (out.freeze(), truncated, None)
 }
 
 fn map_wreq_error(error: wreq::Error) -> DomainError {
@@ -437,6 +649,60 @@ fn map_wreq_error(error: wreq::Error) -> DomainError {
     } else {
         DomainError::new(ErrorCode::ProtocolError, error.to_string())
     }
+}
+
+// Measured GET navigation shapes from native Chromium146/149: direct and
+// authenticated-proxy navigation, including link/reload with Referer and Cookie.
+// This is not recovered incoming wire order; Hyper's HeaderMap cannot supply that.
+// Leave requests with other shapes/headers alone until separately measured.
+const MEASURED_NAVIGATION_HEADERS: &[&str] = &[
+    "Host",
+    "Connection",
+    "Pragma",
+    "Cache-Control",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "Upgrade-Insecure-Requests",
+    "User-Agent",
+    "Accept",
+    "Sec-Fetch-Site",
+    "Sec-Fetch-Mode",
+    "Sec-Fetch-User",
+    "Sec-Fetch-Dest",
+    "Referer",
+    "Accept-Encoding",
+    "Accept-Language",
+    "Cookie",
+];
+
+fn measured_navigation_header_order(
+    req: &OutboundRequest,
+    headers: &HeaderMap,
+) -> Option<wreq::header::OrigHeaderMap> {
+    if !req.preserve_identity_headers || req.method != Method::GET || req.body.len() != 0 {
+        return None;
+    }
+    let has = |name: &str, value: &[u8]| {
+        headers
+            .get(name)
+            .is_some_and(|supplied| supplied.as_bytes() == value)
+    };
+    if !has("sec-fetch-mode", b"navigate")
+        || !has("sec-fetch-dest", b"document")
+        || headers.keys().any(|name| {
+            !MEASURED_NAVIGATION_HEADERS
+                .iter()
+                .any(|known| name.as_str().eq_ignore_ascii_case(known))
+        })
+    {
+        return None;
+    }
+    let mut order = wreq::header::OrigHeaderMap::new();
+    for &name in MEASURED_NAVIGATION_HEADERS {
+        order.insert(name);
+    }
+    Some(order)
 }
 
 fn canonical_headers(headers: &[(String, Vec<u8>)], body_len: u64) -> DomainResult<HeaderMap> {
@@ -529,6 +795,7 @@ mod tests {
 
     fn cache_request() -> OutboundRequest {
         OutboundRequest {
+            identity: TransportIdentity::for_reply(ProjectId(1), &[]),
             method: Method::GET,
             url: "https://cache.test/".into(),
             headers: vec![],
@@ -594,8 +861,504 @@ mod tests {
 
         let mut expired = current;
         expired.expires_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
-        transport.client_for(&expired, &request).unwrap();
-        assert!(transport.clients.lock().is_empty());
+        let original_created = transport.clients.lock().values().next().unwrap().created_at;
+        assert!(transport.client_for(&expired, &request).is_err());
+        // A fresh matching approval reuses the same isolated TLS session cache
+        // after the previous approval expired, without accepting that old dial.
+        let mut fresh = expired;
+        fresh.expires_at = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+        transport.client_for(&fresh, &request).unwrap();
+        assert_eq!(
+            transport.clients.lock().values().next().unwrap().created_at,
+            original_created
+        );
+    }
+
+    #[test]
+    fn transport_identity_separates_projects_captures_and_final_reply_credentials() {
+        let first = vec![("Cookie".into(), b"sid=first".to_vec())];
+        let same_case = vec![("cookie".into(), b"sid=first".to_vec())];
+        let second = vec![("Cookie".into(), b"sid=second".to_vec())];
+        let identity = TransportIdentity::for_reply(ProjectId(1), &first);
+        assert_eq!(
+            identity,
+            TransportIdentity::for_reply(ProjectId(1), &same_case)
+        );
+        assert_ne!(identity, TransportIdentity::for_reply(ProjectId(2), &first));
+        assert_ne!(
+            identity,
+            TransportIdentity::for_reply(ProjectId(1), &second)
+        );
+        assert_ne!(identity, TransportIdentity::for_reply(ProjectId(1), &[]));
+        let transport = WreqTransport::new();
+        let dial = cache_dial("192.0.2.10:443", 1);
+        let mut request = cache_request();
+        request.identity = identity;
+        transport.client_for(&dial, &request).unwrap();
+        request.identity = TransportIdentity::Capture {
+            project_id: ProjectId(1),
+            session_id: 1,
+        };
+        transport.client_for(&dial, &request).unwrap();
+        request.identity = TransportIdentity::Browser {
+            project_id: ProjectId(1),
+            session_id: 1,
+        };
+        transport.client_for(&dial, &request).unwrap();
+        assert_eq!(transport.clients.lock().len(), 3);
+        request.url = "https://member:first@cache.test/".into();
+        transport.client_for(&dial, &request).unwrap();
+        request.url = "https://member:second@cache.test/".into();
+        transport.client_for(&dial, &request).unwrap();
+        assert_eq!(transport.clients.lock().len(), 5);
+        // A changed policy evicts every identity for this origin.
+        let changed = cache_dial("192.0.2.10:443", 2);
+        transport.client_for(&changed, &request).unwrap();
+        assert_eq!(transport.clients.lock().len(), 1);
+    }
+
+    #[test]
+    fn active_client_lifetime_extends_only_with_matching_fresh_approval_and_cache_is_bounded() {
+        let transport = WreqTransport::new();
+        let request = cache_request();
+        let dial = cache_dial("192.0.2.10:443", 1);
+        transport.client_for(&dial, &request).unwrap();
+        let original_created = transport.clients.lock().values().next().unwrap().created_at;
+        let soon = Instant::now() + Duration::from_secs(1);
+        transport
+            .clients
+            .lock()
+            .values_mut()
+            .next()
+            .unwrap()
+            .expires_at = soon;
+        transport.client_for(&dial, &request).unwrap();
+        let clients = transport.clients.lock();
+        let cached = clients.values().next().unwrap();
+        assert!(cached.expires_at > soon);
+        assert_eq!(cached.created_at, original_created);
+        drop(clients);
+        for id in 1..=MAX_CACHED_CLIENTS + 2 {
+            let mut request = cache_request();
+            request.identity = TransportIdentity::Browser {
+                project_id: ProjectId(1),
+                session_id: id as i64,
+            };
+            transport.client_for(&dial, &request).unwrap();
+        }
+        assert_eq!(transport.clients.lock().len(), MAX_CACHED_CLIENTS);
+    }
+
+    #[tokio::test]
+    async fn distinct_identities_use_distinct_connections_and_resume_their_own_pool() {
+        for protocol in [ProtocolMode::Http1, ProtocolMode::Http2] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut connection_id = 0;
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    connection_id += 1;
+                    tokio::spawn(async move {
+                        let service =
+                            service_fn(move |_: Request<hyper::body::Incoming>| async move {
+                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(
+                                    connection_id.to_string(),
+                                ))))
+                            });
+                        if protocol == ProtocolMode::Http2 {
+                            let _ = hyper::server::conn::http2::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(TokioIo::new(socket), service)
+                            .await;
+                        } else {
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(TokioIo::new(socket), service)
+                                .await;
+                        }
+                    });
+                }
+            });
+            let mut dial = cache_dial(&address.to_string(), 1);
+            dial.scheme = "http".into();
+            dial.port = address.port();
+            let transport = WreqTransport::new();
+            for (project, browser, expected_connection) in
+                [(1, 1, "1"), (1, 2, "2"), (2, 1, "3"), (1, 1, "1")]
+            {
+                let mut request = cache_request();
+                request.url = format!("http://cache.test:{}/", address.port());
+                request.protocol = protocol;
+                request.identity = TransportIdentity::Browser {
+                    project_id: ProjectId(project),
+                    session_id: browser,
+                };
+                assert_eq!(
+                    transport.send(&dial, request).await.unwrap().body,
+                    expected_connection
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_session_tickets_resume_only_within_the_same_identity() {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        let certificate = rcgen::generate_simple_self_signed(vec!["tickets.test".into()]).unwrap();
+        let key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+        let mut tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.cert.der().clone()], key.into())
+        .unwrap();
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls));
+        let mut transport = WreqTransport::new();
+        transport.test_cert_store = Some(
+            wreq::tls::trust::CertStore::from_der_certs([certificate.cert.der().as_ref()]).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = acceptor.accept(socket).await.unwrap();
+                observed_tx
+                    .send(socket.get_ref().1.handshake_kind().unwrap())
+                    .unwrap();
+                let mut raw = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    raw.push(byte[0]);
+                    if raw.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let mut dial = cache_dial(&address.to_string(), 1);
+        dial.hostname = "tickets.test".into();
+        dial.port = address.port();
+        for (browser, expected) in [
+            (1, rustls::HandshakeKind::Full),
+            (1, rustls::HandshakeKind::Resumed),
+            (2, rustls::HandshakeKind::Full),
+            (1, rustls::HandshakeKind::Resumed),
+        ] {
+            let mut request = cache_request();
+            request.url = format!("https://tickets.test:{}/", address.port());
+            request.protocol = ProtocolMode::Http1;
+            request.identity = TransportIdentity::Browser {
+                project_id: ProjectId(1),
+                session_id: browser,
+            };
+            assert_eq!(transport.send(&dial, request).await.unwrap().body, "ok");
+            assert_eq!(observed_rx.recv().await.unwrap(), expected);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_document_navigation_header_order_matches_native_chromium() {
+        // Captured at owned HTTP/1 origins, directly and through an authenticated
+        // CONNECT proxy. Cache headers originate in Playwright proxy credentials;
+        // the transport must retain them and order them as the browser does.
+        let cases: &[&[&str]] = &[
+            &[
+                "Host",
+                "Connection",
+                "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "sec-ch-ua-platform",
+                "Upgrade-Insecure-Requests",
+                "User-Agent",
+                "Accept",
+                "Sec-Fetch-Site",
+                "Sec-Fetch-Mode",
+                "Sec-Fetch-User",
+                "Sec-Fetch-Dest",
+                "Accept-Encoding",
+                "Accept-Language",
+            ],
+            &[
+                "Host",
+                "Connection",
+                "Pragma",
+                "Cache-Control",
+                "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "sec-ch-ua-platform",
+                "Upgrade-Insecure-Requests",
+                "User-Agent",
+                "Accept",
+                "Sec-Fetch-Site",
+                "Sec-Fetch-Mode",
+                "Sec-Fetch-User",
+                "Sec-Fetch-Dest",
+                "Accept-Encoding",
+                "Accept-Language",
+            ],
+            &[
+                "Host",
+                "Connection",
+                "Pragma",
+                "Cache-Control",
+                "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "sec-ch-ua-platform",
+                "Upgrade-Insecure-Requests",
+                "User-Agent",
+                "Accept",
+                "Sec-Fetch-Site",
+                "Sec-Fetch-Mode",
+                "Sec-Fetch-User",
+                "Sec-Fetch-Dest",
+                "Referer",
+                "Accept-Encoding",
+                "Accept-Language",
+                "Cookie",
+            ],
+            &[
+                "Host",
+                "Connection",
+                "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "sec-ch-ua-platform",
+                "Upgrade-Insecure-Requests",
+                "User-Agent",
+                "Accept",
+                "Sec-Fetch-Site",
+                "Sec-Fetch-Mode",
+                "Sec-Fetch-User",
+                "Sec-Fetch-Dest",
+                "Referer",
+                "Accept-Encoding",
+                "Accept-Language",
+                "Cookie",
+            ],
+        ];
+        for major in [146, 149] {
+            for &expected in cases {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut raw = Vec::new();
+                    loop {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).await.unwrap();
+                        raw.push(byte[0]);
+                        if raw.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                    String::from_utf8(raw).unwrap()
+                });
+                let mut dial = cache_dial(&address.to_string(), 1);
+                dial.scheme = "http".into();
+                dial.port = address.port();
+                let mut request = cache_request();
+                request.url = format!("http://cache.test:{}/", address.port());
+                request.protocol = ProtocolMode::Http1;
+                request.headers = expected
+                    .iter()
+                    .rev()
+                    .map(|name| {
+                        let name = name.to_ascii_lowercase();
+                        let value = match name.as_str() {
+                            "host" => format!("cache.test:{}", address.port()).into_bytes(),
+                            "sec-fetch-mode" => b"navigate".to_vec(),
+                            "sec-fetch-dest" => b"document".to_vec(),
+                            "connection" => b"keep-alive".to_vec(),
+                            "pragma" | "cache-control" => b"no-cache".to_vec(),
+                            "referer" => b"https://localhost/initial".to_vec(),
+                            "cookie" => b"visitor=local-visit".to_vec(),
+                            _ => b"supplied".to_vec(),
+                        };
+                        (name, value)
+                    })
+                    .collect();
+                request
+                    .headers
+                    .push(("Proxy-Authorization".into(), b"Basic local-only".to_vec()));
+                request
+                    .headers
+                    .push(("Proxy-Connection".into(), b"keep-alive".to_vec()));
+                WreqTransport::with_chrome_major(major)
+                    .unwrap()
+                    .send(&dial, request)
+                    .await
+                    .unwrap();
+                let wire = server.await.unwrap();
+                let names = wire
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(':').map(|(name, _)| name.to_string()))
+                    .collect::<Vec<_>>();
+                assert_eq!(names, expected, "Chrome{major}: {wire}");
+                assert!(!wire.contains("local-only"));
+                if expected.contains(&"Cache-Control") {
+                    assert!(wire.contains("Pragma: no-cache\r\n"));
+                    assert!(wire.contains("Cache-Control: no-cache\r\n"));
+                }
+                if expected.contains(&"Cookie") {
+                    assert!(wire.contains("Cookie: visitor=local-visit\r\n"));
+                    assert!(wire.contains("Referer: https://localhost/initial\r\n"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmeasured_navigation_headers_keep_their_values_without_assuming_native_order() {
+        let mut request = cache_request();
+        request.headers = vec![
+            ("sec-fetch-mode".into(), b"navigate".to_vec()),
+            ("sec-fetch-dest".into(), b"document".to_vec()),
+            ("cache-control".into(), b"no-cache".to_vec()),
+            ("x-visitor-preference".into(), b"comfortable".to_vec()),
+        ];
+        let headers = canonical_headers(&request.headers, 0).unwrap();
+        assert!(measured_navigation_header_order(&request, &headers).is_none());
+        assert_eq!(headers["x-visitor-preference"], "comfortable");
+        assert_eq!(headers["cache-control"], "no-cache");
+    }
+
+    #[tokio::test]
+    async fn secure_websocket_upgrade_uses_profiled_tls_and_preserves_nonce_protocol_and_early_frames(
+    ) {
+        use futures::SinkExt;
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        use tokio_tungstenite::tungstenite::Message;
+        for major in [146, 149] {
+            let certificate =
+                rcgen::generate_simple_self_signed(vec!["socket.test".into()]).unwrap();
+            let key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+            let mut tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.cert.der().clone()], key.into())
+            .unwrap();
+            tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let mut transport = WreqTransport::with_chrome_major(major).unwrap();
+            transport.test_cert_store = Some(
+                wreq::tls::trust::CertStore::from_der_certs([certificate.cert.der().as_ref()])
+                    .unwrap(),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let hello = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    socket,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    hello.client_hello().alpn().unwrap().collect::<Vec<_>>(),
+                    [b"http/1.1".as_slice()]
+                );
+                let ciphers = hello
+                    .client_hello()
+                    .cipher_suites()
+                    .iter()
+                    .copied()
+                    .map(u16::from)
+                    .filter(|cipher| !(cipher >> 8 == cipher & 255 && cipher & 0x0f0f == 0x0a0a))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    ciphers,
+                    [
+                        4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 49171, 49172,
+                        156, 157, 47, 53
+                    ],
+                    "cipher order measured from native Chromium146/149"
+                );
+                let mut socket = hello.into_stream(std::sync::Arc::new(tls)).await.unwrap();
+                let mut raw = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    raw.push(byte[0]);
+                    if raw.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let wire = String::from_utf8(raw).unwrap();
+                assert!(wire.contains("dGhlIHNhbXBsZSBub25jZQ=="));
+                // A frame immediately following 101 must survive Wreq's read buffer.
+                socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: updates\r\n\r\n\x81\x05hello").await.unwrap();
+                let mut socket =
+                    tokio_tungstenite::WebSocketStream::from_raw_socket(socket, Role::Server, None)
+                        .await;
+                assert_eq!(
+                    socket.next().await.unwrap().unwrap(),
+                    Message::Text("received".into())
+                );
+            });
+            let mut dial = cache_dial(&address.to_string(), 1);
+            dial.hostname = "socket.test".into();
+            dial.port = address.port();
+            let mut request = cache_request();
+            request.url = format!("https://socket.test:{}/events", address.port());
+            request.headers = vec![
+                ("Connection".into(), b"Upgrade".to_vec()),
+                ("Upgrade".into(), b"websocket".to_vec()),
+                (
+                    "Sec-WebSocket-Key".into(),
+                    b"dGhlIHNhbXBsZSBub25jZQ==".to_vec(),
+                ),
+                ("Sec-WebSocket-Version".into(), b"13".to_vec()),
+                ("Sec-WebSocket-Protocol".into(), b"updates".to_vec()),
+            ];
+            let response = transport.send_upgrade(&dial, request).await.unwrap();
+            assert_eq!(
+                response.transport_profile,
+                format!("wreq_chrome{major}_protocol_profile")
+            );
+            assert_eq!(response.status, StatusCode::SWITCHING_PROTOCOLS);
+            assert!(response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "sec-websocket-protocol" && value == b"updates"));
+            let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                response.upgraded.unwrap(),
+                Role::Client,
+                None,
+            )
+            .await;
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Text("hello".into())
+            );
+            socket.send(Message::Text("received".into())).await.unwrap();
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -623,6 +1386,7 @@ mod tests {
             path: "/".into(),
         };
         let request = |preserve_identity_headers, headers| OutboundRequest {
+            identity: TransportIdentity::for_reply(ProjectId(1), &[]),
             method: Method::GET,
             url: format!("http://identity.test:{}/", address.port()),
             headers,
@@ -799,6 +1563,7 @@ mod tests {
             path: "/".into(),
         };
         let request = || OutboundRequest {
+            identity: TransportIdentity::for_reply(ProjectId(1), &[]),
             method: Method::GET,
             url: format!("http://pool.test:{}/", address.port()),
             headers: vec![],
@@ -846,6 +1611,7 @@ mod tests {
             .send(
                 &dial,
                 OutboundRequest {
+                    identity: TransportIdentity::for_reply(ProjectId(1), &[]),
                     method: Method::GET,
                     url: "http://cache.test/proxy-check".into(),
                     headers: vec![],
@@ -896,6 +1662,7 @@ mod tests {
             .send(
                 &dial,
                 OutboundRequest {
+                    identity: TransportIdentity::for_reply(ProjectId(1), &[]),
                     method: Method::GET,
                     url: format!("http://profile.test:{}/", addr.port()),
                     headers: vec![],
@@ -947,6 +1714,7 @@ mod tests {
             .send_stream(
                 &dial,
                 OutboundRequest {
+                    identity: TransportIdentity::for_reply(ProjectId(1), &[]),
                     method: Method::GET,
                     url: format!("http://stream.test:{}/", addr.port()),
                     headers: vec![],
@@ -1011,6 +1779,7 @@ mod tests {
             .send(
                 &dial,
                 OutboundRequest {
+                    identity: TransportIdentity::for_reply(ProjectId(1), &[]),
                     method: Method::POST,
                     url: format!("http://upload.test:{}/", addr.port()),
                     headers: vec![],

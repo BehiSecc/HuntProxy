@@ -3,26 +3,19 @@ use crate::app::{AppEvent, AppState};
 use crate::domain::*;
 use crate::policy::scope::{resolve_validated_dial, url_is_in_scope, TargetRef};
 use crate::storage::NewExchange;
+use crate::transport::{OutboundBody, OutboundRequest, ProtocolMode, TransportIdentity};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{client_async_with_config, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 use url::Url;
-
-trait AsyncSocket: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncSocket for T {}
-type BoxedSocket = Box<dyn AsyncSocket>;
 
 pub(super) fn is_upgrade<B>(request: &Request<B>) -> bool {
     request
@@ -32,12 +25,14 @@ pub(super) fn is_upgrade<B>(request: &Request<B>) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
         && request
             .headers()
-            .get(http::header::CONNECTION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .any(|value| {
+                value.to_str().is_ok_and(|value| {
+                    value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                })
             })
 }
 
@@ -78,8 +73,10 @@ pub(super) async fn handle(
         )
         .await?,
     );
-    let upstream_request = upstream_request(&websocket_url, &request_headers)?;
-    let socket = connect_socket(&target, &dial, upstream_proxy.as_deref()).await?;
+    // Compression extensions are not supported by the existing frame relay.
+    // Preserve the browser's nonce, cookies, Origin and subprotocol list.
+    request_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("sec-websocket-extensions"));
+    validate_request_headers(&request_headers)?;
     let cap = usize::try_from(project.limits.capture_body_bytes).unwrap_or(usize::MAX);
     let websocket_config = WebSocketConfig::default()
         .read_buffer_size(16 * 1024)
@@ -87,26 +84,38 @@ pub(super) async fn handle(
         .max_message_size(Some(cap))
         .max_frame_size(Some(cap));
     let started = Instant::now();
-    let (upstream, upstream_response) =
-        client_async_with_config(upstream_request, socket, Some(websocket_config))
-            .await
-            .map_err(ws_error)?;
+    let mut upstream_response = state
+        .transport
+        .send_upgrade(
+            &dial,
+            OutboundRequest {
+                identity: TransportIdentity::for_capture(&session),
+                method: http::Method::GET,
+                url: http_url.clone(),
+                headers: request_headers.clone(),
+                body: OutboundBody::Empty,
+                protocol: ProtocolMode::Http1,
+                connect_timeout: Duration::from_secs(10),
+                total_timeout: Duration::from_secs(60),
+                max_body_bytes: project.limits.capture_body_bytes,
+                preserve_identity_headers: true,
+                upstream_proxy,
+            },
+        )
+        .await?;
+    let handshake_error = upstream_response.error.take().or_else(|| {
+        if upstream_response.status == StatusCode::SWITCHING_PROTOCOLS {
+            validate_response_headers(&request_headers, &upstream_response.headers).err()
+        } else {
+            None
+        }
+    });
 
-    let response_headers = upstream_response
-        .headers()
+    let response_headers = upstream_response.headers.clone();
+    let protocol = response_headers
         .iter()
-        .filter(|(name, _)| {
-            !name
-                .as_str()
-                .eq_ignore_ascii_case("sec-websocket-extensions")
-        })
-        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
-        .collect::<Vec<_>>();
-    let protocol = upstream_response
-        .headers()
-        .get("sec-websocket-protocol")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
+        .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
+        .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
 
     let handshake_exchange_id = if capture {
         match state
@@ -122,19 +131,37 @@ pub(super) async fn handle(
                 port: target.port,
                 path: target.path.clone(),
                 query: target.query.clone(),
-                status_code: Some(upstream_response.status().as_u16()),
+                status_code: Some(upstream_response.status.as_u16()),
                 mime: None,
-                completion: CompletionState::Complete,
-                capture_quality: CaptureQuality::WirePreserved,
-                header_representation: HeaderRepresentation::WirePreserved,
-                body_representation: BodyRepresentation::Unavailable,
+                completion: if let Some(error) = &handshake_error {
+                    match error.code() {
+                        ErrorCode::Timeout => CompletionState::Timeout,
+                        ErrorCode::ProtocolError | ErrorCode::InvalidArgument => {
+                            CompletionState::ProtocolError
+                        }
+                        _ => CompletionState::ConnectionError,
+                    }
+                } else if upstream_response.body_truncated {
+                    CompletionState::TruncatedByPolicy
+                } else {
+                    CompletionState::Complete
+                },
+                capture_quality: CaptureQuality::Semantic,
+                header_representation: HeaderRepresentation::Semantic,
+                body_representation: if upstream_response.status == StatusCode::SWITCHING_PROTOCOLS
+                {
+                    BodyRepresentation::Unavailable
+                } else {
+                    BodyRepresentation::SemanticEncoded
+                },
                 cache_provenance: CacheProvenance::None,
-                transport_provenance: Some(TransportProvenance::GenericUnprofiled),
-                transport_profile: Some("websocket_raw_tunnel".into()),
+                transport_provenance: Some(upstream_response.transport_provenance),
+                transport_profile: Some(upstream_response.transport_profile.clone()),
                 request_headers: header_entries(&request_headers),
                 response_headers: header_entries(&response_headers),
                 request_body: None,
-                response_body: None,
+                response_body: (upstream_response.status != StatusCode::SWITCHING_PROTOCOLS)
+                    .then(|| upstream_response.body.to_vec()),
                 duration_ms: Some(started.elapsed().as_millis() as i64),
                 lineage: ExchangeLineage {
                     capture_session_id: Some(session.id),
@@ -143,7 +170,7 @@ pub(super) async fn handle(
                     ..Default::default()
                 },
                 page_title: None,
-                error_message: None,
+                error_message: handshake_error.as_ref().map(ToString::to_string),
             })
             .await
         {
@@ -175,6 +202,35 @@ pub(super) async fn handle(
     } else {
         None
     };
+
+    if upstream_response.status == StatusCode::SWITCHING_PROTOCOLS {
+        if let Some(error) = handshake_error {
+            return Err(error);
+        }
+    }
+    if upstream_response.status != StatusCode::SWITCHING_PROTOCOLS {
+        // Keep an origin's failed handshake visible to the browser and History.
+        let mut response = Response::builder().status(upstream_response.status);
+        for (name, value) in response_headers {
+            if !name.eq_ignore_ascii_case("transfer-encoding")
+                && !name.eq_ignore_ascii_case("content-length")
+            {
+                response = response.header(name, value);
+            }
+        }
+        return response
+            .body(full_body(upstream_response.body))
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()));
+    }
+    let upstream_socket = upstream_response.upgraded.take().ok_or_else(|| {
+        DomainError::new(
+            ErrorCode::ProtocolError,
+            "successful WebSocket handshake has no upgraded socket",
+        )
+    })?;
+    let upstream =
+        WebSocketStream::from_raw_socket(upstream_socket, Role::Client, Some(websocket_config))
+            .await;
 
     let connection = if capture {
         match state
@@ -396,88 +452,92 @@ fn websocket_policy_url(raw: &str) -> DomainResult<String> {
     Ok(url.into())
 }
 
-fn upstream_request(url: &str, headers: &[(String, Vec<u8>)]) -> DomainResult<http::Request<()>> {
-    let mut request = http::Request::builder()
-        .method("GET")
-        .uri(url)
-        .body(())
-        .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("proxy-authorization")
-            || name.eq_ignore_ascii_case("proxy-connection")
-            || name.eq_ignore_ascii_case("sec-websocket-extensions")
-        {
-            continue;
-        }
-        let name = http::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|error| DomainError::invalid(format!("WebSocket header name: {error}")))?;
-        let value = http::HeaderValue::from_bytes(value)
-            .map_err(|error| DomainError::invalid(format!("WebSocket header value: {error}")))?;
-        request.headers_mut().append(name, value);
-    }
-    Ok(request)
+fn header_values<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Vec<&'a [u8]> {
+    headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_slice())
+        .collect()
 }
 
-async fn connect_socket(
-    target: &TargetRef,
-    dial: &ValidatedDial,
-    upstream_proxy: Option<&str>,
-) -> DomainResult<BoxedSocket> {
-    if upstream_proxy.is_some() {
-        let stream = tokio::time::timeout(
-            Duration::from_secs(15),
-            crate::reply::raw::connect_target(target, upstream_proxy),
-        )
-        .await
-        .map_err(|_| DomainError::new(ErrorCode::Timeout, "upstream connection timed out"))??;
-        if dial.scheme == "https" {
-            let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            let server_name = ServerName::try_from(dial.hostname.clone())
-                .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
-            let tls = TlsConnector::from(Arc::new(config))
-                .connect(server_name, stream)
-                .await
-                .map_err(|error| DomainError::new(ErrorCode::Unavailable, error.to_string()))?;
-            return Ok(Box::new(tls));
-        }
-        return Ok(Box::new(stream));
+fn single_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> DomainResult<&'a str> {
+    let values = header_values(headers, name);
+    if values.len() != 1 {
+        return Err(DomainError::invalid(format!(
+            "WebSocket requires one {name} header"
+        )));
     }
-    let mut last_error = None;
-    let mut stream = None;
-    for address in &dial.approved_socket_addrs {
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(address)).await {
-            Ok(Ok(candidate)) => {
-                stream = Some(candidate);
-                break;
-            }
-            Ok(Err(error)) => last_error = Some(error.to_string()),
-            Err(_) => last_error = Some("connect timed out".into()),
-        }
+    std::str::from_utf8(values[0])
+        .map_err(|_| DomainError::invalid(format!("invalid WebSocket {name}")))
+}
+
+fn validate_request_headers(headers: &[(String, Vec<u8>)]) -> DomainResult<()> {
+    use base64::Engine;
+    let key = single_header(headers, "sec-websocket-key")?;
+    if !base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .is_ok_and(|decoded| decoded.len() == 16)
+    {
+        return Err(DomainError::invalid("invalid WebSocket key"));
     }
-    let stream = stream.ok_or_else(|| {
+    if single_header(headers, "sec-websocket-version")? != "13" {
+        return Err(DomainError::invalid("unsupported WebSocket version"));
+    }
+    Ok(())
+}
+
+fn validate_response_headers(
+    request: &[(String, Vec<u8>)],
+    response: &[(String, Vec<u8>)],
+) -> DomainResult<()> {
+    let error = || {
         DomainError::new(
-            ErrorCode::Unavailable,
-            last_error.unwrap_or_else(|| "no approved WebSocket address".into()),
+            ErrorCode::ProtocolError,
+            "invalid upstream WebSocket handshake",
         )
-    })?;
-    if dial.scheme == "https" {
-        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let server_name = ServerName::try_from(dial.hostname.clone())
-            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
-        let tls = TlsConnector::from(Arc::new(config))
-            .connect(server_name, stream)
-            .await
-            .map_err(|error| DomainError::new(ErrorCode::Unavailable, error.to_string()))?;
-        Ok(Box::new(tls))
-    } else {
-        Ok(Box::new(stream))
+    };
+    let upgrade = single_header(response, "upgrade").map_err(|_| error())?;
+    let connections = header_values(response, "connection");
+    let accept = single_header(response, "sec-websocket-accept").map_err(|_| error())?;
+    let key = single_header(request, "sec-websocket-key")?;
+    if !upgrade.eq_ignore_ascii_case("websocket")
+        || !connections.iter().any(|value| {
+            std::str::from_utf8(value).is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        })
+        || accept != tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes())
+        || !header_values(response, "sec-websocket-extensions").is_empty()
+    {
+        return Err(error());
     }
+    let selected = header_values(response, "sec-websocket-protocol");
+    if selected.len() > 1 {
+        return Err(error());
+    }
+    let offered = header_values(request, "sec-websocket-protocol");
+    if selected.is_empty()
+        && offered.iter().any(|value| {
+            std::str::from_utf8(value)
+                .is_ok_and(|value| value.split(',').any(|protocol| !protocol.trim().is_empty()))
+        })
+    {
+        return Err(error());
+    }
+    if let Some(selected) = selected.first() {
+        let selected = std::str::from_utf8(selected).map_err(|_| error())?;
+        if selected.is_empty()
+            || !offered.iter().any(|value| {
+                std::str::from_utf8(value)
+                    .is_ok_and(|value| value.split(',').any(|protocol| protocol.trim() == selected))
+            })
+        {
+            return Err(error());
+        }
+    }
+    Ok(())
 }
 
 fn ws_error(error: tokio_tungstenite::tungstenite::Error) -> DomainError {
@@ -496,6 +556,13 @@ mod tests {
             .body(())
             .unwrap();
         assert!(is_upgrade(&request));
+        let repeated = Request::builder()
+            .header("upgrade", "websocket")
+            .header("connection", "keep-alive")
+            .header("connection", "Upgrade")
+            .body(())
+            .unwrap();
+        assert!(is_upgrade(&repeated));
         assert_eq!(
             websocket_policy_url("ws://example.test/chat").unwrap(),
             "http://example.test/chat"
@@ -504,5 +571,49 @@ mod tests {
             websocket_url("https://example.test/chat").unwrap(),
             "wss://example.test/chat"
         );
+    }
+    #[test]
+    fn upstream_handshake_requires_the_original_nonce_and_valid_protocol_selection() {
+        let request = vec![
+            (
+                "sec-websocket-key".into(),
+                b"dGhlIHNhbXBsZSBub25jZQ==".to_vec(),
+            ),
+            ("sec-websocket-version".into(), b"13".to_vec()),
+            ("sec-websocket-protocol".into(), b"updates, events".to_vec()),
+        ];
+        let response = vec![
+            ("upgrade".into(), b"websocket".to_vec()),
+            ("connection".into(), b"Upgrade".to_vec()),
+            (
+                "sec-websocket-accept".into(),
+                b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".to_vec(),
+            ),
+        ];
+        assert!(validate_request_headers(&request).is_ok());
+        assert!(
+            validate_response_headers(&request, &response).is_err(),
+            "missing selected protocol"
+        );
+        let mut valid = response.clone();
+        valid.push(("sec-websocket-protocol".into(), b"updates".to_vec()));
+        assert!(validate_response_headers(&request, &valid).is_ok());
+        let mut wrong = response.clone();
+        wrong.push(("sec-websocket-protocol".into(), b"archive".to_vec()));
+        assert!(validate_response_headers(&request, &wrong).is_err());
+        valid.push(("Sec-WebSocket-Protocol".into(), b"events".to_vec()));
+        assert!(validate_response_headers(&request, &valid).is_err());
+        let mut no_protocol = request.clone();
+        no_protocol.pop();
+        assert!(validate_response_headers(&no_protocol, &response).is_ok());
+        let mut repeated_connection = response.clone();
+        repeated_connection.push(("Connection".into(), b"keep-alive".to_vec()));
+        assert!(validate_response_headers(&no_protocol, &repeated_connection).is_ok());
+        repeated_connection[1].1 = b"keep-alive".to_vec();
+        repeated_connection.last_mut().unwrap().1 = b"Upgrade".to_vec();
+        assert!(validate_response_headers(&no_protocol, &repeated_connection).is_ok());
+        let mut wrong_nonce = response.clone();
+        wrong_nonce[2].1 = b"incorrect".to_vec();
+        assert!(validate_response_headers(&no_protocol, &wrong_nonce).is_err());
     }
 }
