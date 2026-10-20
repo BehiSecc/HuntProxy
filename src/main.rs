@@ -284,6 +284,14 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     .as_deref()
                     .unwrap_or("unknown"),
             );
+            println!(
+                "  mode:       {}",
+                match browser.headless {
+                    Some(true) => "headless",
+                    Some(false) => "headed",
+                    None => "unknown",
+                }
+            );
             let transport = huntproxy::app::TransportStatus::for_browser_version(
                 browser.chromium_version.as_deref(),
             );

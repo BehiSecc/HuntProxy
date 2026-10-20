@@ -40,6 +40,8 @@ pub struct BrowserInstallStatus {
     #[serde(default)]
     pub chromium_version: Option<String>,
     #[serde(default)]
+    pub headless: Option<bool>,
+    #[serde(default)]
     pub playwright_core_path: Option<String>,
     #[serde(default)]
     pub playwright_version: Option<String>,
@@ -57,6 +59,7 @@ struct BrowserRuntimeInspection {
     expected_chromium_version: Option<String>,
     chromium_path: Option<PathBuf>,
     chromium_version: Option<String>,
+    headless: Option<bool>,
     #[serde(skip)]
     inspection_error: Option<String>,
 }
@@ -885,7 +888,7 @@ impl WorkerProcess {
         {
             let _ = self.child.start_kill();
         }
-        match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
+        match tokio::time::timeout(Duration::from_secs(6), self.child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(_)) | Err(_) => {
                 let _ = self.child.kill().await;
@@ -979,6 +982,7 @@ fn browser_install_status(
         chromium_available,
         chromium_path: chromium_path.map(|path| path.display().to_string()),
         chromium_version: runtime.chromium_version.clone(),
+        headless: runtime.headless,
         playwright_core_path: playwright_core_path.map(|path| path.display().to_string()),
         playwright_version: runtime.playwright_version.clone(),
         expected_chromium_version: runtime.expected_chromium_version.clone(),
@@ -1309,7 +1313,14 @@ impl BrowserService {
         .await;
         if result.is_err() {
             if let Some(lease) = lease {
-                self.profile_leases.lock().await.remove(&lease);
+                let still_owned = self.runtime_sessions.lock().await.values().any(|runtime| {
+                    runtime.project_id.get() == lease.0
+                        && runtime.persistent
+                        && runtime.profile.as_deref() == Some(lease.1.as_str())
+                });
+                if !still_owned {
+                    self.profile_leases.lock().await.remove(&lease);
+                }
             }
         }
         result
@@ -1457,13 +1468,23 @@ impl BrowserService {
         } else {
             "ok"
         };
+        // Track ownership before launch so a failed startup whose cleanup
+        // cannot stop Chromium remains visible and keeps its profile lease.
+        self.runtime_sessions.lock().await.insert(
+            session.id.get(),
+            RuntimeSession {
+                project_id,
+                capture_session_id: capture.id,
+                persistent,
+                profile: profile.clone(),
+                cdp: None,
+            },
+        );
         let result = match self.call_worker("session.start", start_params).await {
             Ok(result) => result,
             Err(error) => {
-                session.state = BrowserSessionState::Failed;
-                session.checkpoint_status = Some("start_failed".into());
-                let _ = self.db.update_browser_session(&session).await;
-                let _ = self.db.revoke_capture_session(project_id, capture.id).await;
+                self.cleanup_failed_start(project_id, &mut session, capture.id)
+                    .await?;
                 return Err(error);
             }
         };
@@ -1471,14 +1492,14 @@ impl BrowserService {
             verify_worker_identity(&result, session.id, profile_name, profile_dir.as_deref())
         {
             self.cleanup_failed_start(project_id, &mut session, capture.id)
-                .await;
+                .await?;
             return Err(error);
         }
         let checkpoint = match result.get("checkpoint") {
             Some(checkpoint) => checkpoint,
             None => {
                 self.cleanup_failed_start(project_id, &mut session, capture.id)
-                    .await;
+                    .await?;
                 return Err(DomainError::new(
                     ErrorCode::ProtocolError,
                     "worker omitted checkpoint",
@@ -1498,7 +1519,7 @@ impl BrowserService {
             Ok(saved) => saved,
             Err(error) => {
                 self.cleanup_failed_start(project_id, &mut session, capture.id)
-                    .await;
+                    .await?;
                 return Err(error);
             }
         };
@@ -1511,7 +1532,7 @@ impl BrowserService {
         session.checkpoint_hash = Some(saved.hash);
         if let Err(error) = self.db.update_browser_session(&session).await {
             self.cleanup_failed_start(project_id, &mut session, capture.id)
-                .await;
+                .await?;
             return Err(error);
         }
         if let Some(profile_name) = profile_name {
@@ -1520,20 +1541,10 @@ impl BrowserService {
                 .await
             {
                 self.cleanup_failed_start(project_id, &mut session, capture.id)
-                    .await;
+                    .await?;
                 return Err(error);
             }
         }
-        self.runtime_sessions.lock().await.insert(
-            session.id.get(),
-            RuntimeSession {
-                project_id,
-                capture_session_id: capture.id,
-                persistent,
-                profile,
-                cdp: None,
-            },
-        );
         if let Err(error) = self
             .persist_javascript_files(project_id, session.id, session.current_url.as_deref())
             .await
@@ -1600,11 +1611,26 @@ impl BrowserService {
         project_id: ProjectId,
         session: &mut BrowserSession,
         capture_session_id: CaptureSessionId,
-    ) {
-        let _ = self
-            .call_worker("session.stop", json!({ "session_id": session.id.get() }))
-            .await;
+    ) -> DomainResult<()> {
+        let cleanup_error = if self.worker.lock().await.is_some() {
+            self.call_worker("session.stop", json!({ "session_id": session.id.get() }))
+                .await
+                .err()
+        } else {
+            None
+        };
         session.state = BrowserSessionState::Failed;
+        if let Some(error) = cleanup_error {
+            if self.worker.lock().await.is_some() {
+                session.checkpoint_status = Some("start_cleanup_failed".into());
+                let _ = self.db.update_browser_session(session).await;
+                return Err(DomainError::new(
+                    error.code(),
+                    format!("browser startup failed and session {} could not stop: {error}; retry stopping this session before reusing its profile", session.id.get()),
+                ));
+            }
+        }
+        self.runtime_sessions.lock().await.remove(&session.id.get());
         session.checkpoint_status = Some("start_failed".into());
         let _ = self.db.update_browser_session(session).await;
         self.checkpoints.lock().await.remove(&session.id.get());
@@ -1612,6 +1638,7 @@ impl BrowserService {
             .db
             .revoke_capture_session(project_id, capture_session_id)
             .await;
+        Ok(())
     }
 
     async fn cookies_for_launch(
@@ -2272,10 +2299,16 @@ impl BrowserService {
             .cloned();
         let mut persistence_error = None;
         if let Some(runtime) = &runtime {
-            if let Ok(result) = self
+            let result = self
                 .call_worker("session.stop", json!({ "session_id": session_id.get() }))
-                .await
-            {
+                .await;
+            if result.is_err() && self.worker.lock().await.is_some() {
+                // A live worker reports cleanup failure while retaining the
+                // browser. Keep its runtime, profile lease and credentials so
+                // callers can retry rather than opening the profile twice.
+                return result.map(|_| ());
+            }
+            if let Ok(result) = result {
                 if let Some(checkpoint) = result.get("checkpoint") {
                     if let Err(error) = self
                         .save_checkpoint(
@@ -4226,6 +4259,125 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_browser_cleanup_retains_ownership_until_stop_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("worker.sh");
+        std::fs::write(
+            &script,
+            r#"
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  case "$n" in
+    1) printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}' ;;
+    2) printf '%s\n' '{"id":2,"error":{"code":-32000,"message":"Owned browser remains in use"}}' ;;
+    *) printf '{"id":%s,"result":{"stopped":true}}\n' "$n" ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "Browser cleanup recovery".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        // Exercise both explicit stop and the failed-start cleanup caller.
+        for failed_start in [false, true] {
+            let mut service = BrowserService::new_with_proxy_and_ca(
+                db.clone(),
+                None,
+                None,
+                "http://127.0.0.1:17891".into(),
+                None,
+                directory.path().join("profiles"),
+            );
+            service.node_path = Some(PathBuf::from("/bin/sh"));
+            service.worker_path = Some(script.clone());
+            *service.worker.lock().await = Some(
+                WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
+                    .await
+                    .unwrap_or_else(|_| panic!("start cleanup fixture worker")),
+            );
+            let mut session = db
+                .create_browser_session(project.id, Some("account1".into()))
+                .await
+                .unwrap();
+            let capture = db
+                .create_capture_session(CreateCaptureSession {
+                    project_id: project.id,
+                    browser_session_id: Some(session.id),
+                    browser_action_id: None,
+                    is_browser_bound: true,
+                    ttl: None,
+                })
+                .await
+                .unwrap();
+            service.runtime_sessions.lock().await.insert(
+                session.id.get(),
+                RuntimeSession {
+                    project_id: project.id,
+                    capture_session_id: capture.id,
+                    persistent: true,
+                    profile: Some("account1".into()),
+                    cdp: None,
+                },
+            );
+            let lease = (project.id.get(), "account1".to_string());
+            service.profile_leases.lock().await.insert(lease.clone());
+            let error = if failed_start {
+                service
+                    .cleanup_failed_start(project.id, &mut session, capture.id)
+                    .await
+                    .unwrap_err()
+            } else {
+                service.stop(project.id, session.id).await.unwrap_err()
+            };
+            assert_eq!(error.code(), ErrorCode::Unavailable);
+            assert!(service
+                .runtime_sessions
+                .lock()
+                .await
+                .contains_key(&session.id.get()));
+            assert!(service.profile_leases.lock().await.contains(&lease));
+            assert!(db
+                .list_capture_sessions(project.id)
+                .await
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate.id == capture.id)
+                .unwrap()
+                .revoked_at
+                .is_none());
+            assert!(service
+                .delete_browser_profile(project.id, "account1")
+                .await
+                .is_err());
+            service.stop(project.id, session.id).await.unwrap();
+            assert!(!service
+                .runtime_sessions
+                .lock()
+                .await
+                .contains_key(&session.id.get()));
+            assert!(!service.profile_leases.lock().await.contains(&lease));
+            assert!(db
+                .list_capture_sessions(project.id)
+                .await
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate.id == capture.id)
+                .unwrap()
+                .revoked_at
+                .is_some());
+        }
+    }
+
     #[test]
     fn browser_profile_names_are_path_safe() {
         for valid in ["default", "account1", "qa-user", "qa_user"] {
@@ -4497,6 +4649,7 @@ mod tests {
             expected_chromium_version: Some("149.0.7827.55".into()),
             chromium_path: Some(chromium),
             chromium_version: Some("153.0.8010.36".into()),
+            headless: Some(false),
             ..BrowserRuntimeInspection::default()
         };
 
@@ -4507,6 +4660,7 @@ mod tests {
         assert_eq!(ready.install_hint, None);
         assert_eq!(ready.playwright_version.as_deref(), Some("1.61.1"));
         assert_eq!(ready.chromium_version.as_deref(), Some("153.0.8010.36"));
+        assert_eq!(ready.headless, Some(false));
         assert_eq!(
             ready.expected_chromium_version.as_deref(),
             Some("149.0.7827.55")
@@ -4559,6 +4713,7 @@ mod tests {
             "expected_chromium_version": "149.0.7827.55",
             "chromium_path": &node,
             "chromium_version": "153.0.8010.36",
+            "headless": false,
         });
         std::fs::write(
             &node,
@@ -4575,6 +4730,7 @@ mod tests {
         assert_eq!(runtime.chromium_path.as_deref(), Some(node.as_path()));
         assert_eq!(runtime.playwright_version.as_deref(), Some("1.61.1"));
         assert_eq!(runtime.chromium_version.as_deref(), Some("153.0.8010.36"));
+        assert_eq!(runtime.headless, Some(false));
         assert_eq!(
             std::fs::read_to_string(&arguments).unwrap(),
             format!("{}\n--inspect-runtime\n", worker.display())

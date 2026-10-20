@@ -9,12 +9,15 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import net from "node:net";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const PROTOCOL = 1;
 const sessions = new Map();
+const ownedChromeChildren = new Set();
+let shuttingDown = false;
 const MAX_SESSION_EVENTS = 256;
 const MAX_SESSION_EVENT_BYTES = 256 * 1024;
 const MAX_SCREENSHOT_PIXELS = 16 * 1024 * 1024;
@@ -630,10 +633,18 @@ function inspectBrowserRuntime() {
     playwright_core_path: playwrightRuntime.packageDir,
     playwright_version: playwrightRuntime.version,
     expected_chromium_version: playwrightRuntime.expectedChromiumVersion,
+    headless: browserHeadless(),
     chromium_path: executable ? path.resolve(executable) : null,
     chromium_version: version?.status === 0
       ? version.stdout?.match(/\b\d+\.\d+\.\d+\.\d+\b/)?.[0] || null : null,
   };
+}
+
+function browserHeadless() {
+  const value = process.env.HUNTPROXY_BROWSER_HEADLESS?.trim().toLowerCase();
+  if (value == null || value === "" || value === "true" || value === "1") return true;
+  if (value === "false" || value === "0") return false;
+  throw new Error("HUNTPROXY_BROWSER_HEADLESS must be true or false");
 }
 
 function chromiumProxy(proxy) {
@@ -664,7 +675,7 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
   }
   return {
     executablePath: browserRuntime.chromium_path,
-    headless: true,
+    headless: browserRuntime.headless,
     proxy: chromiumProxy(proxy),
     ignoreHTTPSErrors: Boolean(caCertPath),
     serviceWorkers: "allow",
@@ -672,7 +683,107 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
   };
 }
 
+async function nativeDebugPort(preferred) {
+  const listener = net.createServer();
+  await new Promise((resolve, reject) => {
+    listener.once("error", reject);
+    listener.listen(preferred ?? 0, "127.0.0.1", resolve);
+  });
+  const port = listener.address().port;
+  await new Promise((resolve) => listener.close(resolve));
+  return port;
+}
+
+function chromeExited(child, timeout) {
+  if (!child.pid || child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (exited) => {
+      clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeout);
+    child.once("exit", onExit);
+  });
+}
+
+async function stopOwnedChrome(child) {
+  if (!child || await chromeExited(child, 1_500)) return;
+  child.kill("SIGTERM");
+  if (await chromeExited(child, 1_000)) return;
+  child.kill("SIGKILL");
+  if (!await chromeExited(child, 1_000)) throw new Error("Owned Chromium did not exit; its profile remains in use");
+}
+
+async function launchNativeChromium(proxy, caCertPath, profileDir, cdpPort) {
+  const port = await nativeDebugPort(cdpPort);
+  if (shuttingDown) throw new Error("Browser worker is shutting down");
+  const artifactsDir = path.join(profileDir, "huntproxy-artifacts");
+  fs.mkdirSync(artifactsDir, { recursive: true, mode: 0o700 });
+  const args = [
+    `--user-data-dir=${profileDir}`, `--remote-debugging-port=${port}`,
+    "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
+    ...chromiumLaunchOptions(proxy, caCertPath).args,
+    ...(cdpPort != null ? [`--remote-allow-origins=http://127.0.0.1:${port},https://chrome-devtools-frontend.appspot.com`] : []),
+    ...(proxy?.server ? [`--proxy-server=${proxy.server}`] : []),
+    ...(caCertPath ? ["--ignore-certificate-errors"] : []),
+    "about:blank",
+  ];
+  const child = spawn(browserRuntime.chromium_path, args, { stdio: ["ignore", "ignore", "pipe"] });
+  ownedChromeChildren.add(child);
+  child.once("close", () => ownedChromeChildren.delete(child));
+  child.once("exit", () => ownedChromeChildren.delete(child));
+  let browser;
+  try {
+    // Trust only the endpoint emitted by this owned child, never another
+    // browser that happens to occupy the selected port. Drain other stderr
+    // without exposing browser output through the worker's metadata channel.
+    const endpoint = await new Promise((resolve, reject) => {
+      let buffer = "";
+      let settled = false;
+      const finish = (error, endpoint) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.removeListener("exit", onExit);
+        buffer = "";
+        error ? reject(error) : resolve(endpoint);
+      };
+      const onError = () => finish(new Error("Could not start the selected Chromium executable"));
+      const onExit = () => finish(new Error("Chromium exited before startup; check the display and profile availability"));
+      const timer = setTimeout(() => finish(new Error("Chromium debugging endpoint did not become ready")), 15_000);
+      child.on("error", onError);
+      child.once("exit", onExit);
+      child.stderr.on("data", (chunk) => {
+        if (settled) return;
+        buffer = (buffer + chunk.toString()).slice(-8_192);
+        const match = buffer.match(/DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[A-Za-z0-9-]+)/);
+        if (match && new URL(match[1]).port === String(port)) finish(null, match[1]);
+      });
+    });
+    browser = await chromium.connectOverCDP(endpoint, { noDefaults: true, isLocal: true, artifactsDir });
+    const context = browser.contexts()[0];
+    if (!context) throw new Error("Chromium default context is missing");
+    if (proxy?.username || proxy?.password) {
+      await context.setHTTPCredentials({ username: proxy.username || "", password: proxy.password || "" });
+    }
+    const page = context.pages()[0] || await context.newPage();
+    return { browser, context, page, persistent: true, profileDir, ownedChrome: child };
+  } catch (error) {
+    try { await browser?.close(); } catch {}
+    try { await stopOwnedChrome(child); } catch (cleanupError) {
+      Object.defineProperty(cleanupError, "ownedRuntime", { value: {
+        browser: null, context: null, page: null, ownedChrome: child, persistent: true, profileDir,
+      } });
+      throw cleanupError;
+    }
+    throw error;
+  }
+}
+
 async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = null) {
+  if (shuttingDown) throw new Error("Browser worker is shutting down");
   const executablePath = browserRuntime.chromium_path;
   if (!executablePath) {
     throw rpcError(
@@ -685,6 +796,7 @@ async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = nu
   if (profileDir) {
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     try { fs.chmodSync(profileDir, 0o700); } catch {}
+    if (!browserRuntime.headless) return launchNativeChromium(proxy, caCertPath, profileDir, cdpPort);
     const context = await chromium.launchPersistentContext(profileDir, options);
     const page = context.pages()[0] || await context.newPage();
     return {
@@ -811,11 +923,14 @@ async function relaunchSession(session, cdpPort) {
   try {
     launched = await launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies, sessionStorage);
   } catch (error) {
+    if (error.ownedRuntime) Object.assign(session, error.ownedRuntime, { cdp: null });
+    if (error.ownedRuntime || shuttingDown) throw error;
     try {
       const restored = await launchSessionRuntime(session, null, currentUrl, sessionCookies, sessionStorage);
       Object.assign(session, restored.runtime, { cdp: null });
       await initializeSessionTracking(session, existingJavascriptFiles, nextGeneration);
     } catch (restoreError) {
+      if (restoreError.ownedRuntime) Object.assign(session, restoreError.ownedRuntime, { cdp: null });
       throw rpcError(
         -32000,
         `CDP handoff failed and the normal browser could not be restored: ${restoreError?.message || restoreError}`,
@@ -1478,9 +1593,7 @@ async function handle(req) {
             throw rpcError(-32602, "profile_dir is already active in another session");
           }
         }
-        const runtime = await launchChromium(params.proxy || null, caCertPath, profileDir);
         const session = {
-          ...runtime,
           engine,
           proxy: params.proxy || null,
           caCertPath,
@@ -1490,6 +1603,15 @@ async function handle(req) {
           preferProfileState: Boolean(params.prefer_profile_state),
           cdp: null,
         };
+        try {
+          Object.assign(session, await launchChromium(params.proxy || null, caCertPath, profileDir));
+        } catch (error) {
+          if (error.ownedRuntime) {
+            Object.assign(session, error.ownedRuntime);
+            sessions.set(sessionId, session);
+          }
+          throw error;
+        }
         sessions.set(sessionId, session);
         try {
           await initializeSessionTracking(session);
@@ -1766,7 +1888,7 @@ async function handle(req) {
         throw rpcError(-32601, `method not found: ${method}`);
     }
   } catch (error) {
-    const normalized = error?.code
+    const normalized = Number.isSafeInteger(error?.code) && typeof error.message === "string"
       ? error
       : rpcError(-32000, String(error?.message || error));
     logMeta("error", { method, code: normalized.code });
@@ -1775,6 +1897,24 @@ async function handle(req) {
 }
 
 async function closeRuntime(runtime) {
+  if (runtime.ownedChrome) {
+    try {
+      await Promise.race([
+        (async () => {
+          const cdp = await runtime.browser.newBrowserCDPSession();
+          await cdp.send("Browser.close");
+        })(),
+        new Promise((resolve) => { const timer = setTimeout(resolve, 1_000); timer.unref(); }),
+      ]);
+    } catch {}
+    try { await stopOwnedChrome(runtime.ownedChrome); } catch (error) {
+      Object.defineProperty(error, "ownedRuntime", { value: runtime });
+      throw error;
+    }
+    await disposeSessionTracking(runtime);
+    try { await runtime.browser?.close(); } catch {}
+    return;
+  }
   await disposeSessionTracking(runtime);
   try { await runtime.page?.close(); } catch {}
   try { await runtime.context?.close(); } catch {}
@@ -1784,8 +1924,8 @@ async function closeRuntime(runtime) {
 async function closeSession(sessionId) {
   const session = sessions.get(sessionId);
   if (!session) return;
-  sessions.delete(sessionId);
   await closeRuntime(session);
+  sessions.delete(sessionId);
   logMeta("session.stop", { session_id: sessionId });
 }
 
@@ -1802,15 +1942,25 @@ readline.on("line", (line) => {
   }
   queue = queue.then(() => handle(request)).catch(() => undefined);
 });
+async function shutdown(exitCode) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const registered = new Set([...sessions.values()].map((session) => session.ownedChrome));
+  // Close independent browsers together, including a native child whose
+  // startup has not reached session registration yet. One failure must not
+  // prevent termination of another profile's browser.
+  const results = await Promise.allSettled([
+    ...[...sessions.keys()].map(closeSession),
+    ...[...ownedChromeChildren].filter((child) => !registered.has(child)).map(stopOwnedChrome),
+  ]);
+  process.exit(results.some((result) => result.status === "rejected") ? 1 : exitCode);
+}
+
 readline.on("close", async () => {
   await queue;
-  for (const sessionId of [...sessions.keys()]) await closeSession(sessionId);
-  process.exit(0);
+  await shutdown(0);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, async () => {
-    for (const sessionId of [...sessions.keys()]) await closeSession(sessionId);
-    process.exit(signal === "SIGINT" ? 130 : 143);
-  });
+  process.on(signal, () => { void shutdown(signal === "SIGINT" ? 130 : 143); });
 }

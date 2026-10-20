@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
+import vm from "node:vm";
 
 const source = fs.readFileSync(new URL("./index.js", import.meta.url), "utf8");
 const overrides = ["HUNTPROXY_CHROME_EXECUTABLE", "BB_CHROME_EXECUTABLE", "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"];
@@ -30,7 +31,7 @@ function fixture(t) {
       : ${JSON.stringify(bundle)} }
   };`);
   const env = { ...process.env, PATH: bin, HUNTPROXY_PLAYWRIGHT_CORE_PATH: packageDir };
-  for (const key of [...overrides, "BB_PLAYWRIGHT_CORE_PATH", "PLAYWRIGHT_BROWSERS_PATH"]) delete env[key];
+  for (const key of [...overrides, "BB_PLAYWRIGHT_CORE_PATH", "PLAYWRIGHT_BROWSERS_PATH", "HUNTPROXY_BROWSER_HEADLESS"]) delete env[key];
   function executable(filename, version = "149.0.7827.55") {
     fs.writeFileSync(filename, `#!/bin/sh\nprintf 'Chromium ${version}\\n'\n`, { mode: 0o700 });
     return filename;
@@ -59,7 +60,38 @@ test("explicit executable overrides precede the paired browser and preserve vers
   assert.equal(result.playwright_core_path, f.packageDir);
   assert.equal(result.playwright_version, "1.61.1");
   assert.equal(result.expected_chromium_version, "149.0.7827.55");
+  assert.equal(result.headless, true);
   assert.deepEqual(f.run({ HUNTPROXY_CHROME_EXECUTABLE: explicit }, false), result);
+});
+
+test("headed mode is explicit and inspection agrees with worker launch metadata", (t) => {
+  const f = fixture(t);
+  for (const value of ["false", "0", " FALSE "]) {
+    const env = { HUNTPROXY_BROWSER_HEADLESS: value };
+    assert.equal(f.run(env).headless, false);
+    assert.equal(f.run(env, false).headless, false);
+  }
+  for (const value of ["true", "1", ""]) assert.equal(f.run({ HUNTPROXY_BROWSER_HEADLESS: value }).headless, true);
+  const invalid = spawnSync(process.execPath, [f.worker, "--inspect-runtime"], {
+    env: { ...f.env, HUNTPROXY_BROWSER_HEADLESS: "sometimes" }, encoding: "utf8", timeout: 5_000,
+  });
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /HUNTPROXY_BROWSER_HEADLESS must be true or false/);
+});
+
+test("launch options retain mode and routing protections for existing probe paths", () => {
+  const launchSource = source.slice(source.indexOf("function chromiumLaunchOptions"), source.indexOf("async function launchChromium"));
+  for (const headless of [true, false]) {
+    const options = vm.runInNewContext(`${launchSource}; chromiumLaunchOptions(null, null, 12345)`, {
+      browserRuntime: { headless, chromium_path: "/selected/chrome" }, chromiumProxy: (proxy) => proxy,
+    });
+    assert.equal(options.headless, headless);
+    assert.equal(options.executablePath, "/selected/chrome");
+    assert.equal(options.args.includes("--disable-blink-features=AutomationControlled"), false);
+    assert.equal(options.args.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"), true);
+    assert.equal(options.args.includes("--remote-debugging-port=12345"), true);
+    assert.equal(options.args.includes("--disable-quic"), true);
+  }
 });
 
 test("all override aliases work, with missing paths, directories, and non-executable files skipped", (t) => {
