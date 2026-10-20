@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
@@ -413,10 +414,10 @@ async function inspectRuntime(session, action) {
 }
 
 function loadPlaywright() {
-  const candidates = [];
-  if (process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH || process.env.BB_PLAYWRIGHT_CORE_PATH) {
-    candidates.push(process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH || process.env.BB_PLAYWRIGHT_CORE_PATH);
-  }
+  const candidates = [
+    process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH,
+    process.env.BB_PLAYWRIGHT_CORE_PATH,
+  ].filter(Boolean);
   const workerDir = path.dirname(fileURLToPath(import.meta.url));
   candidates.push(
     path.join(workerDir, "node_modules", "playwright-core"),
@@ -428,26 +429,64 @@ function loadPlaywright() {
   const requireFromCwd = createRequire(path.join(process.cwd(), "package.json"));
   let lastError;
   for (const candidate of candidates) {
+    const previousBrowsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
     try {
-      if (path.isAbsolute(candidate)) {
-        const packagePath = fs.statSync(candidate).isDirectory()
-          ? path.join(candidate, "index.js")
-          : candidate;
-        return requireFromWorker(packagePath);
-      }
+      let entry;
       try {
-        return requireFromWorker(candidate);
+        entry = requireFromWorker.resolve(candidate);
       } catch {
-        return requireFromCwd(candidate);
+        entry = requireFromCwd.resolve(candidate);
       }
+      let packageDir = path.dirname(entry);
+      let manifest;
+      while (true) {
+        try {
+          const value = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
+          if (value.name === "playwright-core") {
+            manifest = value;
+            break;
+          }
+        } catch {}
+        const parent = path.dirname(packageDir);
+        if (parent === packageDir) throw new Error("playwright-core package manifest not found");
+        packageDir = parent;
+      }
+      // `browser install` keeps the version-paired browser with its package.
+      // An explicit Playwright cache location still takes precedence.
+      if (previousBrowsersPath == null && fs.existsSync(path.join(packageDir, ".local-browsers"))) {
+        process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
+      }
+      const api = requireFromWorker(entry);
+      let expectedChromiumVersion = null;
+      try {
+        const browsers = JSON.parse(fs.readFileSync(path.join(packageDir, "browsers.json"), "utf8"));
+        expectedChromiumVersion = browsers.browsers.find((browser) => browser.name === "chromium")?.browserVersion || null;
+      } catch {}
+      return { api, packageDir, version: manifest.version, expectedChromiumVersion };
     } catch (error) {
+      if (previousBrowsersPath == null) delete process.env.PLAYWRIGHT_BROWSERS_PATH;
+      else process.env.PLAYWRIGHT_BROWSERS_PATH = previousBrowsersPath;
       lastError = error;
     }
   }
   throw new Error(`playwright-core unavailable: ${lastError?.message || "not found"}`);
 }
 
-const { chromium } = loadPlaywright();
+const inspectRuntimeOnly = process.argv.includes("--inspect-runtime");
+let playwrightRuntime;
+try {
+  playwrightRuntime = loadPlaywright();
+} catch (error) {
+  if (!inspectRuntimeOnly) throw error;
+  process.stdout.write(`${JSON.stringify({})}\n`);
+  process.exit(0);
+}
+const { chromium } = playwrightRuntime.api;
+const browserRuntime = inspectBrowserRuntime();
+if (inspectRuntimeOnly) {
+  process.stdout.write(`${JSON.stringify(browserRuntime)}\n`);
+  process.exit(0);
+}
 
 function respond(id, result, error) {
   const message = error
@@ -469,20 +508,46 @@ function existingChromiumExecutable() {
     process.env.HUNTPROXY_CHROME_EXECUTABLE,
     process.env.BB_CHROME_EXECUTABLE,
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
-    "/usr/bin/google-chrome-stable",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
   ].filter(Boolean);
   try {
     const bundled = chromium.executablePath();
-    if (bundled) candidates.unshift(bundled);
+    if (bundled) candidates.push(bundled);
   } catch {
     // playwright-core commonly has no downloaded browser.
   }
-  return candidates.find((candidate) => fs.existsSync(candidate));
+  for (const name of ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"]) {
+    for (const directory of (process.env.PATH || "").split(path.delimiter)) {
+      if (directory) candidates.push(path.join(directory, name));
+    }
+  }
+  candidates.push(
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  );
+  return candidates.find((candidate) => {
+    try {
+      if (!fs.statSync(candidate).isFile()) return false;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function inspectBrowserRuntime() {
+  const executable = existingChromiumExecutable();
+  const version = executable ? spawnSync(executable, ["--version"], {
+    encoding: "utf8", timeout: 3_000, maxBuffer: 8_192, windowsHide: true,
+  }) : null;
+  return {
+    playwright_core_path: playwrightRuntime.packageDir,
+    playwright_version: playwrightRuntime.version,
+    expected_chromium_version: playwrightRuntime.expectedChromiumVersion,
+    chromium_path: executable ? path.resolve(executable) : null,
+    chromium_version: version?.status === 0
+      ? version.stdout?.match(/\b\d+\.\d+\.\d+\.\d+\b/)?.[0] || null : null,
+  };
 }
 
 function chromiumProxy(proxy) {
@@ -512,7 +577,7 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
     );
   }
   return {
-    executablePath: existingChromiumExecutable(),
+    executablePath: browserRuntime.chromium_path,
     headless: true,
     proxy: chromiumProxy(proxy),
     ignoreHTTPSErrors: Boolean(caCertPath),
@@ -522,7 +587,7 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
 }
 
 async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = null) {
-  const executablePath = existingChromiumExecutable();
+  const executablePath = browserRuntime.chromium_path;
   if (!executablePath) {
     throw rpcError(
       -32003,
@@ -1290,6 +1355,7 @@ async function handle(req) {
         return respond(id, {
           protocol: PROTOCOL,
           engines: ["chromium"],
+          runtime: browserRuntime,
           capabilities: [
             "actions", "checkpoints", "cdp_handoff", "profile_isolation",
             "pages", "events", "scroll", "screenshots", "same_origin_requests",

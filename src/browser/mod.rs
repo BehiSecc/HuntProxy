@@ -37,8 +37,28 @@ pub struct BrowserInstallStatus {
     pub worker_available: bool,
     pub chromium_available: bool,
     pub chromium_path: Option<String>,
+    #[serde(default)]
+    pub chromium_version: Option<String>,
+    #[serde(default)]
+    pub playwright_core_path: Option<String>,
+    #[serde(default)]
+    pub playwright_version: Option<String>,
+    #[serde(default)]
+    pub expected_chromium_version: Option<String>,
     pub node_path: Option<String>,
     pub install_hint: Option<String>,
+}
+
+/// The worker owns browser discovery so diagnostics and launches use one policy.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BrowserRuntimeInspection {
+    playwright_core_path: Option<PathBuf>,
+    playwright_version: Option<String>,
+    expected_chromium_version: Option<String>,
+    chromium_path: Option<PathBuf>,
+    chromium_version: Option<String>,
+    #[serde(skip)]
+    inspection_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -692,9 +712,6 @@ impl WorkerProcess {
         }
         if let Some(path) = playwright_core_path {
             command.env("HUNTPROXY_PLAYWRIGHT_CORE_PATH", path);
-            if path.join(".local-browsers").is_dir() {
-                command.env("PLAYWRIGHT_BROWSERS_PATH", "0");
-            }
         }
         if let Some(path) = chromium_path {
             command.env("HUNTPROXY_CHROME_EXECUTABLE", path);
@@ -899,8 +916,7 @@ pub struct BrowserService {
     proxy_server: String,
     ca_cert_path: Option<PathBuf>,
     profiles_root: PathBuf,
-    playwright_core_path: Option<PathBuf>,
-    chromium_path: Option<PathBuf>,
+    runtime: BrowserRuntimeInspection,
     checkpoints: Mutex<HashMap<i64, Checkpoint>>,
     runtime_sessions: Mutex<HashMap<i64, RuntimeSession>>,
     profile_leases: Mutex<HashSet<(i64, String)>>,
@@ -915,26 +931,18 @@ pub struct BrowserService {
 pub fn inspect_browser_installation(config: &Config) -> BrowserInstallStatus {
     let node_path = existing_path(config.node_path.clone(), "node");
     let worker_path = inspect_worker_path(config.browser_worker_path.clone(), &config.data_dir);
-    let playwright_core_path = worker_path
-        .as_deref()
-        .and_then(find_playwright_core)
-        .or_else(find_playwright_from_environment);
-    let chromium_path = chromium_executable(playwright_core_path.as_deref());
+    let runtime = inspect_browser_runtime(node_path.as_deref(), worker_path.as_deref());
 
-    browser_install_status(
-        node_path.as_deref(),
-        worker_path.as_deref(),
-        playwright_core_path.as_deref(),
-        chromium_path.as_deref(),
-    )
+    browser_install_status(node_path.as_deref(), worker_path.as_deref(), &runtime)
 }
 
 fn browser_install_status(
     node_path: Option<&Path>,
     worker_path: Option<&Path>,
-    playwright_core_path: Option<&Path>,
-    chromium_path: Option<&Path>,
+    runtime: &BrowserRuntimeInspection,
 ) -> BrowserInstallStatus {
+    let playwright_core_path = runtime.playwright_core_path.as_deref();
+    let chromium_path = runtime.chromium_path.as_deref();
     let node_available = node_path.is_some_and(Path::is_file);
     let worker_script_available = worker_path.is_some_and(Path::is_file);
     let worker_available =
@@ -948,6 +956,8 @@ fn browser_install_status(
             "Browser worker missing; reinstall HuntProxy or set HUNTPROXY_BROWSER_WORKER_PATH"
                 .into(),
         )
+    } else if let Some(error) = &runtime.inspection_error {
+        Some(error.clone())
     } else if !playwright_core_path.is_some_and(Path::is_dir) {
         let directory = worker_path
             .and_then(Path::parent)
@@ -967,6 +977,10 @@ fn browser_install_status(
         worker_available,
         chromium_available,
         chromium_path: chromium_path.map(|path| path.display().to_string()),
+        chromium_version: runtime.chromium_version.clone(),
+        playwright_core_path: playwright_core_path.map(|path| path.display().to_string()),
+        playwright_version: runtime.playwright_version.clone(),
+        expected_chromium_version: runtime.expected_chromium_version.clone(),
         node_path: node_path.map(|path| path.display().to_string()),
         install_hint,
     }
@@ -1022,20 +1036,16 @@ impl BrowserService {
         profiles_root: PathBuf,
     ) -> Self {
         let worker_path = resolve_worker_path(worker_path);
-        let playwright_core_path = worker_path
-            .as_deref()
-            .and_then(find_playwright_core)
-            .or_else(find_playwright_from_environment);
-        let chromium_path = chromium_executable(playwright_core_path.as_deref());
+        let node_path = existing_path(node_path, "node");
+        let runtime = inspect_browser_runtime(node_path.as_deref(), worker_path.as_deref());
         Self {
             db,
-            node_path: existing_path(node_path, "node"),
+            node_path,
             worker_path,
             proxy_server,
             ca_cert_path: ca_cert_path.filter(|path| path.is_file()),
             profiles_root,
-            playwright_core_path,
-            chromium_path,
+            runtime,
             checkpoints: Mutex::new(HashMap::new()),
             runtime_sessions: Mutex::new(HashMap::new()),
             profile_leases: Mutex::new(HashSet::new()),
@@ -1050,8 +1060,7 @@ impl BrowserService {
         browser_install_status(
             self.node_path.as_deref(),
             self.worker_path.as_deref(),
-            self.playwright_core_path.as_deref(),
-            self.chromium_path.as_deref(),
+            &self.runtime,
         )
     }
 
@@ -2394,8 +2403,8 @@ impl BrowserService {
                 WorkerProcess::spawn(
                     node_path,
                     worker_path,
-                    self.playwright_core_path.as_deref(),
-                    self.chromium_path.as_deref(),
+                    self.runtime.playwright_core_path.as_deref(),
+                    self.runtime.chromium_path.as_deref(),
                 )
                 .await
                 .map_err(WorkerCallFailure::into_domain)?,
@@ -3420,110 +3429,55 @@ fn existing_path(configured: Option<PathBuf>, executable_name: &str) -> Option<P
         .map(|path| path.canonicalize().unwrap_or(path))
 }
 
-fn chromium_executable(playwright_core_path: Option<&Path>) -> Option<PathBuf> {
-    [
-        "HUNTPROXY_CHROME_EXECUTABLE",
-        "BB_CHROME_EXECUTABLE",
-        "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
-    ]
-    .iter()
-    .find_map(|name| {
-        std::env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-    })
-    .or_else(|| {
-        playwright_core_path.and_then(|path| find_chromium_binary(&path.join(".local-browsers"), 8))
-    })
-    .or_else(|| {
-        [
-            "google-chrome-stable",
-            "google-chrome",
-            "chromium",
-            "chromium-browser",
-        ]
-        .iter()
-        .find_map(|name| which(name))
-    })
-    .or_else(|| {
-        [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.exists())
-    })
-    .or_else(|| find_playwright_chromium(playwright_core_path))
-}
-
-fn find_playwright_chromium(playwright_core_path: Option<&Path>) -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(path) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
-        if path != "0" {
-            roots.push(PathBuf::from(path));
+fn inspect_browser_runtime(
+    node_path: Option<&Path>,
+    worker_path: Option<&Path>,
+) -> BrowserRuntimeInspection {
+    let Some((node_path, worker_path)) = node_path.zip(worker_path) else {
+        return BrowserRuntimeInspection::default();
+    };
+    let inspection_error = "Browser runtime inspection failed; run `HuntProxy browser install` or check HUNTPROXY_BROWSER_WORKER_PATH";
+    let unavailable = || BrowserRuntimeInspection {
+        inspection_error: Some(inspection_error.into()),
+        ..BrowserRuntimeInspection::default()
+    };
+    let mut command = StdCommand::new(node_path);
+    command
+        .arg(worker_path)
+        .arg("--inspect-runtime")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(parent) = worker_path.parent() {
+        command.current_dir(parent);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return unavailable();
+    };
+    // Inspection does no browser/profile work. Bound custom or broken workers
+    // too, rather than letting doctor or daemon startup wait indefinitely.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                return child
+                    .wait_with_output()
+                    .ok()
+                    .filter(|output| output.stdout.len() <= 16 * 1024)
+                    .and_then(|output| serde_json::from_slice(&output.stdout).ok())
+                    .unwrap_or_else(unavailable);
+            }
+            Ok(Some(_)) => return unavailable(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return unavailable();
+            }
         }
     }
-    if let Some(path) = playwright_core_path {
-        roots.push(path.join(".local-browsers"));
-        if let Some(parent) = path.parent() {
-            roots.push(parent.join(".local-browsers"));
-        }
-    }
-    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        roots.push(PathBuf::from(path).join("ms-playwright"));
-    }
-    if let Some(path) = std::env::var_os("HOME") {
-        let home = PathBuf::from(path);
-        roots.push(home.join(".cache/ms-playwright"));
-        roots.push(home.join("Library/Caches/ms-playwright"));
-    }
-    if let Some(path) = std::env::var_os("LOCALAPPDATA") {
-        roots.push(PathBuf::from(path).join("ms-playwright"));
-    }
-
-    roots.into_iter().find_map(|root| {
-        let mut browser_directories = std::fs::read_dir(root)
-            .ok()?
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("chromium-"))
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        browser_directories.sort_by(|left, right| right.cmp(left));
-        browser_directories
-            .into_iter()
-            .find_map(|directory| find_chromium_binary(&directory, 8))
-    })
-}
-
-fn find_chromium_binary(directory: &Path, remaining_depth: usize) -> Option<PathBuf> {
-    if remaining_depth == 0 {
-        return None;
-    }
-    let mut entries = std::fs::read_dir(directory)
-        .ok()?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in &entries {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        if matches!(
-            name.to_str(),
-            Some("chrome" | "chromium" | "chrome.exe" | "Chromium")
-        ) {
-            return Some(path);
-        }
-    }
-    entries.into_iter().find_map(|entry| {
-        let path = entry.path();
-        path.is_dir()
-            .then(|| find_chromium_binary(&path, remaining_depth - 1))
-            .flatten()
-    })
 }
 
 fn resolve_worker_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
@@ -3619,24 +3573,6 @@ fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let temporary = path.with_extension("tmp");
     std::fs::write(&temporary, content)?;
     std::fs::rename(temporary, path)
-}
-
-fn find_playwright_from_environment() -> Option<PathBuf> {
-    std::env::var_os("HUNTPROXY_PLAYWRIGHT_CORE_PATH")
-        .or_else(|| std::env::var_os("BB_PLAYWRIGHT_CORE_PATH"))
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-}
-
-fn find_playwright_core(worker_path: &Path) -> Option<PathBuf> {
-    worker_path.parent().and_then(|directory| {
-        directory.ancestors().find_map(|ancestor| {
-            let package = ancestor.join("node_modules/playwright-core/package.json");
-            package
-                .exists()
-                .then(|| ancestor.join("node_modules/playwright-core"))
-        })
-    })
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -4548,20 +4484,32 @@ mod tests {
         std::fs::write(&worker, "worker").unwrap();
         std::fs::create_dir(&playwright).unwrap();
         std::fs::write(&chromium, "chromium").unwrap();
+        let runtime = BrowserRuntimeInspection {
+            playwright_core_path: Some(playwright),
+            playwright_version: Some("1.61.1".into()),
+            expected_chromium_version: Some("149.0.7827.55".into()),
+            chromium_path: Some(chromium),
+            chromium_version: Some("153.0.8010.36".into()),
+            ..BrowserRuntimeInspection::default()
+        };
 
-        let ready = browser_install_status(
-            Some(&node),
-            Some(&worker),
-            Some(&playwright),
-            Some(&chromium),
-        );
+        let ready = browser_install_status(Some(&node), Some(&worker), &runtime);
         assert!(ready.node_available);
         assert!(ready.worker_available);
         assert!(ready.chromium_available);
         assert_eq!(ready.install_hint, None);
+        assert_eq!(ready.playwright_version.as_deref(), Some("1.61.1"));
+        assert_eq!(ready.chromium_version.as_deref(), Some("153.0.8010.36"));
+        assert_eq!(
+            ready.expected_chromium_version.as_deref(),
+            Some("149.0.7827.55")
+        );
 
-        let missing_playwright =
-            browser_install_status(Some(&node), Some(&worker), None, Some(&chromium));
+        let missing_playwright = browser_install_status(
+            Some(&node),
+            Some(&worker),
+            &BrowserRuntimeInspection::default(),
+        );
         assert!(!missing_playwright.worker_available);
         assert!(missing_playwright
             .install_hint
@@ -4582,6 +4530,57 @@ mod tests {
         assert!(!expected_worker.exists());
         let _ = inspect_browser_installation(&config);
         assert!(!expected_worker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_inspection_uses_worker_metadata_and_distinguishes_probe_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all("/tmp/artis").unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("huntproxy-runtime-contract-")
+            .tempdir_in("/tmp/artis")
+            .unwrap();
+        let node = directory.path().join("node");
+        let worker = directory.path().join("index.js");
+        let arguments = directory.path().join("arguments");
+        std::fs::write(&worker, "// worker").unwrap();
+        let metadata = json!({
+            "playwright_core_path": directory.path(),
+            "playwright_version": "1.61.1",
+            "expected_chromium_version": "149.0.7827.55",
+            "chromium_path": &node,
+            "chromium_version": "153.0.8010.36",
+        });
+        std::fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}'\n",
+                arguments.display(),
+                metadata,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let runtime = inspect_browser_runtime(Some(&node), Some(&worker));
+        assert_eq!(runtime.chromium_path.as_deref(), Some(node.as_path()));
+        assert_eq!(runtime.playwright_version.as_deref(), Some("1.61.1"));
+        assert_eq!(runtime.chromium_version.as_deref(), Some("153.0.8010.36"));
+        assert_eq!(
+            std::fs::read_to_string(&arguments).unwrap(),
+            format!("{}\n--inspect-runtime\n", worker.display())
+        );
+
+        std::fs::write(&node, "#!/bin/sh\nprintf 'invalid response'\n").unwrap();
+        let failed = inspect_browser_runtime(Some(&node), Some(&worker));
+        let status = browser_install_status(Some(&node), Some(&worker), &failed);
+        assert!(!status.worker_available);
+        assert!(status
+            .install_hint
+            .unwrap()
+            .contains("runtime inspection failed"));
     }
 
     #[test]
@@ -4685,16 +4684,5 @@ mod tests {
         assert!(worker_dir.join("index.js").is_file());
         assert!(worker_dir.join("package.json").is_file());
         assert!(worker_dir.join("package-lock.json").is_file());
-    }
-
-    #[test]
-    fn chromium_finder_handles_nested_macos_app_layout() {
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory
-            .path()
-            .join("chromium-1148/chrome-mac/Chromium.app/Contents/MacOS/Chromium");
-        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        std::fs::write(&executable, "browser").unwrap();
-        assert_eq!(find_chromium_binary(directory.path(), 8), Some(executable));
     }
 }

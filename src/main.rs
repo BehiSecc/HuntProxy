@@ -275,6 +275,15 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 "  chromium:   {}",
                 browser.chromium_path.as_deref().unwrap_or("not found")
             );
+            println!(
+                "  versions:   Chromium {} / Playwright {} (paired Chromium {})",
+                browser.chromium_version.as_deref().unwrap_or("unknown"),
+                browser.playwright_version.as_deref().unwrap_or("unknown"),
+                browser
+                    .expected_chromium_version
+                    .as_deref()
+                    .unwrap_or("unknown"),
+            );
             if let Some(hint) = &browser.install_hint {
                 println!("  browser:    {hint}");
             }
