@@ -179,11 +179,6 @@ async fn forward_request(
     let capture = url_is_in_scope(&url, &project.scope)?;
     let dial = resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?;
     let method = parts.method.clone();
-    let protocol = if parts.version == http::Version::HTTP_2 {
-        ProtocolMode::Http2
-    } else {
-        ProtocolMode::Auto
-    };
     let mut headers = parts
         .headers
         .iter()
@@ -263,7 +258,9 @@ async fn forward_request(
                 url: wire_url,
                 headers: wire_headers,
                 body: request_body,
-                protocol,
+                // The intercepted connection's version describes the browser
+                // talking to HuntProxy. Negotiate independently with the origin.
+                protocol: ProtocolMode::Auto,
                 connect_timeout: Duration::from_secs(10),
                 total_timeout: Duration::from_secs(60),
                 max_body_bytes: project.limits.capture_body_bytes,
@@ -1222,6 +1219,80 @@ mod tests {
             request_url(&parts, Some("https")).unwrap(),
             "https://example.com/a?b=1"
         );
+    }
+
+    #[tokio::test]
+    async fn intercepted_http2_request_can_reach_an_http1_only_origin() {
+        std::fs::create_dir_all("/tmp/artis").unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("huntproxy-protocol-")
+            .tempdir_in("/tmp/artis")
+            .unwrap();
+        let (state, _, session) = proxy_test_fixture(&directory).await;
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_server = tokio::spawn(async move {
+            let (stream, _) = origin.accept().await.unwrap();
+            let service = service_fn(|request: Request<Incoming>| async move {
+                assert_eq!(request.version(), http::Version::HTTP_11);
+                assert_eq!(request.headers()["user-agent"], "Chrome/149.0.0.0");
+                assert!(!request.headers().contains_key("sec-ch-ua"));
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"origin ok"))))
+            });
+            http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        // Exercise the same forwarding handler used after CONNECT decryption,
+        // receiving a real HTTP/2 request and negotiating the origin separately.
+        let intercepted = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let intercepted_addr = intercepted.local_addr().unwrap();
+        let proxy_server = tokio::spawn(async move {
+            let (stream, _) = intercepted.accept().await.unwrap();
+            let service = service_fn(move |request: Request<Incoming>| {
+                assert_eq!(request.version(), http::Version::HTTP_2);
+                let state = state.clone();
+                let session = session.clone();
+                async move {
+                    let response = forward_request(state, request, session, None)
+                        .await
+                        .unwrap_or_else(proxy_error_response);
+                    Ok::<_, Infallible>(response)
+                }
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let stream = tokio::net::TcpStream::connect(intercepted_addr)
+            .await
+            .unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
+        let client_connection = tokio::spawn(connection);
+        let request = Request::builder()
+            .uri(format!("http://{origin_addr}/registration"))
+            .header("user-agent", "Chrome/149.0.0.0")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "origin ok"
+        );
+        origin_server.await.unwrap();
+        client_connection.abort();
+        proxy_server.abort();
     }
 
     #[tokio::test]

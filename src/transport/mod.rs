@@ -55,8 +55,9 @@ pub struct OutboundRequest {
     pub connect_timeout: Duration,
     pub total_timeout: Duration,
     pub max_body_bytes: u64,
-    /// Preserve caller-supplied identity headers. Wreq's protocol profile still
-    /// controls TLS/HTTP2 characteristics, while explicit headers win.
+    /// Preserve caller identity headers, including intentional omissions.
+    /// Wreq's protocol profile still controls TLS/HTTP2 characteristics, but
+    /// its default headers are disabled when true and enabled when false.
     pub preserve_identity_headers: bool,
     /// Explicit upstream proxy URL selected by the caller. None is direct.
     pub upstream_proxy: Option<String>,
@@ -253,7 +254,8 @@ impl WreqTransport {
             .pool_idle_timeout(ttl.max(Duration::from_millis(1)))
             .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .pool_max_size(MAX_CACHED_CLIENTS)
-            .emulation(Emulation::Chrome147);
+            // Match browser-worker's pinned Playwright 1.61.1 / Chromium 149 pair.
+            .emulation(Emulation::Chrome149);
 
         if let Some(proxy_url) = &req.upstream_proxy {
             let proxy = wreq::Proxy::all(proxy_url).map_err(|_| {
@@ -335,7 +337,9 @@ impl SemanticTransport for WreqTransport {
     ) -> DomainResult<StreamingOutboundResponse> {
         let client = self.client_for(dial, &req)?;
 
-        let mut request = client.request(req.method.clone(), &req.url);
+        let mut request = client
+            .request(req.method.clone(), &req.url)
+            .default_headers(!req.preserve_identity_headers);
         let body_len = req.body.len();
         let headers = canonical_headers(&req.headers, body_len)?;
         request = request.headers(headers);
@@ -382,12 +386,12 @@ impl SemanticTransport for WreqTransport {
             body,
             protocol,
             transport_provenance: TransportProvenance::ProtocolProfileOnly,
-            transport_profile: "wreq_chrome147_protocol_profile".into(),
+            transport_profile: "wreq_chrome149_protocol_profile".into(),
         })
     }
 
     fn profile_name(&self) -> &str {
-        "wreq_chrome147_protocol_profile"
+        "wreq_chrome149_protocol_profile"
     }
 
     fn provenance(&self) -> TransportProvenance {
@@ -592,6 +596,167 @@ mod tests {
         expired.expires_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
         transport.client_for(&expired, &request).unwrap();
         assert!(transport.clients.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identity_header_preservation_controls_defaults_per_request_on_the_wire() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                observed_tx.send(request.headers().clone()).unwrap();
+                async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok")))) }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let dial = ValidatedDial {
+            hostname: "identity.test".into(),
+            port: address.port(),
+            approved_socket_addrs: vec![address],
+            policy_epoch: 1,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+            scheme: "http".into(),
+            path: "/".into(),
+        };
+        let request = |preserve_identity_headers, headers| OutboundRequest {
+            method: Method::GET,
+            url: format!("http://identity.test:{}/", address.port()),
+            headers,
+            body: OutboundBody::Empty,
+            protocol: ProtocolMode::Http1,
+            connect_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(2),
+            max_body_bytes: 1024,
+            preserve_identity_headers,
+            upstream_proxy: None,
+        };
+        let transport = WreqTransport::new();
+
+        let response = transport.send(&dial, request(true, vec![])).await.unwrap();
+        assert_eq!(response.transport_profile, transport.profile_name());
+        assert_eq!(transport.profile_name(), "wreq_chrome149_protocol_profile");
+        let absent = observed_rx.recv().await.unwrap();
+        for name in ["user-agent", "accept", "accept-language", "accept-encoding"] {
+            assert!(
+                !absent.contains_key(name),
+                "unexpected default header {name}"
+            );
+        }
+        assert!(!absent.keys().any(|name| name.as_str().starts_with("sec-")));
+
+        let supplied = vec![
+            ("User-Agent".into(), b"Chrome/149.0.0.0".to_vec()),
+            ("Sec-CH-UA".into(), b"\"Chromium\";v=\"149\"".to_vec()),
+            ("Sec-Fetch-Mode".into(), b"cors".to_vec()),
+            ("Accept-Language".into(), b"fr-CA,fr;q=0.9".to_vec()),
+            ("X-Client-Tag".into(), b"first".to_vec()),
+            ("X-Client-Tag".into(), b"second".to_vec()),
+        ];
+        transport
+            .send(&dial, request(true, supplied.clone()))
+            .await
+            .unwrap();
+        let preserved = observed_rx.recv().await.unwrap();
+        for (name, value) in &supplied[..4] {
+            assert_eq!(preserved.get(name).unwrap().as_bytes(), value);
+        }
+        assert_eq!(
+            preserved.get_all("x-client-tag").iter().collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        for name in [
+            "accept",
+            "sec-ch-ua-platform",
+            "sec-ch-ua-mobile",
+            "sec-fetch-site",
+            "sec-fetch-dest",
+        ] {
+            assert!(
+                !preserved.contains_key(name),
+                "unexpected default header {name}"
+            );
+        }
+
+        transport.send(&dial, request(false, vec![])).await.unwrap();
+        let defaults = observed_rx.recv().await.unwrap();
+        for name in [
+            "user-agent",
+            "accept",
+            "accept-language",
+            "sec-ch-ua",
+            "sec-ch-ua-platform",
+            "sec-fetch-mode",
+        ] {
+            assert!(
+                defaults.contains_key(name),
+                "missing enabled default header {name}"
+            );
+        }
+        assert!(defaults["user-agent"]
+            .to_str()
+            .unwrap()
+            .contains("Chrome/149."));
+        assert!(defaults["sec-ch-ua"]
+            .to_str()
+            .unwrap()
+            .contains("v=\"149\""));
+        // Switching the per-request policy must not leave defaults enabled on
+        // the pooled client for later browser or Reply requests.
+        transport.send(&dial, request(true, vec![])).await.unwrap();
+        assert_eq!(observed_rx.recv().await.unwrap(), absent);
+        assert_eq!(transport.clients.lock().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn protocol_modes_advertise_the_expected_upstream_alpn() {
+        for (protocol, expected) in [
+            (
+                ProtocolMode::Auto,
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ),
+            (ProtocolMode::Http1, vec![b"http/1.1".to_vec()]),
+            (ProtocolMode::Http2, vec![b"h2".to_vec()]),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let hello = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    stream,
+                )
+                .await
+                .unwrap();
+                let client_hello = hello.client_hello();
+                let protocols = client_hello
+                    .alpn()
+                    .unwrap()
+                    .map(Vec::from)
+                    .collect::<Vec<_>>();
+                protocols
+            });
+            let dial = ValidatedDial {
+                hostname: "alpn.test".into(),
+                port: address.port(),
+                approved_socket_addrs: vec![address],
+                policy_epoch: 1,
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+                scheme: "https".into(),
+                path: "/".into(),
+            };
+            let mut request = cache_request();
+            request.url = format!("https://alpn.test:{}/", address.port());
+            request.protocol = protocol;
+            // Only ClientHello is needed; the local peer closes before any
+            // certificate or HTTP traffic, without weakening certificate checks.
+            assert!(WreqTransport::new().send(&dial, request).await.is_err());
+            assert_eq!(server.await.unwrap(), expected, "{protocol:?}");
+        }
     }
 
     #[tokio::test]
