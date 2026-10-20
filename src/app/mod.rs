@@ -57,6 +57,7 @@ impl TransportStatus {
             .and_then(|major| major.parse::<u32>().ok());
         let chrome_major = match browser_major {
             Some(146) => 146,
+            Some(153) => 153,
             _ => 149,
         };
         let browser_major_matches_profile = browser_major == Some(chrome_major);
@@ -732,14 +733,14 @@ mod tests {
 
     #[test]
     fn transport_profile_tracks_supported_browser_and_reports_fallbacks() {
-        for major in [146, 149] {
+        for major in [146, 149, 153] {
             let status = TransportStatus::for_browser_version(Some(&format!("{major}.0.1.2")));
             assert_eq!(status.chrome_major, major);
             assert!(status.browser_major_matches_profile);
             assert!(status.warning.is_none());
             assert!(WreqTransport::with_chrome_major(status.chrome_major).is_ok());
         }
-        for version in [None, Some("unavailable"), Some("153.0.1.2")] {
+        for version in [None, Some("unavailable"), Some("154.0.1.2")] {
             let status = TransportStatus::for_browser_version(version);
             assert_eq!(status.chrome_major, 149);
             assert!(!status.browser_major_matches_profile);

@@ -333,11 +333,12 @@ impl WreqTransport {
         let emulation = match major {
             146 => Emulation::Chrome146,
             149 => Emulation::Chrome149,
+            153 => Emulation::Chrome153,
             _ => {
                 return Err(DomainError::new(
                     ErrorCode::ConfigInvalid,
                     format!(
-                        "no tested transport profile for Chromium {major}; supported: 146, 149"
+                        "no tested transport profile for Chromium {major}; supported: 146, 149, 153"
                     ),
                 ))
             }
@@ -450,6 +451,7 @@ impl WreqTransport {
             .default_headers(!req.preserve_identity_headers);
         let body_len = req.body.len();
         let headers = canonical_headers(&req.headers, body_len)?;
+        let navigation = preserved_document_navigation(&req, &headers);
         if let Some(order) = measured_navigation_header_order(&req, &headers) {
             request = request.orig_headers(order);
         }
@@ -471,7 +473,18 @@ impl WreqTransport {
             }
         }
 
-        request.send().await.map_err(map_wreq_error)
+        let mut request = request.build().map_err(map_wreq_error)?;
+        // Native Chromium sends document HEADERS with weight 256. Keep the
+        // previous profile's 220 fallback for other requests; newer upstream
+        // profiles default every request to 256. Both share one identity pool.
+        request
+            .extensions_mut()
+            .insert(wreq::http2::StreamDependency::new(
+                wreq::http2::StreamId::zero(),
+                if navigation { 255 } else { 219 },
+                true,
+            ));
+        client.execute(request).await.map_err(map_wreq_error)
     }
 }
 
@@ -674,28 +687,34 @@ const MEASURED_NAVIGATION_HEADERS: &[&str] = &[
     "Accept-Encoding",
     "Accept-Language",
     "Cookie",
+    "Priority",
 ];
+
+fn preserved_document_navigation(req: &OutboundRequest, headers: &HeaderMap) -> bool {
+    req.preserve_identity_headers
+        && headers
+            .get("sec-fetch-mode")
+            .is_some_and(|value| value.as_bytes() == b"navigate")
+        && headers
+            .get("sec-fetch-dest")
+            .is_some_and(|value| value.as_bytes() == b"document")
+}
 
 fn measured_navigation_header_order(
     req: &OutboundRequest,
     headers: &HeaderMap,
 ) -> Option<wreq::header::OrigHeaderMap> {
-    if !req.preserve_identity_headers || req.method != Method::GET || req.body.len() != 0 {
+    if !preserved_document_navigation(req, headers)
+        || req.method != Method::GET
+        || req.body.len() != 0
+    {
         return None;
     }
-    let has = |name: &str, value: &[u8]| {
-        headers
-            .get(name)
-            .is_some_and(|supplied| supplied.as_bytes() == value)
-    };
-    if !has("sec-fetch-mode", b"navigate")
-        || !has("sec-fetch-dest", b"document")
-        || headers.keys().any(|name| {
-            !MEASURED_NAVIGATION_HEADERS
-                .iter()
-                .any(|known| name.as_str().eq_ignore_ascii_case(known))
-        })
-    {
+    if headers.keys().any(|name| {
+        !MEASURED_NAVIGATION_HEADERS
+            .iter()
+            .any(|known| name.as_str().eq_ignore_ascii_case(known))
+    }) {
         return None;
     }
     let mut order = wreq::header::OrigHeaderMap::new();
@@ -819,6 +838,92 @@ mod tests {
             scheme: "https".into(),
             path: "/".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn document_and_resource_priorities_share_one_http2_connection() {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        let certificate = rcgen::generate_simple_self_signed(vec!["priority.test".into()]).unwrap();
+        let key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+        let mut tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.cert.der().clone()], key.into())
+        .unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls));
+        let mut transport = WreqTransport::new();
+        transport.test_cert_store = Some(
+            wreq::tls::trust::CertStore::from_der_certs([certificate.cert.der().as_ref()]).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Accept exactly one TCP/TLS connection for all five requests.
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = acceptor.accept(socket).await.unwrap();
+            let mut preface = [0; 24];
+            socket.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            socket
+                .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut observed = Vec::new();
+            while observed.len() < 5 {
+                let mut head = [0; 9];
+                socket.read_exact(&mut head).await.unwrap();
+                let length =
+                    ((head[0] as usize) << 16) | ((head[1] as usize) << 8) | head[2] as usize;
+                let mut payload = vec![0; length];
+                socket.read_exact(&mut payload).await.unwrap();
+                if head[3] == 1 {
+                    assert_ne!(head[4] & 0x20, 0, "HEADERS retains priority information");
+                    assert_eq!(&payload[..4], &[0x80, 0, 0, 0], "exclusive root dependency");
+                    observed.push((
+                        u32::from_be_bytes(head[5..9].try_into().unwrap()),
+                        payload[4],
+                    ));
+                    let mut response = vec![0, 0, 1, 1, 5];
+                    response.extend_from_slice(&head[5..9]);
+                    response.push(0x88); // HPACK :status 200, END_HEADERS | END_STREAM.
+                    socket.write_all(&response).await.unwrap();
+                }
+            }
+            observed
+        });
+        let mut dial = cache_dial(&address.to_string(), 1);
+        dial.hostname = "priority.test".into();
+        dial.port = address.port();
+        for (path, preserved, method, destination) in [
+            ("first", true, Method::GET, "document"),
+            ("asset", true, Method::GET, "image"),
+            ("again", true, Method::GET, "document"),
+            ("generated", false, Method::GET, "document"),
+            ("post", true, Method::POST, "document"),
+        ] {
+            let mut request = cache_request();
+            request.url = format!("https://priority.test:{}/{path}", address.port());
+            request.method = method;
+            request.preserve_identity_headers = preserved;
+            request.headers = vec![
+                ("sec-fetch-mode".into(), b"navigate".to_vec()),
+                ("sec-fetch-dest".into(), destination.as_bytes().to_vec()),
+                ("priority".into(), b"u=0, i".to_vec()),
+            ];
+            assert_eq!(
+                transport.send(&dial, request).await.unwrap().status,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            [(1, 255), (3, 219), (5, 255), (7, 219), (9, 255)]
+        );
+        assert_eq!(transport.clients.lock().len(), 1);
     }
 
     #[test]
@@ -1151,7 +1256,7 @@ mod tests {
                 "Cookie",
             ],
         ];
-        for major in [146, 149] {
+        for major in [146, 149, 153] {
             for &expected in cases {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
@@ -1251,7 +1356,7 @@ mod tests {
         use rustls::pki_types::PrivatePkcs8KeyDer;
         use tokio_tungstenite::tungstenite::protocol::Role;
         use tokio_tungstenite::tungstenite::Message;
-        for major in [146, 149] {
+        for major in [146, 149, 153] {
             let certificate =
                 rcgen::generate_simple_self_signed(vec!["socket.test".into()]).unwrap();
             let key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());

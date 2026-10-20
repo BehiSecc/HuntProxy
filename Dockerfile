@@ -4,10 +4,12 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY vendor ./vendor
 COPY src ./src
 COPY migrations ./migrations
 COPY web ./web
 COPY browser-worker ./browser-worker
+COPY LICENSE THIRD_PARTY_NOTICES ./
 RUN cargo build --release --locked --bin HuntProxy
 
 FROM node:20-bookworm-slim AS browser
@@ -33,6 +35,7 @@ RUN apt-get update \
   && install -d -o huntproxy -g huntproxy /data /opt/huntproxy/browser-worker
 
 COPY --from=build /src/target/release/HuntProxy /usr/local/bin/HuntProxy
+COPY --from=build /src/LICENSE /src/THIRD_PARTY_NOTICES /usr/share/doc/huntproxy/
 COPY --from=browser --chown=huntproxy:huntproxy /browser-worker /opt/huntproxy/browser-worker
 
 ENV HUNTPROXY_DATA_DIR=/data \

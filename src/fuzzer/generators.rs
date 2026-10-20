@@ -28,19 +28,14 @@ pub enum PayloadGenerator {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegexBypassEncoding {
+    #[default]
     Url,
     Unicode,
     Raw,
     DoubleUrl,
-}
-
-impl Default for RegexBypassEncoding {
-    fn default() -> Self {
-        Self::Url
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

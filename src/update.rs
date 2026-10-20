@@ -200,11 +200,10 @@ async fn run_with_context(
         .transpose()?;
     let release = resolve_release(&client, &context.source, requested).await?;
     let target = StableVersion::parse(&release.tag_name)?;
-    if Some(target) != requested && requested.is_some() {
+    if let Some(requested) = requested.filter(|version| *version != target) {
         return Err(update_error(format!(
             "GitHub returned release {} for requested {}",
-            release.tag_name,
-            requested.unwrap()
+            release.tag_name, requested
         )));
     }
     let current_text = context.current_version.to_string();
@@ -1054,7 +1053,16 @@ mod tests {
         let server = MockServer::start().await;
         let release = archive(&[
             ("HuntProxy", script("0.1.1")),
-            ("LICENSE", b"test license\n".to_vec()),
+            // Preserve the archive format accepted by installed older updaters.
+            (
+                "LICENSE",
+                format!(
+                    "{}\n{}",
+                    include_str!("../LICENSE"),
+                    include_str!("../THIRD_PARTY_NOTICES")
+                )
+                .into_bytes(),
+            ),
         ]);
         mock_release(&server, "v0.1.1", &release, None).await;
         let directory = tempfile::tempdir().unwrap();

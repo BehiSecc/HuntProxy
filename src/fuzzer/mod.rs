@@ -947,7 +947,6 @@ async fn load_wordlist_files(template: &mut FuzzTemplate) -> DomainResult<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn run_job(
     db: Arc<Db>,
     reply: Arc<ReplyService>,

@@ -131,7 +131,7 @@ impl StoredCookieProfile {
             .iter()
             .filter(|cookie| managed_cookie_applies(cookie, &target, now))
             .collect::<Vec<_>>();
-        applicable.sort_by(|left, right| right.path.len().cmp(&left.path.len()));
+        applicable.sort_by_key(|cookie| std::cmp::Reverse(cookie.path.len()));
         let pairs = applicable
             .into_iter()
             .map(|cookie| format!("{}={}", cookie.name, cookie.value))

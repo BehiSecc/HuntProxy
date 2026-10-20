@@ -1405,6 +1405,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)] // Tungstenite fixes the callback's error response type.
     async fn websocket_proxy_captures_relays_and_injects_messages() {
         use futures::SinkExt;
         use tokio::net::TcpStream;

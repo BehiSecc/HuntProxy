@@ -2,7 +2,7 @@
 name = "HuntProxy"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.98"
 description = "A web security workbench built for AI agents and authorized testing"
 license = "Apache-2.0"
 repository = "https://github.com/BehiSecc/HuntProxy"
@@ -38,10 +38,10 @@ http2 = { version = "=0.5.19", features = ["unstable"] }
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "set-header"] }
-# Semantic egress — exact-pinned permissive prerelease (Apache-2.0).
+# Semantic egress — exact-pinned upstream revisions (Apache-2.0).
 # Cookies, decompression, and system-proxy support intentionally stay disabled.
-wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["webpki-roots", "tokio-rt", "stream", "socks"] }
-wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation", "tokio-rt"] }
+wreq = { git = "https://github.com/0x676e67/wreq", rev = "307c60df0663dd3fb434c82777b3fe9a0158d82a", default-features = false, features = ["webpki-roots", "tokio-rt", "stream", "socks"] }
+wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "5715529002738f46eea86a7271f918f9374d3582", default-features = false, features = ["emulation", "tokio-rt", "emulation-chromium-pki"] }
 
 # TLS / CA
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
@@ -108,7 +108,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # BoringSSL symbol prefixing is supported only on Linux and Android. Keeping it
 # enabled on macOS prefixes the Rust bindings but not the native libraries.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["prefix-symbols"] }
+wreq = { git = "https://github.com/0x676e67/wreq", rev = "307c60df0663dd3fb434c82777b3fe9a0158d82a", default-features = false, features = ["prefix-symbols"] }
 
 [dev-dependencies]
 proptest = "1"
@@ -123,3 +123,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+# Published releases lack the measured Chrome153 TLS signature/trust-anchor support.
+wreq = { git = "https://github.com/0x676e67/wreq", rev = "307c60df0663dd3fb434c82777b3fe9a0158d82a" }
+btls = { git = "https://github.com/0x676e67/btls", rev = "3bb18eec7a94887de45187bdbddab173947c40f1" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "3bb18eec7a94887de45187bdbddab173947c40f1" }
+tokio-btls = { git = "https://github.com/0x676e67/btls", rev = "3bb18eec7a94887de45187bdbddab173947c40f1" }
+# Keep request-specific HTTP/2 priority on the existing shared connection pool.
+http2 = { path = "vendor/http2" }

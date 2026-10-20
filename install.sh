@@ -99,7 +99,7 @@ NODE_INSTALLED=0; NODE_REUSED=0; WORKER_TOUCHED=0; STATE_BACKED_UP=0; INSTALL_CO
 NEW_PLUGIN_LIST="$TEMP_DIR/new-plugins"
 : >"$NEW_PLUGIN_LIST"
 STATE_BACKUP="$TEMP_DIR/state-backup"
-STATE_FILES=(config.toml huntproxy.db huntproxy.db-wal huntproxy.db-shm bb.db bb.db-wal bb.db-shm ca/ca.crt ca/ca.key placeholder.key .mcp-stop-guard)
+STATE_FILES=(config.toml huntproxy.db huntproxy.db-wal huntproxy.db-shm bb.db bb.db-wal bb.db-shm ca/ca.crt ca/ca.key placeholder.key .mcp-stop-guard licenses/LICENSE)
 
 remove_managed_tree() {
   local target=$1 parent=$2
@@ -378,6 +378,7 @@ if [[ -S "$DATA_DIR/daemon.sock" ]]; then
   case "$status_output" in *'daemon: running'*|*'daemon: unhealthy'*) die 'HuntProxy is running; run HuntProxy stop, restart/reconnect AI clients, then rerun the installer' ;; esac
 fi
 
+[[ ! -L "$DATA_DIR/licenses" ]] || die "refusing symlinked license directory: $DATA_DIR/licenses"
 mkdir -p "$STATE_BACKUP"
 for relative in "${STATE_FILES[@]}"; do
   state_target="$DATA_DIR/$relative"
@@ -531,6 +532,16 @@ if [[ "$STOP_GUARD_EXISTED" -eq 1 ]]; then
   cp -p -- "$STATE_BACKUP/.mcp-stop-guard" "$DATA_DIR/.mcp-stop-guard"
 fi
 ok 'HuntProxy daemon and plugins verified'
+
+# Preserve the bundled project license and third-party attributions.
+license_count="$(awk '$0 == "LICENSE" { count++ } END { print count + 0 }' <<<"$archive_members")"
+[[ "$license_count" -le 1 ]] || die 'duplicate release LICENSE'
+if [[ "$license_count" -eq 1 ]]; then
+  license_details="$(tar -tvzf "$DOWNLOAD_DIR/$ASSET_NAME" LICENSE)" || die 'cannot inspect LICENSE'
+  [[ "${license_details:0:1}" == '-' ]] || die 'the LICENSE archive member must be a regular file'
+  mkdir -p "$DATA_DIR/licenses"
+  tar -xOzf "$DOWNLOAD_DIR/$ASSET_NAME" LICENSE >"$DATA_DIR/licenses/LICENSE" || die 'cannot extract LICENSE'
+fi
 
 # The executable is the last component replaced.
 NEW_BIN="$(mktemp "$INSTALL_DIR/.HuntProxy.new.XXXXXX")"
