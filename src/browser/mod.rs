@@ -402,6 +402,7 @@ fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
                 "response",
                 "request_failed",
                 "window_message",
+                "observer_error",
             ];
             if kinds.len() > KINDS.len() || kinds.iter().any(|kind| !KINDS.contains(&kind.as_str()))
             {
@@ -3638,6 +3639,12 @@ mod tests {
             _ => panic!("wrong browser action"),
         }
         validate_browser_action(&events).unwrap();
+
+        let observer_events: BrowserAction = serde_json::from_value(json!({
+            "type": "events", "kinds": ["console", "page_error", "observer_error"]
+        }))
+        .unwrap();
+        validate_browser_action(&observer_events).unwrap();
     }
 
     #[test]

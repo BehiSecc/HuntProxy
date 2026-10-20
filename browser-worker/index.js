@@ -167,6 +167,7 @@ function trackPage(session, page, initial = false) {
   }, page));
   page.on("close", () => {
     recordSessionEvent(session, "page", { action: "closed" }, page);
+    void disposePageMessageObserver(session, page);
     session.pages.delete(pageId);
     if (session.page === page) {
       session.page = [...session.pages.values()].find((candidate) => !candidate.isClosed()) || null;
@@ -183,6 +184,7 @@ function trackPage(session, page, initial = false) {
       action: "opened", url: publicLocation(page.url()),
     }, page));
   }
+  if (session.messageObservers) startPageMessageObserver(session, page);
   return pageId;
 }
 
@@ -223,24 +225,108 @@ function installWindowMessageObserver(observerKey) {
   });
 }
 
+function observerFailure(session, page, operation) {
+  recordSessionEvent(session, "observer_error", { observer: "window_message", operation }, page);
+  return operation;
+}
+
+function startPageMessageObserver(session, page) {
+  if (session.messageObservers.has(page)) return session.messageObservers.get(page);
+  const state = { connection: null, contexts: new Set(), listeners: [], disposed: false, error: null };
+  session.messageObservers.set(page, state);
+  state.ready = (async () => {
+    const connection = await session.context.newCDPSession(page);
+    state.connection = connection;
+    const listen = (event, listener) => {
+      connection.on(event, listener);
+      state.listeners.push([event, listener]);
+    };
+    listen("Runtime.executionContextCreated", ({ context }) => {
+      if (context.name === session.messageObserverWorld
+          && context.auxData?.frameId === state.mainFrameId) state.contexts.add(context.id);
+    });
+    listen("Runtime.executionContextDestroyed", ({ executionContextId }) => state.contexts.delete(executionContextId));
+    listen("Runtime.executionContextsCleared", () => state.contexts.clear());
+    await connection.send("Page.enable");
+    const { frameTree } = await connection.send("Page.getFrameTree");
+    state.mainFrameId = frameTree.frame.id;
+    await connection.send("Runtime.enable");
+    // Isolated worlds share DOM events but have their own global object. Keep
+    // the queue and drain function out of the application's JavaScript world.
+    // A newly opened popup can execute its first inline script before CDP is
+    // attached; subsequent scripts/navigation use the registered init script.
+    await connection.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `(${installWindowMessageObserver.toString()})(${JSON.stringify(session.messageObserverKey)})`,
+      worldName: session.messageObserverWorld,
+      runImmediately: true,
+    });
+    if (!state.contexts.size) throw new Error("Isolated message observer context was not created");
+  })().catch(() => {
+    if (!state.disposed && !page.isClosed()) state.error = observerFailure(session, page, "initialization");
+  });
+  return state;
+}
+
+async function disposePageMessageObserver(session, page) {
+  const state = session.messageObservers?.get(page);
+  if (!state) return;
+  session.messageObservers.delete(page);
+  state.disposed = true;
+  await state.ready;
+  if (!state.connection) return;
+  for (const [event, listener] of state.listeners) state.connection.removeListener(event, listener);
+  // Target closure also detaches its CDP sessions.
+  await state.connection.detach().catch(() => undefined);
+  state.contexts.clear();
+}
+
+async function disposeSessionTracking(session) {
+  if (session.trackingPageListener) session.context.off("page", session.trackingPageListener);
+  await Promise.all([...(session.messageObservers?.keys() || [])]
+    .map((page) => disposePageMessageObserver(session, page)));
+}
+
 async function drainWindowMessages(session) {
   for (const page of [...session.pages.values()]) {
     if (page.isClosed()) continue;
-    const messages = await page.evaluate((observerKey) => {
-      const drain = window[observerKey];
-      return typeof drain === "function" ? drain() : [];
-    }, session.messageObserverKey).catch(() => []);
-    if (!Array.isArray(messages)) continue;
-    for (const message of messages.slice(0, 128)) {
-      if (!message || typeof message !== "object") continue;
-      recordSessionEvent(session, "window_message", {
-        origin: publicLocation(message.origin),
-        source_relation: ["same_window", "other_window", "none"].includes(message.source_relation)
-          ? message.source_relation : "none",
-        data_type: String(message.data_type || "unknown").slice(0, 32),
-        data_size: Number.isSafeInteger(message.data_size) && message.data_size >= 0
-          ? message.data_size : null,
-      }, page);
+    const state = startPageMessageObserver(session, page);
+    await state.ready;
+    if (state.disposed || page.isClosed()) continue;
+    // A broken observer must not hide the independently collected page and
+    // console events. Its diagnostic and persistent status remain retrievable.
+    if (state.error) continue;
+    for (const contextId of [...state.contexts]) {
+      let result;
+      try {
+        result = await state.connection.send("Runtime.evaluate", {
+          expression: `globalThis[${JSON.stringify(session.messageObserverKey)}]()`,
+          contextId,
+          returnByValue: true,
+        });
+      } catch (error) {
+        if (page.isClosed() || state.disposed
+            || /Cannot find context|Execution context was destroyed|Inspected target navigated or closed/.test(String(error?.message))) {
+          state.contexts.delete(contextId);
+          continue;
+        }
+        state.error = observerFailure(session, page, "read");
+        break;
+      }
+      if (result.exceptionDetails || !Array.isArray(result.result?.value)) {
+        state.error = observerFailure(session, page, "read");
+        break;
+      }
+      for (const message of result.result.value.slice(0, 128)) {
+        if (!message || typeof message !== "object") continue;
+        recordSessionEvent(session, "window_message", {
+          origin: publicLocation(message.origin),
+          source_relation: ["same_window", "other_window", "none"].includes(message.source_relation)
+            ? message.source_relation : "none",
+          data_type: String(message.data_type || "unknown").slice(0, 32),
+          data_size: Number.isSafeInteger(message.data_size) && message.data_size >= 0
+            ? message.data_size : null,
+        }, page);
+      }
     }
   }
 }
@@ -259,12 +345,12 @@ async function initializeSessionTracking(session, existingJavascriptFiles = new 
   session.eventBytes = 0;
   session.eventsDropped = 0;
   session.messageObserverKey = `__huntproxy_messages_${generation}_${Date.now()}__`;
-  session.context.on("page", (page) => trackPage(session, page, false));
+  session.messageObserverWorld = `huntproxy_window_messages_${generation}`;
+  session.messageObservers = new Map();
+  session.trackingPageListener = (page) => trackPage(session, page, false);
+  session.context.on("page", session.trackingPageListener);
   for (const page of session.context.pages()) trackPage(session, page, true);
-  await session.context.addInitScript(installWindowMessageObserver, session.messageObserverKey);
-  for (const page of session.context.pages()) {
-    await page.evaluate(installWindowMessageObserver, session.messageObserverKey).catch(() => undefined);
-  }
+  await Promise.all([...session.messageObservers.values()].map((state) => state.ready));
 }
 
 async function activePage(session) {
@@ -1033,6 +1119,11 @@ async function performEvents(session, action) {
     oldest_sequence: oldestSequence,
     cursor_expired: after > 0 && after < oldestSequence - 1,
     dropped_events: session.eventsDropped,
+    observer_errors: [...session.messageObservers.entries()]
+      .filter(([, state]) => state.error)
+      .map(([page, state]) => ({
+        page_id: pageIdFor(session, page), observer: "window_message", operation: state.error,
+      })),
   } };
 }
 
@@ -1684,6 +1775,7 @@ async function handle(req) {
 }
 
 async function closeRuntime(runtime) {
+  await disposeSessionTracking(runtime);
   try { await runtime.page?.close(); } catch {}
   try { await runtime.context?.close(); } catch {}
   try { await runtime.browser?.close(); } catch {}

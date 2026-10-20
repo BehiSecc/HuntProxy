@@ -246,7 +246,7 @@ fn browser_action_schema() -> Value {
             "runtime_generation": {"type":"integer","minimum":1,"description":"Generation returned by pages/events or browser context. Required when reusing a page ID or nonzero event cursor."},
             "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"For events, return observations after this sequence."},
             "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Maximum browser events to return."},
-            "kinds": {"type":"array","maxItems":10,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message"]},"description":"Optional browser event filter."},
+            "kinds": {"type":"array","maxItems":11,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message","observer_error"]},"description":"Optional browser event filter. Observer failures also appear in observer_errors, including when a filter excludes observer_error."},
             "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"For events, wait up to this long for a matching event."},
             "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal wheel delta for scroll."},
             "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical wheel delta for scroll."},
@@ -2734,6 +2734,11 @@ mod tests {
         for action in ["pages", "events", "scroll", "screenshot", "request"] {
             assert!(action_types.contains(&json!(action)));
         }
+        let event_kinds = schema["properties"]["kinds"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(event_kinds.contains(&json!("observer_error")));
+        assert_eq!(schema["properties"]["kinds"]["maxItems"], event_kinds.len());
         assert_eq!(
             schema["properties"]["max_response_bytes"]["maximum"],
             65_536
