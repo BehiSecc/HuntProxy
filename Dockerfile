@@ -16,7 +16,7 @@ FROM node:20-bookworm-slim AS browser
 WORKDIR /browser-worker
 COPY browser-worker/package.json browser-worker/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
-COPY browser-worker/index.js ./
+COPY browser-worker/index.js browser-worker/headless.js ./
 
 FROM debian:bookworm-slim
 RUN apt-get update \

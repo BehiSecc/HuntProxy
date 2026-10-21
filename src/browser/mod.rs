@@ -28,6 +28,7 @@ const MAX_BROWSER_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BROWSER_REQUEST_RESPONSE_BYTES: u64 = 65_536;
 const MAX_BROWSER_SCREENSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const EMBEDDED_WORKER: &str = include_str!("../../browser-worker/index.js");
+const EMBEDDED_WORKER_HEADLESS: &str = include_str!("../../browser-worker/headless.js");
 const EMBEDDED_WORKER_PACKAGE: &str = include_str!("../../browser-worker/package.json");
 const EMBEDDED_WORKER_LOCK: &str = include_str!("../../browser-worker/package-lock.json");
 
@@ -41,6 +42,8 @@ pub struct BrowserInstallStatus {
     pub chromium_version: Option<String>,
     #[serde(default)]
     pub headless: Option<bool>,
+    #[serde(default)]
+    pub headless_compatibility: Option<bool>,
     #[serde(default)]
     pub playwright_core_path: Option<String>,
     #[serde(default)]
@@ -60,6 +63,8 @@ struct BrowserRuntimeInspection {
     chromium_path: Option<PathBuf>,
     chromium_version: Option<String>,
     headless: Option<bool>,
+    headless_compatibility: Option<bool>,
+    compatibility_error: Option<String>,
     #[serde(skip)]
     inspection_error: Option<String>,
 }
@@ -949,8 +954,10 @@ fn browser_install_status(
     let chromium_path = runtime.chromium_path.as_deref();
     let node_available = node_path.is_some_and(Path::is_file);
     let worker_script_available = worker_path.is_some_and(Path::is_file);
-    let worker_available =
-        node_available && worker_script_available && playwright_core_path.is_some_and(Path::is_dir);
+    let worker_available = node_available
+        && worker_script_available
+        && playwright_core_path.is_some_and(Path::is_dir)
+        && runtime.compatibility_error.is_none();
     let chromium_available = chromium_path.is_some_and(Path::is_file);
 
     let install_hint = if !node_available {
@@ -961,6 +968,8 @@ fn browser_install_status(
                 .into(),
         )
     } else if let Some(error) = &runtime.inspection_error {
+        Some(error.clone())
+    } else if let Some(error) = &runtime.compatibility_error {
         Some(error.clone())
     } else if !playwright_core_path.is_some_and(Path::is_dir) {
         let directory = worker_path
@@ -983,6 +992,7 @@ fn browser_install_status(
         chromium_path: chromium_path.map(|path| path.display().to_string()),
         chromium_version: runtime.chromium_version.clone(),
         headless: runtime.headless,
+        headless_compatibility: runtime.headless_compatibility,
         playwright_core_path: playwright_core_path.map(|path| path.display().to_string()),
         playwright_version: runtime.playwright_version.clone(),
         expected_chromium_version: runtime.expected_chromium_version.clone(),
@@ -3604,6 +3614,10 @@ fn materialize_embedded_worker(data_dir: &Path) -> std::io::Result<PathBuf> {
     let package_path = directory.join("package.json");
     let lock_path = directory.join("package-lock.json");
     write_if_changed(&worker_path, EMBEDDED_WORKER.as_bytes())?;
+    write_if_changed(
+        &directory.join("headless.js"),
+        EMBEDDED_WORKER_HEADLESS.as_bytes(),
+    )?;
     write_if_changed(&package_path, EMBEDDED_WORKER_PACKAGE.as_bytes())?;
     write_if_changed(&lock_path, EMBEDDED_WORKER_LOCK.as_bytes())?;
     Ok(worker_path)
@@ -4679,6 +4693,18 @@ done
         assert_eq!(ready.playwright_version.as_deref(), Some("1.61.1"));
         assert_eq!(ready.chromium_version.as_deref(), Some("153.0.8010.36"));
         assert_eq!(ready.headless, Some(false));
+        let mut compatibility = runtime.clone();
+        compatibility.headless = Some(true);
+        compatibility.headless_compatibility = Some(true);
+        compatibility.compatibility_error =
+            Some("Headless compatibility dependencies missing".into());
+        let missing_dependency = browser_install_status(Some(&node), Some(&worker), &compatibility);
+        assert!(!missing_dependency.worker_available);
+        assert_eq!(missing_dependency.headless_compatibility, Some(true));
+        assert!(missing_dependency
+            .install_hint
+            .unwrap()
+            .contains("compatibility"));
         assert_eq!(
             ready.expected_chromium_version.as_deref(),
             Some("149.0.7827.55")
@@ -4865,5 +4891,9 @@ done
         assert!(worker_dir.join("index.js").is_file());
         assert!(worker_dir.join("package.json").is_file());
         assert!(worker_dir.join("package-lock.json").is_file());
+        assert_eq!(
+            std::fs::read_to_string(worker_dir.join("headless.js")).unwrap(),
+            EMBEDDED_WORKER_HEADLESS
+        );
     }
 }

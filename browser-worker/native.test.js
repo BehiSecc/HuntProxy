@@ -25,7 +25,7 @@ function fixture(t, mode = "ready") {
   const browser = {
     contexts: () => [{
       async setHTTPCredentials(credentials) { events.push("auth"); assert.equal(credentials.username, "workspace"); if (mode === "auth-error") throw Error("Authentication setup failed"); },
-      pages() { events.push("pages"); return [{}]; },
+      pages() { events.push("pages"); return [{ async bringToFront() { events.push("activate"); } }]; },
     }],
     async close() { events.push("disconnect"); },
   };
@@ -62,7 +62,7 @@ test("native startup attaches only its emitted endpoint and retains auth and rou
   const f = fixture(t);
   const runtime = await f.api.launchNativeChromium({ server: "http://127.0.0.1:17891", username: "workspace", password: "local-session" }, "/managed/ca.crt", f.profile, null);
   assert.equal(runtime.ownedChrome, f.child);
-  assert.deepEqual(f.events, ["connect", "auth", "pages"]);
+  assert.deepEqual(f.events, ["connect", "auth", "pages", "activate"]);
   for (const argument of ["--remote-debugging-address=127.0.0.1", "--proxy-bypass-list=<-loopback>", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--ignore-certificate-errors", "--disable-quic"]) assert.equal(f.args().includes(argument), true);
   assert.equal(f.args().at(-1), "about:blank");
   assert.equal(f.args().some((value) => /remote-debugging-pipe|AutomationControlled|local-session/.test(value)), false);
@@ -85,6 +85,13 @@ test("an occupied handoff port fails before launching a browser", async (t) => {
   t.after(() => new Promise((resolve) => listener.close(resolve)));
   const f = fixture(t);
   await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, listener.address().port), { code: "EADDRINUSE" });
+  assert.equal(f.args(), undefined);
+});
+
+test("an unavailable artifacts directory fails before spawning another browser", async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.profile, "huntproxy-artifacts"), "occupied");
+  await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, null));
   assert.equal(f.args(), undefined);
 });
 

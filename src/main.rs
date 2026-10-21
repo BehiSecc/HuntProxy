@@ -287,6 +287,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!(
                 "  mode:       {}",
                 match browser.headless {
+                    Some(true) if browser.headless_compatibility == Some(true) =>
+                        "headless (native compatibility)",
                     Some(true) => "headless",
                     Some(false) => "headed",
                     None => "unknown",

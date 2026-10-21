@@ -14,6 +14,8 @@ function fixture(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const worker = path.join(root, "worker.mjs");
   fs.writeFileSync(worker, source);
+  fs.copyFileSync(new URL("./headless.js", import.meta.url), path.join(root, "headless.js"));
+  fs.writeFileSync(path.join(root, "package.json"), '{"type":"module"}');
   const bin = path.join(root, "bin");
   fs.mkdirSync(bin);
   const bundle = path.join(root, "paired-chromium");
@@ -31,7 +33,7 @@ function fixture(t) {
       : ${JSON.stringify(bundle)} }
   };`);
   const env = { ...process.env, PATH: bin, HUNTPROXY_PLAYWRIGHT_CORE_PATH: packageDir };
-  for (const key of [...overrides, "BB_PLAYWRIGHT_CORE_PATH", "PLAYWRIGHT_BROWSERS_PATH", "HUNTPROXY_BROWSER_HEADLESS"]) delete env[key];
+  for (const key of [...overrides, "BB_PLAYWRIGHT_CORE_PATH", "PLAYWRIGHT_BROWSERS_PATH", "HUNTPROXY_BROWSER_HEADLESS", "HUNTPROXY_BROWSER_HEADLESS_COMPAT"]) delete env[key];
   function executable(filename, version = "149.0.7827.55") {
     fs.writeFileSync(filename, `#!/bin/sh\nprintf 'Chromium ${version}\\n'\n`, { mode: 0o700 });
     return filename;
@@ -140,4 +142,25 @@ test("missing Chromium keeps Playwright diagnostics available", { skip: process.
   assert.equal(result.playwright_version, "1.61.1");
   assert.equal(result.chromium_path, null);
   assert.equal(result.chromium_version, null);
+});
+
+test("headless compatibility is explicit, launch-free during inspection, and diagnoses missing dependencies", (t) => {
+  const f = fixture(t);
+  assert.equal(f.run().headless_compatibility, false);
+  assert.equal(f.run().compatibility_error, null);
+  // Exercise the runtime's dependency diagnostic independently of whether this
+  // host happens to provide a system-wide ws package.
+  fs.writeFileSync(path.join(f.root, "headless.js"), `export const headlessDependencyError = () => "Missing dependencies; run HuntProxy browser install";
+    export const inspectNativeIdentity = () => { throw Error("Inspection must not launch"); };
+    export const createIdentityRelay = () => { throw Error("Inspection must not launch"); };`);
+  const result = f.run({ HUNTPROXY_BROWSER_HEADLESS_COMPAT: 'true' });
+  assert.equal(result.headless, true);
+  assert.equal(result.headless_compatibility, true);
+  assert.match(result.compatibility_error, /browser install/);
+  assert.equal(fs.existsSync(path.join(f.root, 'profiles')), false);
+  const conflict = spawnSync(process.execPath, [f.worker, '--inspect-runtime'], {
+    env: { ...f.env, HUNTPROXY_BROWSER_HEADLESS: 'false', HUNTPROXY_BROWSER_HEADLESS_COMPAT: 'true' }, encoding: 'utf8',
+  });
+  assert.notEqual(conflict.status, 0);
+  assert.match(conflict.stderr, /requires headless mode/);
 });

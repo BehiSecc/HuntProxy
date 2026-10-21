@@ -14,6 +14,7 @@ cargo test --all-targets
 
 echo "== browser worker syntax =="
 node --check browser-worker/index.js
+node --check browser-worker/headless.js
 
 echo "== build =="
 cargo build --release
