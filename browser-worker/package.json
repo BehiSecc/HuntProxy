@@ -8,6 +8,7 @@
     "test": "node --test"
   },
   "dependencies": {
-    "playwright-core": "1.61.1"
+    "playwright-core": "1.61.1",
+    "ws": "8.22.0"
   }
 }
