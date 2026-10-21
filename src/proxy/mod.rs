@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
@@ -910,51 +910,42 @@ async fn handle_connect(
                 return;
             }
         };
-        let acceptor = TlsAcceptor::from(tls_config);
-        let tls = match acceptor.accept(TokioIo::new(upgraded)).await {
-            Ok(tls) => tls,
-            Err(error) => {
-                tracing::debug!(%error, "CONNECT TLS interception failed");
-                return;
-            }
+        // Chromium tunnels both ws:// and wss:// through CONNECT. Keep the
+        // prelude buffered so selecting plaintext HTTP never consumes its GET,
+        // while TLS still follows the existing certificate/interception path.
+        let mut stream = BufReader::new(TokioIo::new(upgraded));
+        let first = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            result = stream.fill_buf() => match result {
+                Ok(bytes) => bytes.first().copied(),
+                Err(error) => {
+                    tracing::debug!(%error, "CONNECT protocol detection failed");
+                    return;
+                }
+            },
         };
-        let service_state = state.clone();
-        let service_session = session.clone();
-        let service = service_fn(move |inner| {
-            let state = service_state.clone();
-            let session = service_session.clone();
-            async move {
-                let response = match forward_request(state, inner, session, Some("https")).await {
-                    Ok(response) => response,
-                    Err(error) => proxy_error_response(error),
+        match first {
+            Some(0x16) => {
+                let acceptor = TlsAcceptor::from(tls_config);
+                let tls = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    result = acceptor.accept(stream) => match result {
+                        Ok(tls) => tls,
+                        Err(error) => {
+                            tracing::debug!(%error, "CONNECT TLS interception failed");
+                            return;
+                        }
+                    },
                 };
-                Ok::<_, Infallible>(response)
+                serve_connect_io(tls, state, session, "https").await;
             }
-        });
-        let monitor_state = state.clone();
-        let monitor_session = session.clone();
-        let revocation = async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if !capture_session_active(&monitor_state, &monitor_session).await {
-                    tracing::debug!(
-                        session_id = monitor_session.id.get(),
-                        "closing revoked CONNECT tunnel"
-                    );
-                    break;
-                }
+            Some(first) if first.is_ascii_alphabetic() => {
+                serve_connect_io(stream, state, session, "http").await;
             }
-        };
-        let builder = AutoServerBuilder::new(TokioExecutor::new());
-        let connection = builder.serve_connection_with_upgrades(TokioIo::new(tls), service);
-        tokio::select! {
-            _ = shutdown.cancelled() => {}
-            _ = revocation => {}
-            result = connection => {
-                if let Err(error) = result {
-                    tracing::debug!(%error, "intercepted CONNECT closed");
-                }
+            Some(_) => {
+                tracing::debug!("CONNECT requires TLS or an HTTP request");
             }
+            None => {}
         }
     });
 
@@ -962,6 +953,53 @@ async fn handle_connect(
         .status(StatusCode::OK)
         .body(full_body(Bytes::new()))
         .expect("static CONNECT response"))
+}
+
+async fn serve_connect_io<I>(
+    io: I,
+    state: Arc<AppState>,
+    session: CaptureSession,
+    scheme: &'static str,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service_state = state.clone();
+    let service_session = session.clone();
+    let service = service_fn(move |inner| {
+        let state = service_state.clone();
+        let session = service_session.clone();
+        async move {
+            let response = match forward_request(state, inner, session, Some(scheme)).await {
+                Ok(response) => response,
+                Err(error) => proxy_error_response(error),
+            };
+            Ok::<_, Infallible>(response)
+        }
+    });
+    let shutdown = state.shutdown.clone();
+    let revocation = async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !capture_session_active(&state, &session).await {
+                tracing::debug!(
+                    session_id = session.id.get(),
+                    "closing revoked CONNECT tunnel"
+                );
+                break;
+            }
+        }
+    };
+    let builder = AutoServerBuilder::new(TokioExecutor::new());
+    let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
+    tokio::select! {
+        _ = shutdown.cancelled() => {}
+        _ = revocation => {}
+        result = connection => {
+            if let Err(error) = result {
+                tracing::debug!(%error, "intercepted CONNECT closed");
+            }
+        }
+    }
 }
 
 async fn capture_session_active(state: &AppState, session: &CaptureSession) -> bool {
@@ -1404,9 +1442,30 @@ mod tests {
         proxy.await.unwrap().unwrap();
     }
 
-    #[tokio::test]
+    async fn open_test_connect(
+        proxy: SocketAddr,
+        target: SocketAddr,
+        token: &str,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncReadExt;
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Bearer {token}\r\n\r\n").as_bytes()).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                assert!(response.len() < 4096);
+                response.push(stream.read_u8().await.unwrap());
+            }
+            response
+        })
+        .await
+        .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        stream
+    }
+
     #[allow(clippy::result_large_err)] // Tungstenite fixes the callback's error response type.
-    async fn websocket_proxy_captures_relays_and_injects_messages() {
+    async fn assert_websocket_proxy_captures_relays_and_injects_messages(tunneled: bool) {
         use futures::SinkExt;
         use tokio::net::TcpStream;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -1477,7 +1536,16 @@ mod tests {
             listener,
             cancel.clone(),
         ));
-        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let stream = if tunneled {
+            open_test_connect(
+                proxy_addr,
+                target_addr,
+                session.token_once.as_deref().unwrap(),
+            )
+            .await
+        } else {
+            TcpStream::connect(proxy_addr).await.unwrap()
+        };
         let url = format!("ws://{target_addr}/events");
         let mut request = url.clone().into_client_request().unwrap();
         request.headers_mut().insert(
@@ -1491,12 +1559,14 @@ mod tests {
             "sec-websocket-extensions",
             "permessage-deflate".parse().unwrap(),
         );
-        request.headers_mut().insert(
-            "proxy-authorization",
-            format!("Bearer {}", session.token_once.as_deref().unwrap())
-                .parse()
-                .unwrap(),
-        );
+        if !tunneled {
+            request.headers_mut().insert(
+                "proxy-authorization",
+                format!("Bearer {}", session.token_once.as_deref().unwrap())
+                    .parse()
+                    .unwrap(),
+            );
+        }
         let (mut client, response) = tokio_tungstenite::client_async(request, stream)
             .await
             .unwrap();
@@ -1562,6 +1632,136 @@ mod tests {
                 .unwrap()[0]
                 .name,
             "WebSocket marker"
+        );
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_proxy_captures_relays_and_injects_messages() {
+        assert_websocket_proxy_captures_relays_and_injects_messages(false).await;
+    }
+
+    #[tokio::test]
+    async fn connect_websocket_proxy_captures_relays_and_injects_messages() {
+        assert_websocket_proxy_captures_relays_and_injects_messages(true).await;
+    }
+
+    #[tokio::test]
+    async fn tls_connect_still_intercepts_and_forwards_http() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, project, session) = proxy_test_fixture(&directory).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let origin = tokio::spawn(async move {
+            let (stream, _) = target.accept().await.unwrap();
+            let service = service_fn(|request: Request<Incoming>| async move {
+                assert_eq!(request.uri().path(), "/verification");
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                    b"verified TLS tunnel",
+                ))))
+            });
+            http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        let stream = open_test_connect(
+            proxy_addr,
+            target_addr,
+            session.token_once.as_deref().unwrap(),
+        )
+        .await;
+        let mut roots = rustls::RootCertStore::empty();
+        let pem = std::fs::read(state.config.ca_cert_path()).unwrap();
+        for certificate in rustls_pemfile::certs(&mut pem.as_slice()) {
+            roots.add(certificate.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::IpAddress(
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap().into(),
+                ),
+                stream,
+            )
+            .await
+            .unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        let client = tokio::spawn(connection);
+        // Absolute-form HTTP remains accepted inside the intercepted TLS
+        // stream, as before; the test origin needs no separate trust bypass.
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{target_addr}/verification"))
+                    .header("host", target_addr.to_string())
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "verified TLS tunnel"
+        );
+        assert_eq!(
+            wait_for_exchange(&state, project.id).await.summary.path,
+            "/verification"
+        );
+        origin.await.unwrap();
+        client.abort();
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_non_http_non_tls_starts_without_dialing_origin() {
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _, session) = proxy_test_fixture(&directory).await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(state, listener, cancel.clone()));
+        let mut stream = open_test_connect(
+            proxy_addr,
+            target.local_addr().unwrap(),
+            session.token_once.as_deref().unwrap(),
+        )
+        .await;
+        stream.write_all(&[0x01, 0x02]).await.unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err()
         );
         cancel.cancel();
         proxy.await.unwrap().unwrap();
