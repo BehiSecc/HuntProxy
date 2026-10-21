@@ -3515,8 +3515,17 @@ fn inspect_browser_runtime(
 }
 
 fn resolve_worker_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    resolve_worker_path_in(explicit, &crate::config::default_data_dir())
+}
+
+fn resolve_worker_path_in(explicit: Option<PathBuf>, fallback_data_dir: &Path) -> Option<PathBuf> {
     let mut candidates = worker_path_candidates(explicit);
-    if let Ok(materialized) = materialize_embedded_worker(&crate::config::default_data_dir()) {
+    // Explicit/installed workers already own their assets and dependencies.
+    // Do not rewrite another data directory merely to discover that path.
+    if let Some(worker) = first_existing_worker(candidates.clone()) {
+        return Some(worker);
+    }
+    if let Ok(materialized) = materialize_embedded_worker(fallback_data_dir) {
         candidates.push(materialized);
     }
     append_source_worker_candidate(&mut candidates);
@@ -4629,6 +4638,15 @@ done
         let directory = tempfile::tempdir().unwrap();
         let worker = directory.path().join("index.js");
         std::fs::write(&worker, "// worker").unwrap();
+        let unused = directory.path().join("unused-data");
+        assert_eq!(
+            resolve_worker_path_in(Some(worker.clone()), &unused),
+            Some(worker.clone())
+        );
+        assert!(
+            !unused.exists(),
+            "explicit worker discovery must not materialize default assets"
+        );
         assert_eq!(resolve_worker_path(Some(worker.clone())), Some(worker));
     }
 
