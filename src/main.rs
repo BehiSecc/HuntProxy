@@ -565,11 +565,42 @@ async fn run(cli: Cli) -> DomainResult<()> {
             match cmd {
                 BrowserCmd::Install { with_deps } => {
                     let cfg = Config::load(cli.data_dir)?;
+                    let node = cfg.node_path.as_deref().filter(|node| {
+                        huntproxy::config::browser_node_supported(node)
+                    }).ok_or_else(|| DomainError::new(ErrorCode::Unavailable,
+                        "Browser installation requires Node.js 20 or newer; rerun the HuntProxy installer for its private Node runtime, or configure node_path"))?
+                        .canonicalize().map_err(|error| DomainError::new(ErrorCode::Unavailable, error.to_string()))?;
+                    let node_bin = node.parent().ok_or_else(|| {
+                        DomainError::new(
+                            ErrorCode::Unavailable,
+                            "Node.js path has no parent directory",
+                        )
+                    })?;
+                    let npm = if cfg!(windows) {
+                        node_bin.join("node_modules/npm/bin/npm-cli.js")
+                    } else {
+                        node_bin.join("npm")
+                    };
+                    if !npm.is_file() {
+                        return Err(DomainError::new(ErrorCode::Unavailable,
+                            "The selected Node.js installation is missing npm; rerun the HuntProxy installer"));
+                    }
+                    let search_path =
+                        std::env::join_paths(std::iter::once(node_bin.to_path_buf()).chain(
+                            std::env::var_os("PATH").into_iter().flat_map(|value| {
+                                std::env::split_paths(&value).collect::<Vec<_>>()
+                            }),
+                        ))
+                        .map_err(|error| {
+                            DomainError::new(ErrorCode::ConfigInvalid, error.to_string())
+                        })?;
                     println!("Installing browser-worker dependencies…");
                     let worker =
                         huntproxy::browser::prepare_browser_worker_installation(&cfg.data_dir)?;
-                    let status = std::process::Command::new("npm")
+                    let status = std::process::Command::new(&node)
+                        .arg(npm)
                         .args(["ci"])
+                        .env("PATH", &search_path)
                         .current_dir(&worker)
                         .status()
                         .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
@@ -586,11 +617,12 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     }
                     args.push("chromium");
                     println!("Installing Playwright Chromium…");
-                    let status = std::process::Command::new("node")
+                    let status = std::process::Command::new(&node)
                         .arg(playwright_cli)
                         .args(args)
                         .current_dir(&worker)
                         .env("PLAYWRIGHT_BROWSERS_PATH", "0")
+                        .env("PATH", &search_path)
                         .status()
                         .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
                     if !status.success() {

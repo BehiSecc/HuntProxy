@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_API_ADDR: &str = "127.0.0.1:17890";
 pub const DEFAULT_PROXY_ADDR: &str = "127.0.0.1:17891";
@@ -243,11 +245,15 @@ impl Config {
             })?;
             cfg.apply_file(file);
         }
-        if cfg.node_path.as_ref().is_none_or(|path| !path.is_file()) {
-            let managed_node = cfg.runtime_dir.join("node/bin/node");
-            if managed_node.is_file() {
-                cfg.node_path = Some(managed_node);
-            }
+        let managed_node = cfg.runtime_dir.join("node/bin/node");
+        if managed_node.is_file()
+            && !cfg.node_path.as_deref().is_some_and(browser_node_supported)
+            && browser_node_supported(&managed_node)
+        {
+            cfg.node_path = Some(managed_node);
+        }
+        if cfg.node_path.as_ref().is_none_or(|node| !node.is_file()) {
+            cfg.node_path = which_path("node");
         }
         cfg.validate()?;
         cfg.ensure_layout()?;
@@ -497,6 +503,44 @@ fn which_path(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Playwright's minimum applies to every browser mode. Keep an older system
+/// Node usable for other software; use the installer's private runtime instead.
+pub fn browser_node_supported(node: &Path) -> bool {
+    let Ok(mut child) = Command::new(node)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                return child.wait_with_output().ok().is_some_and(|output| {
+                    std::str::from_utf8(&output.stdout)
+                        .ok()
+                        .and_then(|version| version.trim().strip_prefix('v'))
+                        .and_then(|version| version.split('.').next())
+                        .and_then(|major| major.parse::<u32>().ok())
+                        .is_some_and(|major| major >= 20)
+                });
+            }
+            Ok(Some(_)) => return false,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,13 +586,16 @@ mod tests {
         assert_eq!(config.db_path(), data_dir.join(DB_FILE_NAME));
     }
 
+    #[cfg(unix)]
     #[test]
     fn load_falls_back_to_the_managed_node_runtime() {
+        use std::os::unix::fs::PermissionsExt;
         let parent = tempfile::tempdir().unwrap();
         let data_dir = parent.path().join("data");
         let node = data_dir.join("runtime/node/bin/node");
         std::fs::create_dir_all(node.parent().unwrap()).unwrap();
-        std::fs::write(&node, b"node").unwrap();
+        std::fs::write(&node, b"#!/bin/sh\nprintf 'v22.23.2\\n'\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(
             data_dir.join(CONFIG_FILE_NAME),
             "node_path = '/missing/node'\n",
@@ -557,6 +604,46 @@ mod tests {
 
         let config = Config::load(Some(data_dir)).unwrap();
         assert_eq!(config.node_path.as_deref(), Some(node.as_path()));
+    }
+
+    #[test]
+    fn missing_configured_node_uses_the_same_path_selection_for_install_and_runtime() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::write(
+            parent.path().join(CONFIG_FILE_NAME),
+            "node_path = '/missing/node'\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(parent.path().to_path_buf())).unwrap();
+        assert_eq!(config.node_path, which_path("node"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_node_replaces_an_unsupported_node_but_preserves_supported_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let data = parent.path().join("data");
+        let managed = data.join("runtime/node/bin/node");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        let selected = parent.path().join("selected-node");
+        for (selected_version, managed_version, expected) in [
+            ("18.19.1", "22.23.2", &managed),
+            ("20.20.0", "22.23.2", &selected),
+            ("18.19.1", "18.19.1", &selected),
+        ] {
+            for (node, version) in [(&selected, selected_version), (&managed, managed_version)] {
+                std::fs::write(node, format!("#!/bin/sh\nprintf 'v{version}\\n'\n")).unwrap();
+                std::fs::set_permissions(node, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            std::fs::write(
+                data.join(CONFIG_FILE_NAME),
+                format!("node_path = '{}'\n", selected.display()),
+            )
+            .unwrap();
+            let config = Config::load(Some(data.clone())).unwrap();
+            assert_eq!(config.node_path.as_ref(), Some(expected));
+        }
     }
 
     #[test]

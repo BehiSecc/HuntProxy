@@ -190,37 +190,13 @@ show_browser_smoke_error() {
 
 install_chromium_runtime_libraries() {
   local playwright_path="$WORKER_DIR/node_modules/playwright-core"
-  local package_list package
-  local packages=() missing_packages=()
-  for command_name in apt-get dpkg-query; do
-    command -v "$command_name" >/dev/null 2>&1 || return 1
-  done
-  package_list="$("$MANAGED_NODE_DIR/bin/node" -e '
-const path = require("path");
-const root = process.argv[1];
-const platform = require(path.join(root, "lib/utils/hostPlatform.js"));
-const native = require(path.join(root, "lib/server/registry/nativeDeps.js"));
-const packages = platform.isOfficiallySupportedPlatform && native.deps[platform.hostPlatform]?.chromium;
-if (!Array.isArray(packages) || !packages.length) process.exit(1);
-process.stdout.write(packages.join("\n"));
-' "$playwright_path")" || return 1
-  while IFS= read -r package; do
-    [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || return 1
-    packages+=("$package")
-  done <<<"$package_list"
-  ((${#packages[@]})) || return 1
-  for package in "${packages[@]}"; do
-    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
-      missing_packages+=("$package")
-    fi
-  done
-  ((${#missing_packages[@]})) || return 1
+  command -v apt-get >/dev/null 2>&1 || return 1
+  # Use Playwright's supported CLI, not private package paths that change
+  # between releases. This branch already requires root or interactive sudo.
   if [[ "$(id -u)" == 0 ]]; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+    DEBIAN_FRONTEND=noninteractive "$MANAGED_NODE_DIR/bin/node" "$playwright_path/cli.js" install-deps chromium
   else
-    sudo apt-get update
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_packages[@]}"
+    sudo env DEBIAN_FRONTEND=noninteractive "$MANAGED_NODE_DIR/bin/node" "$playwright_path/cli.js" install-deps chromium
   fi
 }
 
@@ -429,9 +405,9 @@ cat >"$TEMP_DIR/browser-smoke.ndjson" <<'EOF'
 {"jsonrpc":"2.0","id":2,"method":"session.start","params":{"session_id":1,"engine":"chromium","url":"about:blank","persistent":false}}
 {"jsonrpc":"2.0","id":3,"method":"session.stop","params":{"session_id":1}}
 EOF
-if browser_smoke "$WORKER_DIR" browser-existing; then
-  ok 'Existing Chromium runtime launched successfully and was reused'
-else
+# The embedded lock can change without the HuntProxy version changing. Refresh
+# it even when an older SDK/browser still launches, preserving rollback below.
+{
   if [[ -d "$WORKER_DIR" ]]; then
     WORKER_BACKUP="$(mktemp -d "$DATA_DIR/.browser-worker.old.XXXXXX")"
     rmdir "$WORKER_BACKUP"
@@ -468,7 +444,7 @@ else
     fi
   fi
   ok 'Chromium launched successfully'
-fi
+}
 
 PLUGIN_DIR="$DATA_DIR/plugins"
 if [[ -f "$DATA_DIR/config.toml" ]]; then

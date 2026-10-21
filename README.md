@@ -75,9 +75,12 @@ docker run -d \
   --name huntproxy \
   --network host \
   --shm-size=1g \
+  --security-opt seccomp=./docker/seccomp_profile.json \
   -v huntproxy-data:/data \
   huntproxy:local
 ```
+
+The image includes Node 22 and the pinned Playwright Chromium. Keep its non-root user and the supplied [Playwright 1.63 seccomp profile](https://github.com/microsoft/playwright/blob/v1.63.0/utils/docker/seccomp_profile.json) so Chromium can create its sandbox namespaces. Default native persistent workspaces keep Chromium's sandbox enabled.
 
 Connect your AI agent to the running container:
 
@@ -346,7 +349,7 @@ Use `HuntProxy browser install` for the paired Chromium runtime. Startup selects
 
 Browsers run headless by default. Persistent workspaces automatically use native compatibility mode without a display: the selected browser's own version, brands and platform metadata, a 1280×720 virtual screen, and normal browser APIs. Playwright diagnostics, proxy capture, History and request rules remain available. Set `HUNTPROXY_BROWSER_HEADLESS_COMPAT=false` in the daemon's environment to use the standard Playwright headless launch instead. Transient probes retain their existing launch behavior. This mode improves consistency; it does not guarantee acceptance by every website.
 
-Run `HuntProxy browser install` after upgrading an older installation to refresh the browser-worker dependencies. Missing dependencies or unsupported native metadata fail visibly rather than silently switching modes. Compatibility mode has been verified on Linux with bundled Chromium149 and installed Chrome153; macOS and Windows have not been qualified.
+Run `HuntProxy browser install` after upgrading an older installation to refresh the browser-worker dependencies. The pinned Playwright 1.63.0 runtime includes Chromium 153.0.8010.12 and requires Node.js 20 or newer. The installer supplies a private Node 22 runtime; an unsupported system Node can use that managed runtime without changing other software. Source installs can set `node_path` in `config.toml`. Browser installation uses the same selected Node as the worker. Missing dependencies, stale managed SDKs or unsupported native metadata fail visibly rather than silently switching modes. Linux testing covers Debian 12 and the current VPS; Playwright no longer officially supports Ubuntu 20.04. macOS and Windows have not been qualified.
 
 Set `HUNTPROXY_BROWSER_HEADLESS=false` to use a headed persistent workspace instead; Linux needs an available display, such as Xvfb. The compatibility default turns off automatically in headed mode. Use `HUNTPROXY_CHROME_EXECUTABLE=/absolute/path/to/chrome` to select an installed browser; otherwise the paired Chromium remains preferred. `HuntProxy doctor` and browser status report its path, version and selected mode without launching a browser. Apply these settings before starting the daemon; existing sessions keep their current process until restarted. Persistent headed and compatibility workspaces start an owned browser with a private loopback debugging port, then attach Playwright for control.
 

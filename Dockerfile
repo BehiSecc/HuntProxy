@@ -12,21 +12,21 @@ COPY browser-worker ./browser-worker
 COPY LICENSE THIRD_PARTY_NOTICES ./
 RUN cargo build --release --locked --bin HuntProxy
 
-FROM node:20-bookworm-slim AS browser
+FROM node:22.23.2-bookworm-slim AS browser
 WORKDIR /browser-worker
 COPY browser-worker/package.json browser-worker/package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev \
+  && PLAYWRIGHT_BROWSERS_PATH=0 node node_modules/playwright-core/cli.js install chromium \
+  && npm cache clean --force
 COPY browser-worker/index.js browser-worker/headless.js ./
 
-FROM debian:bookworm-slim
+FROM node:22.23.2-bookworm-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
-    chromium \
     curl \
     dumb-init \
     fonts-liberation \
-    nodejs \
     python3 \
     python3-boto3 \
   && rm -rf /var/lib/apt/lists/* \
@@ -37,11 +37,12 @@ RUN apt-get update \
 COPY --from=build /src/target/release/HuntProxy /usr/local/bin/HuntProxy
 COPY --from=build /src/LICENSE /src/THIRD_PARTY_NOTICES /usr/share/doc/huntproxy/
 COPY --from=browser --chown=huntproxy:huntproxy /browser-worker /opt/huntproxy/browser-worker
+RUN node /opt/huntproxy/browser-worker/node_modules/playwright-core/cli.js install-deps chromium \
+  && rm -rf /var/lib/apt/lists/*
 
 ENV HUNTPROXY_DATA_DIR=/data \
     HUNTPROXY_BROWSER_WORKER_PATH=/opt/huntproxy/browser-worker/index.js \
-    HUNTPROXY_PLAYWRIGHT_CORE_PATH=/opt/huntproxy/browser-worker/node_modules/playwright-core \
-    HUNTPROXY_CHROME_EXECUTABLE=/usr/bin/chromium
+    HUNTPROXY_PLAYWRIGHT_CORE_PATH=/opt/huntproxy/browser-worker/node_modules/playwright-core
 
 USER huntproxy:huntproxy
 VOLUME ["/data"]

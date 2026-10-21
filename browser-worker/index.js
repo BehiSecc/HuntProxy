@@ -519,8 +519,13 @@ function loadPlaywright() {
 
   const requireFromWorker = createRequire(path.join(workerDir, "package.json"));
   const requireFromCwd = createRequire(path.join(process.cwd(), "package.json"));
+  const explicit = candidates[0] === process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH
+    || candidates[0] === process.env.BB_PLAYWRIGHT_CORE_PATH;
+  const pinnedVersion = explicit ? null
+    : JSON.parse(fs.readFileSync(path.join(workerDir, "package.json"), "utf8"))
+      .dependencies?.["playwright-core"];
   let lastError;
-  for (const candidate of candidates) {
+  for (const candidate of explicit ? candidates.slice(0, 1) : candidates) {
     const previousBrowsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
     try {
       let entry;
@@ -543,6 +548,9 @@ function loadPlaywright() {
         if (parent === packageDir) throw new Error("playwright-core package manifest not found");
         packageDir = parent;
       }
+      if (!explicit && pinnedVersion && manifest.version !== pinnedVersion) {
+        throw new Error(`playwright-core ${pinnedVersion} is required; run HuntProxy browser install`);
+      }
       // `browser install` keeps the version-paired browser with its package.
       // An explicit Playwright cache location still takes precedence.
       if (previousBrowsersPath == null && fs.existsSync(path.join(packageDir, ".local-browsers"))) {
@@ -559,6 +567,7 @@ function loadPlaywright() {
       if (previousBrowsersPath == null) delete process.env.PLAYWRIGHT_BROWSERS_PATH;
       else process.env.PLAYWRIGHT_BROWSERS_PATH = previousBrowsersPath;
       lastError = error;
+      if (explicit || error.message?.includes("is required; run HuntProxy browser install")) throw error;
     }
   }
   throw new Error(`playwright-core unavailable: ${lastError?.message || "not found"}`);
@@ -567,10 +576,13 @@ function loadPlaywright() {
 const inspectRuntimeOnly = process.argv.includes("--inspect-runtime");
 let playwrightRuntime;
 try {
+  if (Number(process.versions.node.split(".")[0]) < 20) {
+    throw new Error("Browser worker requires Node.js 20 or newer; rerun the HuntProxy installer for its private Node runtime, or configure node_path");
+  }
   playwrightRuntime = loadPlaywright();
 } catch (error) {
   if (!inspectRuntimeOnly) throw error;
-  process.stdout.write(`${JSON.stringify({})}\n`);
+  process.stdout.write(`${JSON.stringify({ compatibility_error: error.message })}\n`);
   process.exit(0);
 }
 const { chromium } = playwrightRuntime.api;

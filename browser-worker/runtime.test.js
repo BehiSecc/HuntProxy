@@ -126,13 +126,55 @@ test("package-local installs and explicit Playwright overrides use the same reso
   assert.equal(result.chromium_path, localBrowser);
   assert.deepEqual(f.run({}, false), result);
   assert.equal(f.run({ PLAYWRIGHT_BROWSERS_PATH: path.join(f.root, "custom-cache") }).chromium_path, f.bundle);
-  assert.equal(f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: path.join(f.root, "missing"), BB_PLAYWRIGHT_CORE_PATH: f.packageDir }).playwright_core_path, f.packageDir);
+  assert.match(f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: path.join(f.root, "missing"), BB_PLAYWRIGHT_CORE_PATH: f.packageDir }).compatibility_error, /missing/);
 });
 
 test("inspection reports missing Playwright without creating profiles or launching Chromium", (t) => {
   const f = fixture(t);
   fs.rmSync(f.packageDir, { recursive: true });
-  assert.deepEqual(f.run(), {});
+  assert.match(f.run().compatibility_error, /Cannot find module/);
+  assert.equal(fs.existsSync(path.join(f.root, "profiles")), false);
+});
+
+test("managed SDKs must match the embedded pin; explicit SDK overrides remain intentional", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, "package.json"), JSON.stringify({
+    type: "module", dependencies: { "playwright-core": "1.63.0" },
+  }));
+  const local = path.join(f.root, "node_modules", "playwright-core");
+  fs.mkdirSync(path.dirname(local));
+  fs.cpSync(f.packageDir, local, { recursive: true });
+  const stale = f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: "" });
+  assert.match(stale.compatibility_error, /1\.63\.0 is required; run HuntProxy browser install/);
+  assert.equal(stale.playwright_core_path, undefined);
+  assert.equal(f.run().playwright_version, "1.61.1");
+  const manifest = JSON.parse(fs.readFileSync(path.join(local, "package.json")));
+  manifest.version = "1.63.0";
+  fs.writeFileSync(path.join(local, "package.json"), JSON.stringify(manifest));
+  assert.equal(f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: "" }).playwright_version, "1.63.0");
+});
+
+test("a deliberate SDK override also supports a standalone worker without a package manifest", (t) => {
+  const f = fixture(t);
+  fs.unlinkSync(path.join(f.root, "package.json"));
+  assert.equal(f.run().playwright_core_path, f.packageDir);
+});
+
+test("Node 18 inspection reports an actionable requirement without loading Playwright", (t) => {
+  const oldNode = "/usr/bin/node";
+  if (!fs.existsSync(oldNode) || !spawnSync(oldNode, ["--version"], { encoding: "utf8" }).stdout.startsWith("v18.")) {
+    t.skip("Node 18 is not installed");
+    return;
+  }
+  const f = fixture(t);
+  const inspected = spawnSync(oldNode, [f.worker, "--inspect-runtime"], {
+    env: f.env, encoding: "utf8", timeout: 5_000,
+  });
+  assert.equal(inspected.status, 0);
+  assert.match(JSON.parse(inspected.stdout).compatibility_error, /Node\.js 20 or newer/);
+  const launch = spawnSync(oldNode, [f.worker], { env: f.env, encoding: "utf8", timeout: 5_000 });
+  assert.notEqual(launch.status, 0);
+  assert.match(launch.stderr, /Node\.js 20 or newer/);
   assert.equal(fs.existsSync(path.join(f.root, "profiles")), false);
 });
 

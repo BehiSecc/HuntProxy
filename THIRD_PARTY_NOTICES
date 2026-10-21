@@ -4,6 +4,11 @@ HuntProxy is licensed under Apache-2.0; see LICENSE. The following notices
 accompany its browser worker dependencies, vendored HTTP/2 implementation
 and Chromium root data.
 
+Playwright 1.63.0 and its pinned Docker seccomp profile (Apache-2.0)
+Source: https://github.com/microsoft/playwright/tree/v1.63.0
+docker/seccomp_profile.json is copied unchanged from utils/docker/seccomp_profile.json.
+The full Apache-2.0 license text is in LICENSE.
+
 Pinned transport source provenance (Wreq/util: Apache-2.0; btls family:
 MIT OR Apache-2.0, as specified by each crate):
 - https://github.com/0x676e67/wreq/tree/307c60df0663dd3fb434c82777b3fe9a0158d82a
