@@ -71,6 +71,7 @@ test("headed mode is explicit and inspection agrees with worker launch metadata"
   for (const value of ["false", "0", " FALSE "]) {
     const env = { HUNTPROXY_BROWSER_HEADLESS: value };
     assert.equal(f.run(env).headless, false);
+    assert.equal(f.run(env).headless_compatibility, false);
     assert.equal(f.run(env, false).headless, false);
   }
   for (const value of ["true", "1", ""]) assert.equal(f.run({ HUNTPROXY_BROWSER_HEADLESS: value }).headless, true);
@@ -144,19 +145,27 @@ test("missing Chromium keeps Playwright diagnostics available", { skip: process.
   assert.equal(result.chromium_version, null);
 });
 
-test("headless compatibility is explicit, launch-free during inspection, and diagnoses missing dependencies", (t) => {
+test("headless compatibility defaults on, supports an opt-out, and inspects without launching", (t) => {
   const f = fixture(t);
-  assert.equal(f.run().headless_compatibility, false);
-  assert.equal(f.run().compatibility_error, null);
+  assert.equal(f.run().headless_compatibility, true);
+  for (const value of ["false", "0", " FALSE "]) {
+    const result = f.run({ HUNTPROXY_BROWSER_HEADLESS_COMPAT: value });
+    assert.equal(result.headless, true);
+    assert.equal(result.headless_compatibility, false);
+    assert.equal(result.compatibility_error, null);
+    assert.deepEqual(f.run({ HUNTPROXY_BROWSER_HEADLESS_COMPAT: value }, false), result);
+  }
   // Exercise the runtime's dependency diagnostic independently of whether this
   // host happens to provide a system-wide ws package.
   fs.writeFileSync(path.join(f.root, "headless.js"), `export const headlessDependencyError = () => "Missing dependencies; run HuntProxy browser install";
     export const inspectNativeIdentity = () => { throw Error("Inspection must not launch"); };
     export const createIdentityRelay = () => { throw Error("Inspection must not launch"); };`);
-  const result = f.run({ HUNTPROXY_BROWSER_HEADLESS_COMPAT: 'true' });
+  const result = f.run();
   assert.equal(result.headless, true);
   assert.equal(result.headless_compatibility, true);
   assert.match(result.compatibility_error, /browser install/);
+  assert.deepEqual(f.run({ HUNTPROXY_BROWSER_HEADLESS_COMPAT: 'true' }), result);
+  assert.deepEqual(f.run({}, false), result);
   assert.equal(fs.existsSync(path.join(f.root, 'profiles')), false);
   const conflict = spawnSync(process.execPath, [f.worker, '--inspect-runtime'], {
     env: { ...f.env, HUNTPROXY_BROWSER_HEADLESS: 'false', HUNTPROXY_BROWSER_HEADLESS_COMPAT: 'true' }, encoding: 'utf8',

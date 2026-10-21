@@ -658,7 +658,7 @@ function browserHeadless() {
 }
 
 function browserHeadlessCompatibility() {
-  const enabled = environmentBoolean("HUNTPROXY_BROWSER_HEADLESS_COMPAT", false);
+  const enabled = environmentBoolean("HUNTPROXY_BROWSER_HEADLESS_COMPAT", browserHeadless());
   if (enabled && !browserHeadless()) throw new Error("HUNTPROXY_BROWSER_HEADLESS_COMPAT requires headless mode");
   return enabled;
 }
