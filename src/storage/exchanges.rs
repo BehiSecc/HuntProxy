@@ -63,6 +63,11 @@ pub struct JavascriptFileRecord {
     pub status_code: Option<u16>,
     pub related_page_urls: Vec<String>,
     pub related_page_hosts: Vec<String>,
+    /// True only when a domain filter includes this file through a browser
+    /// session with matching captured or discovered evidence, without a
+    /// matching resource/page host on this file.
+    /// Always false without a domain filter.
+    pub related_via_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -237,8 +242,27 @@ impl Db {
     ) -> DomainResult<(Vec<JavascriptFileRecord>, bool)> {
         let limit = limit.clamp(1, 10_000) as usize;
         self.with_conn(move |conn| {
-            let sql = "WITH matching_urls AS (
-                SELECT javascript_url
+            let matching_sessions = "WITH matching_sessions AS (
+                SELECT DISTINCT browser_session_id
+                  FROM javascript_provenance
+                 WHERE project_id=?1 AND browser_session_id IS NOT NULL
+                   AND (
+                       lower(source_page_host)=?3
+                       OR substr(lower(source_page_host), -(length(?3) + 1))='.' || ?3
+                       OR lower(javascript_host)=?3
+                       OR substr(lower(javascript_host), -(length(?3) + 1))='.' || ?3
+                   )
+                UNION
+                SELECT browser_session_id
+                  FROM exchanges
+                 WHERE project_id=?1 AND browser_session_id IS NOT NULL
+                   AND (
+                       lower(host)=?3
+                       OR substr(lower(host), -(length(?3) + 1))='.' || ?3
+                   )
+            )";
+            let sql = format!("{matching_sessions}, matching_urls AS (
+                SELECT javascript_url, source_page_host, browser_session_id
                   FROM javascript_provenance
                  WHERE project_id=?1
                    AND (
@@ -247,6 +271,7 @@ impl Db {
                        OR substr(lower(source_page_host), -(length(?3) + 1))='.' || ?3
                        OR lower(javascript_host)=?3
                        OR substr(lower(javascript_host), -(length(?3) + 1))='.' || ?3
+                       OR browser_session_id IN (SELECT browser_session_id FROM matching_sessions)
                    )
             ), ranked AS (
                 SELECT exchange_id, scheme, authority, host, path, query, mime, status_code,
@@ -261,7 +286,15 @@ impl Db {
                        ?3 IS NULL
                        OR lower(host)=?3
                        OR substr(lower(host), -(length(?3) + 1))='.' || ?3
-                       OR (scheme || '://' || authority || path || CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END) IN (SELECT javascript_url FROM matching_urls)
+                       OR EXISTS (
+                           SELECT 1 FROM matching_urls
+                            WHERE matching_urls.javascript_url=(exchanges.scheme || '://' || exchanges.authority || exchanges.path || CASE WHEN exchanges.query IS NULL OR exchanges.query='' THEN '' ELSE '?' || exchanges.query END)
+                              AND (
+                                  lower(matching_urls.source_page_host)=?3
+                                  OR substr(lower(matching_urls.source_page_host), -(length(?3) + 1))='.' || ?3
+                                  OR matching_urls.browser_session_id=exchanges.browser_session_id
+                              )
+                       )
                    )
                    AND (
                        lower(path) LIKE '%.js'
@@ -275,8 +308,8 @@ impl Db {
               FROM ranked
              WHERE row_number=1
              ORDER BY exchange_id ASC
-             LIMIT ?4";
-            let mut stmt = conn.prepare(sql).map_err(storage_error)?;
+             LIMIT ?4");
+            let mut stmt = conn.prepare(&sql).map_err(storage_error)?;
             let rows = stmt
                 .query_map(
                     params![
@@ -306,6 +339,7 @@ impl Db {
                             status_code: row.get::<_, Option<i64>>(7)?.map(|value| value as u16),
                             related_page_urls: Vec::new(),
                             related_page_hosts: Vec::new(),
+                            related_via_session: false,
                         })
                     },
                 )
@@ -313,7 +347,8 @@ impl Db {
             let mut files = collect_rows(rows)?;
             let mut discovered = conn
                 .prepare(
-                    "SELECT javascript_url, javascript_path, javascript_host
+                    &format!("{matching_sessions}
+                     SELECT javascript_url, javascript_path, javascript_host
                        FROM javascript_provenance
                       WHERE project_id=?1
                         AND (?2 IS NULL OR browser_session_id=?2)
@@ -323,9 +358,10 @@ impl Db {
                             OR substr(lower(source_page_host), -(length(?3) + 1))='.' || ?3
                             OR lower(javascript_host)=?3
                             OR substr(lower(javascript_host), -(length(?3) + 1))='.' || ?3
+                            OR browser_session_id IN (SELECT browser_session_id FROM matching_sessions)
                         )
                       ORDER BY lower(javascript_url), javascript_url
-                      LIMIT ?4",
+                      LIMIT ?4"),
                 )
                 .map_err(storage_error)?;
             let discovered_rows = discovered
@@ -346,6 +382,7 @@ impl Db {
                             status_code: None,
                             related_page_urls: Vec::new(),
                             related_page_hosts: Vec::new(),
+                            related_via_session: false,
                         })
                     },
                 )
@@ -399,6 +436,14 @@ impl Db {
                     if !file.related_page_hosts.contains(&host) {
                         file.related_page_hosts.push(host);
                     }
+                }
+                if let Some(domain) = &domain {
+                    let matches_domain = |host: &str| {
+                        let host = host.to_ascii_lowercase();
+                        host == *domain || host.ends_with(&format!(".{domain}"))
+                    };
+                    file.related_via_session = !matches_domain(&file.host)
+                        && !file.related_page_hosts.iter().any(|host| matches_domain(host));
                 }
             }
             files.sort_by(|left, right| {
@@ -1512,6 +1557,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session_files.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn javascript_provenance_includes_nested_session_files_without_unrelated_sessions() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "nested javascript provenance".into(),
+                target_url: "https://target.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        for (url, page, session) in [
+            (
+                "https://cdn.vendor.test/main.js",
+                "https://app.target.test/home",
+                Some(11),
+            ),
+            (
+                "https://cdn.vendor.test/nested.js",
+                "https://frames.vendor.test/inner",
+                Some(11),
+            ),
+            (
+                "https://target.test/helper.js",
+                "https://outer.partner.test/frame",
+                Some(22),
+            ),
+            (
+                "https://cdn.vendor.test/source-only.js",
+                "https://frames.vendor.test/deeper",
+                Some(22),
+            ),
+            (
+                "https://cdn.vendor.test/unrelated.js",
+                "https://other.test/home",
+                Some(33),
+            ),
+            (
+                "https://cdn.vendor.test/unsessioned.js",
+                "https://frames.vendor.test/inner",
+                None,
+            ),
+            (
+                "https://cdn.vendor.test/direct.js",
+                "https://target.test/start",
+                None,
+            ),
+            (
+                "https://target.test/local.js",
+                "https://other.test/home",
+                None,
+            ),
+            (
+                "https://cdn.vendor.test/near-match.js",
+                "https://eviltarget.test/home",
+                Some(44),
+            ),
+        ] {
+            db.record_javascript_files(
+                project.id,
+                page,
+                vec![JavascriptProvenanceInput {
+                    url: url.into(),
+                    source_page_url: None,
+                }],
+                session.map(BrowserSessionId),
+                "browser",
+            )
+            .await
+            .unwrap();
+        }
+        let mut captured = spool_exchange(project.id);
+        captured.host = "cdn.vendor.test".into();
+        captured.authority = captured.host.clone();
+        captured.path = "/nested.js".into();
+        captured.mime = Some("application/javascript".into());
+        captured.lineage.browser_session_id = Some(BrowserSessionId(11));
+        let target_exchange_id = db.insert_exchange(captured.clone()).await.unwrap();
+        captured.lineage.browser_session_id = Some(BrowserSessionId(33));
+        db.insert_exchange(captured.clone()).await.unwrap();
+        captured.lineage.browser_session_id = None;
+        db.insert_exchange(captured).await.unwrap();
+
+        let (files, truncated) = db
+            .list_javascript_files(project.id, None, Some("target.test".into()), 20)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(files.len(), 6);
+        let nested = files.iter().find(|file| file.path == "/nested.js").unwrap();
+        assert_eq!(nested.exchange_id, Some(target_exchange_id));
+        assert_eq!(
+            nested.related_page_urls,
+            ["https://frames.vendor.test/inner"]
+        );
+        assert!(nested.related_via_session);
+        let discovered = files
+            .iter()
+            .find(|file| file.path == "/source-only.js")
+            .unwrap();
+        assert!(discovered.exchange_id.is_none());
+        assert!(discovered.related_via_session);
+        for file in &files {
+            assert_eq!(
+                file.related_via_session,
+                matches!(file.path.as_str(), "/nested.js" | "/source-only.js")
+            );
+        }
+        let (session, _) = db
+            .list_javascript_files(
+                project.id,
+                Some(BrowserSessionId(11)),
+                Some("target.test".into()),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.len(), 2);
+        let (unrelated, _) = db
+            .list_javascript_files(
+                project.id,
+                Some(BrowserSessionId(33)),
+                Some("target.test".into()),
+                20,
+            )
+            .await
+            .unwrap();
+        assert!(unrelated.is_empty());
+        let (unfiltered, _) = db
+            .list_javascript_files(project.id, None, None, 20)
+            .await
+            .unwrap();
+        assert!(unfiltered.iter().all(|file| !file.related_via_session));
+        assert!(unfiltered.iter().any(|file| file.path == "/unsessioned.js"));
+        let (limited, truncated) = db
+            .list_javascript_files(project.id, None, Some("target.test".into()), 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn target_document_anchors_nested_javascript_without_direct_javascript_provenance() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "document session provenance".into(),
+                target_url: "https://target.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let mut document = spool_exchange(project.id);
+        document.method = "GET".into();
+        document.host = "app.target.test".into();
+        document.authority = document.host.clone();
+        document.path = "/home".into();
+        document.mime = Some("text/html".into());
+        document.lineage.browser_session_id = Some(BrowserSessionId(17));
+        db.insert_exchange(document).await.unwrap();
+        for (path, session) in [("/nested.js", 17), ("/other.js", 18)] {
+            db.record_javascript_files(
+                project.id,
+                "https://frames.vendor.test/inner",
+                vec![JavascriptProvenanceInput {
+                    url: format!("https://cdn.vendor.test{path}"),
+                    source_page_url: None,
+                }],
+                Some(BrowserSessionId(session)),
+                "browser",
+            )
+            .await
+            .unwrap();
+        }
+        let (files, truncated) = db
+            .list_javascript_files(project.id, None, Some("target.test".into()), 20)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].url, "https://cdn.vendor.test/nested.js");
+        assert_eq!(
+            files[0].related_page_urls,
+            ["https://frames.vendor.test/inner"]
+        );
+        assert!(files[0].related_via_session);
     }
 
     #[tokio::test]

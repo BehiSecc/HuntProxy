@@ -1032,6 +1032,110 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
 }
 
 #[tokio::test]
+async fn js_files_reports_nested_session_provenance_and_excludes_unrelated_scripts() {
+    let (_directory, state, project_id) = test_state().await;
+    for (url, page, session) in [
+        (
+            "https://cdn.vendor.test/main.js",
+            "https://example.com/home",
+            Some(71),
+        ),
+        (
+            "https://cdn.vendor.test/frame.js",
+            "https://frames.vendor.test/nested",
+            Some(71),
+        ),
+        (
+            "https://cdn.vendor.test/document-frame.js",
+            "https://frames.vendor.test/document-nested",
+            Some(73),
+        ),
+        (
+            "https://cdn.vendor.test/other.js",
+            "https://other.test/home",
+            Some(72),
+        ),
+        (
+            "https://cdn.vendor.test/unsessioned.js",
+            "https://frames.vendor.test/nested",
+            None,
+        ),
+    ] {
+        state
+            .db
+            .record_javascript_files(
+                project_id,
+                page,
+                vec![huntproxy::storage::JavascriptProvenanceInput {
+                    url: url.into(),
+                    source_page_url: None,
+                }],
+                session.map(BrowserSessionId),
+                "browser",
+            )
+            .await
+            .unwrap();
+    }
+    let mut script = exchange(project_id, "GET", "/frame.js");
+    script.host = "cdn.vendor.test".into();
+    script.authority = script.host.clone();
+    script.mime = Some("application/javascript".into());
+    script.lineage.browser_session_id = Some(BrowserSessionId(71));
+    let exchange_id = state.db.insert_exchange(script).await.unwrap();
+    let mut document = exchange(project_id, "GET", "/embedded-home");
+    document.mime = Some("text/html".into());
+    document.lineage.browser_session_id = Some(BrowserSessionId(73));
+    state.db.insert_exchange(document).await.unwrap();
+    let result = huntproxy::mcp::call_tool(
+        state.clone(),
+        "js_files",
+        serde_json::json!({"project_id": project_id.get(), "domain": "example.com"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["source"], "history");
+    assert_eq!(result["count"], 3);
+    let files = result["files"].as_array().unwrap();
+    let nested = files
+        .iter()
+        .find(|file| file["path"] == "/frame.js")
+        .unwrap();
+    assert_eq!(nested["exchange_id"], exchange_id.get());
+    assert_eq!(nested["related_via_session"], true);
+    assert_eq!(
+        nested["related_page_urls"],
+        serde_json::json!(["https://frames.vendor.test/nested"])
+    );
+    assert_eq!(
+        nested["related_page_hosts"],
+        serde_json::json!(["frames.vendor.test"])
+    );
+    let direct = files
+        .iter()
+        .find(|file| file["path"] == "/main.js")
+        .unwrap();
+    assert_eq!(direct["related_via_session"], false);
+    let document_frame = files
+        .iter()
+        .find(|file| file["path"] == "/document-frame.js")
+        .unwrap();
+    assert_eq!(document_frame["related_via_session"], true);
+    let unfiltered = huntproxy::mcp::call_tool(
+        state,
+        "js_files",
+        serde_json::json!({"project_id": project_id.get()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unfiltered["count"], 5);
+    assert!(unfiltered["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|file| file["related_via_session"] == false));
+}
+
+#[tokio::test]
 async fn get_words_includes_javascript_related_to_the_requested_site_by_default() {
     let (_directory, state, project_id) = test_state().await;
 
