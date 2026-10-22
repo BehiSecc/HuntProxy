@@ -2090,6 +2090,105 @@ async fn overview_reports_project_activity_and_empty_projects() {
 }
 
 #[tokio::test]
+async fn zstd_response_body_preserves_exact_decoded_pages_and_raw_access() {
+    let (_directory, state, project_id) = test_state().await;
+    let response_body = (0..=255).cycle().take(9000).collect::<Vec<u8>>();
+    let compressed = zstd::encode_all(response_body.as_slice(), 1).unwrap();
+    let mut captured = exchange(project_id, "GET", "/assets/application.js");
+    captured.mime = Some("application/javascript".into());
+    captured.response_headers = vec![HeaderEntry {
+        name: "Content-Encoding".into(),
+        value: b"zstd".to_vec(),
+        ordinal: 0,
+    }];
+    captured.response_body = Some(compressed.clone());
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+
+    let mut decoded_body = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = huntproxy::mcp::call_tool(
+            state.clone(),
+            "exchange_body",
+            serde_json::json!({
+                "project_id": project_id.get(),
+                "exchange_id": exchange_id.get(),
+                "raw": false,
+                "encoding": "base64",
+                "max_bytes": 4096,
+                "offset": offset
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["available"], true);
+        assert_eq!(page["decoded"], true);
+        assert_eq!(page["content_encoding"], "zstd");
+        assert_eq!(page["total"], response_body.len());
+        assert_eq!(page["raw_total"], compressed.len());
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(page["preview"].as_str().unwrap())
+            .unwrap();
+        decoded_body.extend(bytes);
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                assert_eq!(page["truncated"], true);
+                offset = next;
+            }
+            None => {
+                assert_eq!(page["truncated"], false);
+                break;
+            }
+        }
+    }
+    assert_eq!(decoded_body, response_body);
+
+    let raw = huntproxy::mcp::call_tool(
+        state.clone(),
+        "exchange_body",
+        serde_json::json!({
+            "project_id": project_id.get(),
+            "exchange_id": exchange_id.get(),
+            "raw": true,
+            "encoding": "base64"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(raw["decoded"], false);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(raw["preview"].as_str().unwrap())
+            .unwrap(),
+        compressed
+    );
+
+    let response = huntproxy::api::router(state)
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/body?side=response",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let decoded = json_response(response).await;
+    assert_eq!(decoded["decoded"], true);
+    assert_eq!(decoded["content_encoding"], "zstd");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(decoded["data"].as_str().unwrap())
+            .unwrap(),
+        response_body
+    );
+}
+
+#[tokio::test]
 async fn exchange_body_base64_pages_preserve_exact_request_bytes() {
     let (_directory, state, project_id) = test_state().await;
     let mut captured = exchange(project_id, "POST", "/binary");

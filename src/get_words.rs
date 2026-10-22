@@ -323,6 +323,10 @@ fn decode_response_prefix(
         read_decoded_prefix(brotli::Decompressor::new(input, 4096), max_output, "brotli")
     } else if encoding.eq_ignore_ascii_case("deflate") {
         read_decoded_prefix(flate2::read::ZlibDecoder::new(input), max_output, "deflate")
+    } else if encoding.eq_ignore_ascii_case("zstd") {
+        let reader = zstd::stream::read::Decoder::new(input)
+            .map_err(|error| DomainError::invalid(format!("zstd decode: {error}")))?;
+        read_decoded_prefix(reader, max_output, "zstd")
     } else {
         Err(DomainError::invalid(format!(
             "unsupported content encoding `{encoding}`"
@@ -579,5 +583,14 @@ mod tests {
         let (decoded, truncated) = decode_response_prefix(&compressed, "gzip", 256).unwrap();
         assert!(truncated);
         assert!(String::from_utf8_lossy(&decoded).contains("TargetVocabulary"));
+
+        let compressed = zstd::encode_all(content.as_bytes(), 1).unwrap();
+        let (decoded, truncated) = decode_response_prefix(&compressed, "ZSTD", 256).unwrap();
+        assert!(truncated);
+        assert_eq!(decoded, content.as_bytes()[..256]);
+        let (decoded, truncated) =
+            decode_response_prefix(&compressed, "zstd", content.len()).unwrap();
+        assert!(!truncated);
+        assert_eq!(decoded, content.as_bytes());
     }
 }

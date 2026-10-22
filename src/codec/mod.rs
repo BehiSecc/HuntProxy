@@ -145,6 +145,10 @@ pub fn decode_content_encodings(
                 max_output,
                 "deflate",
             )?
+        } else if encoding.eq_ignore_ascii_case("zstd") {
+            let reader = zstd::stream::read::Decoder::new(output.as_slice())
+                .map_err(|error| DomainError::invalid(format!("zstd decode: {error}")))?;
+            decode_reader(reader, max_output, "zstd")?
         } else {
             return Err(DomainError::invalid(format!(
                 "unsupported content encoding `{encoding}`; request the raw body instead"
@@ -256,5 +260,48 @@ mod tests {
         gzip.write_all(&[b'a'; 64]).unwrap();
         let gzip = gzip.finish().unwrap();
         assert!(decode_content_encodings(&gzip, "gzip", 8).is_err());
+    }
+
+    #[test]
+    fn zstd_decodes_exact_bytes_and_content_encoding_chains() {
+        use std::io::Write;
+
+        let expected = b"const message = 'welcome';\n\x00\xff";
+        let compressed = zstd::encode_all(expected.as_slice(), 1).unwrap();
+        assert_eq!(
+            decode_content_encodings(&compressed, " ZsTd ", expected.len()).unwrap(),
+            expected
+        );
+
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(expected).unwrap();
+        let gzip = gzip.finish().unwrap();
+        let compressed = zstd::encode_all(gzip.as_slice(), 1).unwrap();
+        assert_eq!(
+            decode_content_encodings(&compressed, "gzip, zstd", 1024).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn zstd_decodes_concatenated_frames() {
+        let mut compressed = zstd::encode_all(b"first ".as_slice(), 1).unwrap();
+        compressed.extend(zstd::encode_all(b"second".as_slice(), 1).unwrap());
+        assert_eq!(
+            decode_content_encodings(&compressed, "zstd", 12).unwrap(),
+            b"first second"
+        );
+    }
+
+    #[test]
+    fn zstd_rejects_invalid_truncated_and_oversized_bodies() {
+        let compressed = zstd::encode_all([b'a'; 64].as_slice(), 1).unwrap();
+        let oversized = decode_content_encodings(&compressed, "zstd", 8).unwrap_err();
+        assert_eq!(oversized.code(), ErrorCode::BodyTooLarge);
+        for invalid in [b"invalid".as_slice(), &compressed[..compressed.len() - 1]] {
+            let error = decode_content_encodings(invalid, "zstd", 1024).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(error.to_string().contains("zstd decode:"));
+        }
     }
 }
