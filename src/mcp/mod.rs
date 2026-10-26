@@ -212,7 +212,7 @@ fn reply_draft_schema() -> Value {
 fn locator_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Use one locator strategy: role/name, text, test_id, or css.",
+        "description": "Use one locator strategy: role/name, text, test_id, or css. Required for click, fill, select, and upload; optional for inspect, scroll, screenshot, and press.",
         "properties": {
             "role": {"type": ["string", "null"]},
             "name": {"type": ["string", "null"]},
@@ -233,31 +233,44 @@ fn browser_action_schema() -> Value {
             "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "pages", "events", "scroll", "screenshot", "request", "press", "wait", "back", "forward", "close"]},
             "url": {"type": "string", "description":"Required by navigate and request; optional for pages op=new. request must match the active page origin."},
             "locator": locator_schema(),
-            "value": {"type": "string"},
-            "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Absolute paths to regular readable files on the HuntProxy machine. An empty array clears a direct file input; chooser uploads require at least one file."},
-            "via_chooser": {"type":"boolean","default":false,"description":"For upload, click locator as a trusted Browse/file-chooser trigger instead of setting an input directly."},
-            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"description":"Upload or request deadline. request requires at least 1000 ms and defaults to 15000."},
-            "key": {"type": "string"},
-            "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"]},
-            "format": {"type": "string", "enum": ["accessibility", "dom"]},
-            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"Bound for snapshot, inspect, or screenshot output."},
-            "op": {"type":"string","enum":["list","select","new","close"],"description":"Operation for pages."},
-            "page_id": {"type":"integer","minimum":1,"description":"Required with runtime_generation for pages select/close."},
-            "runtime_generation": {"type":"integer","minimum":1,"description":"Generation returned by pages/events or browser context. Required when reusing a page ID or nonzero event cursor."},
-            "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"For events, return observations after this sequence."},
-            "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Maximum browser events to return."},
-            "kinds": {"type":"array","maxItems":11,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message","observer_error"]},"description":"Optional browser event filter. Observer failures also appear in observer_errors, including when a filter excludes observer_error."},
-            "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"For events, wait up to this long for a matching event."},
-            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal wheel delta for scroll."},
-            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical wheel delta for scroll."},
-            "full_page": {"type":"boolean","default":false,"description":"Capture the full page for screenshot; cannot be combined with locator."},
+            "value": {"type": "string","description":"Required for fill, select, and wait. For wait: selector is a Playwright selector; text is visible text; url is a Playwright URL pattern; timeout is a numeric string in 0..60000 milliseconds; load_state is load, domcontentloaded, or networkidle (empty string defaults to domcontentloaded). Other wait modes have a 30000 ms deadline."},
+            "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Required for upload: at most 16 absolute paths, each at most 4096 bytes, to regular readable files on the HuntProxy machine. An empty array clears a direct file input; chooser uploads require at least one file."},
+            "via_chooser": {"type":"boolean","default":false,"description":"For upload, click locator as a trusted Browse/file-chooser trigger instead of setting an input directly. Defaults to false."},
+            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"description":"Upload deadline in 1..30000 ms, default 10000; request deadline in 1000..30000 ms, default 15000. For wait, use for_what and value."},
+            "key": {"type": "string","description":"Required for press: Playwright key or key combination, such as Enter or Control+A."},
+            "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"],"description":"Required with value for wait. Select what to wait for; value supplies the selector, text, URL pattern, milliseconds, or load state."},
+            "format": {"type": "string", "enum": ["accessibility", "dom"],"description":"Snapshot format; defaults to accessibility."},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"Output byte bound: inspect accepts 1..65536, default 4096; screenshot accepts 1..8388608, default 4194304; snapshot defaults to 200000 and caps captured output at 2000000. Supply a positive integer."},
+            "op": {"type":"string","enum":["list","select","new","close"],"description":"Required for pages. list takes no page_id, runtime_generation, or url; new takes only an optional url; select/close require page_id and runtime_generation and omit url."},
+            "page_id": {"type":"integer","minimum":1,"description":"Positive integer returned by pages. Required with runtime_generation for pages select/close; omit for list/new."},
+            "runtime_generation": {"type":"integer","minimum":1,"description":"Positive integer generation returned by pages/events or browser context. Required for pages select/close and events with after_sequence greater than 0. Omit for pages list/new; reuse the generation paired with the page ID or event cursor."},
+            "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"For events, return observations after this nonnegative integer sequence; defaults to 0. A value greater than 0 requires its matching runtime_generation."},
+            "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Maximum browser events to return: integer in 1..100; defaults to 50."},
+            "kinds": {"type":"array","maxItems":11,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message","observer_error"]},"description":"Optional browser event filter: at most 11 unique kinds; defaults to all kinds. Observer failures also appear in observer_errors, including when a filter excludes observer_error."},
+            "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"For events, wait up to this many milliseconds for a matching event: integer in 0..30000; defaults to 0."},
+            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal wheel delta for scroll: integer in -100000..100000; defaults to 0. Scroll requires a locator or a nonzero delta."},
+            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical wheel delta for scroll: integer in -100000..100000; defaults to 0. Scroll requires a locator or a nonzero delta."},
+            "full_page": {"type":"boolean","default":false,"description":"Capture the full page for screenshot; cannot be combined with locator. Defaults to false."},
             "method": {"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"],"description":"Required for request."},
-            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"Request headers. Duplicate names and browser-managed or Fetch-forbidden transport, identity, origin, host, length, proxy, Sec-*, and internal headers are rejected rather than silently changed."},
+            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"Request headers: at most 64 entries and 65536 bytes total across names and values; defaults to empty. Duplicate names and browser-managed or Fetch-forbidden transport, identity, origin, host, length, proxy, Sec-*, and internal headers are rejected rather than silently changed."},
             "body_text": {"type":"string","description":"Optional UTF-8 request body, up to 2 MiB; mutually exclusive with body_base64."},
             "body_base64": {"type":"string","description":"Optional exact request body as base64, up to 2 MiB decoded; mutually exclusive with body_text."},
-            "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Maximum exact response preview bytes returned by request."}
+            "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Maximum exact response preview bytes returned by request: integer in 1..65536; defaults to 4096."}
         },
         "required": ["type"],
+        "allOf": [
+            {"if":{"properties":{"type":{"const":"navigate"}},"required":["type"]},"then":{"required":["url"]}},
+            {"if":{"properties":{"type":{"enum":["click","fill","select","upload"]}},"required":["type"]},"then":{"required":["locator"]}},
+            {"if":{"properties":{"type":{"enum":["fill","select","wait"]}},"required":["type"]},"then":{"required":["value"]}},
+            {"if":{"properties":{"type":{"const":"upload"}},"required":["type"]},"then":{"required":["files"]}},
+            {"if":{"properties":{"type":{"const":"press"}},"required":["type"]},"then":{"required":["key"]}},
+            {"if":{"properties":{"type":{"const":"request"}},"required":["type"]},"then":{"required":["method","url"],"properties":{"timeout_ms":{"minimum":1000}}}},
+            {"if":{"properties":{"type":{"const":"inspect"}},"required":["type"]},"then":{"properties":{"max_bytes":{"maximum":65536}}}},
+            {"if":{"properties":{"type":{"const":"pages"}},"required":["type"]},"then":{"required":["op"]}},
+            {"if":{"properties":{"type":{"const":"pages"},"op":{"enum":["select","close"]}},"required":["type","op"]},"then":{"required":["page_id","runtime_generation"]}},
+            {"if":{"properties":{"type":{"const":"wait"}},"required":["type"]},"then":{"required":["for_what"]}},
+            {"if":{"properties":{"type":{"const":"events"},"after_sequence":{"minimum":1}},"required":["type","after_sequence"]},"then":{"required":["runtime_generation"]}}
+        ],
         "additionalProperties": false
     })
 }
@@ -396,7 +409,7 @@ fn tool_defs() -> Value {
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. Repeated unchanged seeds preserve newer browser cookies; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Explicitly reimport the matching cookie_profile into this browser profile only."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omit to resume the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer"},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
+        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer project ID returned by projects; use the project owning this browser session."},"session_id":{"type":"integer","description":"Required integer session ID returned by browser_start for this project."},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
         {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on port 9222, inspect handoff status, or return control to the agent. While enabled, browser_action is paused. On a VPS, run the returned ssh_forward_command (ssh -N -L 9222:127.0.0.1:9222 <current-user>@<routed-host-ip>); its user and host are detected at runtime. Try hosted_devtools_url to avoid transferring the frontend through SSH; use devtools_url if the browser restricts the hosted frontend's local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; use the active browser session ID."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions and resources: per-project capacity including ephemeral sessions, verified profile ownership, and a global CDP busy flag. Reuse these observations until a lifecycle transition or browser error; capacity is not a reservation. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page in Chromium. A domain filter matches the JavaScript host or its related page host, including subdomains. Saved history also includes scripts from browser sessions with a matching saved exchange or JavaScript page/resource provenance. related_via_session is true only when this session relationship alone includes a file for the domain filter; it is false for direct host/page matches and unfiltered results. Related page URLs remain the immediate pages that loaded each script.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
@@ -2756,6 +2769,137 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("browser_cdp remains available"));
+    }
+
+    #[test]
+    fn browser_action_schema_exposes_conditional_requirements() {
+        let schema = browser_action_schema();
+        let rules = schema["allOf"].as_array().unwrap();
+        for rule in [
+            json!({"if":{"properties":{"type":{"const":"pages"}},"required":["type"]},"then":{"required":["op"]}}),
+            json!({"if":{"properties":{"type":{"const":"pages"},"op":{"enum":["select","close"]}},"required":["type","op"]},"then":{"required":["page_id","runtime_generation"]}}),
+            json!({"if":{"properties":{"type":{"const":"wait"}},"required":["type"]},"then":{"required":["for_what"]}}),
+            json!({"if":{"properties":{"type":{"enum":["fill","select","wait"]}},"required":["type"]},"then":{"required":["value"]}}),
+            json!({"if":{"properties":{"type":{"const":"events"},"after_sequence":{"minimum":1}},"required":["type","after_sequence"]},"then":{"required":["runtime_generation"]}}),
+            json!({"if":{"properties":{"type":{"const":"request"}},"required":["type"]},"then":{"required":["method","url"],"properties":{"timeout_ms":{"minimum":1000}}}}),
+            json!({"if":{"properties":{"type":{"const":"inspect"}},"required":["type"]},"then":{"properties":{"max_bytes":{"maximum":65536}}}}),
+        ] {
+            assert!(
+                rules.contains(&rule),
+                "missing conditional contract: {rule}"
+            );
+        }
+
+        // These minimal forms must stay compatible with serde's required fields.
+        for action in [
+            json!({"type":"pages","op":"list"}),
+            json!({"type":"pages","op":"new"}),
+            json!({"type":"pages","op":"select","page_id":1,"runtime_generation":2}),
+            json!({"type":"pages","op":"close","page_id":1,"runtime_generation":2}),
+            json!({"type":"wait","for_what":"timeout","value":"0"}),
+            json!({"type":"wait","for_what":"load_state","value":""}),
+            json!({"type":"events"}),
+            json!({"type":"events","after_sequence":1,"runtime_generation":2}),
+        ] {
+            assert!(
+                serde_json::from_value::<BrowserAction>(action.clone()).is_ok(),
+                "{action}"
+            );
+        }
+        for action in [
+            json!({"type":"pages"}),
+            json!({"type":"wait","value":"0"}),
+            json!({"type":"wait","for_what":"timeout"}),
+            json!({"type":"fill","locator":{"css":"input"}}),
+            json!({"type":"select","value":"one"}),
+            json!({"type":"upload","locator":{"css":"input"}}),
+            json!({"type":"press"}),
+            json!({"type":"request","url":"https://example.test/"}),
+        ] {
+            assert!(
+                serde_json::from_value::<BrowserAction>(action.clone()).is_err(),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_action_descriptions_preserve_bounds_and_required_inputs() {
+        let definitions = tool_defs();
+        let tool = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "browser_action")
+            .unwrap();
+        let inputs = &tool["inputSchema"];
+        assert_eq!(
+            inputs["required"],
+            json!(["project_id", "session_id", "action"])
+        );
+        for field in ["project_id", "session_id"] {
+            assert_eq!(inputs["properties"][field]["type"], "integer");
+            assert!(inputs["properties"][field]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Required integer"));
+        }
+        let properties = &inputs["properties"]["action"]["properties"];
+        for (field, fragments) in [
+            (
+                "op",
+                vec![
+                    "Required for pages",
+                    "select/close require page_id and runtime_generation",
+                    "list",
+                    "new",
+                ],
+            ),
+            ("for_what", vec!["Required with value for wait"]),
+            (
+                "value",
+                vec![
+                    "0..60000",
+                    "30000 ms",
+                    "domcontentloaded",
+                    "selector",
+                    "text",
+                    "url",
+                ],
+            ),
+            (
+                "runtime_generation",
+                vec!["Positive integer", "after_sequence greater than 0"],
+            ),
+            ("limit", vec!["1..100", "defaults to 50"]),
+            ("wait_ms", vec!["0..30000", "defaults to 0"]),
+            (
+                "timeout_ms",
+                vec!["1..30000", "1000..30000", "default 10000", "default 15000"],
+            ),
+            (
+                "max_bytes",
+                vec![
+                    "1..65536",
+                    "default 4096",
+                    "1..8388608",
+                    "default 4194304",
+                    "200000",
+                    "2000000",
+                ],
+            ),
+            ("max_response_bytes", vec!["1..65536", "defaults to 4096"]),
+            ("delta_x", vec!["-100000..100000", "defaults to 0"]),
+            ("delta_y", vec!["-100000..100000", "defaults to 0"]),
+        ] {
+            let description = properties[field]["description"].as_str().unwrap();
+            for fragment in fragments {
+                assert!(
+                    description.contains(fragment),
+                    "{field} must describe {fragment}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
