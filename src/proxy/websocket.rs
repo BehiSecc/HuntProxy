@@ -1,4 +1,4 @@
-use super::{full_body, header_entries, request_url, ProxyBody};
+use super::{full_body, header_entries, is_own_api_target, request_url, ProxyBody};
 use crate::app::{AppEvent, AppState};
 use crate::domain::*;
 use crate::policy::scope::{resolve_validated_dial, url_is_in_scope, TargetRef};
@@ -49,7 +49,8 @@ pub(super) async fn handle(
     let mut applied_rules =
         crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut http_url).await?;
     let target = TargetRef::from_url(&http_url)?;
-    let capture = url_is_in_scope(&http_url, &project.scope)?;
+    let capture = url_is_in_scope(&http_url, &project.scope)?
+        && !is_own_api_target(&target, state.config.api_listen);
     let dial = resolve_validated_dial(&http_url, &project.scope, Duration::from_secs(60)).await?;
     let upstream_proxy = state
         .db

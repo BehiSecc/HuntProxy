@@ -67,6 +67,13 @@ const CHROME_BACKGROUND_REQUESTS: &[(&str, &str, &str, bool, bool)] = &[
         true,
         false,
     ),
+    (
+        "POST",
+        "content-autofill.googleapis.com",
+        "/v1/forms:",
+        true,
+        false,
+    ),
 ];
 static SKIPPED_CHROME_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -107,6 +114,28 @@ fn skip_chrome_background_request(
     let count = SKIPPED_CHROME_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
     tracing::debug!(count, "skipped Chrome background requests");
     true
+}
+
+fn is_own_api_target(target: &TargetRef, listener: SocketAddr) -> bool {
+    if target.port != listener.port() {
+        return false;
+    }
+    let accepts_loopback = listener.ip().is_loopback() || listener.ip().is_unspecified();
+    if target.host == "localhost" {
+        return accepts_loopback;
+    }
+    let Ok(ip) = target
+        .host
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+    else {
+        return false;
+    };
+    (accepts_loopback && ip.is_loopback())
+        || ip == listener.ip()
+        || (listener.ip().is_unspecified()
+            && !ip.is_unspecified()
+            && std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok())
 }
 
 type ProxyBody = UnsyncBoxBody<Bytes, Infallible>;
@@ -251,7 +280,9 @@ async fn forward_request(
             None,
         )
         .await?;
-    let capture = url_is_in_scope(&url, &project.scope)?;
+    let capture = url_is_in_scope(&url, &project.scope)?
+        && !is_own_api_target(&target, state.config.api_listen)
+        && !is_own_api_target(&wire_target, state.config.api_listen);
     let dial = resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?;
     let method = parts.method.clone();
     let mut headers = parts
@@ -1348,6 +1379,21 @@ mod tests {
                 "https://content-autofill.googleapis.com/v1/pages/example",
                 true,
             ),
+            (
+                "POST",
+                "https://content-autofill.googleapis.com/v1/forms:vote?alt=proto",
+                true,
+            ),
+            (
+                "GET",
+                "https://content-autofill.googleapis.com/v1/forms:vote",
+                false,
+            ),
+            (
+                "POST",
+                "https://content-autofill.googleapis.com/v1/forms/vote",
+                false,
+            ),
             ("POST", "https://android.clients.google.com/other", false),
             ("POST", "https://accounts.google.com/ListAccounts", false),
             (
@@ -1386,6 +1432,150 @@ mod tests {
             &TargetRef::from_url("https://android.clients.google.com/checkin").unwrap(),
             &Method::POST
         ));
+        assert!(!is_chrome_background_request(
+            &session,
+            &TargetRef::from_url("https://content-autofill.googleapis.com/v1/forms:vote?alt=proto")
+                .unwrap(),
+            &Method::POST
+        ));
+    }
+
+    #[test]
+    fn own_api_target_matches_listener_port_and_hosts() {
+        let listener = "127.0.0.1:17890".parse().unwrap();
+        for (url, expected) in [
+            ("http://localhost:17890/", true),
+            ("http://127.0.0.1:17890/api", true),
+            ("http://127.0.0.2:17890/", true),
+            ("http://[::1]:17890/", true),
+            ("http://192.0.2.10:17890/", false),
+            ("http://192.0.2.11:17890/", false),
+            ("http://localhost:17891/", false),
+            ("http://localhost.example:17890/", false),
+        ] {
+            assert_eq!(
+                is_own_api_target(&TargetRef::from_url(url).unwrap(), listener),
+                expected,
+                "{url}"
+            );
+        }
+        let specific = "192.0.2.10:17890".parse().unwrap();
+        assert!(is_own_api_target(
+            &TargetRef::from_url("http://192.0.2.10:17890/").unwrap(),
+            specific
+        ));
+        assert!(!is_own_api_target(
+            &TargetRef::from_url("http://127.0.0.1:17890/").unwrap(),
+            specific
+        ));
+        let wildcard = "0.0.0.0:17890".parse().unwrap();
+        assert!(!is_own_api_target(
+            &TargetRef::from_url("http://192.0.2.11:17890/").unwrap(),
+            wildcard
+        ));
+    }
+
+    #[tokio::test]
+    async fn own_api_is_forwarded_without_http_or_websocket_history() {
+        use futures::SinkExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, project, external) = proxy_test_fixture(&directory).await;
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        Arc::get_mut(&mut state).unwrap().config.api_listen = origin_addr;
+        let browser = state
+            .db
+            .create_browser_session(project.id, Some("default".into()))
+            .await
+            .unwrap();
+        let browser_capture = state
+            .db
+            .create_capture_session(CreateCaptureSession {
+                project_id: project.id,
+                browser_session_id: Some(browser.id),
+                browser_action_id: None,
+                is_browser_bound: true,
+                ttl: None,
+            })
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = origin.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..read]).contains("/api/v1/projects"));
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let (socket, _) = origin.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let message = ws.next().await.unwrap().unwrap();
+            ws.send(message).await.unwrap();
+        });
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        for session in [&external, &browser_capture] {
+            let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+            client.write_all(format!("GET http://{origin_addr}/api/v1/projects HTTP/1.1\r\nHost: {origin_addr}\r\nProxy-Authorization: Bearer {}\r\nConnection: close\r\n\r\n", session.token_once.as_deref().unwrap()).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert!(String::from_utf8_lossy(&response).ends_with("ok"));
+        }
+        let stream = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut request = format!("ws://{origin_addr}/events")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "proxy-authorization",
+            format!("Bearer {}", external.token_once.as_deref().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+        ws.send(Message::Text("hello".into())).await.unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap().into_text().unwrap(),
+            "hello"
+        );
+        server.await.unwrap();
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(format!("GET http://{origin_addr}/api/v1/projects HTTP/1.1\r\nHost: {origin_addr}\r\nProxy-Authorization: Bearer {}\r\nConnection: close\r\n\r\n", external.token_once.as_deref().unwrap()).as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(!String::from_utf8_lossy(&response).contains("200 OK"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(state
+            .db
+            .list_history(project.id, 10, None, None)
+            .await
+            .unwrap()
+            .0
+            .is_empty());
+        assert!(state
+            .db
+            .list_websocket_connections(project.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -151,13 +151,15 @@ pub async fn run_daemon(mut config: Config) -> DomainResult<()> {
     let _daemon_lock = acquire_daemon_lock(&config)?;
     prepare_release_runtime(&mut config).await?;
 
-    let state = bootstrap_state(config.clone()).await?;
-    let shutdown = state.shutdown.clone();
-
     // Bind every public/private listener before spawning any server. This makes
     // readiness atomic: a port/socket conflict fails startup and is never
     // reported as a ready daemon.
     let api_listener = crate::api::bind_api(config.api_listen).await?;
+    config.api_listen = api_listener
+        .local_addr()
+        .map_err(|error| DomainError::new(ErrorCode::Unavailable, error.to_string()))?;
+    let state = bootstrap_state(config.clone()).await?;
+    let shutdown = state.shutdown.clone();
     let proxy_listener = crate::proxy::bind_proxy(config.proxy_listen).await?;
     #[cfg(unix)]
     let uds_listener = crate::api::bind_uds(&config.socket_path())?;
