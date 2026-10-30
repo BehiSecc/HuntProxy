@@ -1652,8 +1652,17 @@ async function performBrowserRequest(session, action) {
   return { message: "browser request completed", data: result };
 }
 
+const PAGE_ACTIONS = new Set([
+  "navigate", "snapshot", "click", "fill", "select", "upload", "inspect",
+  "scroll", "screenshot", "press", "wait", "back", "forward",
+]);
+
 async function executeAction(session, action = {}) {
   const page = await activePage(session);
+  // A popup can take foreground focus without changing the selected page.
+  // Restore it before page actions so Chromium runs animation frames and
+  // Playwright can complete its actionability checks.
+  if (PAGE_ACTIONS.has(action.type)) await page.bringToFront();
   switch (action.type) {
     case "navigate": {
       await page.goto(action.url, {
