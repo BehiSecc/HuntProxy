@@ -1715,10 +1715,9 @@ mod tests {
 
     #[tokio::test]
     async fn intercepted_http2_request_can_reach_an_http1_only_origin() {
-        std::fs::create_dir_all("/tmp/artis").unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("huntproxy-protocol-")
-            .tempdir_in("/tmp/artis")
+            .prefix("hp-protocol-")
+            .tempdir()
             .unwrap();
         let (state, _, session) = proxy_test_fixture(&directory).await;
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();

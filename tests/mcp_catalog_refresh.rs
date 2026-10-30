@@ -23,10 +23,9 @@ struct Bridge {
 
 impl Bridge {
     async fn start(auto_start_daemon: bool) -> (Self, Config) {
-        std::fs::create_dir_all("/tmp/artis").unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("huntproxy-mcp-catalog-")
-            .tempdir_in("/tmp/artis")
+            .prefix("hp-catalog-")
+            .tempdir()
             .unwrap();
         let mut config = Config {
             data_dir: directory.path().to_owned(),
@@ -344,10 +343,9 @@ async fn stopped_or_older_daemon_uses_local_restart_definition() {
 
 #[tokio::test]
 async fn private_catalog_route_is_read_only_and_returns_current_tools() {
-    std::fs::create_dir_all("/tmp/artis").unwrap();
     let directory = tempfile::Builder::new()
-        .prefix("huntproxy-mcp-route-")
-        .tempdir_in("/tmp/artis")
+        .prefix("hp-route-")
+        .tempdir()
         .unwrap();
     let config = Config {
         data_dir: directory.path().to_owned(),

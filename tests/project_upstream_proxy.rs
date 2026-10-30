@@ -17,10 +17,9 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn configuration() -> (TempDir, Config) {
-    std::fs::create_dir_all("/tmp/artis/upstream").unwrap();
     let directory = tempfile::Builder::new()
-        .prefix("huntproxy-live-upstream-")
-        .tempdir_in("/tmp/artis/upstream")
+        .prefix("hp-upstream-")
+        .tempdir()
         .unwrap();
     let config = Config {
         data_dir: directory.path().to_path_buf(),

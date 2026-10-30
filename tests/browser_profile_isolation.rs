@@ -355,13 +355,13 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        Self::new_in(Path::new("/tmp/artis")).await
+        Self::new_in(&std::env::temp_dir()).await
     }
 
     async fn new_in(parent: &Path) -> Self {
         std::fs::create_dir_all(parent).unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("huntproxy-profile-regression-")
+            .prefix("hp-profile-")
             .tempdir_in(parent)
             .unwrap();
         let fixture = LocalFixture::start().await;

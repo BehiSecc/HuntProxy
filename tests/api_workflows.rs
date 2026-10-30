@@ -968,10 +968,9 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
     use axum::routing::get;
     use std::sync::{Arc, Mutex};
 
-    std::fs::create_dir_all("/tmp/artis").unwrap();
     let directory = tempfile::Builder::new()
         .prefix("hp-page-analyzer-")
-        .tempdir_in("/tmp/artis")
+        .tempdir()
         .unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

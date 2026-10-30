@@ -298,10 +298,9 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[tokio::test]
 async fn scoped_exports_match_legacy_rows_isolate_projects_and_roundtrip() {
-    std::fs::create_dir_all("/tmp/artis").unwrap();
     let directory = tempfile::Builder::new()
         .prefix("transfer-scoped-")
-        .tempdir_in("/tmp/artis")
+        .tempdir()
         .unwrap();
     let config = test_config(&directory.path().join("source"));
     let db = Db::open(&config).await.unwrap();

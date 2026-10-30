@@ -584,22 +584,12 @@ mod tests {
     use super::*;
     use crate::config::{create_private_dir, write_private_file};
     use serde_json::{json, Value};
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-
-    fn test_root() -> &'static Path {
-        static ROOT: OnceLock<PathBuf> = OnceLock::new();
-        ROOT.get_or_init(|| {
-            let root = PathBuf::from("/tmp/artis/huntproxy-update-journal-tests");
-            fs::create_dir_all(&root).unwrap();
-            root
-        })
-    }
 
     fn directory() -> TempDir {
         tempfile::Builder::new()
             .prefix("journal-")
-            .tempdir_in(test_root())
+            .tempdir()
             .unwrap()
     }
 

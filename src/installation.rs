@@ -1543,11 +1543,9 @@ mod tests {
     use super::*;
 
     fn temporary_directory() -> tempfile::TempDir {
-        let root = Path::new("/tmp/artis");
-        fs::create_dir_all(root).unwrap();
         tempfile::Builder::new()
-            .prefix("huntproxy-installation-test-")
-            .tempdir_in(root)
+            .prefix("hp-install-")
+            .tempdir()
             .unwrap()
     }
 

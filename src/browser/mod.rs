@@ -4083,15 +4083,20 @@ mod tests {
         let operation_guard = operation.lock().await;
         let observation = service.active_status(project.id);
         tokio::pin!(observation);
-        // Poll status until it is waiting for the busy session. Cancellation
-        // here only drops the timer; the observation future remains pinned.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut observation)
-                .await
-                .is_err()
-        );
+        // The map and this test hold two references. A third means status has
+        // reached the busy session's operation lock.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&operation) < 3 {
+                tokio::select! {
+                    result = &mut observation => panic!("status completed before waiting: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("status did not reach the busy session");
         tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             service.stop(other_project.id, other.id),
         )
         .await
@@ -4953,10 +4958,9 @@ done
     fn runtime_inspection_uses_worker_metadata_and_distinguishes_probe_failures() {
         use std::os::unix::fs::PermissionsExt;
 
-        std::fs::create_dir_all("/tmp/artis").unwrap();
         let directory = tempfile::Builder::new()
             .prefix("huntproxy-runtime-contract-")
-            .tempdir_in("/tmp/artis")
+            .tempdir()
             .unwrap();
         let node = directory.path().join("node");
         let worker = directory.path().join("index.js");
@@ -5030,10 +5034,9 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn aliased_profile_directories_cannot_claim_another_identity() {
-        std::fs::create_dir_all("/tmp/artis").unwrap();
         let directory = tempfile::Builder::new()
             .prefix("huntproxy-profile-owner-")
-            .tempdir_in("/tmp/artis")
+            .tempdir()
             .unwrap();
         let service = BrowserService::new_with_proxy_and_ca(
             Arc::new(Db::open_in_memory().await.unwrap()),

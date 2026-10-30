@@ -17,8 +17,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const TEST_ROOT: &str = "/tmp/artis";
-
 struct Daemon {
     child: Child,
     binary: PathBuf,
@@ -96,10 +94,9 @@ impl Drop for Fixture {
 fn v011_data_and_full_bundle_upgrade_to_current_release() {
     let legacy = required_legacy_binary();
     let current = PathBuf::from(env!("CARGO_BIN_EXE_HuntProxy"));
-    fs::create_dir_all(TEST_ROOT).unwrap();
     let workspace = tempfile::Builder::new()
         .prefix("legacy-upgrade-")
-        .tempdir_in(TEST_ROOT)
+        .tempdir()
         .unwrap();
     let data_dir = workspace.path().join("data");
     let bundle = workspace.path().join("v0.1.1-full.huntproxy");

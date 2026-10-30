@@ -66,10 +66,9 @@ struct Agent {
 
 impl Agent {
     async fn start(auto_start_daemon: bool) -> Self {
-        std::fs::create_dir_all("/tmp/artis").unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("huntproxy-mcp-lifecycle-")
-            .tempdir_in("/tmp/artis")
+            .prefix("hp-mcp-")
+            .tempdir()
             .unwrap();
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
