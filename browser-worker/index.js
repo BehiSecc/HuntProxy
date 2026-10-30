@@ -685,7 +685,7 @@ function chromiumProxy(proxy) {
   };
 }
 
-function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
+function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null, executablePath = browserRuntime.chromium_path) {
   const args = [
     "--disable-quic",
     "--disk-cache-size=52428800",
@@ -702,7 +702,7 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null) {
     );
   }
   return {
-    executablePath: browserRuntime.chromium_path,
+    executablePath,
     headless: browserRuntime.headless,
     proxy: chromiumProxy(proxy),
     ignoreHTTPSErrors: Boolean(caCertPath),
@@ -878,10 +878,10 @@ async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = nu
   if (!executablePath) {
     throw rpcError(
       -32003,
-      "Chromium executable not found; install Chromium or set HUNTPROXY_CHROME_EXECUTABLE",
+      "managed Chromium executable not found; prepare the browser runtime or set HUNTPROXY_CHROME_EXECUTABLE",
     );
   }
-  const options = chromiumLaunchOptions(proxy, caCertPath, cdpPort);
+  const options = chromiumLaunchOptions(proxy, caCertPath, cdpPort, executablePath);
   options.serviceWorkers = profileDir ? "allow" : "block";
   if (profileDir) {
     fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
@@ -970,7 +970,78 @@ function cookieIdentityKey(cookie) {
   ]);
 }
 
-async function launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies = [], sessionStorage = {}) {
+async function checkpointRuntimePages(session) {
+  const active = await activePage(session);
+  const pages = [];
+  let activeIndex = 0;
+  for (const page of session.context.pages()) {
+    if (page.isClosed()) continue;
+    const url = page.url() || "about:blank";
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw rpcError(-32000, "CDP handoff could not preserve an open tab URL");
+    }
+    if (!new Set(["http:", "https:", "about:"]).has(parsed.protocol)) {
+      throw rpcError(-32000, `CDP handoff cannot preserve an open ${parsed.protocol} tab`);
+    }
+    let sessionStorage = {};
+    if (new Set(["http:", "https:"]).has(parsed.protocol)) {
+      try {
+        sessionStorage = await page.evaluate(() => Object.fromEntries(
+          Array.from({ length: window.sessionStorage.length }, (_, index) => {
+            const key = window.sessionStorage.key(index);
+            return [key, window.sessionStorage.getItem(key)];
+          }),
+        ));
+      } catch {
+        throw rpcError(-32000, "CDP handoff could not preserve session storage for every open tab");
+      }
+    }
+    if (page === active) activeIndex = pages.length;
+    pages.push({ url, session_storage: sessionStorage });
+  }
+  if (!pages.length) pages.push({ url: "about:blank", session_storage: {} });
+  return { pages, active_index: activeIndex };
+}
+
+async function restoreRuntimePages(runtime, pageState) {
+  const states = Array.isArray(pageState?.pages) && pageState.pages.length
+    ? pageState.pages : [{ url: "about:blank", session_storage: {} }];
+  const initialPages = runtime.context.pages();
+  const first = initialPages[0] || await runtime.context.newPage();
+  const pages = [];
+  for (let index = 0; index < states.length; index += 1) {
+    const state = states[index];
+    const page = index === 0 ? first : await runtime.context.newPage();
+    pages.push(page);
+    if (state.url && state.url !== "about:blank") {
+      await page.goto(state.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.evaluate((values) => {
+        sessionStorage.clear();
+        for (const [key, value] of Object.entries(values || {})) {
+          sessionStorage.setItem(key, value);
+        }
+      }, state.session_storage || {});
+      // Let application startup observe the restored per-tab state just as it
+      // did before the runtime handoff.
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
+    }
+  }
+  for (const page of initialPages) {
+    if (!pages.includes(page) && !page.isClosed()) {
+      await page.close({ runBeforeUnload: false });
+    }
+  }
+  const activeIndex = Number.isInteger(pageState?.active_index)
+    && pageState.active_index >= 0 && pageState.active_index < pages.length
+    ? pageState.active_index : 0;
+  runtime.page = pages[activeIndex];
+  await runtime.page.bringToFront();
+}
+
+async function launchSessionRuntime(session, cdpPort, pageState, sessionCookies = []) {
   const runtime = await launchChromium(
     session.proxy || null,
     session.caCertPath || null,
@@ -979,13 +1050,7 @@ async function launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies
   );
   try {
     if (sessionCookies.length) await runtime.context.addCookies(sessionCookies);
-    if (currentUrl && currentUrl !== "about:blank") {
-      await runtime.page.goto(currentUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await reconcileCurrentOriginStorage({
-        ...runtime, preferProfileState: true,
-        restoreState: { session_storage: sessionStorage }, restoredOrigins: new Set(),
-      });
-    }
+    await restoreRuntimePages(runtime, pageState);
     const cdp = cdpPort == null ? null : await discoverCdp(runtime.page, cdpPort);
     return { runtime, cdp };
   } catch (error) {
@@ -998,25 +1063,20 @@ async function relaunchSession(session, cdpPort) {
   if (!session.persistent || !session.profileDir) {
     throw rpcError(-32602, "CDP handoff requires a persistent project browser");
   }
-  const currentPage = await activePage(session);
-  const currentUrl = currentPage.url() || "about:blank";
+  const pageState = await checkpointRuntimePages(session);
   const existingJavascriptFiles = new Map(session.javascriptFiles || []);
   const nextGeneration = Number(session.runtimeGeneration || 0) + 1;
   const sessionCookies = await session.context.cookies()
     .then((cookies) => cookies.filter(isSessionCookie));
-  const checkpoint = await extractCheckpoint(session);
-  const sessionStorage = checkpoint.origin
-    ? { [checkpoint.origin]: checkpoint._private.session_storage }
-    : {};
   await closeRuntime(session);
   let launched;
   try {
-    launched = await launchSessionRuntime(session, cdpPort, currentUrl, sessionCookies, sessionStorage);
+    launched = await launchSessionRuntime(session, cdpPort, pageState, sessionCookies);
   } catch (error) {
     if (error.ownedRuntime) Object.assign(session, error.ownedRuntime, { cdp: null });
     if (error.ownedRuntime || shuttingDown) throw error;
     try {
-      const restored = await launchSessionRuntime(session, null, currentUrl, sessionCookies, sessionStorage);
+      const restored = await launchSessionRuntime(session, null, pageState, sessionCookies);
       Object.assign(session, restored.runtime, { cdp: null });
       await initializeSessionTracking(session, existingJavascriptFiles, nextGeneration);
     } catch (restoreError) {

@@ -107,10 +107,21 @@ impl StoredCookieProfile {
             host: self.host.clone(),
             target_url: self.target_url.clone(),
             names: self.names.clone(),
-            cookie_count: self.names.len(),
+            cookie_count: self.cookie_count(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         }
+    }
+
+    pub(crate) fn cookie_count(&self) -> usize {
+        self.managed_cookies
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or_else(|| {
+                parse_cookie_header(&self.cookie_header)
+                    .map(|pairs| pairs.len())
+                    .unwrap_or(self.names.len())
+            })
     }
 
     pub fn pairs(&self) -> DomainResult<Vec<CookiePair>> {
@@ -141,6 +152,13 @@ impl StoredCookieProfile {
 }
 
 impl ValidatedCookieProfile {
+    pub(crate) fn cookie_count(&self) -> usize {
+        self.managed_cookies
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(self.pairs.len())
+    }
+
     pub fn cookie_header_for_url(&self, target_url: &str) -> DomainResult<Option<String>> {
         let profile = StoredCookieProfile {
             project_id: ProjectId(0),

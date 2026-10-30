@@ -6,24 +6,24 @@ cd "$(dirname "$0")/.."
 echo "== fmt =="
 cargo fmt --check
 
+echo "== Rust dependency notices =="
+python3 scripts/test-prepare-rust-notices.py
+python3 scripts/prepare-rust-notices.py --check
+
+echo "== release asset validation =="
+python3 scripts/test-prepare-release-assets.py
+
 echo "== clippy =="
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 
 echo "== test =="
-cargo test --all-targets
+cargo test --locked --all-targets
 
 echo "== browser worker syntax =="
 node --check browser-worker/index.js
 node --check browser-worker/headless.js
 
 echo "== build =="
-cargo build --release
-
-if command -v cargo-deny >/dev/null 2>&1; then
-  echo "== deny =="
-  cargo deny check
-else
-  echo "== deny skipped (cargo-deny not installed) =="
-fi
+cargo build --release --locked
 
 echo "OK"

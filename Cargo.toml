@@ -1,6 +1,6 @@
 [package]
 name = "HuntProxy"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.98"
 description = "A web security workbench built for AI agents and authorized testing"
@@ -44,9 +44,8 @@ wreq = { git = "https://github.com/0x676e67/wreq", rev = "307c60df0663dd3fb434c8
 wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "5715529002738f46eea86a7271f918f9374d3582", default-features = false, features = ["emulation", "tokio-rt", "emulation-chromium-pki"] }
 
 # TLS / CA
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pemfile = "2"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 webpki-roots = "0.26"
 
@@ -111,6 +110,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 wreq = { git = "https://github.com/0x676e67/wreq", rev = "307c60df0663dd3fb434c82777b3fe9a0158d82a", default-features = false, features = ["prefix-symbols"] }
 
 [dev-dependencies]
+rustls-pemfile = "2"
 proptest = "1"
 tempfile = "3"
 tokio-test = "0.4"

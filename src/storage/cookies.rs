@@ -18,6 +18,7 @@ impl Db {
         let name = name.to_string();
         let now = now_rfc3339();
         let names_json = cookie_metadata_json(&profile)?;
+        let cookie_count = profile.cookie_count();
         self.with_conn(move |connection| {
             let created_at = connection
                 .query_row(
@@ -51,7 +52,7 @@ impl Db {
                 host: profile.host,
                 target_url: profile.target_url,
                 names: profile.names.clone(),
-                cookie_count: profile.names.len(),
+                cookie_count,
                 created_at,
                 updated_at: now,
             })
@@ -727,5 +728,34 @@ mod tests {
             .delete_named_cookie_profile(project.id, "first")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn named_profile_cookie_count_counts_distinct_path_entries() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "cookie count".into(),
+                target_url: "https://example.com".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let status = db
+            .upsert_named_cookie_profile(
+                project.id,
+                "account",
+                crate::cookies::validate_named_cookie_profile(
+                    "https://example.com",
+                    r#"[{"name":"sid","value":"root","domain":"example.com","path":"/"},{"name":"sid","value":"admin","domain":"example.com","path":"/admin"}]"#.into(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.names, vec!["sid"]);
+        assert_eq!(status.cookie_count, 2);
+        let listed = db.list_named_cookie_profiles(project.id).await.unwrap();
+        assert_eq!(listed[0].1.cookie_count, 2);
     }
 }

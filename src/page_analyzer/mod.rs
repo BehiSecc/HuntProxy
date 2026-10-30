@@ -166,8 +166,13 @@ pub struct ScriptTreeAnalysis {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptBundleContent {
+    /// Effective URL after request rules. Nested relative imports are resolved
+    /// from this URL rather than the pre-rewrite discovery URL.
+    pub source_url: String,
     pub body: Vec<u8>,
-    pub truncated: bool,
+    pub status_code: Option<u16>,
+    pub content_type: Option<String>,
+    pub completion: crate::domain::CompletionState,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -178,6 +183,12 @@ pub struct ExchangePageAnalysis {
     pub decoded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_encoding: Option<String>,
+    pub body_truncated: bool,
+    pub analysis_incomplete: bool,
+    pub completion: crate::domain::CompletionState,
+    pub status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     #[serde(flatten)]
     pub analysis: PageAnalysis,
 }
@@ -197,6 +208,28 @@ pub(crate) struct DecodedExchangeContent {
     pub decoded: bool,
     pub content_encoding: Option<String>,
     pub body_truncated: bool,
+    pub completion: crate::domain::CompletionState,
+    pub status_code: Option<u16>,
+    pub content_type: Option<String>,
+}
+
+fn looks_like_html_document(body: &[u8]) -> bool {
+    let prefix = String::from_utf8_lossy(&body[..body.len().min(512)]);
+    let prefix = prefix
+        .trim_start_matches(|character: char| character.is_whitespace() || character == '\u{feff}');
+    let prefix = prefix.to_ascii_lowercase();
+    prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.starts_with("<head")
+        || prefix.starts_with("<body")
+}
+
+fn acceptable_script_response(content: &ScriptBundleContent) -> bool {
+    content
+        .status_code
+        .is_some_and(|status| (200..300).contains(&status))
+        && !crate::page_title::is_html_mime(content.content_type.as_deref())
+        && !looks_like_html_document(&content.body)
 }
 
 fn attribute_value<'a>(captures: &'a regex::Captures<'a>) -> Option<&'a str> {
@@ -550,7 +583,23 @@ where
                 continue;
             }
         };
-        truncated |= fetched.truncated;
+        if !same_origin_url(source_url, &fetched.source_url) {
+            failures += 1;
+            continue;
+        }
+        if !acceptable_script_response(&fetched) {
+            failures += 1;
+            truncated |= fetched.completion != crate::domain::CompletionState::Complete;
+            continue;
+        }
+        if fetched.completion != crate::domain::CompletionState::Complete {
+            // A partial response can still contain useful static discoveries,
+            // but it did not complete successfully and must be reported as
+            // both incomplete analysis and a failed bundle fetch.
+            failures += 1;
+            truncated = true;
+        }
+        let effective_url = fetched.source_url;
         let body = fetched.body;
         let take = body.len().min(MAX_SCRIPT_BUNDLE_BYTES).min(remaining_bytes);
         if take < body.len() {
@@ -566,7 +615,7 @@ where
         remaining_bytes -= take;
         merge_analysis(&mut analysis, analyze_page(&body[..take]));
 
-        let discovered = script_targets(&url, &body[..take]);
+        let discovered = script_targets(&effective_url, &body[..take]);
         truncated |= discovered.truncated;
         for target in discovered.targets {
             if queued.insert(target.clone()) {
@@ -683,6 +732,11 @@ pub async fn analyze_exchange(
         source_url: content.source_url,
         decoded: content.decoded,
         content_encoding: content.content_encoding,
+        body_truncated: content.body_truncated,
+        analysis_incomplete: content.body_truncated,
+        completion: content.completion,
+        status_code: content.status_code,
+        content_type: content.content_type,
         analysis: analyze_page(&content.body),
     })
 }
@@ -739,8 +793,10 @@ pub(crate) async fn load_exchange_content(
         body,
         decoded,
         content_encoding,
-        body_truncated: detail.summary.completion
-            == crate::domain::CompletionState::TruncatedByPolicy,
+        body_truncated: detail.summary.completion != crate::domain::CompletionState::Complete,
+        completion: detail.summary.completion,
+        status_code: detail.summary.status_code,
+        content_type: detail.summary.mime,
     })
 }
 
@@ -1442,8 +1498,11 @@ mod tests {
                         .get(&url)
                         .cloned()
                         .map(|body| ScriptBundleContent {
+                            source_url: url,
                             body,
-                            truncated: false,
+                            status_code: Some(200),
+                            content_type: Some("application/javascript".into()),
+                            completion: crate::domain::CompletionState::Complete,
                         }))
                 }
             }
@@ -1477,13 +1536,16 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch = {
             let calls = Arc::clone(&calls);
-            move |_url: String| {
+            move |url: String| {
                 let calls = Arc::clone(&calls);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(Some(ScriptBundleContent {
+                        source_url: url,
                         body: b" ".to_vec(),
-                        truncated: false,
+                        status_code: Some(200),
+                        content_type: Some("application/javascript".into()),
+                        completion: crate::domain::CompletionState::Complete,
                     }))
                 }
             }
@@ -1511,8 +1573,11 @@ mod tests {
                     b"fetch('/api/users/:user_id?include=teams');".to_vec()
                 };
                 Ok(Some(ScriptBundleContent {
+                    source_url: url,
                     body,
-                    truncated: false,
+                    status_code: Some(200),
+                    content_type: Some("text/plain".into()),
+                    completion: crate::domain::CompletionState::Complete,
                 }))
             },
         )
@@ -1528,15 +1593,110 @@ mod tests {
         let result = analyze_script_tree(
             "https://example.test/index.html",
             br#"<script src="/static/app.js"></script>"#,
-            |_url: String| async move {
+            |url: String| async move {
                 Ok(Some(ScriptBundleContent {
+                    source_url: url,
                     body: b"fetch('/api/health');".to_vec(),
-                    truncated: true,
+                    status_code: Some(200),
+                    content_type: Some("application/javascript".into()),
+                    completion: crate::domain::CompletionState::Timeout,
                 }))
             },
         )
         .await;
 
         assert!(result.js_bundles_truncated);
+        assert_eq!(result.js_bundle_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn script_tree_rejects_http_and_html_error_bundles_but_accepts_plain_text_javascript() {
+        let root = br#"
+          <script src="/missing.js"></script>
+          <script src="/error.js"></script>
+          <script src="/plain.js"></script>
+        "#;
+        let result = analyze_script_tree(
+            "https://example.test/index.html",
+            root,
+            |url: String| async move {
+                let (status_code, content_type, body) = if url.ends_with("missing.js") {
+                    (
+                        404,
+                        "text/html",
+                        b"<html>missing /api/false-positive</html>".to_vec(),
+                    )
+                } else if url.ends_with("error.js") {
+                    (
+                        200,
+                        "text/html; charset=utf-8",
+                        b"<html>error /api/also-false</html>".to_vec(),
+                    )
+                } else {
+                    (200, "text/plain", b"fetch('/api/accepted');".to_vec())
+                };
+                Ok(Some(ScriptBundleContent {
+                    source_url: url,
+                    body,
+                    status_code: Some(status_code),
+                    content_type: Some(content_type.into()),
+                    completion: crate::domain::CompletionState::Complete,
+                }))
+            },
+        )
+        .await;
+
+        assert_eq!(result.js_bundle_failures, 2);
+        assert!(result
+            .analysis
+            .endpoints
+            .contains(&"/api/accepted".to_string()));
+        assert!(!result
+            .analysis
+            .endpoints
+            .contains(&"/api/false-positive".to_string()));
+        assert!(!result
+            .analysis
+            .endpoints
+            .contains(&"/api/also-false".to_string()));
+    }
+
+    #[tokio::test]
+    async fn script_tree_resolves_nested_scripts_from_the_effective_bundle_url() {
+        let result = analyze_script_tree(
+            "https://example.test/index.html",
+            br#"<script src="/assets/entry.js"></script>"#,
+            |url: String| async move {
+                let (source_url, body) = if url.ends_with("/assets/entry.js") {
+                    (
+                        "https://example.test/rewritten/nested/entry.js".to_string(),
+                        br#"<script src="./child.js"></script>"#.to_vec(),
+                    )
+                } else {
+                    (url.clone(), b"fetch('/api/from-child');".to_vec())
+                };
+                Ok(Some(ScriptBundleContent {
+                    source_url,
+                    body,
+                    status_code: Some(200),
+                    content_type: Some("text/plain".into()),
+                    completion: crate::domain::CompletionState::Complete,
+                }))
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.js_bundles,
+            [
+                "https://example.test/assets/entry.js",
+                "https://example.test/rewritten/nested/child.js",
+            ]
+        );
+        assert!(result
+            .analysis
+            .endpoints
+            .contains(&"/api/from-child".to_string()));
+        assert_eq!(result.js_bundle_failures, 0);
     }
 }

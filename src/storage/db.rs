@@ -30,6 +30,7 @@ impl Db {
 
         let sync = cfg.sqlite_synchronous.clone();
         let busy = cfg.busy_timeout_ms;
+        let migration_backup_dir = cfg.runtime_dir.join("migration-backups");
         // Configure and migrate on a connection
         {
             let conn = pool
@@ -42,6 +43,10 @@ impl Db {
                 // WAL is database-wide
                 c.pragma_update(None, "journal_mode", "WAL")
                     .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+                let version = migrations::schema_version(c)?;
+                if version > 0 && version < migrations::current_schema_version() {
+                    backup_before_migration(c, &migration_backup_dir, version)?;
+                }
                 migrations::migrate(c)
             })
             .await
@@ -112,6 +117,40 @@ impl Db {
     }
 }
 
+fn backup_before_migration(
+    source: &Connection,
+    directory: &Path,
+    version: i32,
+) -> DomainResult<()> {
+    crate::config::create_private_dir(directory)?;
+    let path = directory.join(format!("schema-{version}-{}.sqlite3", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut target = Connection::open(&path)?;
+        let backup = rusqlite::backup::Backup::new(source, &mut target)?;
+        backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
+        drop(backup);
+        target.pragma_update(None, "journal_mode", "DELETE")?;
+        drop(target);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::File::open(&path)?.sync_all()?;
+        std::fs::File::open(directory)?.sync_all()?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&path);
+        return Err(DomainError::new(
+            ErrorCode::MigrationError,
+            format!("could not preserve the database before upgrading: {error}"),
+        ));
+    }
+    tracing::info!(path = %path.display(), schema = version, "preserved database before schema upgrade");
+    Ok(())
+}
+
 pub(crate) fn write_transaction(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
     rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
 }
@@ -163,3 +202,75 @@ pub fn configure_connection(
 
 /// Shared app state handle.
 pub type DbHandle = Arc<Db>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_database(directory: &Path) -> Config {
+        let config = Config {
+            data_dir: directory.to_owned(),
+            spool_dir: directory.join("spool"),
+            export_dir: directory.join("exports"),
+            runtime_dir: directory.join("runtime"),
+            plugin_dir: directory.join("plugins"),
+            ..Config::default()
+        };
+        config.ensure_layout().unwrap();
+        let database = Connection::open(config.db_path()).unwrap();
+        migrations::migrate(&database).unwrap();
+        database.execute_batch("ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14; CREATE TABLE saved_fixture(name TEXT); INSERT INTO saved_fixture VALUES ('Existing project');").unwrap();
+        config
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_keeps_a_private_usable_backup_and_does_not_repeat_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = legacy_database(directory.path());
+        let database = Db::open(&config).await.unwrap();
+        assert_eq!(database.schema_version().await.unwrap(), 15);
+        let backups = config.runtime_dir.join("migration-backups");
+        let paths: Vec<_> = std::fs::read_dir(&backups)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        let restored = Connection::open(&paths[0]).unwrap();
+        assert_eq!(migrations::schema_version(&restored).unwrap(), 14);
+        assert_eq!(
+            restored
+                .query_row("SELECT name FROM saved_fixture", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Existing project"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&paths[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(database);
+        Db::open(&config).await.unwrap();
+        assert_eq!(std::fs::read_dir(backups).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn backup_failure_prevents_schema_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = legacy_database(directory.path());
+        std::fs::write(config.runtime_dir.join("migration-backups"), b"occupied").unwrap();
+        assert!(Db::open(&config).await.is_err());
+        let database = Connection::open(config.db_path()).unwrap();
+        assert_eq!(migrations::schema_version(&database).unwrap(), 14);
+        assert_eq!(
+            database
+                .query_row("SELECT name FROM saved_fixture", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Existing project"
+        );
+    }
+}

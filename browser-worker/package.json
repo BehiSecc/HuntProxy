@@ -11,7 +11,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "playwright-core": "1.63.0",
+    "playwright-core": "1.64.0",
     "ws": "8.22.0"
   }
 }

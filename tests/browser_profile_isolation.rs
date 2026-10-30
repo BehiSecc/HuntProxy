@@ -297,7 +297,19 @@ async fn serve_connection(mut stream: TcpStream, mutations: Arc<AtomicUsize>) {
         (
             "200 OK",
             "text/html",
-            "<!doctype html><title>Fixture details</title><main>Details ready</main>".to_owned(),
+            r#"<!doctype html><title>Fixture details</title>
+<main id="popup-state">Details ready</main>
+<button id="save-popup-state">Save tab state</button>
+<button id="read-popup-state">Read tab state</button>
+<script>
+document.getElementById('save-popup-state').onclick = () => {
+  sessionStorage.setItem('handoff-state', 'preserved');
+  document.getElementById('popup-state').textContent = 'Saved tab state';
+};
+document.getElementById('read-popup-state').onclick = () => {
+  document.getElementById('popup-state').textContent = sessionStorage.getItem('handoff-state') || 'Missing tab state';
+};
+</script>"#.to_owned(),
         )
     } else if path == "/api/mutate" {
         mutations.fetch_add(1, Ordering::SeqCst);
@@ -497,6 +509,89 @@ async fn structured_playwright_actions_cover_live_browser_workflows() {
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; uses only a local fixture"]
+async fn empty_event_wait_does_not_block_another_browser_session() {
+    let h = Harness::new_in(&std::env::temp_dir()).await;
+    let result = std::panic::AssertUnwindSafe(verify_event_wait_is_session_local(&h))
+        .catch_unwind()
+        .await;
+    h.service.force_stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn verify_event_wait_is_session_local(h: &Harness) {
+    let first = h
+        .service
+        .start_with_profile(h.project, h.fixture.url("localhost", "waiter"), "waiter")
+        .await
+        .unwrap();
+    let second = h
+        .service
+        .start_with_profile(h.project, h.fixture.url("localhost", "other"), "other")
+        .await
+        .unwrap();
+    let cursor = h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Events {
+                after_sequence: 0,
+                runtime_generation: None,
+                limit: 100,
+                kinds: vec![],
+                wait_ms: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let context = cursor.browser.unwrap();
+    let cursor = cursor.data.unwrap()["latest_sequence"].as_u64().unwrap();
+    let started = tokio::time::Instant::now();
+    let (waited, other) = tokio::join!(
+        h.service.action(
+            h.project,
+            first.id,
+            BrowserAction::Events {
+                after_sequence: cursor,
+                runtime_generation: Some(context.runtime_generation),
+                limit: 10,
+                kinds: vec!["dialog".into()],
+                wait_ms: 2000,
+            },
+        ),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1000),
+                h.service.action(
+                    h.project,
+                    second.id,
+                    BrowserAction::Pages {
+                        op: "list".into(),
+                        page_id: None,
+                        runtime_generation: None,
+                        url: None,
+                    },
+                ),
+            )
+            .await
+        }
+    );
+    let other = other
+        .expect("another session action was blocked by the empty event wait")
+        .unwrap();
+    assert_eq!(other.data.unwrap()["pages"].as_array().unwrap().len(), 1);
+    assert!(waited.unwrap().data.unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1800));
 }
 
 async fn verify_structured_playwright_actions(h: &Harness) {
@@ -835,11 +930,8 @@ async fn verify_structured_playwright_actions(h: &Harness) {
         .action(
             h.project,
             session.id,
-            BrowserAction::Pages {
-                op: "close".into(),
-                page_id: Some(popup_id),
-                runtime_generation: Some(generation),
-                url: None,
+            BrowserAction::Click {
+                locator: css_locator("#save-popup-state"),
             },
         )
         .await
@@ -880,6 +972,39 @@ async fn verify_structured_playwright_actions(h: &Harness) {
         .unwrap();
     let resumed_context = resumed.browser.unwrap();
     assert!(resumed_context.runtime_generation > generation);
+    let resumed_pages = resumed.data.unwrap()["pages"].as_array().unwrap().to_vec();
+    assert_eq!(resumed_pages.len(), 2);
+    assert!(resumed_pages
+        .iter()
+        .any(|page| page["active"] == true && page["title"] == "Fixture details"));
+    h.service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Click {
+                locator: css_locator("#read-popup-state"),
+            },
+        )
+        .await
+        .unwrap();
+    let restored_popup = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Snapshot {
+                format: "dom".into(),
+                max_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert!(restored_popup["content"]
+        .as_str()
+        .unwrap()
+        .contains("preserved"));
     assert!(h
         .service
         .action(
@@ -926,7 +1051,10 @@ async fn verify_structured_playwright_actions(h: &Harness) {
         .data
         .unwrap();
     assert_eq!(closed["pages"].as_array().unwrap().len(), 1);
-    assert_eq!(closed["pages"][0]["url"], "about:blank");
+    assert!(closed["pages"][0]["url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/app"));
 }
 
 fn css_locator(selector: &str) -> Locator {

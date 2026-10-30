@@ -21,8 +21,18 @@ use std::sync::Arc;
 trait ToolBackend: Send + Sync {
     async fn call(&self, name: &str, args: Value) -> DomainResult<Value>;
 
-    fn definitions(&self) -> Value {
+    async fn definitions(&self) -> Value {
         tool_defs()
+    }
+
+    async fn definitions_changed(&self) -> bool {
+        false
+    }
+
+    async fn reset_definitions_changed(&self) {}
+
+    fn supports_list_changed(&self) -> bool {
+        false
     }
 }
 
@@ -36,13 +46,73 @@ impl ToolBackend for LocalToolBackend {
         call_tool(self.state.clone(), name, args).await
     }
 
-    fn definitions(&self) -> Value {
+    async fn definitions(&self) -> Value {
         local_tool_defs()
     }
 }
 
 struct DaemonToolBackend {
     config: Config,
+    catalog: tokio::sync::RwLock<Option<DaemonToolCatalog>>,
+    catalog_change_pending: tokio::sync::Mutex<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DaemonToolCatalog {
+    version: String,
+    protocol: u32,
+    tools: Value,
+}
+
+impl DaemonToolBackend {
+    fn new(config: Config) -> Self {
+        Self {
+            config,
+            catalog: tokio::sync::RwLock::new(Some(DaemonToolCatalog {
+                version: SERVER_VERSION.to_string(),
+                protocol: crate::INTERNAL_PROTOCOL_VERSION,
+                tools: tool_defs(),
+            })),
+            catalog_change_pending: tokio::sync::Mutex::new(false),
+        }
+    }
+
+    async fn refresh_catalog(&self) -> DomainResult<Option<Value>> {
+        let Some(catalog) = fetch_daemon_tool_catalog(&self.config).await? else {
+            return Ok(None);
+        };
+        if catalog.version.is_empty()
+            || catalog.version.len() > 128
+            || catalog.protocol == 0
+            || !catalog.tools.is_array()
+        {
+            return Err(DomainError::new(
+                ErrorCode::ProtocolError,
+                "daemon returned an invalid MCP tool catalog",
+            ));
+        }
+
+        let tools = catalog.tools.clone();
+        let mut current = self.catalog.write().await;
+        let changed = current.as_ref().is_some_and(|previous| {
+            previous.version != catalog.version || previous.protocol != catalog.protocol
+        });
+        *current = Some(catalog);
+        drop(current);
+        if changed {
+            *self.catalog_change_pending.lock().await = true;
+        }
+        Ok(Some(tools))
+    }
+
+    async fn cached_definitions(&self) -> Value {
+        self.catalog
+            .read()
+            .await
+            .as_ref()
+            .map(|catalog| catalog.tools.clone())
+            .unwrap_or_else(tool_defs)
+    }
 }
 
 #[async_trait::async_trait]
@@ -73,6 +143,29 @@ impl ToolBackend for DaemonToolBackend {
         }
         let result = call_daemon_tool(&self.config, name, args).await;
         result
+    }
+
+    async fn definitions(&self) -> Value {
+        match self.refresh_catalog().await {
+            Ok(Some(tools)) => tools,
+            Ok(None) | Err(_) => self.cached_definitions().await,
+        }
+    }
+
+    async fn definitions_changed(&self) -> bool {
+        if self.refresh_catalog().await.is_err() {
+            return false;
+        }
+        let mut pending = self.catalog_change_pending.lock().await;
+        std::mem::take(&mut *pending)
+    }
+
+    async fn reset_definitions_changed(&self) {
+        *self.catalog_change_pending.lock().await = false;
+    }
+
+    fn supports_list_changed(&self) -> bool {
+        true
     }
 }
 
@@ -367,7 +460,7 @@ fn request_rules_tool_def() -> Value {
     }"#).expect("request rules tool schema is valid JSON")
 }
 
-fn tool_defs() -> Value {
+pub(crate) fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List projects, create one, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope"],"description":"list needs no project_id; create needs name and target_url; usage needs project_id; set_scope needs project_id; omitted scope resets to defaults."},"project_id":{"type":"integer","description":"Required for usage and set_scope."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List compact installed-extension summaries and any rejected packages. Use extension_describe for schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -399,7 +492,7 @@ fn tool_defs() -> Value {
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. Repeated unchanged seeds preserve newer browser cookies; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. browser_cdp remains available for interactions these actions cannot express.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"]}},
+        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. browser_cdp remains available for interactions these actions cannot express.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
         {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on port 9222, inspect handoff status, or return control to the agent. While enabled, browser_action is paused. On a VPS, use ssh_forward_command when returned; otherwise forward port 9222 to 127.0.0.1:9222 over SSH. The command is available when the runtime user and host IP can be detected. Try hosted_devtools_url to avoid transferring the frontend through SSH; use devtools_url if the browser restricts the hosted frontend's local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; use the active browser session ID."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions and resources: per-project capacity including ephemeral sessions, verified profile ownership, and a global CDP busy flag. Reuse these observations until a lifecycle transition or browser error; capacity is not a reservation. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page in Chromium. A domain filter matches the JavaScript host or its related page host, including subdomains. Saved history also includes scripts from browser sessions with a matching saved exchange or JavaScript page/resource provenance. related_via_session is true only when this session relationship alone includes a file for the domain filter; it is false for direct host/page matches and unfiltered results. Related page URLs remain the immediate pages that loaded each script.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
@@ -437,7 +530,7 @@ pub async fn run_stdio_mcp_client(config: Config) -> DomainResult<()> {
     // The inexpensive bridge must outlive an idle/stopped daemon so restart
     // and the next tool call remain available on the same client connection.
     run_stdio_backend(
-        Arc::new(DaemonToolBackend { config }),
+        Arc::new(DaemonToolBackend::new(config)),
         std::time::Duration::ZERO,
     )
     .await
@@ -465,8 +558,24 @@ async fn run_stdio_backend(
         }
     });
 
+    let poll_period = std::time::Duration::from_secs(5);
+    let mut catalog_poll =
+        tokio::time::interval_at(tokio::time::Instant::now() + poll_period, poll_period);
+    catalog_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut initialized = false;
+
     loop {
-        let next_line = if idle_timeout.is_zero() {
+        let next_line = if backend.supports_list_changed() && initialized {
+            tokio::select! {
+                line = lines.recv() => line,
+                _ = catalog_poll.tick() => {
+                    if backend.definitions_changed().await {
+                        write_notification("notifications/tools/list_changed");
+                    }
+                    continue;
+                }
+            }
+        } else if idle_timeout.is_zero() {
             lines.recv().await
         } else {
             match tokio::time::timeout(idle_timeout, lines.recv()).await {
@@ -506,6 +615,10 @@ async fn run_stdio_backend(
             }
         };
         let id = req.id.clone();
+        if req.method == "initialize" {
+            // Establish a catalog baseline before notifications become legal.
+            let _ = backend.definitions().await;
+        }
         match handle_rpc(backend.clone(), &req).await {
             Ok(Some(value)) => {
                 write_response(JsonRpcResponse {
@@ -531,6 +644,15 @@ async fn run_stdio_backend(
                 }),
             }),
         }
+        if matches!(
+            req.method.as_str(),
+            "notifications/initialized" | "initialized"
+        ) {
+            // Catalog differences observed before initialization are already
+            // reflected in the client's first tools/list response.
+            backend.reset_definitions_changed().await;
+            initialized = true;
+        }
     }
     Ok(())
 }
@@ -539,6 +661,15 @@ fn write_response(resp: JsonRpcResponse) {
     let mut out = std::io::stdout().lock();
     if let Ok(s) = serde_json::to_string(&resp) {
         let _ = writeln!(out, "{s}");
+        let _ = out.flush();
+    }
+}
+
+fn write_notification(method: &str) {
+    let mut out = std::io::stdout().lock();
+    let notification = json!({ "jsonrpc": "2.0", "method": method });
+    if let Ok(serialized) = serde_json::to_string(&notification) {
+        let _ = writeln!(out, "{serialized}");
         let _ = out.flush();
     }
 }
@@ -609,6 +740,65 @@ async fn call_daemon_tool(config: &Config, name: &str, args: Value) -> DomainRes
     ))
 }
 
+#[cfg(unix)]
+async fn fetch_daemon_tool_catalog(config: &Config) -> DomainResult<Option<DaemonToolCatalog>> {
+    const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full, Limited};
+    use hyper::client::conn::http1;
+    use hyper::{Request, StatusCode};
+    use hyper_util::rt::TokioIo;
+
+    let fetch = async {
+        let stream = match tokio::net::UnixStream::connect(config.socket_path()).await {
+            Ok(stream) => stream,
+            Err(_) => return Ok(None),
+        };
+        let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "MCP catalog connection closed");
+            }
+        });
+        let request = Request::get("/internal/mcp/tools")
+            .header(hyper::header::HOST, "localhost")
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|error| DomainError::new(ErrorCode::Unavailable, error.to_string()))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                format!("daemon tool catalog returned HTTP {}", response.status()),
+            ));
+        }
+        let bytes = Limited::new(response.into_body(), MAX_CATALOG_BYTES)
+            .collect()
+            .await
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?
+            .to_bytes();
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), fetch)
+        .await
+        .map_err(|_| DomainError::new(ErrorCode::Timeout, "daemon tool catalog timed out"))?
+}
+
+#[cfg(not(unix))]
+async fn fetch_daemon_tool_catalog(_config: &Config) -> DomainResult<Option<DaemonToolCatalog>> {
+    Ok(None)
+}
+
 #[cfg(not(unix))]
 async fn call_daemon_tool(_config: &Config, _name: &str, _args: Value) -> DomainResult<Value> {
     Err(DomainError::new(
@@ -624,12 +814,12 @@ async fn handle_rpc(
     match req.method.as_str() {
         "initialize" => Ok(Some(json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
+            "capabilities": { "tools": { "listChanged": backend.supports_list_changed() } },
             "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
         }))),
         "notifications/initialized" | "initialized" => Ok(None),
         "ping" => Ok(Some(json!({}))),
-        "tools/list" => Ok(Some(json!({ "tools": backend.definitions() }))),
+        "tools/list" => Ok(Some(json!({ "tools": backend.definitions().await }))),
         "tools/call" => {
             let name = req
                 .params
@@ -757,6 +947,10 @@ async fn fetch_page_analyzer_bundle(
         .reply
         .send_same_origin(project_id, &draft, source_url)
         .await?;
+    let effective_url = result.effective_url.clone();
+    if !crate::page_analyzer::same_origin_url(source_url, &effective_url) {
+        return Ok(None);
+    }
     if let Some(exchange_id) = result.exchange_id {
         emit_event(
             state,
@@ -767,8 +961,11 @@ async fn fetch_page_analyzer_bundle(
         let content =
             crate::page_analyzer::load_exchange_content(&state.db, project_id, exchange_id).await?;
         return Ok(Some(crate::page_analyzer::ScriptBundleContent {
+            source_url: content.source_url,
             body: content.body,
-            truncated: content.body_truncated,
+            status_code: content.status_code,
+            content_type: content.content_type,
+            completion: content.completion,
         }));
     }
     let Some(response) = result.response else {
@@ -776,8 +973,19 @@ async fn fetch_page_analyzer_bundle(
     };
     let (body, _, _) = crate::page_analyzer::decode_ephemeral_response(&response)?;
     Ok(Some(crate::page_analyzer::ScriptBundleContent {
+        source_url: effective_url,
         body,
-        truncated: response.body_truncated,
+        status_code: Some(response.status_code),
+        content_type: response
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+            .map(|header| header.value.clone()),
+        completion: if response.body_truncated {
+            crate::domain::CompletionState::TruncatedByPolicy
+        } else {
+            crate::domain::CompletionState::Complete
+        },
     }))
 }
 
@@ -797,7 +1005,12 @@ async fn analyze_page_script_tree(
     .await
 }
 
-fn page_analysis_tree_fields(tree: crate::page_analyzer::ScriptTreeAnalysis) -> Value {
+fn page_analysis_tree_fields(
+    tree: crate::page_analyzer::ScriptTreeAnalysis,
+    root_incomplete: bool,
+) -> Value {
+    let analysis_incomplete =
+        root_incomplete || tree.js_bundles_truncated || tree.js_bundle_failures > 0;
     let analysis = tree.analysis;
     json!({
         "endpoints": analysis.endpoints,
@@ -808,6 +1021,7 @@ fn page_analysis_tree_fields(tree: crate::page_analyzer::ScriptTreeAnalysis) -> 
         "js_bundles": tree.js_bundles,
         "js_bundles_truncated": tree.js_bundles_truncated,
         "js_bundle_failures": tree.js_bundle_failures,
+        "analysis_incomplete": analysis_incomplete,
     })
 }
 
@@ -1465,7 +1679,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         content.body,
                     )
                     .await;
-                    let mut output = page_analysis_tree_fields(tree);
+                    let mut output = page_analysis_tree_fields(tree, content.body_truncated);
                     let object = output.as_object_mut().expect("page analysis object");
                     object.insert("project_id".into(), json!(project_id));
                     object.insert("exchange_id".into(), json!(exchange_id));
@@ -1473,6 +1687,9 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     object.insert("decoded".into(), json!(content.decoded));
                     object.insert("content_encoding".into(), json!(content.content_encoding));
                     object.insert("body_truncated".into(), json!(content.body_truncated));
+                    object.insert("completion".into(), json!(content.completion));
+                    object.insert("status_code".into(), json!(content.status_code));
+                    object.insert("content_type".into(), json!(content.content_type));
                     Ok(output)
                 }
                 (None, Some(url)) => {
@@ -1496,44 +1713,66 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .await?;
                     let effective_url = result.effective_url.clone();
                     let exchange_id = result.exchange_id;
-                    let (effective_source_url, body, decoded, content_encoding, body_truncated) =
-                        if let Some(exchange_id) = exchange_id {
-                            emit_event(
-                                &state,
-                                project_id,
-                                "exchange",
-                                json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
-                            );
-                            let content = crate::page_analyzer::load_exchange_content(
-                                &state.db,
-                                project_id,
-                                exchange_id,
+                    let (
+                        effective_source_url,
+                        body,
+                        decoded,
+                        content_encoding,
+                        body_truncated,
+                        completion,
+                        status_code,
+                        content_type,
+                    ) = if let Some(exchange_id) = exchange_id {
+                        emit_event(
+                            &state,
+                            project_id,
+                            "exchange",
+                            json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
+                        );
+                        let content = crate::page_analyzer::load_exchange_content(
+                            &state.db,
+                            project_id,
+                            exchange_id,
+                        )
+                        .await?;
+                        (
+                            content.source_url,
+                            content.body,
+                            content.decoded,
+                            content.content_encoding,
+                            content.body_truncated,
+                            content.completion,
+                            content.status_code,
+                            content.content_type,
+                        )
+                    } else {
+                        let response = result.response.ok_or_else(|| {
+                            DomainError::new(
+                                ErrorCode::Internal,
+                                "URL analysis response body was unavailable",
                             )
-                            .await?;
-                            (
-                                content.source_url,
-                                content.body,
-                                content.decoded,
-                                content.content_encoding,
-                                content.body_truncated,
-                            )
-                        } else {
-                            let response = result.response.ok_or_else(|| {
-                                DomainError::new(
-                                    ErrorCode::Internal,
-                                    "URL analysis response body was unavailable",
-                                )
-                            })?;
-                            let (body, decoded, content_encoding) =
-                                crate::page_analyzer::decode_ephemeral_response(&response)?;
-                            (
-                                effective_url,
-                                body,
-                                decoded,
-                                content_encoding,
-                                response.body_truncated,
-                            )
-                        };
+                        })?;
+                        let (body, decoded, content_encoding) =
+                            crate::page_analyzer::decode_ephemeral_response(&response)?;
+                        (
+                            effective_url,
+                            body,
+                            decoded,
+                            content_encoding,
+                            response.body_truncated,
+                            if response.body_truncated {
+                                crate::domain::CompletionState::TruncatedByPolicy
+                            } else {
+                                crate::domain::CompletionState::Complete
+                            },
+                            Some(response.status_code),
+                            response
+                                .headers
+                                .iter()
+                                .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+                                .map(|header| header.value.clone()),
+                        )
+                    };
                     let tree = analyze_page_script_tree(
                         &state,
                         project_id,
@@ -1541,7 +1780,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         body,
                     )
                     .await;
-                    let mut output = page_analysis_tree_fields(tree);
+                    let mut output = page_analysis_tree_fields(tree, body_truncated);
                     let object = output.as_object_mut().expect("page analysis object");
                     object.insert("project_id".into(), json!(project_id));
                     object.insert("exchange_id".into(), json!(exchange_id));
@@ -1549,6 +1788,9 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     object.insert("decoded".into(), json!(decoded));
                     object.insert("content_encoding".into(), json!(content_encoding));
                     object.insert("body_truncated".into(), json!(body_truncated));
+                    object.insert("completion".into(), json!(completion));
+                    object.insert("status_code".into(), json!(status_code));
+                    object.insert("content_type".into(), json!(content_type));
                     Ok(output)
                 }
                 _ => Err(DomainError::invalid(
@@ -2759,6 +3001,29 @@ mod tests {
 
     #[test]
     fn browser_action_schema_stays_flat_for_codex() {
+        fn remove_ignored_keywords(value: &mut Value) {
+            match value {
+                Value::Object(fields) => {
+                    // Codex's JsonSchema type drops these keywords before measuring the schema.
+                    for keyword in [
+                        "default",
+                        "minimum",
+                        "maximum",
+                        "minLength",
+                        "maxItems",
+                        "uniqueItems",
+                    ] {
+                        fields.remove(keyword);
+                    }
+                    for value in fields.values_mut() {
+                        remove_ignored_keywords(value);
+                    }
+                }
+                Value::Array(values) => values.iter_mut().for_each(remove_ignored_keywords),
+                _ => {}
+            }
+        }
+
         let definitions = tool_defs();
         let tool = definitions
             .as_array()
@@ -2767,15 +3032,22 @@ mod tests {
             .find(|tool| tool["name"] == "browser_action")
             .unwrap();
         let input = &tool["inputSchema"];
+        let mut normalized = input.clone();
+        remove_ignored_keywords(&mut normalized);
+        let normalized_size = serde_json::to_vec(&normalized).unwrap().len();
+        assert!(
+            normalized_size <= 5_000,
+            "normalized schema is {normalized_size} bytes"
+        );
         let action = &input["properties"]["action"];
         for schema in [input, action] {
             assert_eq!(schema["type"], "object");
+            assert_eq!(schema["additionalProperties"], false);
             for keyword in ["allOf", "anyOf", "oneOf", "$ref", "if", "then", "else"] {
                 assert!(schema.get(keyword).is_none(), "unexpected {keyword}");
             }
         }
         assert_eq!(action["required"], json!(["type"]));
-        assert_eq!(action["additionalProperties"], false);
         for field in [
             "type",
             "url",
@@ -3010,7 +3282,7 @@ mod tests {
         ));
         for backend in [
             Arc::new(LocalToolBackend { state }) as Arc<dyn ToolBackend>,
-            Arc::new(DaemonToolBackend { config }) as Arc<dyn ToolBackend>,
+            Arc::new(DaemonToolBackend::new(config)) as Arc<dyn ToolBackend>,
         ] {
             for query in [json!("time:>1970-01-01T00:00:00Z"), json!(100)] {
                 let request = history_call(json!({"project_id": project.id.get(), "q": query}));
@@ -3293,15 +3565,8 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "browser_action")
             .unwrap();
-        assert!(
-            browser["inputSchema"]["properties"]["action"]["properties"]["type"]["enum"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "navigate")
-        );
         let action = &browser["inputSchema"]["properties"]["action"]["properties"];
-        for name in ["upload", "inspect"] {
+        for name in ["navigate", "upload", "inspect"] {
             assert!(action["type"]["enum"]
                 .as_array()
                 .unwrap()
@@ -3365,14 +3630,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("cookies(profile_name=...)"));
-        assert!(browser_start["inputSchema"]["properties"]["refresh_cookies"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("Requires matching cookie_profile"));
-        assert!(browser_start["inputSchema"]["properties"]["url"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("Omitted or about:blank"));
+        assert!(
+            browser_start["inputSchema"]["properties"]["refresh_cookies"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Requires matching cookie_profile")
+        );
+        assert!(
+            browser_start["inputSchema"]["properties"]["url"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Omitted or about:blank")
+        );
         let browser_manage = tools
             .iter()
             .find(|tool| tool["name"] == "browser_manage")

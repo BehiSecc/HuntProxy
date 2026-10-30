@@ -938,9 +938,27 @@ pub struct BrowserService {
 /// Inspect the installed browser runtime without starting the daemon, launching
 /// Chromium, or materializing the embedded worker.
 pub fn inspect_browser_installation(config: &Config) -> BrowserInstallStatus {
+    if let Some(prepared) = crate::installation::inspect(config) {
+        let runtime = inspect_browser_runtime_with_paths(
+            Some(&prepared.node_path),
+            Some(&prepared.worker_path),
+            Some(&prepared.playwright_core_path),
+            Some(&prepared.chromium_path),
+        );
+        return browser_install_status(
+            Some(&prepared.node_path),
+            Some(&prepared.worker_path),
+            &runtime,
+        );
+    }
     let node_path = existing_path(config.node_path.clone(), "node");
     let worker_path = inspect_worker_path(config.browser_worker_path.clone(), &config.data_dir);
-    let runtime = inspect_browser_runtime(node_path.as_deref(), worker_path.as_deref());
+    let runtime = inspect_browser_runtime_with_paths(
+        node_path.as_deref(),
+        worker_path.as_deref(),
+        config.browser_playwright_core_path.as_deref(),
+        config.browser_chromium_path.as_deref(),
+    );
 
     browser_install_status(node_path.as_deref(), worker_path.as_deref(), &runtime)
 }
@@ -1069,6 +1087,26 @@ impl BrowserService {
             session_ops: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
         }
+    }
+
+    /// Apply paths verified by the release installer without process-wide
+    /// environment changes or changing an existing browser profile.
+    pub(crate) fn with_runtime_paths(
+        mut self,
+        playwright_core_path: Option<PathBuf>,
+        chromium_path: Option<PathBuf>,
+    ) -> Self {
+        let playwright_core_path = playwright_core_path.filter(|path| path.is_dir());
+        let chromium_path = chromium_path.filter(|path| path.is_file());
+        if playwright_core_path.is_some() || chromium_path.is_some() {
+            self.runtime = inspect_browser_runtime_with_paths(
+                self.node_path.as_deref(),
+                self.worker_path.as_deref(),
+                playwright_core_path.as_deref(),
+                chromium_path.as_deref(),
+            );
+        }
+        self
     }
 
     pub fn status(&self) -> BrowserInstallStatus {
@@ -2142,17 +2180,44 @@ impl BrowserService {
         }
         session.state = BrowserSessionState::Busy;
         self.db.update_browser_session(&session).await?;
-        let worker_result = self
-            .call_worker(
-                "session.action",
-                json!({
-                    "session_id": session_id.get(),
-                    "action": serde_json::to_value(&action).map_err(|error| {
-                        DomainError::new(ErrorCode::InvalidArgument, error.to_string())
-                    })?,
-                }),
-            )
-            .await;
+        let event_wait_ms = match &action {
+            BrowserAction::Events { wait_ms, .. } => *wait_ms,
+            _ => 0,
+        };
+        let mut worker_action = serde_json::to_value(&action)
+            .map_err(|error| DomainError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        // A worker RPC is serialized behind one shared stdin/stdout stream. Keep
+        // long-poll timing here so an empty event wait does not monopolize that
+        // stream and block independent browser sessions.
+        if event_wait_ms > 0 {
+            worker_action["wait_ms"] = json!(0);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(event_wait_ms);
+        let worker_result = loop {
+            let result = self
+                .call_worker(
+                    "session.action",
+                    json!({
+                        "session_id": session_id.get(),
+                        "action": worker_action.clone(),
+                    }),
+                )
+                .await;
+            let should_wait = event_wait_ms > 0
+                && result.as_ref().is_ok_and(|value| {
+                    value
+                        .get("data")
+                        .and_then(|data| data.get("events"))
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                })
+                && tokio::time::Instant::now() < deadline;
+            if !should_wait {
+                break result;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+        };
         let result = match worker_result {
             Ok(result) => result,
             Err(error) => {
@@ -3477,6 +3542,15 @@ fn inspect_browser_runtime(
     node_path: Option<&Path>,
     worker_path: Option<&Path>,
 ) -> BrowserRuntimeInspection {
+    inspect_browser_runtime_with_paths(node_path, worker_path, None, None)
+}
+
+fn inspect_browser_runtime_with_paths(
+    node_path: Option<&Path>,
+    worker_path: Option<&Path>,
+    playwright_core_path: Option<&Path>,
+    chromium_path: Option<&Path>,
+) -> BrowserRuntimeInspection {
     let Some((node_path, worker_path)) = node_path.zip(worker_path) else {
         return BrowserRuntimeInspection::default();
     };
@@ -3494,6 +3568,12 @@ fn inspect_browser_runtime(
         .stderr(Stdio::null());
     if let Some(parent) = worker_path.parent() {
         command.current_dir(parent);
+    }
+    if let Some(path) = playwright_core_path {
+        command.env("HUNTPROXY_PLAYWRIGHT_CORE_PATH", path);
+    }
+    if let Some(path) = chromium_path {
+        command.env("HUNTPROXY_CHROME_EXECUTABLE", path);
     }
     let Ok(mut child) = command.spawn() else {
         return unavailable();
@@ -3590,8 +3670,7 @@ fn browser_worker_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Materialize the version-matched worker and package manifest in a stable,
-/// per-user location. The CLI install command should run `npm install` in the
-/// returned directory instead of relying on its current working directory.
+/// per-user location for release runtime preparation.
 pub fn prepare_browser_worker_installation(data_dir: &Path) -> DomainResult<PathBuf> {
     let worker = materialize_embedded_worker(data_dir).map_err(|error| {
         DomainError::new(
@@ -4750,6 +4829,7 @@ done
         let node = directory.path().join("node");
         let worker = directory.path().join("index.js");
         let arguments = directory.path().join("arguments");
+        let selected = directory.path().join("selected");
         std::fs::write(&worker, "// worker").unwrap();
         let metadata = json!({
             "playwright_core_path": directory.path(),
@@ -4762,8 +4842,9 @@ done
         std::fs::write(
             &node,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' \"$HUNTPROXY_PLAYWRIGHT_CORE_PATH\" \"$HUNTPROXY_CHROME_EXECUTABLE\" > '{}'\nprintf '%s\\n' '{}'\n",
                 arguments.display(),
+                selected.display(),
                 metadata,
             ),
         )
@@ -4778,6 +4859,19 @@ done
         assert_eq!(
             std::fs::read_to_string(&arguments).unwrap(),
             format!("{}\n--inspect-runtime\n", worker.display())
+        );
+
+        let playwright = directory.path().join("selected-playwright");
+        let chromium = directory.path().join("selected-chromium");
+        inspect_browser_runtime_with_paths(
+            Some(&node),
+            Some(&worker),
+            Some(&playwright),
+            Some(&chromium),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&selected).unwrap(),
+            format!("{}\n{}\n", playwright.display(), chromium.display())
         );
 
         std::fs::write(&node, "#!/bin/sh\nprintf 'invalid response'\n").unwrap();

@@ -3,11 +3,57 @@
 
 use huntproxy::config::Config;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+fn local_browser_fixture() -> PathBuf {
+    for name in [
+        "HUNTPROXY_CHROME_EXECUTABLE",
+        "BB_CHROME_EXECUTABLE",
+        "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
+    ] {
+        if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
+            assert!(
+                path.is_file(),
+                "{name} does not point to a local browser: {}",
+                path.display()
+            );
+            return path;
+        }
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            for executable in [
+                "google-chrome",
+                "google-chrome-stable",
+                "chromium",
+                "chromium-browser",
+            ] {
+                let candidate = directory.join(executable);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    for candidate in [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    ] {
+        let candidate = Path::new(candidate);
+        if candidate.is_file() {
+            return candidate.to_owned();
+        }
+    }
+
+    panic!("mcp lifecycle tests require a local Chromium fixture; set HUNTPROXY_CHROME_EXECUTABLE");
+}
 
 struct Agent {
     bridge: Child,
@@ -42,15 +88,31 @@ impl Agent {
         config.ensure_layout().unwrap();
         config.write_default_config().unwrap();
         drop((api, proxy));
-        let mut bridge = Command::new(env!("CARGO_BIN_EXE_HuntProxy"))
+        let browser = local_browser_fixture();
+        // Prepare the installation before measuring lifecycle RPC responses.
+        // Fresh Node provisioning and browser validation have their own limits.
+        let prepared = Command::new(env!("CARGO_BIN_EXE_HuntProxy"))
+            .args(["prepare-update", "--data-dir"])
+            .arg(directory.path())
+            .env("HUNTPROXY_CHROME_EXECUTABLE", &browser)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .expect("prepare local runtime fixture");
+        assert!(prepared.success(), "local runtime fixture did not prepare");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_HuntProxy"));
+        command
             .args(["mcp", "--data-dir"])
             .arg(directory.path())
+            // Lifecycle coverage should not include a managed-browser download.
+            // CI and developer hosts provide this maintained browser fixture.
+            .env("HUNTPROXY_CHROME_EXECUTABLE", browser)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+            .kill_on_drop(true);
+        let mut bridge = command.spawn().unwrap();
         let input = bridge.stdin.take().unwrap();
         let output = BufReader::new(bridge.stdout.take().unwrap()).lines();
         Self {
@@ -189,7 +251,7 @@ async fn explicit_restart_is_available_when_auto_start_is_disabled() {
         )
         .await;
     assert_eq!(stopped["error"]["data"]["code"], "daemon_not_running");
-    assert!(!agent.config.daemon_lock_path().exists());
+    assert!(!huntproxy::app::daemon_is_active(&agent.config).unwrap());
     let restarted = agent.tool("huntproxy_restart", json!({})).await;
     assert_eq!(restarted["ok"], true);
     agent.tool("projects", json!({"action": "list"})).await;

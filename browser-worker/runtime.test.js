@@ -139,19 +139,19 @@ test("inspection reports missing Playwright without creating profiles or launchi
 test("managed SDKs must match the embedded pin; explicit SDK overrides remain intentional", (t) => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.root, "package.json"), JSON.stringify({
-    type: "module", dependencies: { "playwright-core": "1.63.0" },
+    type: "module", dependencies: { "playwright-core": "1.64.0" },
   }));
   const local = path.join(f.root, "node_modules", "playwright-core");
   fs.mkdirSync(path.dirname(local));
   fs.cpSync(f.packageDir, local, { recursive: true });
   const stale = f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: "" });
-  assert.match(stale.compatibility_error, /1\.63\.0 is required; run HuntProxy browser install/);
+  assert.match(stale.compatibility_error, /1\.64\.0 is required; run HuntProxy browser install/);
   assert.equal(stale.playwright_core_path, undefined);
   assert.equal(f.run().playwright_version, "1.61.1");
   const manifest = JSON.parse(fs.readFileSync(path.join(local, "package.json")));
-  manifest.version = "1.63.0";
+  manifest.version = "1.64.0";
   fs.writeFileSync(path.join(local, "package.json"), JSON.stringify(manifest));
-  assert.equal(f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: "" }).playwright_version, "1.63.0");
+  assert.equal(f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: "" }).playwright_version, "1.64.0");
 });
 
 test("a deliberate SDK override also supports a standalone worker without a package manifest", (t) => {

@@ -1,0 +1,378 @@
+name: Build release candidate
+
+on:
+  push:
+    branches:
+      - "release/v*"
+  workflow_dispatch:
+
+concurrency:
+  group: candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.98.0"
+  CARGO_TERM_COLOR: always
+  PLUGIN_CATALOG_COMMIT: d4e1aa3f2907338d40361938deca8c4c711394e7
+  PLUGIN_CATALOG_PRIOR_COMMIT: 95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32
+
+jobs:
+  dependency-audit:
+    name: Audit locked dependencies
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.2"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+
+      - name: Audit Rust and browser worker dependencies
+        env:
+          HUNTPROXY_AUDIT_DIR: ${{ runner.temp }}/huntproxy-dependency-audit
+        run: scripts/check-dependencies.sh
+
+  source-checks:
+    name: Validate candidate source
+    needs: dependency-audit
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config zstd
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup override set "$RUST_VERSION"
+
+      - name: Install browser-worker Node runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.2"
+
+      - name: Test browser worker
+        working-directory: browser-worker
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+
+      - name: Run repository checks
+        env:
+          HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-candidate-default
+        run: scripts/check.sh
+
+      - name: Fetch immutable plugin catalog source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          plugin_repo="${RUNNER_TEMP}/huntproxy-plugins"
+          git init "$plugin_repo"
+          git -C "$plugin_repo" remote add origin https://github.com/BehiSecc/HuntProxy-Plugins.git
+          git -C "$plugin_repo" fetch --depth=1 origin "$PLUGIN_CATALOG_COMMIT" "$PLUGIN_CATALOG_PRIOR_COMMIT"
+          git -C "$plugin_repo" checkout --detach "$PLUGIN_CATALOG_COMMIT"
+          [[ "$(git -C "$plugin_repo" rev-parse HEAD)" == "$PLUGIN_CATALOG_COMMIT" ]]
+
+      - name: Verify embedded release assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/prepare-release-assets.py \
+            "${RUNNER_TEMP}/huntproxy-plugins" \
+            --output-dir resources/release \
+            --current-commit "$PLUGIN_CATALOG_COMMIT" \
+            --prior-commit "$PLUGIN_CATALOG_PRIOR_COMMIT" \
+            --playwright-tgz resources/release/playwright-core-1.64.0.tgz \
+            --playwright-lock browser-worker/package-lock.json \
+            --check
+
+      - name: Install pinned Chromium system dependencies
+        run: npx --yes playwright@1.64.0 install-deps chromium
+
+      - name: Provision candidate browser runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          data_dir="${RUNNER_TEMP}/huntproxy-upgrade-runtime"
+          target/release/HuntProxy --data-dir "$data_dir" prepare-update
+          python3 - "$data_dir/runtime/browser-validation.json" "$GITHUB_ENV" "$GITHUB_PATH" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          marker_path = pathlib.Path(sys.argv[1])
+          marker = json.loads(marker_path.read_text(encoding="utf-8"))
+          playwright_path = marker_path.parent / f"playwright-core-{marker['playwright']}"
+          if not (playwright_path / "cli.js").is_file():
+              raise RuntimeError(f"prepared Playwright SDK is missing: {playwright_path}")
+          values = {
+              "HUNTPROXY_PLAYWRIGHT_CORE_PATH": str(playwright_path),
+              "HUNTPROXY_CHROME_EXECUTABLE": marker["chromium"]["path"],
+          }
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          node_dir = pathlib.Path(marker["node"]["path"]).parent
+          with pathlib.Path(sys.argv[3]).open("a", encoding="utf-8") as output:
+              output.write(f"{node_dir}\n")
+          PY
+
+      - name: Fetch verified HuntProxy 0.1.1 fixture
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="${RUNNER_TEMP}/huntproxy-v0.1.1-linux-x86_64.tar.gz"
+          fixture_dir="${RUNNER_TEMP}/huntproxy-v0.1.1"
+          curl --fail --location --silent --show-error \
+            https://github.com/BehiSecc/HuntProxy/releases/download/v0.1.1/huntproxy-linux-x86_64.tar.gz \
+            --output "$archive"
+          echo "8d691a62337932db28d1203ca5d860b45b9cfd89c898ee049a627ce1f10d4ac1  $archive" \
+            | sha256sum -c -
+          mkdir -p "$fixture_dir"
+          tar -xzf "$archive" -C "$fixture_dir" HuntProxy
+          chmod 755 "$fixture_dir/HuntProxy"
+          [[ "$("$fixture_dir/HuntProxy" --version)" == "HuntProxy 0.1.1" ]]
+          echo "HUNTPROXY_LEGACY_BINARY=$fixture_dir/HuntProxy" >> "$GITHUB_ENV"
+
+      - name: Exercise a full 0.1.1 data and bundle upgrade
+        env:
+          HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-upgrade-default
+          TMPDIR: ${{ runner.temp }}
+        run: cargo test --locked --test upgrade_workflows -- --ignored --test-threads=1 --nocapture
+
+  build:
+    name: Build and smoke-test ${{ matrix.asset }}
+    needs: [dependency-audit, source-checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: huntproxy-linux-x86_64.tar.gz
+            platform: linux
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: huntproxy-linux-aarch64.tar.gz
+            platform: linux
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: huntproxy-mac-intel-chip.tar.gz
+            platform: macos
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: huntproxy-mac-apple-chip.tar.gz
+            platform: macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake clang libclang-dev pkg-config
+
+      - name: Install Node.js
+        if: matrix.platform == 'linux'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.2"
+
+      - name: Install pinned Chromium system dependencies
+        if: matrix.platform == 'linux'
+        run: npx --yes playwright@1.64.0 install-deps chromium
+
+      - name: Install macOS build dependencies
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          brew install cmake llvm pkg-config
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup target add --toolchain "$RUST_VERSION" "${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo "+${RUST_VERSION}" build --release --locked --target "${{ matrix.target }}" --bin HuntProxy
+
+      - name: Check linked libraries
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          binary="target/${{ matrix.target }}/release/HuntProxy"
+          if [[ "${{ matrix.platform }}" == linux ]]; then
+            ldd "$binary"
+          else
+            dependencies="$(otool -L "$binary")"
+            printf '%s\n' "$dependencies"
+            if grep -q '/opt/homebrew\|/usr/local/Cellar\|/usr/local/opt' <<<"$dependencies"; then
+              exit 1
+            fi
+          fi
+
+      - name: Package candidate archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          package_dir="${RUNNER_TEMP}/huntproxy-package"
+          mkdir -p "$package_dir"
+          cp "target/${{ matrix.target }}/release/HuntProxy" "$package_dir/HuntProxy"
+          cat LICENSE THIRD_PARTY_NOTICES THIRD_PARTY_NOTICES.md RUST_THIRD_PARTY_NOTICES.txt > "$package_dir/LICENSE"
+          [[ "$(wc -c < "$package_dir/LICENSE")" -le 1048576 ]]
+          chmod 755 "$package_dir/HuntProxy"
+          tar -czf "${{ matrix.asset }}" -C "$package_dir" HuntProxy LICENSE
+          [[ "$(tar -tzf "${{ matrix.asset }}" | LC_ALL=C sort | tr '\n' ' ')" == "HuntProxy LICENSE " ]]
+          shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          shasum -a 256 -c "${{ matrix.asset }}.sha256"
+
+      - name: Smoke-test packaged candidate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          smoke_dir="${RUNNER_TEMP}/huntproxy-smoke"
+          data_dir="${RUNNER_TEMP}/huntproxy-data"
+          mkdir -p "$smoke_dir"
+          tar -xzf "${{ matrix.asset }}" -C "$smoke_dir"
+          binary="$smoke_dir/HuntProxy"
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          [[ "$("$binary" --version)" == "HuntProxy $package_version" ]]
+
+          prepare_output="$("$binary" --data-dir "$data_dir" prepare-update)"
+          PREPARE_OUTPUT="$prepare_output" PACKAGE_VERSION="$package_version" python3 <<'PY'
+          import json
+          import os
+
+          result = json.loads(os.environ["PREPARE_OUTPUT"])
+          assert result["ok"] is True
+          assert result["version"] == os.environ["PACKAGE_VERSION"]
+          assert isinstance(result["schema"], int) and result["schema"] > 0
+          PY
+
+          "$binary" --data-dir "$data_dir" serve >"${RUNNER_TEMP}/huntproxy-serve.log" 2>&1 &
+          daemon_pid=$!
+          cleanup() {
+            "$binary" --data-dir "$data_dir" stop >/dev/null 2>&1 || true
+            kill "$daemon_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for _ in {1..60}; do
+            status="$("$binary" --data-dir "$data_dir" status)"
+            if grep -q '^daemon: running$' <<<"$status"; then
+              break
+            fi
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              cat "${RUNNER_TEMP}/huntproxy-serve.log" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          grep -q '^daemon: running$' <<<"$("$binary" --data-dir "$data_dir" status)"
+          api_address="$(python3 - "$data_dir/config.toml" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          config = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          address = re.search(r'^api_listen = "([^"]+)"$', config, re.MULTILINE)
+          if address is None:
+              raise RuntimeError("generated config is missing api_listen")
+          print(address.group(1))
+          PY
+          )"
+          curl --fail --silent --show-error "http://${api_address}/api/v1/extensions" \
+            > "${RUNNER_TEMP}/extensions.json"
+          python3 - "${RUNNER_TEMP}/extensions.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          response = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "403-bypasser": "0.6.1",
+              "auth-analyzer": "1.4.2",
+              "cache-analyzer": "0.15.0",
+              "csrf-analyzer": "1.5.2",
+              "ip-rotate": "1.1.1",
+              "jwt-analyzer": "1.3.4",
+              "param-finder": "0.7.0",
+              "racer": "0.6.4",
+              "request-smuggler": "1.4.9",
+              "upload-analyzer": "1.3.4",
+          }
+          actual = {plugin["id"]: plugin["version"] for plugin in response["plugins"]}
+          assert actual == expected, (actual, expected)
+          assert response["load_issues"] == [], response["load_issues"]
+          PY
+          "$binary" --data-dir "$data_dir" stop
+          wait "$daemon_pid"
+          trap - EXIT
+
+      - name: Upload candidate archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    name: Verify candidate checksums
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download candidate archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify all platform archives
+        working-directory: dist
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t archives < <(find . -maxdepth 1 -type f -name 'huntproxy-*.tar.gz' -printf '%f\n' | sort)
+          [[ "${#archives[@]}" == 4 ]]
+          for archive in "${archives[@]}"; do
+            sha256sum -c "${archive}.sha256"
+          done
+          sha256sum "${archives[@]}" | sort > SHA256SUMS
+
+      - name: Upload complete candidate set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: huntproxy-candidate-${{ github.sha }}
+          path: |
+            dist/huntproxy-*.tar.gz
+            dist/huntproxy-*.tar.gz.sha256
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

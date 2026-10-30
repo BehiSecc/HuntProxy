@@ -126,6 +126,51 @@ async fn dynamic_api_responses_are_never_browser_cached() {
 }
 
 #[tokio::test]
+async fn project_event_stream_ends_promptly_on_shutdown() {
+    let (_directory, state, project_id) = test_state().await;
+    let response = huntproxy::api::router(state.clone())
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}/events", project_id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+
+    let mut body = response.into_body();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+        .await
+        .expect("ready event timed out")
+        .expect("event stream ended before ready")
+        .expect("ready event body failed");
+    let ready = std::str::from_utf8(ready.data_ref().expect("ready event was not data")).unwrap();
+    assert!(ready.contains("event: ready"));
+    assert!(ready.contains(&format!(r#"{{"project_id":{}}}"#, project_id.get())));
+
+    let next = body.frame();
+    tokio::pin!(next);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut next)
+            .await
+            .is_err(),
+        "idle event stream produced an unexpected frame"
+    );
+    state.shutdown.cancel();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), &mut next)
+        .await
+        .expect("event stream did not observe shutdown promptly");
+    assert!(
+        ended.is_none(),
+        "event stream emitted a frame after shutdown"
+    );
+}
+
+#[tokio::test]
 async fn ip_rotation_status_is_visible_and_blocks_project_deletion_until_cleanup() {
     let (_directory, state, project_id) = test_state().await;
     let app = huntproxy::api::router(state.clone());
@@ -876,6 +921,46 @@ async fn page_analyzer_extracts_saved_response_findings_through_http_api() {
         serde_json::json!(["include", "user_id"])
     );
     assert_eq!(analysis["stats"]["parameters"], 2);
+    assert_eq!(analysis["completion"], "complete");
+    assert_eq!(analysis["status_code"], 200);
+    assert_eq!(analysis["content_type"], "application/javascript");
+    assert_eq!(analysis["body_truncated"], false);
+    assert_eq!(analysis["analysis_incomplete"], false);
+}
+
+#[tokio::test]
+async fn page_analyzer_qualifies_incomplete_saved_roots() {
+    let (_directory, state, project_id) = test_state().await;
+
+    for completion in [CompletionState::Timeout, CompletionState::Interrupted] {
+        let mut captured = exchange(project_id, "GET", "/partial.js");
+        captured.mime = Some("text/javascript".into());
+        captured.status_code = Some(206);
+        captured.completion = completion;
+        captured.response_body = Some(b"fetch('/api/partial');".to_vec());
+        let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+
+        let result = huntproxy::mcp::call_tool(
+            state.clone(),
+            "page_analyzer",
+            serde_json::json!({
+                "project_id": project_id.get(),
+                "exchange_id": exchange_id.get()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["body_truncated"], true);
+        assert_eq!(result["analysis_incomplete"], true);
+        assert_eq!(
+            result["completion"],
+            serde_json::to_value(completion).unwrap()
+        );
+        assert_eq!(result["status_code"], 206);
+        assert_eq!(result["content_type"], "text/javascript");
+        assert_eq!(result["endpoints"], serde_json::json!(["/api/partial"]));
+    }
 }
 
 #[tokio::test]
@@ -896,7 +981,8 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
         <script>
           window._MODERNJS_ROUTE_MANIFEST = {"routeAssets": {
             "album-cover/page": {"assets": [
-              "static/js/async/page.js", "static/css/async/page.css"
+              "static/js/async/page.js", "static/js/async/http-error.js",
+              "static/js/async/html.js", "static/css/async/page.css"
             ]}
           }};
         </script>
@@ -917,7 +1003,7 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
             }),
         )
         .route(
-            "/static/js/async/page.js",
+            "/rewritten/nested/page.js",
             get({
                 let seen = Arc::clone(&seen);
                 move || {
@@ -925,10 +1011,65 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
                     async move {
                         seen.lock()
                             .unwrap()
-                            .push("/static/js/async/page.js".to_string());
+                            .push("/rewritten/nested/page.js".to_string());
                         (
-                            [(http::header::CONTENT_TYPE, "application/javascript")],
+                            [(http::header::CONTENT_TYPE, "text/plain")],
+                            "<script src=\"./child.js\"></script>",
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/rewritten/nested/child.js",
+            get({
+                let seen = Arc::clone(&seen);
+                move || {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push("/rewritten/nested/child.js".to_string());
+                        (
+                            [(http::header::CONTENT_TYPE, "text/plain")],
                             "fetch('/api/v1/users/:user_id?include=teams');",
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/static/js/async/http-error.js",
+            get({
+                let seen = Arc::clone(&seen);
+                move || {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push("/static/js/async/http-error.js".to_string());
+                        (
+                            StatusCode::NOT_FOUND,
+                            [(http::header::CONTENT_TYPE, "text/html")],
+                            "<html>missing /api/not-real</html>",
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/static/js/async/html.js",
+            get({
+                let seen = Arc::clone(&seen);
+                move || {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push("/static/js/async/html.js".to_string());
+                        (
+                            [(http::header::CONTENT_TYPE, "text/html")],
+                            "<html>error /api/also-not-real</html>",
                         )
                     }
                 }
@@ -976,6 +1117,26 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
         })
         .await
         .unwrap();
+    state
+        .db
+        .create_request_rule(
+            project.id,
+            huntproxy::request_rules::RequestRuleInput {
+                name: "serve nested bundle fixture".into(),
+                enabled: true,
+                position: 0,
+                host_pattern: Some("127.0.0.1".into()),
+                target: huntproxy::request_rules::RequestRuleTarget::Url,
+                operation: huntproxy::request_rules::RequestRuleOperation::Replace,
+                header_name: None,
+                match_kind: huntproxy::request_rules::RequestRuleMatchKind::Literal,
+                pattern: format!("http://{address}/static/js/async/page.js"),
+                replacement: Some(format!("http://{address}/rewritten/nested/page.js")),
+                replace_all: true,
+            },
+        )
+        .await
+        .unwrap();
 
     let result = huntproxy::mcp::call_tool(
         state.clone(),
@@ -1002,13 +1163,31 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
 
     assert_eq!(
         *seen.lock().unwrap(),
-        ["/", "/static/js/async/page.js", "/static/js/async/page.js"]
+        [
+            "/",
+            "/rewritten/nested/page.js",
+            "/static/js/async/http-error.js",
+            "/static/js/async/html.js",
+            "/rewritten/nested/child.js",
+            "/rewritten/nested/page.js",
+            "/static/js/async/http-error.js",
+            "/static/js/async/html.js",
+            "/rewritten/nested/child.js",
+        ]
     );
     assert_eq!(
         result["js_bundles"],
-        serde_json::json!([format!("http://{address}/static/js/async/page.js")])
+        serde_json::json!([
+            format!("http://{address}/static/js/async/page.js"),
+            format!("http://{address}/static/js/async/http-error.js"),
+            format!("http://{address}/static/js/async/html.js"),
+            format!("http://{address}/rewritten/nested/child.js"),
+        ])
     );
-    assert_eq!(result["js_bundle_failures"], 0);
+    assert_eq!(result["js_bundle_failures"], 2);
+    assert_eq!(result["analysis_incomplete"], true);
+    assert_eq!(result["status_code"], 200);
+    assert_eq!(result["content_type"], "text/html");
     assert_eq!(
         result["parameters"],
         serde_json::json!(["csrf_token", "include", "user_id"])
@@ -1027,7 +1206,10 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
         .map(|exchange| exchange.path.as_str())
         .collect::<std::collections::HashSet<_>>();
     assert!(captured_paths.contains("/"));
-    assert!(captured_paths.contains("/static/js/async/page.js"));
+    assert!(captured_paths.contains("/rewritten/nested/page.js"));
+    assert!(captured_paths.contains("/rewritten/nested/child.js"));
+    assert!(captured_paths.contains("/static/js/async/http-error.js"));
+    assert!(captured_paths.contains("/static/js/async/html.js"));
     assert!(!captured_paths.contains("/static/css/async/page.css"));
 }
 

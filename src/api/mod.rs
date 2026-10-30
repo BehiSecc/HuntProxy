@@ -382,6 +382,7 @@ fn private_router(state: Arc<AppState>) -> Router {
                 "/internal/mcp/call",
                 post(internal_mcp_call).layer(DefaultBodyLimit::max(payload_body_limit)),
             )
+            .route("/internal/mcp/tools", get(internal_mcp_tools))
             .route("/internal/shutdown", post(internal_shutdown))
             .with_state(state),
     )
@@ -399,6 +400,14 @@ fn api_payload_body_limit(max_body_bytes: u64) -> usize {
 async fn internal_shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.shutdown.cancel();
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn internal_mcp_tools() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": crate::INTERNAL_PROTOCOL_VERSION,
+        "tools": crate::mcp::tool_defs(),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -2279,12 +2288,15 @@ async fn events(
     Path(id): Path<i64>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events.subscribe();
+    let cancel = state.shutdown.clone();
     let stream = futures::stream::unfold(Some(rx), move |state_rx| {
         let id = id;
+        let cancel = cancel.clone();
         async move {
             let mut rx = state_rx?;
             loop {
                 tokio::select! {
+                    _ = cancel.cancelled() => return None,
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
                         return Some((Ok(Event::default().event("ping").data("{}")), Some(rx)));
                     }

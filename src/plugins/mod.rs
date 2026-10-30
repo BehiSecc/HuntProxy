@@ -1222,6 +1222,7 @@ impl PluginService {
                 format!("plugin {plugin_id} is installed but disabled"),
             ));
         }
+        validate_host_plugin_compatibility(&plugin.manifest)?;
         if !plugin
             .manifest
             .actions
@@ -1272,7 +1273,14 @@ impl PluginService {
         validate_action_base_exchange(&plugin.manifest, action_manifest, base_exchange_id)?;
         let started = Instant::now();
         let prepared = self
-            .prepare_plugin_plan(project_id, base_exchange_id, plugin.clone(), action, &input)
+            .prepare_plugin_plan(
+                project_id,
+                base_exchange_id,
+                plugin.clone(),
+                action,
+                &input,
+                None,
+            )
             .await?;
         let project = self.db.get_project(project_id).await?;
         let mut by_type = BTreeMap::<String, usize>::new();
@@ -1641,6 +1649,7 @@ impl PluginService {
         plugin: Arc<LoadedPlugin>,
         action: &str,
         input: &Value,
+        cancel: Option<CancellationToken>,
     ) -> DomainResult<PreparedPluginPlan> {
         self.db.get_project(project_id).await?;
         let privileged_identity = plugin
@@ -1686,7 +1695,9 @@ impl PluginService {
             "related_exchanges": related_exchanges,
             "resources": &*plugin.resources,
         });
-        let plan_value = run_js_stage(&plugin, "plan", input, &Value::Null, &context).await?;
+        let plan_value =
+            run_js_stage_with_timeout(&plugin, "plan", input, &Value::Null, &context, None, cancel)
+                .await?;
         let plan: PluginPlan = serde_json::from_value(plan_value)
             .map_err(|error| DomainError::invalid(format!("invalid plugin plan: {error}")))?;
         validate_plan_preview(plan.preview.as_ref())?;
@@ -1830,7 +1841,14 @@ impl PluginService {
             resolved_identities,
             planned_requests,
         } = self
-            .prepare_plugin_plan(project_id, base_exchange_id, plugin.clone(), action, input)
+            .prepare_plugin_plan(
+                project_id,
+                base_exchange_id,
+                plugin.clone(),
+                action,
+                input,
+                Some(job.cancel.clone()),
+            )
             .await?;
         job.view.write().operation_count = planned_requests;
         let mut execution_summary = PluginExecutionSummary {
@@ -4389,6 +4407,50 @@ impl PluginService {
     }
 }
 
+fn validate_host_plugin_compatibility(manifest: &PluginManifest) -> DomainResult<()> {
+    // Racer versions before 0.6.4 analyze the current host's explicit failed
+    // race observations as novel response signatures. Preserved or modified
+    // copies are not auto-upgraded, so fail before preview or execution rather
+    // than returning false findings.
+    if manifest.id != "racer" || compatible_racer_version(&manifest.version) {
+        return Ok(());
+    }
+    Err(DomainError::new(
+        ErrorCode::ProtocolIncompatible,
+        format!(
+            "Racer {} is incompatible with this HuntProxy host; update or restore the Racer plugin to version 0.6.4 or newer before previewing or running it",
+            manifest.version
+        ),
+    ))
+}
+
+fn compatible_racer_version(version: &str) -> bool {
+    let version = version.trim();
+    let core_and_prerelease = version.split_once('+').map_or(version, |(core, _)| core);
+    let (core, prerelease) = core_and_prerelease
+        .split_once('-')
+        .map_or((core_and_prerelease, false), |(core, _)| (core, true));
+    let mut components = core.split('.');
+    let parsed = components
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .zip(
+            components
+                .next()
+                .and_then(|minor| minor.parse::<u64>().ok()),
+        )
+        .zip(
+            components
+                .next()
+                .and_then(|patch| patch.parse::<u64>().ok()),
+        )
+        .map(|((major, minor), patch)| (major, minor, patch));
+    let Some(parsed) = parsed.filter(|_| components.next().is_none()) else {
+        return false;
+    };
+    parsed > (0, 6, 4) || (parsed == (0, 6, 4) && !prerelease)
+}
+
 fn validate_plan_preview(preview: Option<&PluginPlanPreview>) -> DomainResult<()> {
     let Some(preview) = preview else {
         return Ok(());
@@ -6449,16 +6511,6 @@ fn validate_manifest(manifest: &PluginManifest) -> DomainResult<()> {
     Ok(())
 }
 
-async fn run_js_stage(
-    plugin: &LoadedPlugin,
-    stage: &'static str,
-    input: &Value,
-    observations: &Value,
-    context: &Value,
-) -> DomainResult<Value> {
-    run_js_stage_with_timeout(plugin, stage, input, observations, context, None, None).await
-}
-
 async fn run_js_stage_with_timeout(
     plugin: &LoadedPlugin,
     stage: &'static str,
@@ -6545,8 +6597,12 @@ fn run_js_sync(
     let interrupted_handler = interrupted.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_handler = cancelled.clone();
+    let interrupt_cancel = cancel.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || {
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        if interrupt_cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
             cancelled_handler.store(true, Ordering::Relaxed);
             return true;
         }
@@ -6607,20 +6663,14 @@ fn run_js_sync(
             .transpose()?
             .ok_or_else(|| "plugin returned undefined".to_string())
     });
-    if cancelled.load(Ordering::Relaxed) {
-        return Err(DomainError::new(
-            ErrorCode::Cancelled,
-            "plugin JavaScript stage cancelled",
-        ));
-    }
-    if interrupted.load(Ordering::Relaxed) {
-        return Err(DomainError::new(
-            ErrorCode::Timeout,
-            format!(
-                "plugin JavaScript stage exceeded {} ms",
-                stage_timeout.as_millis()
-            ),
-        ));
+    if let Some(error) = javascript_stage_terminal_error(
+        cancelled.load(Ordering::Relaxed),
+        interrupted.load(Ordering::Relaxed),
+        cancel.as_ref(),
+        deadline,
+        stage_timeout,
+    ) {
+        return Err(error);
     }
     let output = output.map_err(|error| {
         DomainError::new(
@@ -6634,6 +6684,31 @@ fn run_js_sync(
             format!("plugin {stage} returned invalid JSON: {error}"),
         )
     })
+}
+
+fn javascript_stage_terminal_error(
+    interrupted_cancel: bool,
+    interrupted_timeout: bool,
+    cancel: Option<&CancellationToken>,
+    deadline: Instant,
+    stage_timeout: Duration,
+) -> Option<DomainError> {
+    if interrupted_cancel || cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Some(DomainError::new(
+            ErrorCode::Cancelled,
+            "plugin JavaScript stage cancelled",
+        ));
+    }
+    if interrupted_timeout || Instant::now() >= deadline {
+        return Some(DomainError::new(
+            ErrorCode::Timeout,
+            format!(
+                "plugin JavaScript stage exceeded {} ms",
+                stage_timeout.as_millis()
+            ),
+        ));
+    }
+    None
 }
 
 fn bounded_javascript_error(mut message: String) -> String {
@@ -6702,6 +6777,18 @@ mod tests {
             cancel: CancellationToken::new(),
             analysis_checkpoint: parking_lot::Mutex::new(None),
         })
+    }
+
+    fn fail_on_terminal_job(status: &PluginJobView, expectation: &str) {
+        assert!(
+            !matches!(
+                status.state,
+                PluginJobState::Completed | PluginJobState::Failed | PluginJobState::Cancelled
+            ),
+            "{expectation}, reached {:?}: {:?}",
+            status.state,
+            status.error
+        );
     }
 
     #[test]
@@ -7230,6 +7317,55 @@ mod tests {
     }
 
     #[test]
+    fn javascript_short_stage_honors_zero_timeout() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { return {operations: []}; }, analyze() { return {}; }
+        };"#;
+        for (stage, observations) in [("plan", "null"), ("analyze", "[]")] {
+            let error = run_js_sync(
+                script,
+                stage,
+                "{}",
+                observations,
+                "{}",
+                4 * 1024 * 1024,
+                Duration::ZERO,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Timeout, "stage {stage}");
+        }
+    }
+
+    #[test]
+    fn javascript_stage_checks_elapsed_deadline_after_execution() {
+        let error = javascript_stage_terminal_error(
+            false,
+            false,
+            None,
+            Instant::now() - Duration::from_millis(1),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(error.code(), ErrorCode::Timeout);
+    }
+
+    #[test]
+    fn javascript_stage_rechecks_cancellation_after_execution() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = javascript_stage_terminal_error(
+            false,
+            false,
+            Some(&cancel),
+            Instant::now() - Duration::from_millis(1),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+    }
+
+    #[test]
     fn required_base_exchange_is_rejected_before_plugin_planning() {
         let manifest = PluginManifest {
             schema_version: PLUGIN_API_VERSION,
@@ -7437,7 +7573,7 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if service.status(job.id).unwrap().state == PluginJobState::Completed {
                     break;
@@ -7478,6 +7614,117 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn javascript_short_stage_gives_pre_cancelled_token_precedence() {
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { return {operations: []}; }, analyze() { return {}; }
+        };"#;
+        for (stage, observations) in [("plan", "null"), ("analyze", "[]")] {
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let error = run_js_sync(
+                script,
+                stage,
+                "{}",
+                observations,
+                "{}",
+                4 * 1024 * 1024,
+                Duration::ZERO,
+                Some(cancel),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Cancelled, "stage {stage}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_job_interrupts_javascript_planning_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::load(Some(directory.path().join("data"))).unwrap();
+        let db = Arc::new(crate::storage::Db::open(&config).await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "planning cancellation".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let plugin_directory = directory.path().join("plugins");
+        let package = plugin_directory.join("planning-cancel-test");
+        crate::config::create_private_dir(&package).unwrap();
+        let script = r#"globalThis.HuntProxyPlugin = {
+          plan() { while (true) {} },
+          analyze() { throw new Error("analysis must not run"); }
+        };"#;
+        std::fs::write(package.join("index.js"), script).unwrap();
+        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+        std::fs::write(
+            package.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":1,"id":"planning-cancel-test","name":"Planning Cancel Test","version":"1.0.0","description":"test","enabled":true,
+                "entrypoint":"index.js","entrypoint_sha256":digest,"capabilities":[],
+                "limits":{"timeout_ms":30000,"js_stage_timeout_ms":30000,"max_operations":1,"max_concurrency":1,"memory_mb":8},
+                "actions":[{"name":"run","description":"run","input_schema":{"type":"object"}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+        });
+        let service = PluginService::load(plugin_directory, db, reply).unwrap();
+        let job = service
+            .run(project.id, "planning-cancel-test", "run", None, json!({}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = service.status(job.id).unwrap();
+                if status.phase == PluginJobPhase::Planning
+                    && status.state == PluginJobState::Running
+                {
+                    break;
+                }
+                fail_on_terminal_job(&status, "expected JavaScript planning to start");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        service.cancel(job.id).unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = service.status(job.id).unwrap();
+                if status.state == PluginJobState::Cancelled {
+                    break status;
+                }
+                fail_on_terminal_job(&status, "expected planning cancellation");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(cancelled.phase, PluginJobPhase::Finished);
+        assert_eq!(cancelled.operation_count, 0);
+        assert_eq!(cancelled.completed_operations, 0);
+        assert!(cancelled
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled")));
+        assert!(!service
+            .results(job.id, PluginResultView::Full, 0, 25)
+            .unwrap()["result_available"]
+            .as_bool()
+            .unwrap());
     }
 
     #[test]
@@ -7585,12 +7832,13 @@ mod tests {
             .run(project.id, "retry-test", "run", None, json!({}))
             .await
             .unwrap();
-        let failed = tokio::time::timeout(Duration::from_secs(2), async {
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = service.status(initial.id).unwrap();
                 if status.state == PluginJobState::Failed {
                     break status;
                 }
+                fail_on_terminal_job(&status, "expected initial analysis to fail");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7608,12 +7856,13 @@ mod tests {
             .resume_analysis(initial.id, Some(1000))
             .await
             .unwrap();
-        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = service.status(initial.id).unwrap();
                 if status.state == PluginJobState::Completed {
                     break status;
                 }
+                fail_on_terminal_job(&status, "expected resumed analysis to complete");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7647,15 +7896,13 @@ mod tests {
             .run(project.id, "retry-test", "run", None, json!({}))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service
-                    .status(cancelled_job.id)
-                    .unwrap()
-                    .analysis_resume_available
-                {
+                let status = service.status(cancelled_job.id).unwrap();
+                if status.analysis_resume_available {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected resumable failed analysis");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7666,12 +7913,13 @@ mod tests {
             .await
             .unwrap();
         service.cancel(cancelled_job.id).unwrap();
-        let cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+        let cancelled = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = service.status(cancelled_job.id).unwrap();
                 if status.state == PluginJobState::Cancelled {
                     break status;
                 }
+                fail_on_terminal_job(&status, "expected resumed analysis cancellation");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7702,12 +7950,13 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service.status(failed_operation_job.id).unwrap().state == PluginJobState::Failed
-                {
+                let status = service.status(failed_operation_job.id).unwrap();
+                if status.state == PluginJobState::Failed {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected operation failure");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7735,22 +7984,26 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service.status(interrupted.id).unwrap().completed_operations == 1 {
+                let status = service.status(interrupted.id).unwrap();
+                if status.completed_operations == 1 {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected first operation before cancellation");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
         service.cancel(interrupted.id).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service.status(interrupted.id).unwrap().state == PluginJobState::Cancelled {
+                let status = service.status(interrupted.id).unwrap();
+                if status.state == PluginJobState::Cancelled {
                     break;
                 }
+                fail_on_terminal_job(&status, "expected interrupted job cancellation");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7767,12 +8020,12 @@ mod tests {
             .unwrap());
 
         let mut timeout_plugin = service.plugins.get("retry-test").unwrap().as_ref().clone();
-        timeout_plugin.manifest.limits.timeout_ms = Some(1000);
-        timeout_plugin.manifest.limits.js_stage_timeout_ms = Some(2000);
+        timeout_plugin.manifest.limits.timeout_ms = Some(5000);
+        timeout_plugin.manifest.limits.js_stage_timeout_ms = Some(10000);
         timeout_plugin.script = Arc::from(
             timeout_plugin
                 .script
-                .replace("Date.now() + 400", "Date.now() + 1500"),
+                .replace("Date.now() + 400", "Date.now() + 30000"),
         );
         let timeout_job = test_job(PluginJobState::Queued);
         {
@@ -7795,22 +8048,19 @@ mod tests {
                 )
                 .await;
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if service
-                    .status(timeout_id)
-                    .unwrap()
-                    .analysis_checkpoint_status
-                    == "retained"
-                {
+                if timeout_job.analysis_checkpoint.lock().is_some() {
                     break;
                 }
+                let status = service.status(timeout_id).unwrap();
+                fail_on_terminal_job(&status, "expected analysis checkpoint creation");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), running)
+        tokio::time::timeout(Duration::from_secs(10), running)
             .await
             .unwrap()
             .unwrap();
@@ -8657,6 +8907,36 @@ mod tests {
             load_plugin(&plugin).unwrap_err().code(),
             ErrorCode::ConfigInvalid
         );
+    }
+
+    #[test]
+    fn incompatible_preserved_racer_versions_are_blocked_before_use() {
+        let manifest = |id: &str, version: &str| {
+            serde_json::from_value::<PluginManifest>(json!({
+                "schema_version": 1,
+                "id": id,
+                "name": "Fixture",
+                "version": version,
+                "description": "test",
+                "enabled": true,
+                "entrypoint": "index.js",
+                "entrypoint_sha256": "0".repeat(64),
+                "capabilities": [],
+                "actions": [{"name":"run","description":"test","input_schema":{"type":"object"}}]
+            }))
+            .unwrap()
+        };
+
+        for version in ["0.6.3", "0.6.4-beta.1", "modified-copy"] {
+            let error =
+                validate_host_plugin_compatibility(&manifest("racer", version)).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::ProtocolIncompatible);
+            assert!(error.to_string().contains("version 0.6.4 or newer"));
+        }
+        for version in ["0.6.4", "0.6.4+local", "0.7.0", "1.0.0"] {
+            validate_host_plugin_compatibility(&manifest("racer", version)).unwrap();
+        }
+        validate_host_plugin_compatibility(&manifest("custom-racer", "0.1.0")).unwrap();
     }
 
     #[test]

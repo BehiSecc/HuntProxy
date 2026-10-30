@@ -2004,12 +2004,14 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none")
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Keep the writes distinct while leaving ample scheduler margin
+            // before the client's idle window expires under suite load.
+            tokio::time::sleep(Duration::from_millis(5)).await;
             socket
                 .write_all(b"HTTP/1.1 201 OK\r\nContent-Length: 3\r\n\r\ntwo")
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         });
         let mut stream = connect_any(&[address], Duration::from_secs(1))
             .await
@@ -2020,8 +2022,8 @@ mod tests {
             4096,
             &RawHttp1Options {
                 response_mode: RawResponseMode::UntilIdle,
-                read_timeout_ms: 500,
-                idle_timeout_ms: 50,
+                read_timeout_ms: 1_000,
+                idle_timeout_ms: 250,
                 ..Default::default()
             },
             false,

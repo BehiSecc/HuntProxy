@@ -4,6 +4,7 @@ set -Eeuo pipefail
 REPOSITORY="BehiSecc/HuntProxy"
 PLUGIN_REPOSITORY="BehiSecc/HuntProxy-Plugins"
 NODE_VERSION="v22.23.2"
+LEGACY_PLUGIN_SHA="95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; RESET='\033[0m'
@@ -31,10 +32,11 @@ Options:
 Environment equivalents:
   HUNTPROXY_VERSION, HUNTPROXY_INSTALL_DIR, HUNTPROXY_DATA_DIR
 
-The installer downloads the HuntProxy release binary, a private Node.js runtime,
-Playwright Chromium, and the current first-party plugin snapshot. It never uses
-Git or builds HuntProxy from source. Existing data, CA files, and plugin folders
-are preserved.
+The installer downloads the HuntProxy release binary and a private Node.js
+runtime. HuntProxy 0.2 and newer provision their embedded, version-matched
+browser SDK and first-party plugins. Unmodified official plugins are upgraded;
+modified packages and custom plugin folders are preserved. Existing project
+data, CA files, and MCP client configuration are preserved.
 EOF
 }
 
@@ -96,6 +98,7 @@ TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/huntproxy-install.XXXXXX")"
 NEW_BIN=''; LOCK_DIR=''; LOCK_HELD=0; VERIFY_PID=''; NODE_BACKUP=''; WORKER_BACKUP=''; PLUGIN_DIR=''
 NODE_INCOMING=''; PLUGIN_INCOMING=''; PLUGIN_SOURCE_TEMP=''
 NODE_INSTALLED=0; NODE_REUSED=0; WORKER_TOUCHED=0; STATE_BACKED_UP=0; INSTALL_COMPLETE=0
+CURRENT_RUNTIME=0
 NEW_PLUGIN_LIST="$TEMP_DIR/new-plugins"
 : >"$NEW_PLUGIN_LIST"
 STATE_BACKUP="$TEMP_DIR/state-backup"
@@ -155,11 +158,31 @@ curl_download() {
   curl --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors -fsSL "$1" -o "$2"
 }
 
+version_at_least() {
+  local actual=${1#v} minimum=${2#v}
+  awk -v actual="$actual" -v minimum="$minimum" 'BEGIN {
+    split(actual, a, "."); split(minimum, m, ".");
+    for (i = 1; i <= 3; i++) {
+      if ((a[i] + 0) > (m[i] + 0)) exit 0;
+      if ((a[i] + 0) < (m[i] + 0)) exit 1;
+    }
+    exit 0;
+  }'
+}
+
 node_runtime_ready() {
   local runtime=$1
   [[ -x "$runtime/bin/node" && -x "$runtime/bin/npm" ]] \
     && [[ "$("$runtime/bin/node" --version 2>/dev/null)" == "$NODE_VERSION" ]] \
     && PATH="$runtime/bin:$PATH" "$runtime/bin/npm" --version >/dev/null 2>&1
+}
+
+browser_node_supported() {
+  local version
+  [[ -x "$1" ]] || return 1
+  version="$("$1" --version 2>/dev/null)" || return 1
+  [[ "$version" =~ ^v([0-9]+)\. ]] || return 1
+  ((10#${BASH_REMATCH[1]} >= 20))
 }
 
 browser_smoke() {
@@ -189,14 +212,14 @@ show_browser_smoke_error() {
 }
 
 install_chromium_runtime_libraries() {
-  local playwright_path="$WORKER_DIR/node_modules/playwright-core"
+  local playwright_path=$1
+  local node_path=${2:-$MANAGED_NODE_DIR/bin/node}
+  [[ -x "$node_path" && -f "$playwright_path/cli.js" ]] || return 1
   command -v apt-get >/dev/null 2>&1 || return 1
-  # Use Playwright's supported CLI, not private package paths that change
-  # between releases. This branch already requires root or interactive sudo.
   if [[ "$(id -u)" == 0 ]]; then
-    DEBIAN_FRONTEND=noninteractive "$MANAGED_NODE_DIR/bin/node" "$playwright_path/cli.js" install-deps chromium
+    DEBIAN_FRONTEND=noninteractive "$node_path" "$playwright_path/cli.js" install-deps chromium
   else
-    sudo env DEBIAN_FRONTEND=noninteractive "$MANAGED_NODE_DIR/bin/node" "$playwright_path/cli.js" install-deps chromium
+    sudo env DEBIAN_FRONTEND=noninteractive "$node_path" "$playwright_path/cli.js" install-deps chromium
   fi
 }
 
@@ -217,8 +240,6 @@ case "$os_name/$arch_name" in
   Linux/*|Darwin/*) die "unsupported CPU architecture: $arch_name" ;;
   *) die "unsupported operating system: $os_name" ;;
 esac
-MANAGED_NODE_DIR="$DATA_DIR/runtime/node"
-
 # Resolve and verify the HuntProxy release before touching its destination.
 DOWNLOAD_DIR="$TEMP_DIR/release"; mkdir -p "$DOWNLOAD_DIR"
 if [[ "$REQUESTED_VERSION" == latest ]]; then
@@ -261,7 +282,22 @@ tar -xOzf "$DOWNLOAD_DIR/$ASSET_NAME" HuntProxy >"$STAGED_BIN" || die 'cannot ex
 chmod 755 "$STAGED_BIN"
 binary_version="$("$STAGED_BIN" --version 2>/dev/null | awk '{print $NF}')" || die 'the downloaded binary cannot run'
 [[ "$binary_version" == "${RELEASE_TAG#v}" ]] || die "release $RELEASE_TAG contains HuntProxy $binary_version"
+if version_at_least "$binary_version" "0.2.0"; then
+  CURRENT_RUNTIME=1
+fi
 
+# Persist absolute paths in generated configuration and MCP registrations. A
+# relative installer path would otherwise be resolved against each client's
+# working directory rather than the directory where this script was invoked.
+mkdir -p "$DATA_DIR" "$INSTALL_DIR"
+DATA_DIR="$(cd "$DATA_DIR" && pwd -P)"
+INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
+HOME_CANON="$(cd "$HOME" && pwd -P)"
+[[ "$DATA_DIR" != / && "$DATA_DIR" != "$HOME_CANON" ]] \
+  || die 'data directory is too broad'
+MANAGED_NODE_DIR="$DATA_DIR/runtime/node"
+
+if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
 # Reuse the private managed runtime when it is already the pinned version.
 if node_runtime_ready "$MANAGED_NODE_DIR"; then
   STAGED_NODE=$MANAGED_NODE_DIR
@@ -294,53 +330,67 @@ else
   ok 'Node.js checksum and runtime verified'
 fi
 
-# Resolve master once, then download and validate that immutable plugin snapshot.
-PLUGIN_JSON="$TEMP_DIR/plugin-commit.json"
-curl_download "https://api.github.com/repos/$PLUGIN_REPOSITORY/commits/master" "$PLUGIN_JSON" \
-  || die "could not resolve $PLUGIN_REPOSITORY master"
-PLUGIN_SHA="$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$PLUGIN_JSON" | awk 'NR == 1 { first = $0 } END { print first }')"
-[[ "$PLUGIN_SHA" =~ ^[0-9a-f]{40}$ ]] || die 'the plugin commit response was invalid'
+# Legacy hosts receive the exact plugin snapshot published alongside v0.1.1,
+# never a moving branch.
+PLUGIN_SHA=$LEGACY_PLUGIN_SHA
 PLUGIN_ARCHIVE="$TEMP_DIR/plugins.tar.gz"
-info "Downloading first-party plugins at ${PLUGIN_SHA:0:12}"
+info "Downloading legacy first-party plugins at ${PLUGIN_SHA:0:12}"
 curl_download "https://github.com/$PLUGIN_REPOSITORY/archive/$PLUGIN_SHA.tar.gz" "$PLUGIN_ARCHIVE" \
-  || die 'could not download the first-party plugins'
-plugin_members="$(tar -tzf "$PLUGIN_ARCHIVE")" || die 'the plugin archive could not be read'
-PLUGIN_ROOT=''
-while IFS= read -r member; do
-  normalized="${member%/}"
-  case "$normalized" in ''|/*|..|../*|*/..|*/../*) die "unsafe plugin archive path: $member" ;; esac
-  root="${normalized%%/*}"
-  [[ -n "$PLUGIN_ROOT" ]] || PLUGIN_ROOT=$root
-  [[ "$root" == "$PLUGIN_ROOT" ]] || die 'the plugin archive contains multiple roots'
-done <<<"$plugin_members"
-plugin_details="$(tar -tvzf "$PLUGIN_ARCHIVE")" || die 'the plugin archive could not be inspected'
-while IFS= read -r detail; do
-  case "${detail:0:1}" in -|d) ;; *) die 'the plugin archive contains a link or special file' ;; esac
-done <<<"$plugin_details"
-mkdir -p "$TEMP_DIR/plugins"
-tar -xzf "$PLUGIN_ARCHIVE" -C "$TEMP_DIR/plugins" || die 'could not extract the plugins'
-PLUGIN_SOURCE="$TEMP_DIR/plugins/$PLUGIN_ROOT"
-[[ -d "$PLUGIN_SOURCE/plugins" ]] || die 'the plugin snapshot has no plugins directory'
-plugin_count=0
-for plugin_source in "$PLUGIN_SOURCE/plugins/"*; do
-  [[ -d "$plugin_source" ]] || continue
-  [[ -f "$plugin_source/plugin.json" && -f "$plugin_source/index.js" ]] \
-    || die "invalid plugin directory: ${plugin_source##*/}"
-  plugin_count=$((plugin_count + 1))
-done
-[[ "$plugin_count" -gt 0 ]] || die 'the plugin snapshot is empty'
-if ! PATH="$STAGED_NODE/bin:$PATH" "$STAGED_NODE/bin/npm" test --prefix "$PLUGIN_SOURCE" >"$TEMP_DIR/plugin-tests.log" 2>&1; then
-  sed -n '1,160p' "$TEMP_DIR/plugin-tests.log" >&2
-  die 'the first-party plugin validation suite failed'
-fi
-ok "$plugin_count first-party plugins validated"
+  || die 'could not download the legacy first-party plugins'
+  plugin_members="$(tar -tzf "$PLUGIN_ARCHIVE")" || die 'the plugin archive could not be read'
+  PLUGIN_ROOT=''
+  while IFS= read -r member; do
+    normalized="${member%/}"
+    case "$normalized" in ''|/*|..|../*|*/..|*/../*) die "unsafe plugin archive path: $member" ;; esac
+    root="${normalized%%/*}"
+    [[ -n "$PLUGIN_ROOT" ]] || PLUGIN_ROOT=$root
+    [[ "$root" == "$PLUGIN_ROOT" ]] || die 'the plugin archive contains multiple roots'
+  done <<<"$plugin_members"
+  plugin_details="$(tar -tvzf "$PLUGIN_ARCHIVE")" || die 'the plugin archive could not be inspected'
+  while IFS= read -r detail; do
+    case "${detail:0:1}" in -|d) ;; *) die 'the plugin archive contains a link or special file' ;; esac
+  done <<<"$plugin_details"
+  mkdir -p "$TEMP_DIR/plugins"
+  tar -xzf "$PLUGIN_ARCHIVE" -C "$TEMP_DIR/plugins" || die 'could not extract the plugins'
+  PLUGIN_SOURCE="$TEMP_DIR/plugins/$PLUGIN_ROOT"
+  [[ -d "$PLUGIN_SOURCE/plugins" ]] || die 'the plugin snapshot has no plugins directory'
+  plugin_count=0
+  for plugin_source in "$PLUGIN_SOURCE/plugins/"*; do
+    [[ -d "$plugin_source" ]] || continue
+    [[ -f "$plugin_source/plugin.json" && -f "$plugin_source/index.js" ]] \
+      || die "invalid plugin directory: ${plugin_source##*/}"
+    plugin_count=$((plugin_count + 1))
+  done
+  [[ "$plugin_count" -gt 0 ]] || die 'the plugin snapshot is empty'
+  if ! PATH="$STAGED_NODE/bin:$PATH" "$STAGED_NODE/bin/npm" test --prefix "$PLUGIN_SOURCE" >"$TEMP_DIR/plugin-tests.log" 2>&1; then
+    sed -n '1,160p' "$TEMP_DIR/plugin-tests.log" >&2
+    die 'the legacy first-party plugin validation suite failed'
+  fi
+ok "$plugin_count legacy first-party plugins validated"
 
 # From this point on, serialize target changes and keep rollback copies.
 mkdir -p "$DATA_DIR" "$INSTALL_DIR"
 chmod 700 "$DATA_DIR"
+DATA_DIR_CANON="$(cd "$DATA_DIR" && pwd -P)"
+INSTALL_DIR_CANON="$(cd "$INSTALL_DIR" && pwd -P)"
 LOCK_DIR="$DATA_DIR/.installer-lock"
 mkdir "$LOCK_DIR" 2>/dev/null || die "another installer is active; remove $LOCK_DIR only if no installer is running"
 LOCK_HELD=1
+
+PLUGIN_DIR="$DATA_DIR/plugins"
+if [[ -f "$DATA_DIR/config.toml" ]]; then
+  configured_plugin_dir="$(sed -n 's/^plugin_dir = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"
+  [[ -z "$configured_plugin_dir" ]] || PLUGIN_DIR=$configured_plugin_dir
+fi
+[[ ! -L "$PLUGIN_DIR" ]] || die "refusing symlinked plugin directory: $PLUGIN_DIR"
+[[ ! -e "$PLUGIN_DIR" || -d "$PLUGIN_DIR" ]] || die "plugin path is not a directory: $PLUGIN_DIR"
+mkdir -p "$PLUGIN_DIR"
+PLUGIN_DIR="$(cd "$PLUGIN_DIR" && pwd -P)"
+[[ -n "${PLUGIN_DIR%/*}" ]] || die 'configured plugin_dir is too broad for safe installation'
+case "$PLUGIN_DIR" in /|"$HOME"|"$DATA_DIR_CANON"|"$INSTALL_DIR_CANON") die 'configured plugin_dir is too broad for safe installation' ;; esac
+case "$DATA_DIR_CANON/" in "$PLUGIN_DIR/"*) die 'configured plugin_dir contains the HuntProxy data directory' ;; esac
+case "$INSTALL_DIR_CANON/" in "$PLUGIN_DIR/"*) die 'configured plugin_dir contains the install directory' ;; esac
+chmod 700 "$PLUGIN_DIR"
 
 ca_cert_exists=0; ca_key_exists=0
 [[ ! -e "$DATA_DIR/ca/ca.crt" ]] || ca_cert_exists=1
@@ -400,76 +450,68 @@ CA_CERT_HASH="$(sha256_file "$DATA_DIR/ca/ca.crt")"
 CA_KEY_HASH="$(sha256_file "$DATA_DIR/ca/ca.key")"
 
 WORKER_DIR="$DATA_DIR/browser-worker-$binary_version"
-cat >"$TEMP_DIR/browser-smoke.ndjson" <<'EOF'
+  cat >"$TEMP_DIR/browser-smoke.ndjson" <<'EOF'
 {"jsonrpc":"2.0","id":1,"method":"hello"}
 {"jsonrpc":"2.0","id":2,"method":"session.start","params":{"session_id":1,"engine":"chromium","url":"about:blank","persistent":false}}
 {"jsonrpc":"2.0","id":3,"method":"session.stop","params":{"session_id":1}}
 EOF
 # The embedded lock can change without the HuntProxy version changing. Refresh
 # it even when an older SDK/browser still launches, preserving rollback below.
-{
-  if [[ -d "$WORKER_DIR" ]]; then
-    WORKER_BACKUP="$(mktemp -d "$DATA_DIR/.browser-worker.old.XXXXXX")"
-    rmdir "$WORKER_BACKUP"
-    mv -- "$WORKER_DIR" "$WORKER_BACKUP"
-  fi
-  WORKER_TOUCHED=1
-  info 'Installing Chromium in the HuntProxy data directory'
-  "$STAGED_BIN" --data-dir "$DATA_DIR" browser install >"$TEMP_DIR/browser-install.log" 2>&1 \
-    || { sed -n '1,160p' "$TEMP_DIR/browser-install.log" >&2; die 'browser runtime installation failed'; }
-
-  if ! browser_smoke "$WORKER_DIR" browser-installed; then
-    linux_id=''
-    if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
-      linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
-    fi
-    if [[ "$linux_id" != ubuntu && "$linux_id" != debian ]]; then
-      show_browser_smoke_error browser-installed
-      die 'Chromium could not launch; automatic system libraries are supported only on Debian/Ubuntu'
-    fi
-    if [[ "$(id -u)" != 0 ]] && ! { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
-      show_browser_smoke_error browser-installed
-      die 'Chromium needs system libraries; rerun interactively with sudo available'
-    fi
-    info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
-    install_chromium_runtime_libraries >"$TEMP_DIR/browser-deps.log" 2>&1 \
-      || {
-        sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
-        show_browser_smoke_error browser-installed
-        die 'Chromium system library installation failed'
-      }
-    if ! browser_smoke "$WORKER_DIR" browser-with-deps; then
-      show_browser_smoke_error browser-with-deps
-      die 'Chromium still could not launch after installing its system libraries'
-    fi
-  fi
-  ok 'Chromium launched successfully'
-}
-
-PLUGIN_DIR="$DATA_DIR/plugins"
-if [[ -f "$DATA_DIR/config.toml" ]]; then
-  configured_plugin_dir="$(sed -n 's/^plugin_dir = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"
-  [[ -z "$configured_plugin_dir" ]] || PLUGIN_DIR=$configured_plugin_dir
+if [[ -d "$WORKER_DIR" ]]; then
+  WORKER_BACKUP="$(mktemp -d "$DATA_DIR/.browser-worker.old.XXXXXX")"
+  rmdir "$WORKER_BACKUP"
+  mv -- "$WORKER_DIR" "$WORKER_BACKUP"
 fi
-mkdir -p "$PLUGIN_DIR"; chmod 700 "$PLUGIN_DIR"
+WORKER_TOUCHED=1
+info 'Installing the legacy Chromium runtime in the HuntProxy data directory'
+"$STAGED_BIN" --data-dir "$DATA_DIR" browser install >"$TEMP_DIR/browser-install.log" 2>&1 \
+  || { sed -n '1,160p' "$TEMP_DIR/browser-install.log" >&2; die 'browser runtime installation failed'; }
+
+if ! browser_smoke "$WORKER_DIR" browser-installed; then
+  linux_id=''
+  if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
+    linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
+  fi
+  if [[ "$linux_id" != ubuntu && "$linux_id" != debian ]]; then
+    show_browser_smoke_error browser-installed
+    die 'Chromium could not launch; automatic system libraries are supported only on Debian/Ubuntu'
+  fi
+  if [[ "$(id -u)" != 0 ]] && ! { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
+    show_browser_smoke_error browser-installed
+    die 'Chromium needs system libraries; rerun interactively with sudo available'
+  fi
+  info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
+  install_chromium_runtime_libraries "$WORKER_DIR/node_modules/playwright-core" >"$TEMP_DIR/browser-deps.log" 2>&1 \
+    || {
+      sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
+      show_browser_smoke_error browser-installed
+      die 'Chromium system library installation failed'
+    }
+  if ! browser_smoke "$WORKER_DIR" browser-with-deps; then
+    show_browser_smoke_error browser-with-deps
+    die 'Chromium still could not launch after installing its system libraries'
+  fi
+fi
+ok 'Chromium launched successfully'
+
 installed_plugins=0; preserved_plugins=0
 for plugin_source in "$PLUGIN_SOURCE/plugins/"*; do
-  [[ -d "$plugin_source" ]] || continue
-  plugin_name="${plugin_source##*/}"
-  plugin_target="$PLUGIN_DIR/$plugin_name"
-  if [[ -e "$plugin_target" ]]; then
-    preserved_plugins=$((preserved_plugins + 1))
-    continue
-  fi
-  plugin_incoming="$(mktemp -d "$PLUGIN_DIR/.plugin.new.XXXXXX")"
-  PLUGIN_INCOMING=$plugin_incoming
-  cp -R "$plugin_source/." "$plugin_incoming/"
-  mv -- "$plugin_incoming" "$plugin_target"
-  PLUGIN_INCOMING=''
-  printf '%s\n' "$plugin_target" >>"$NEW_PLUGIN_LIST"
-  installed_plugins=$((installed_plugins + 1))
+    [[ -d "$plugin_source" ]] || continue
+    plugin_name="${plugin_source##*/}"
+    plugin_target="$PLUGIN_DIR/$plugin_name"
+    if [[ -e "$plugin_target" ]]; then
+      preserved_plugins=$((preserved_plugins + 1))
+      continue
+    fi
+    plugin_incoming="$(mktemp -d "$PLUGIN_DIR/.plugin.new.XXXXXX")"
+    PLUGIN_INCOMING=$plugin_incoming
+    cp -R "$plugin_source/." "$plugin_incoming/"
+    mv -- "$plugin_incoming" "$plugin_target"
+    PLUGIN_INCOMING=''
+    printf '%s\n' "$plugin_target" >>"$NEW_PLUGIN_LIST"
+    installed_plugins=$((installed_plugins + 1))
 done
-ok "$installed_plugins plugins installed; $preserved_plugins existing plugin folders preserved"
+ok "$installed_plugins legacy plugins installed; $preserved_plugins existing plugin folders preserved"
 
 # Doctor output stays private: only concise assertions are surfaced.
 DOCTOR_OUTPUT="$("$STAGED_BIN" --data-dir "$DATA_DIR" doctor 2>&1)" || die 'HuntProxy doctor failed'
@@ -496,11 +538,20 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 [[ "$health_ready" -eq 1 ]] || { sed -n '1,120p' "$TEMP_DIR/serve.log" >&2; die 'the HuntProxy daemon did not become healthy'; }
 curl -fsS "http://$API_ADDR/api/v1/extensions" -o "$TEMP_DIR/extensions.json" || die 'could not verify loaded plugins'
+set +e
 "$MANAGED_NODE_DIR/bin/node" -e '
 const fs = require("fs");
 const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-if (!Array.isArray(result.plugins) || !Array.isArray(result.load_issues) || result.load_issues.length) process.exit(1);
-' "$TEMP_DIR/extensions.json" || die 'one or more installed plugins failed to load'
+if (!Array.isArray(result.plugins) || !Array.isArray(result.load_issues)) process.exit(1);
+if (result.load_issues.length) process.exit(2);
+' "$TEMP_DIR/extensions.json"
+extension_status=$?
+set -e
+case "$extension_status" in
+  0) ;;
+  2) warn 'One or more preserved or custom plugins did not load; HuntProxy itself is ready.' ;;
+  *) die 'the extension status response was invalid' ;;
+esac
 kill "$VERIFY_PID" >/dev/null 2>&1 || true
 wait "$VERIFY_PID" >/dev/null 2>&1 || true
 VERIFY_PID=''
@@ -533,7 +584,62 @@ if PLUGIN_SOURCE_TEMP="$(mktemp "$PLUGIN_DIR/.first-party-source.new.XXXXXX")" \
 else
   [[ -z "$PLUGIN_SOURCE_TEMP" || ! -f "$PLUGIN_SOURCE_TEMP" ]] || rm -f -- "$PLUGIN_SOURCE_TEMP"
   PLUGIN_SOURCE_TEMP=''
-  warn 'Could not record the first-party plugin source commit.'
+  warn 'Could not record the legacy first-party plugin source commit.'
+fi
+else
+  mkdir -p "$DATA_DIR" "$INSTALL_DIR"
+  chmod 700 "$DATA_DIR"
+  info 'Coordinating release preparation and activation'
+  if ! "$STAGED_BIN" install-release \
+    --executable "$INSTALL_DIR/HuntProxy" \
+    --data-dir "$DATA_DIR" >"$TEMP_DIR/install-release.log" 2>&1; then
+    linux_id=''
+    if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
+      linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
+    fi
+    stable_playwright="$DATA_DIR/runtime/playwright-core-1.64.0"
+    runtime_node=''
+    if [[ -f "$DATA_DIR/config.toml" ]]; then
+      runtime_node="$(sed -n 's/^node_path = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"
+    fi
+    if ! browser_node_supported "$runtime_node"; then
+      runtime_node="$DATA_DIR/runtime/node-22.23.2/bin/node"
+    fi
+    if ! browser_node_supported "$runtime_node"; then
+      runtime_node="$(command -v node 2>/dev/null || true)"
+    fi
+    can_request_packages=0
+    if [[ "$(id -u)" == 0 ]] || { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
+      can_request_packages=1
+    fi
+    if [[ "$linux_id" =~ ^(ubuntu|debian)$ ]] \
+      && [[ "$can_request_packages" -eq 1 ]] \
+      && browser_node_supported "$runtime_node" \
+      && [[ -f "$stable_playwright/cli.js" ]] \
+      && grep -Eqi 'chromium|browser validation|browser worker' "$TEMP_DIR/install-release.log"; then
+      info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
+      if install_chromium_runtime_libraries "$stable_playwright" "$runtime_node" >"$TEMP_DIR/browser-deps.log" 2>&1 \
+        && "$STAGED_BIN" install-release \
+          --executable "$INSTALL_DIR/HuntProxy" \
+          --data-dir "$DATA_DIR" >>"$TEMP_DIR/install-release.log" 2>&1; then
+        :
+      else
+        sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
+        sed -n '1,160p' "$TEMP_DIR/install-release.log" >&2
+        die 'coordinated release installation failed'
+      fi
+    else
+      sed -n '1,160p' "$TEMP_DIR/install-release.log" >&2
+      die 'coordinated release installation failed'
+    fi
+  fi
+  INSTALL_COMPLETE=1
+  [[ -x "$INSTALL_DIR/HuntProxy" ]] || die 'coordinated installation did not create the executable'
+  installed_version="$("$INSTALL_DIR/HuntProxy" --version 2>/dev/null | awk '{print $NF}')" \
+    || die 'the installed executable failed its final check'
+  [[ "$installed_version" == "$binary_version" ]] \
+    || die "coordinated installation activated HuntProxy $installed_version instead of $binary_version"
+  ok 'Release runtime, data, plugins, and executable installed'
 fi
 
 configure_mcp_clients() {

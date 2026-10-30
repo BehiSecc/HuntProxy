@@ -39,6 +39,11 @@ pub struct Config {
     pub runtime_dir: PathBuf,
     pub node_path: Option<PathBuf>,
     pub browser_worker_path: Option<PathBuf>,
+    /// Resolved release runtime paths; these are not user configuration.
+    #[serde(skip)]
+    pub browser_playwright_core_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub browser_chromium_path: Option<PathBuf>,
     /// Installed HuntProxy extensions. Each immediate child may contain one
     /// integrity-pinned `plugin.json` package.
     pub plugin_dir: PathBuf,
@@ -216,6 +221,8 @@ impl Default for Config {
             runtime_dir: data_dir.join("runtime"),
             node_path: which_path("node"),
             browser_worker_path: None,
+            browser_playwright_core_path: None,
+            browser_chromium_path: None,
             plugin_dir: data_dir.join("plugins"),
             auto_start_daemon: true,
             idle_timeout_seconds: 60 * 60,
@@ -245,15 +252,20 @@ impl Config {
             })?;
             cfg.apply_file(file);
         }
-        let managed_node = cfg.runtime_dir.join("node/bin/node");
-        if managed_node.is_file()
-            && !cfg.node_path.as_deref().is_some_and(browser_node_supported)
-            && browser_node_supported(&managed_node)
+        if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH")
+            .or_else(|| std::env::var_os("BB_BROWSER_WORKER_PATH"))
         {
-            cfg.node_path = Some(managed_node);
+            cfg.browser_worker_path = Some(PathBuf::from(path));
         }
-        if cfg.node_path.as_ref().is_none_or(|node| !node.is_file()) {
-            cfg.node_path = which_path("node");
+        if !cfg.node_path.as_deref().is_some_and(browser_node_supported) {
+            let managed_node = cfg.runtime_dir.join("node/bin/node");
+            cfg.node_path = if browser_node_supported(&managed_node) {
+                Some(managed_node)
+            } else if cfg.node_path.as_ref().is_none_or(|node| !node.is_file()) {
+                which_path("node").filter(|node| browser_node_supported(node))
+            } else {
+                None
+            };
         }
         cfg.validate()?;
         cfg.ensure_layout()?;
@@ -301,6 +313,9 @@ impl Config {
         }
         if let Some(v) = f.plugin_dir {
             self.plugin_dir = PathBuf::from(v);
+        }
+        if let Some(v) = f.browser_worker_path {
+            self.browser_worker_path = Some(PathBuf::from(v));
         }
         if let Some(v) = f.upstream_proxies {
             self.upstream_proxies = v;
@@ -407,6 +422,10 @@ impl Config {
             auto_start_daemon: Some(self.auto_start_daemon),
             idle_timeout_seconds: Some(self.idle_timeout_seconds),
             node_path: self.node_path.as_ref().map(|p| p.display().to_string()),
+            browser_worker_path: self
+                .browser_worker_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
             plugin_dir: Some(self.plugin_dir.display().to_string()),
             upstream_proxies: Some(self.upstream_proxies.clone()),
         };
@@ -431,6 +450,7 @@ struct ConfigFile {
     auto_start_daemon: Option<bool>,
     idle_timeout_seconds: Option<u64>,
     node_path: Option<String>,
+    browser_worker_path: Option<String>,
     plugin_dir: Option<String>,
     upstream_proxies: Option<UpstreamProxyConfig>,
 }
@@ -615,7 +635,10 @@ mod tests {
         )
         .unwrap();
         let config = Config::load(Some(parent.path().to_path_buf())).unwrap();
-        assert_eq!(config.node_path, which_path("node"));
+        assert_eq!(
+            config.node_path,
+            which_path("node").filter(|node| browser_node_supported(node))
+        );
     }
 
     #[cfg(unix)]
@@ -628,9 +651,9 @@ mod tests {
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
         let selected = parent.path().join("selected-node");
         for (selected_version, managed_version, expected) in [
-            ("18.19.1", "22.23.2", &managed),
-            ("20.20.0", "22.23.2", &selected),
-            ("18.19.1", "18.19.1", &selected),
+            ("18.19.1", "22.23.2", Some(&managed)),
+            ("20.20.0", "22.23.2", Some(&selected)),
+            ("18.19.1", "18.19.1", None),
         ] {
             for (node, version) in [(&selected, selected_version), (&managed, managed_version)] {
                 std::fs::write(node, format!("#!/bin/sh\nprintf 'v{version}\\n'\n")).unwrap();
@@ -642,8 +665,24 @@ mod tests {
             )
             .unwrap();
             let config = Config::load(Some(data.clone())).unwrap();
-            assert_eq!(config.node_path.as_ref(), Some(expected));
+            assert_eq!(config.node_path.as_ref(), expected);
         }
+    }
+
+    #[test]
+    fn configured_browser_worker_survives_serialization_and_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: directory.path().to_owned(),
+            browser_worker_path: Some(directory.path().join("custom-worker/index.js")),
+            ..Config::default()
+        };
+        config.write_default_config().unwrap();
+        let encoded = std::fs::read_to_string(directory.path().join(CONFIG_FILE_NAME)).unwrap();
+        let file: ConfigFile = toml::from_str(&encoded).unwrap();
+        let mut loaded = Config::default();
+        loaded.apply_file(file);
+        assert_eq!(loaded.browser_worker_path, config.browser_worker_path);
     }
 
     #[test]

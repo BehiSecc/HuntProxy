@@ -2,11 +2,12 @@
 
 use crate::config::{create_private_dir, write_private_file, Config};
 use crate::domain::*;
-use crate::storage::{reconcile_project_usage_conn, Db};
+use crate::storage::{migrate, reconcile_project_usage_conn, schema_version, Db};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 
 pub const BUNDLE_FORMAT: &str = "huntproxy-project";
@@ -120,11 +121,12 @@ impl Db {
                 if let Some(parent) = destination.parent() {
                     create_private_dir(parent)?;
                 }
+                let temporary = temporary_bundle_path(&destination)?;
+                let _temporary_guard = RemoveFileOnDrop(temporary.clone());
                 let output = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
                     .write(true)
-                    .open(&destination)
+                    .open(&temporary)
                     .map_err(|error| storage_error(format!("create bundle: {error}")))?;
                 let encoder = zstd::Encoder::new(output, 3).map_err(storage_error)?;
                 let mut tar = tar::Builder::new(encoder);
@@ -140,10 +142,12 @@ impl Db {
                 let encoder = tar.into_inner().map_err(storage_error)?;
                 let mut output = encoder.finish().map_err(storage_error)?;
                 output.flush().map_err(storage_error)?;
-                secure_file(&destination)?;
+                output.sync_all().map_err(storage_error)?;
+                secure_file(&temporary)?;
+                std::fs::rename(&temporary, &destination)
+                    .map_err(|error| storage_error(format!("commit bundle: {error}")))?;
                 Ok(destination)
             })();
-            let _ = std::fs::remove_dir_all(&staging);
             result
         })
         .await
@@ -164,7 +168,7 @@ impl Db {
             ));
         }
         let staging = private_staging(&config.runtime_dir, "bundle-import")?;
-        let extracted = staging.clone();
+        let extracted = staging.to_path_buf();
         tokio::task::spawn_blocking(move || extract_bundle(&source, &extracted))
             .await
             .map_err(|error| storage_error(format!("bundle extraction task: {error}")))??;
@@ -175,16 +179,27 @@ impl Db {
         if manifest.format != BUNDLE_FORMAT || manifest.version != BUNDLE_VERSION {
             return Err(DomainError::invalid("unsupported HuntProxy bundle"));
         }
-        let current_schema = self.schema_version().await?;
-        if manifest.source_schema != current_schema {
-            return Err(DomainError::invalid(format!(
-                "bundle schema {} is incompatible with local schema {current_schema}",
-                manifest.source_schema
-            )));
-        }
         let archive_db = staging.join("project.sqlite3");
         if sha256_file(&archive_db)? != manifest.database_sha256 {
             return Err(DomainError::invalid("bundle database checksum mismatch"));
+        }
+        let current_schema = self.schema_version().await?;
+        prepare_archive_database(&archive_db, manifest.source_schema, current_schema)?;
+        let secrets_included = match manifest.secrets.as_str() {
+            "full" => true,
+            "sanitized" => false,
+            _ => return Err(DomainError::invalid("invalid bundle secrets mode")),
+        };
+        let source_browser = staging.join("browser");
+        if !secrets_included && source_browser.is_dir() {
+            return Err(DomainError::invalid(
+                "sanitized bundle must not contain browser state",
+            ));
+        }
+        if manifest.chromium_profile && !secrets_included {
+            return Err(DomainError::invalid(
+                "sanitized bundle cannot include a Chromium profile",
+            ));
         }
         let archive_db_for_import = archive_db.clone();
         let name_override_for_import = name_override.clone();
@@ -193,7 +208,6 @@ impl Db {
                 import_snapshot(conn, &archive_db_for_import, name_override_for_import)
             })
             .await?;
-        let source_browser = staging.join("browser");
         let target_browser = config
             .browser_profiles_dir()
             .join("projects")
@@ -203,15 +217,18 @@ impl Db {
         let chromium_profile_imported = source_browser.join("chromium").is_dir();
         if source_browser.is_dir() {
             if let Err(error) = copy_tree_safe(&source_browser, &target_browser) {
-                let _ = self.delete_project(project.id).await;
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(error);
+                let _ = std::fs::remove_dir_all(&target_browser);
+                return match self.delete_project(project.id).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(storage_error(format!(
+                        "import browser state failed: {error}; project cleanup failed: {cleanup_error}"
+                    ))),
+                };
             }
         }
-        let _ = std::fs::remove_dir_all(&staging);
         Ok(BundleImportResult {
             project,
-            secrets_included: manifest.secrets == "full",
+            secrets_included,
             browser_state_imported,
             chromium_profile_imported,
         })
@@ -252,6 +269,10 @@ fn prune_snapshot(path: &Path, project_id: ProjectId, secrets: SecretMode) -> Do
         )
         .map_err(storage_error)?;
         tx.execute("DELETE FROM project_cookies", [])
+            .map_err(storage_error)?;
+        tx.execute("DELETE FROM named_cookie_profiles", [])
+            .map_err(storage_error)?;
+        tx.execute("DELETE FROM ip_rotation_profiles", [])
             .map_err(storage_error)?;
         tx.execute("DELETE FROM capture_sessions", [])
             .map_err(storage_error)?;
@@ -346,6 +367,42 @@ fn import_snapshot(
     })();
     let _ = conn.execute_batch("DETACH DATABASE hp_archive");
     result
+}
+
+fn prepare_archive_database(
+    path: &Path,
+    declared_schema: i32,
+    current_schema: i32,
+) -> DomainResult<()> {
+    if declared_schema > current_schema {
+        return Err(DomainError::invalid(format!(
+            "bundle schema {declared_schema} is newer than local schema {current_schema}"
+        )));
+    }
+    let conn = rusqlite::Connection::open(path).map_err(storage_error)?;
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(storage_error)?;
+    conn.pragma_update(None, "trusted_schema", false)
+        .map_err(storage_error)?;
+    let actual_schema = schema_version(&conn)?;
+    if actual_schema != declared_schema {
+        return Err(DomainError::invalid(format!(
+            "bundle manifest schema {declared_schema} does not match database schema {actual_schema}"
+        )));
+    }
+    if actual_schema > current_schema {
+        return Err(DomainError::invalid(format!(
+            "bundle schema {actual_schema} is newer than local schema {current_schema}"
+        )));
+    }
+    let migrated_schema = migrate(&conn)?;
+    if migrated_schema != current_schema {
+        return Err(DomainError::invalid(format!(
+            "bundle migrated to schema {migrated_schema}, expected local schema {current_schema}"
+        )));
+    }
+    drop(conn);
+    secure_file(path)
 }
 
 fn materialize_reply_placeholders(
@@ -473,6 +530,8 @@ struct IdOffsets {
     websocket_connection: i64,
     websocket_message: i64,
     request_rule: i64,
+    ip_rotation_profile: i64,
+    ip_rotation_gateway: i64,
 }
 impl IdOffsets {
     fn load(c: &rusqlite::Connection) -> DomainResult<Self> {
@@ -499,6 +558,8 @@ impl IdOffsets {
             websocket_connection: max(c, "websocket_connections")?,
             websocket_message: max(c, "websocket_messages")?,
             request_rule: max(c, "request_rules")?,
+            ip_rotation_profile: max(c, "ip_rotation_profiles")?,
+            ip_rotation_gateway: max(c, "ip_rotation_gateways")?,
         })
     }
 }
@@ -523,12 +584,15 @@ INSERT INTO annotations SELECT id+{annotation},{new},exchange_id,display_title,n
 INSERT INTO exchange_labels SELECT {new},exchange_id,label_id+{label} FROM hp_archive.exchange_labels WHERE project_id={old};
 INSERT INTO findings SELECT id+{finding},{new},exchange_id,title,description,created_at,updated_at FROM hp_archive.findings WHERE project_id={old};
 INSERT INTO project_cookies SELECT {new},host,target_url,cookie_header,names_json,created_at,updated_at FROM hp_archive.project_cookies WHERE project_id={old};
+INSERT INTO named_cookie_profiles SELECT {new},name,target_url,cookie_header,names_json,created_at,updated_at FROM hp_archive.named_cookie_profiles WHERE project_id={old};
 INSERT INTO javascript_provenance SELECT {new},javascript_url,javascript_host,javascript_path,source_page_url,source_page_host,CASE WHEN browser_session_id IS NULL THEN NULL ELSE browser_session_id+{browser} END,discovery_kind,created_at FROM hp_archive.javascript_provenance WHERE project_id={old};
 INSERT INTO audit_events SELECT id+{audit},{new},event_type,actor,target_type,target_id,metadata_json,created_at FROM hp_archive.audit_events WHERE project_id={old};
 INSERT INTO websocket_connections SELECT id+{websocket_connection},{new},handshake_exchange_id,url,protocol,CASE WHEN state='open' THEN 'interrupted' ELSE state END,opened_at,COALESCE(closed_at,opened_at),message_count,client_bytes,server_bytes,last_error FROM hp_archive.websocket_connections WHERE project_id={old};
 INSERT INTO websocket_messages SELECT id+{websocket_message},{new},connection_id+{websocket_connection},direction,opcode,payload,payload_length,truncated,created_at FROM hp_archive.websocket_messages WHERE project_id={old};
 INSERT INTO request_rules SELECT id+{request_rule},{new},name,enabled,position,host_pattern,target,operation,header_name,match_kind,pattern,replacement,replace_all,revision,created_at,updated_at FROM hp_archive.request_rules WHERE project_id={old};
 INSERT INTO exchange_request_rules SELECT {new},exchange_id,CASE WHEN rule_id IS NULL THEN NULL ELSE rule_id+{request_rule} END,rule_name FROM hp_archive.exchange_request_rules WHERE project_id={old};
+INSERT INTO ip_rotation_profiles SELECT id+{ip_rotation_profile},{new},target_origin,stage_name,enabled,created_at,updated_at FROM hp_archive.ip_rotation_profiles WHERE project_id={old};
+INSERT INTO ip_rotation_gateways SELECT id+{ip_rotation_gateway},profile_id+{ip_rotation_profile},region,rest_api_id,endpoint FROM hp_archive.ip_rotation_gateways WHERE profile_id IN (SELECT id FROM hp_archive.ip_rotation_profiles WHERE project_id={old});
 INSERT INTO project_seq (project_id,next_exchange_id) SELECT {new},COALESCE(MAX(exchange_id),0)+1 FROM hp_archive.exchanges WHERE project_id={old};
 INSERT INTO project_usage (project_id,updated_at) VALUES ({new},strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 INSERT INTO search_fts (project_id,exchange_id,title,preview,labels) SELECT {new},exchange_id,title,preview,labels FROM hp_archive.search_fts WHERE project_id={old};
@@ -549,6 +613,8 @@ INSERT INTO search_fts (project_id,exchange_id,title,preview,labels) SELECT {new
         websocket_connection = o.websocket_connection,
         websocket_message = o.websocket_message,
         request_rule = o.request_rule,
+        ip_rotation_profile = o.ip_rotation_profile,
+        ip_rotation_gateway = o.ip_rotation_gateway,
         old = old,
         new = new
     )
@@ -614,11 +680,45 @@ fn validate_relative(path: &Path) -> DomainResult<()> {
         Ok(())
     }
 }
-fn private_staging(root: &Path, prefix: &str) -> DomainResult<PathBuf> {
+struct PrivateStaging(PathBuf);
+
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+impl Deref for PrivateStaging {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for PrivateStaging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn private_staging(root: &Path, prefix: &str) -> DomainResult<PrivateStaging> {
     create_private_dir(root)?;
     let path = root.join(format!(".{prefix}-{}", uuid::Uuid::new_v4()));
     create_private_dir(&path)?;
-    Ok(path)
+    Ok(PrivateStaging(path))
+}
+fn temporary_bundle_path(destination: &Path) -> DomainResult<PathBuf> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| DomainError::invalid("bundle destination has no parent directory"))?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project.huntproxy");
+    Ok(parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4())))
 }
 fn sha256_file(path: &Path) -> DomainResult<String> {
     let mut file = std::fs::File::open(path).map_err(storage_error)?;
@@ -667,6 +767,7 @@ fn storage_error(error: impl std::fmt::Display) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cookies::validate_named_cookie_profile;
     use crate::storage::NewExchange;
     #[test]
     fn rejects_unsafe_paths() {
@@ -719,6 +820,63 @@ mod tests {
             lineage: ExchangeLineage::default(),
             page_title: None,
             error_message: None,
+        }
+    }
+
+    fn unpack_bundle(bundle: &Path, target: &Path) {
+        create_private_dir(target).unwrap();
+        extract_bundle(bundle, target).unwrap();
+    }
+
+    fn repack_bundle(source: &Path, bundle: &Path) {
+        let output = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(bundle)
+            .unwrap();
+        let encoder = zstd::Encoder::new(output, 3).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        tar.append_path_with_name(source.join("manifest.json"), "manifest.json")
+            .unwrap();
+        tar.append_path_with_name(source.join("project.sqlite3"), "project.sqlite3")
+            .unwrap();
+        if source.join("browser").is_dir() {
+            tar.append_dir_all("browser", source.join("browser"))
+                .unwrap();
+        }
+        let encoder = tar.into_inner().unwrap();
+        encoder.finish().unwrap();
+    }
+
+    fn update_bundle_manifest(source: &Path, update: impl FnOnce(&mut BundleManifest)) {
+        let manifest_path = source.join("manifest.json");
+        let mut manifest: BundleManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.database_sha256 = sha256_file(&source.join("project.sqlite3")).unwrap();
+        update(&mut manifest);
+        write_private_file(
+            &manifest_path,
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn assert_no_import_staging(config: &Config) {
+        let leftovers = std::fs::read_dir(&config.runtime_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(".bundle-import-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "import staging leaked: {leftovers:?}");
+    }
+
+    fn rotation_gateway() -> crate::storage::IpRotationGateway {
+        crate::storage::IpRotationGateway {
+            region: "us-east-1".into(),
+            rest_api_id: "abc123".into(),
+            endpoint: "https://abc123.execute-api.us-east-1.amazonaws.com/transfer".into(),
         }
     }
 
@@ -801,6 +959,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_bundle_preserves_named_identities_and_rotation_relationships() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_config = test_config(&directory.path().join("source"));
+        let source_db = Db::open(&source_config).await.unwrap();
+        let project = source_db
+            .create_project(CreateProjectRequest {
+                name: "identity source".into(),
+                target_url: "https://example.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        source_db
+            .upsert_named_cookie_profile(
+                project.id,
+                "account1",
+                validate_named_cookie_profile("https://example.test/", "sid=account-one".into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        source_db
+            .activate_ip_rotation(
+                project.id,
+                "https://example.test".into(),
+                "transfer".into(),
+                vec![rotation_gateway()],
+            )
+            .await
+            .unwrap();
+
+        let bundle = directory.path().join("identities.huntproxy");
+        source_db
+            .export_bundle(
+                &source_config,
+                project.id,
+                bundle.clone(),
+                BundleExportOptions {
+                    secrets: SecretMode::Full,
+                    include_chromium_profile: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let destination_config = test_config(&directory.path().join("destination"));
+        let destination_db = Db::open(&destination_config).await.unwrap();
+        let imported = destination_db
+            .import_bundle(&destination_config, bundle, None)
+            .await
+            .unwrap();
+        let named = destination_db
+            .get_named_cookie_profile(imported.project.id, "account1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(named.cookie_header, "sid=account-one");
+        let rotation = destination_db
+            .list_ip_rotation_profiles(imported.project.id)
+            .await
+            .unwrap();
+        assert_eq!(rotation.len(), 1);
+        assert_eq!(rotation[0].gateways, vec![rotation_gateway()]);
+    }
+
+    #[tokio::test]
     async fn sanitized_bundle_reports_no_secrets_or_browser_state() {
         let directory = tempfile::tempdir().unwrap();
         let config = test_config(directory.path());
@@ -816,6 +1040,21 @@ mod tests {
         db.insert_exchange(sample_exchange(project.id))
             .await
             .unwrap();
+        db.upsert_named_cookie_profile(
+            project.id,
+            "account1",
+            validate_named_cookie_profile("https://example.test/", "sid=private".into()).unwrap(),
+        )
+        .await
+        .unwrap();
+        db.activate_ip_rotation(
+            project.id,
+            "https://example.test".into(),
+            "private-stage".into(),
+            vec![rotation_gateway()],
+        )
+        .await
+        .unwrap();
         let profile = config
             .browser_profiles_dir()
             .join("projects")
@@ -851,5 +1090,229 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        assert!(db
+            .list_named_cookie_profiles(imported.project.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_ip_rotation_profiles(imported.project.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn imports_schema_14_bundle_after_checksum_verification_and_private_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_config = test_config(&directory.path().join("source"));
+        let source_db = Db::open(&source_config).await.unwrap();
+        let project = source_db
+            .create_project(CreateProjectRequest {
+                name: "v0.1.1 project".into(),
+                target_url: "https://example.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        source_db
+            .upsert_named_cookie_profile(
+                project.id,
+                "legacy-account",
+                validate_named_cookie_profile("https://example.test/", "sid=legacy".into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        source_db
+            .create_browser_session(project.id, Some("default".into()))
+            .await
+            .unwrap();
+        let legacy_default_state = source_config
+            .browser_profiles_dir()
+            .join("projects")
+            .join(project.id.get().to_string())
+            .join("state.json");
+        write_private_file(
+            &legacy_default_state,
+            br#"{"last_url":"https://example.test/account"}"#,
+        )
+        .unwrap();
+        let current_bundle = directory.path().join("current.huntproxy");
+        source_db
+            .export_bundle(
+                &source_config,
+                project.id,
+                current_bundle.clone(),
+                BundleExportOptions {
+                    secrets: SecretMode::Full,
+                    include_chromium_profile: false,
+                },
+            )
+            .await
+            .unwrap();
+        let unpacked = directory.path().join("schema14");
+        unpack_bundle(&current_bundle, &unpacked);
+        let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
+        archive
+            .execute_batch(
+                "ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14;",
+            )
+            .unwrap();
+        drop(archive);
+        update_bundle_manifest(&unpacked, |manifest| {
+            manifest.source_schema = 14;
+            manifest.producer_version = "0.1.1".into();
+        });
+        let legacy_bundle = directory.path().join("v0.1.1.huntproxy");
+        repack_bundle(&unpacked, &legacy_bundle);
+
+        let destination_config = test_config(&directory.path().join("destination"));
+        let destination_db = Db::open(&destination_config).await.unwrap();
+        let imported = destination_db
+            .import_bundle(&destination_config, legacy_bundle, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            destination_db
+                .get_named_cookie_profile(imported.project.id, "legacy-account")
+                .await
+                .unwrap()
+                .unwrap()
+                .cookie_header,
+            "sid=legacy"
+        );
+        let session = destination_db
+            .get_browser_session(imported.project.id, BrowserSessionId(1))
+            .await
+            .unwrap();
+        assert_eq!(session.profile, None);
+        assert_eq!(
+            std::fs::read(
+                destination_config
+                    .browser_profiles_dir()
+                    .join("projects")
+                    .join(imported.project.id.get().to_string())
+                    .join("state.json")
+            )
+            .unwrap(),
+            br#"{"last_url":"https://example.test/account"}"#
+        );
+        assert_no_import_staging(&destination_config);
+    }
+
+    #[tokio::test]
+    async fn checksum_failure_wins_over_future_schema_and_cleans_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_config = test_config(&directory.path().join("source"));
+        let source_db = Db::open(&source_config).await.unwrap();
+        let project = source_db
+            .create_project(CreateProjectRequest {
+                name: "future".into(),
+                target_url: "https://example.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let bundle = directory.path().join("source.huntproxy");
+        source_db
+            .export_bundle(
+                &source_config,
+                project.id,
+                bundle.clone(),
+                BundleExportOptions {
+                    secrets: SecretMode::Full,
+                    include_chromium_profile: false,
+                },
+            )
+            .await
+            .unwrap();
+        let unpacked = directory.path().join("future");
+        unpack_bundle(&bundle, &unpacked);
+        let manifest_path = unpacked.join("manifest.json");
+        let mut manifest: BundleManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.source_schema = 16;
+        manifest.database_sha256 = "00".repeat(32);
+        write_private_file(
+            &manifest_path,
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let invalid = directory.path().join("invalid.huntproxy");
+        repack_bundle(&unpacked, &invalid);
+
+        let destination_config = test_config(&directory.path().join("destination"));
+        let destination_db = Db::open(&destination_config).await.unwrap();
+        let error = destination_db
+            .import_bundle(&destination_config, invalid, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert_no_import_staging(&destination_config);
+
+        let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
+        archive.pragma_update(None, "user_version", 16).unwrap();
+        drop(archive);
+        update_bundle_manifest(&unpacked, |manifest| manifest.source_schema = 16);
+        let future = directory.path().join("future-schema.huntproxy");
+        repack_bundle(&unpacked, &future);
+        let error = destination_db
+            .import_bundle(&destination_config, future, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("newer than local schema"));
+        assert!(destination_db.list_projects().await.unwrap().is_empty());
+        assert_no_import_staging(&destination_config);
+    }
+
+    #[tokio::test]
+    async fn failed_import_rolls_back_project_and_cleans_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_config = test_config(&directory.path().join("source"));
+        let source_db = Db::open(&source_config).await.unwrap();
+        let project = source_db
+            .create_project(CreateProjectRequest {
+                name: "atomic".into(),
+                target_url: "https://example.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let bundle = directory.path().join("source.huntproxy");
+        source_db
+            .export_bundle(
+                &source_config,
+                project.id,
+                bundle.clone(),
+                BundleExportOptions {
+                    secrets: SecretMode::Full,
+                    include_chromium_profile: false,
+                },
+            )
+            .await
+            .unwrap();
+        let unpacked = directory.path().join("atomic");
+        unpack_bundle(&bundle, &unpacked);
+        let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
+        archive
+            .execute(
+                "INSERT INTO reply_tabs(project_id,name,revision,protocol,draft_json,created_at,updated_at) VALUES(?1,'invalid draft',1,'auto','not-json','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                params![project.id.get()],
+            )
+            .unwrap();
+        drop(archive);
+        update_bundle_manifest(&unpacked, |_| {});
+        let invalid = directory.path().join("atomic-invalid.huntproxy");
+        repack_bundle(&unpacked, &invalid);
+
+        let destination_config = test_config(&directory.path().join("destination"));
+        let destination_db = Db::open(&destination_config).await.unwrap();
+        assert!(destination_db
+            .import_bundle(&destination_config, invalid, None)
+            .await
+            .is_err());
+        assert!(destination_db.list_projects().await.unwrap().is_empty());
+        assert_no_import_staging(&destination_config);
     }
 }
