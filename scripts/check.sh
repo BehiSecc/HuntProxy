@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+quick=false
+if [[ $# -gt 0 ]]; then
+  if [[ $# -ne 1 || $1 != --quick ]]; then
+    echo "Usage: $0 [--quick]" >&2
+    exit 2
+  fi
+  quick=true
+fi
+
 export PATH="${HOME}/.cargo/bin:${PATH}"
 cd "$(dirname "$0")/.."
 
@@ -23,7 +33,11 @@ echo "== browser worker syntax =="
 node --check browser-worker/index.js
 node --check browser-worker/headless.js
 
-echo "== build =="
-cargo build --release --locked
+if [[ $quick == true ]]; then
+  echo "== release build skipped (--quick) =="
+else
+  echo "== build =="
+  cargo build --release --locked
+fi
 
 echo "OK"

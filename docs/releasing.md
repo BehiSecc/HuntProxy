@@ -28,7 +28,7 @@ policy, and audits the browser worker's production npm dependencies. CI,
 candidate builds, and tag builds require this gate to pass; unavailable audit
 services fail the gate.
 
-Run `scripts/check.sh`: formatting, locked Clippy with warnings denied, all normal tests, worker syntax, and the locked release build. Use a disposable data directory for tests, and run the ignored browser suite serially with the pinned SDK and Chromium:
+Run `scripts/check.sh --quick` for day-to-day formatting, notices, asset validation, Clippy, tests, and worker syntax checks. Before a release, run `scripts/check.sh` for the same checks plus the locked release build. Use a disposable data directory for tests, and run the ignored browser suite serially with the pinned SDK and Chromium:
 
 ```bash
 cargo test --locked --test browser_profile_isolation -- --ignored --test-threads=1
