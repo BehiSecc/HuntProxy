@@ -17,7 +17,7 @@ import tempfile
 import urllib.request
 
 
-PLAYWRIGHT_VERSION = "1.64.0"
+PLAYWRIGHT_VERSION = "1.63.0"
 WS_VERSION = "8.22.0"
 NODE_VERSION = "22.23.2"
 PUBLISHED_PLUGIN_COMMIT = "95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32"

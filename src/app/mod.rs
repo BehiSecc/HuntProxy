@@ -57,8 +57,9 @@ impl TransportStatus {
             .and_then(|major| major.parse::<u32>().ok());
         let chrome_major = match browser_major {
             Some(146) => 146,
+            Some(149) => 149,
             Some(153) => 153,
-            _ => 149,
+            _ => 153,
         };
         let browser_major_matches_profile = browser_major == Some(chrome_major);
         let warning = if browser_major_matches_profile {
@@ -66,9 +67,9 @@ impl TransportStatus {
         } else {
             Some(match browser_major {
                 Some(major) => format!(
-                    "Chromium {major} has no tested transport profile; using Chrome149. Configure Chromium 146, 149, or 153 for a matching profile."
+                    "Chromium {major} has no tested transport profile; using Chrome153. Configure Chromium 146, 149, or 153 for a matching profile."
                 ),
-                None => "Browser version unavailable; using the Chrome149 transport profile.".into(),
+                None => "Browser version unavailable; using the Chrome153 transport profile.".into(),
             })
         };
         Self {
@@ -855,6 +856,10 @@ mod tests {
 
     #[test]
     fn transport_profile_tracks_supported_browser_and_reports_fallbacks() {
+        let bundled = TransportStatus::for_browser_version(Some("153.0.8010.12"));
+        assert_eq!(bundled.chrome_major, 153);
+        assert!(bundled.browser_major_matches_profile);
+        assert!(bundled.warning.is_none());
         for major in [146, 149, 153] {
             let status = TransportStatus::for_browser_version(Some(&format!("{major}.0.1.2")));
             assert_eq!(status.chrome_major, major);
@@ -869,14 +874,14 @@ mod tests {
             Some("156.0.1.2"),
         ] {
             let status = TransportStatus::for_browser_version(version);
-            assert_eq!(status.chrome_major, 149);
+            assert_eq!(status.chrome_major, 153);
             assert!(!status.browser_major_matches_profile);
             assert!(status.warning.is_some());
         }
         let warning = TransportStatus::for_browser_version(Some("156.0.1.2"))
             .warning
             .unwrap();
-        assert!(warning.contains("using Chrome149"));
+        assert!(warning.contains("using Chrome153"));
         assert!(warning.contains("146, 149, or 153"));
     }
 

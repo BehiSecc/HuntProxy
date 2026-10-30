@@ -326,7 +326,7 @@ pub struct WreqTransport {
 
 impl WreqTransport {
     pub fn new() -> Self {
-        Self::with_chrome_major(149).expect("pinned Chrome149 transport profile")
+        Self::with_chrome_major(153).expect("pinned Chrome153 transport profile")
     }
 
     pub fn with_chrome_major(major: u32) -> DomainResult<Self> {
@@ -1507,7 +1507,7 @@ mod tests {
 
         let response = transport.send(&dial, request(true, vec![])).await.unwrap();
         assert_eq!(response.transport_profile, transport.profile_name());
-        assert_eq!(transport.profile_name(), "wreq_chrome149_protocol_profile");
+        assert_eq!(transport.profile_name(), "wreq_chrome153_protocol_profile");
         let absent = observed_rx.recv().await.unwrap();
         for name in ["user-agent", "accept", "accept-language", "accept-encoding"] {
             assert!(
@@ -1568,11 +1568,11 @@ mod tests {
         assert!(defaults["user-agent"]
             .to_str()
             .unwrap()
-            .contains("Chrome/149."));
+            .contains("Chrome/153."));
         assert!(defaults["sec-ch-ua"]
             .to_str()
             .unwrap()
-            .contains("v=\"149\""));
+            .contains("v=\"153\""));
         // Switching the per-request policy must not leave defaults enabled on
         // the pooled client for later browser or Reply requests.
         transport.send(&dial, request(true, vec![])).await.unwrap();

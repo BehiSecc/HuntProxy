@@ -126,7 +126,7 @@ jobs:
 
       - name: Install pinned Chromium system dependencies
         if: matrix.platform == 'linux'
-        run: npx --yes playwright@1.64.0 install-deps chromium
+        run: npx --yes playwright@1.63.0 install-deps chromium
 
       - name: Install macOS build dependencies
         if: matrix.platform == 'macos'

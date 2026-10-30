@@ -4,7 +4,7 @@ The v0.2.0 candidate is prepared on `release/v0.2.0`. Publication needs human ap
 
 ## Source and assets
 
-The browser worker uses Playwright Core 1.64.0 and its managed Chromium 156.0.8078.4 (revision 1248). The embedded archive and browser metadata are verified against `browser-worker/package-lock.json`. The Node manifest pins verified distribution checksums. Embedded first-party plugins use source commit `d4e1aa3f2907338d40361938deca8c4c711394e7` from HuntProxy-Plugins; the legacy ownership fingerprints use `95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32`.
+The browser worker uses Playwright Core 1.63.0 and its managed Chromium 153.0.8010.12 (revision 1243). The embedded archive and browser metadata are verified against `browser-worker/package-lock.json`. The Node manifest pins verified distribution checksums. Embedded first-party plugins use source commit `d4e1aa3f2907338d40361938deca8c4c711394e7` from HuntProxy-Plugins; the legacy ownership fingerprints use `95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32`.
 
 Publish the plugin source branch before running candidate CI so that immutable commit is fetchable. The plugin framework v0.2.0 metadata/doc changes do not change the bundled runtime files. Run its complete `npm test` suite and syntax checks.
 
@@ -14,7 +14,7 @@ Verify the embedded bytes against an existing checkout of that source:
 python3 scripts/prepare-release-assets.py /path/to/HuntProxy-Plugins \
   --output-dir resources/release \
   --current-commit d4e1aa3f2907338d40361938deca8c4c711394e7 \
-  --playwright-tgz resources/release/playwright-core-1.64.0.tgz \
+  --playwright-tgz resources/release/playwright-core-1.63.0.tgz \
   --playwright-lock browser-worker/package-lock.json \
   --check
 ```

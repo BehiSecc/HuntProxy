@@ -597,7 +597,7 @@ else
     if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
       linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
     fi
-    stable_playwright="$DATA_DIR/runtime/playwright-core-1.64.0"
+    stable_playwright="$DATA_DIR/runtime/playwright-core-1.63.0"
     runtime_node=''
     if [[ -f "$DATA_DIR/config.toml" ]]; then
       runtime_node="$(sed -n 's/^node_path = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"

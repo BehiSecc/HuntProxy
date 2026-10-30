@@ -16,11 +16,11 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-const PLAYWRIGHT_VERSION: &str = "1.64.0";
+const PLAYWRIGHT_VERSION: &str = "1.63.0";
 const WS_VERSION: &str = "8.22.0";
 const NODE_VERSION: &str = "22.23.2";
-const CHROMIUM_REVISION: &str = "1248";
-const CHROMIUM_VERSION: &str = "156.0.8078.4";
+const CHROMIUM_REVISION: &str = "1243";
+const CHROMIUM_VERSION: &str = "153.0.8010.12";
 const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PLUGIN_ENTRIES: usize = 20_000;
 const MAX_PLAYWRIGHT_BYTES: u64 = 64 * 1024 * 1024;
@@ -34,7 +34,7 @@ const PLUGIN_SOURCE_MARKER: &str = ".huntproxy-first-party-source";
 
 const PLUGIN_CATALOG_ARCHIVE: &[u8] =
     include_bytes!("../resources/release/plugins-catalog.tar.zst");
-const PLAYWRIGHT_ARCHIVE: &[u8] = include_bytes!("../resources/release/playwright-core-1.64.0.tgz");
+const PLAYWRIGHT_ARCHIVE: &[u8] = include_bytes!("../resources/release/playwright-core-1.63.0.tgz");
 const WS_ARCHIVE: &[u8] = include_bytes!("../resources/release/ws-8.22.0.tgz");
 const WORKER_LOCK: &str = include_str!("../browser-worker/package-lock.json");
 const PLAYWRIGHT_MANIFEST: &[u8] = include_bytes!("../resources/release/playwright-core.json");
@@ -1647,7 +1647,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first.file_name().and_then(|value| value.to_str()),
-            Some("playwright-core-1.64.0")
+            Some("playwright-core-1.63.0")
         );
     }
 
@@ -1785,7 +1785,7 @@ mod tests {
     #[test]
     fn interrupted_runtime_swap_restores_the_previous_directory() {
         let temporary = temporary_directory();
-        let destination = temporary.path().join("playwright-core-1.64.0");
+        let destination = temporary.path().join("playwright-core-1.63.0");
         let backup = directory_backup_path(&destination).unwrap();
         fs::create_dir(&backup).unwrap();
         fs::write(backup.join("package.json"), b"previous").unwrap();

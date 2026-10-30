@@ -93,6 +93,20 @@ class ReleaseAssetChecks(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "differs from generated output"):
             assets.verify_asset(existing, candidate)
 
+    def test_playwright_archive_matches_lock_and_browser_metadata(self):
+        repo = Path(__file__).resolve().parent.parent
+        archive = repo / "resources/release/playwright-core-1.63.0.tgz"
+        lock = repo / "browser-worker/package-lock.json"
+        sha, revision, version = assets.verify_playwright(archive, lock)
+        manifest = json.loads((repo / "resources/release/playwright-core.json").read_text())
+        self.assertEqual((sha, revision, version),
+                         (manifest["sha512"], "1243", "153.0.8010.12"))
+        self.assertEqual(manifest["version"], assets.PLAYWRIGHT_VERSION)
+        corrupted = self.root / "playwright-corrupted.tgz"
+        corrupted.write_bytes(archive.read_bytes() + b"extra")
+        with self.assertRaisesRegex(ValueError, "does not match package-lock integrity"):
+            assets.verify_playwright(corrupted, lock)
+
     def test_ws_archive_matches_the_lock_and_rejects_tampering(self):
         repo = Path(__file__).resolve().parent.parent
         archive = repo / "resources/release/ws-8.22.0.tgz"

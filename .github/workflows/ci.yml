@@ -101,7 +101,7 @@ jobs:
           node-version: "22.23.2"
 
       - name: Install pinned Chromium system dependencies
-        run: npx --yes playwright@1.64.0 install-deps chromium
+        run: npx --yes playwright@1.63.0 install-deps chromium
 
       - name: Install Rust
         run: |
