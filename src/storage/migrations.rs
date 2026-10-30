@@ -61,6 +61,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "015_browser_profiles",
         include_str!("../../migrations/015_browser_profiles.sql"),
     ),
+    (
+        "016_project_upstream_proxies",
+        include_str!("../../migrations/016_project_upstream_proxies.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {

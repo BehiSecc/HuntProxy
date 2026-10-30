@@ -12,6 +12,7 @@ mod fuzz_store;
 mod ip_rotation;
 mod lifecycle;
 mod migrations;
+mod project_upstream_proxies;
 mod projects;
 mod reply_store;
 mod sessions;
@@ -23,6 +24,7 @@ pub use db::*;
 pub use exchanges::*;
 pub use lifecycle::*;
 pub use migrations::*;
+pub use project_upstream_proxies::*;
 pub use projects::*;
 pub use sessions::*;
 // side-effect modules register `impl Db` methods

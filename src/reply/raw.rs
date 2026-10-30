@@ -222,11 +222,15 @@ impl ReplyService {
         }
 
         let started = Instant::now();
-        let upstream_proxy = self.upstream_proxies.proxy_for_project(
-            project_id.get(),
-            &target.host,
-            options.upstream_proxy.as_deref(),
-        )?;
+        let upstream_proxy = self
+            .db
+            .resolve_upstream_proxy(
+                project_id,
+                &self.upstream_proxies,
+                &target.host,
+                options.upstream_proxy.as_deref(),
+            )
+            .await?;
         let mut stream = tokio::time::timeout(
             Duration::from_secs(15),
             connect_target(&target, upstream_proxy.as_deref()),
