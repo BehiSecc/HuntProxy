@@ -14,34 +14,47 @@ function fixture(t, mode = "ready", startup = {}) {
   const profile = fs.mkdtempSync("/tmp/artis/huntproxy-native-");
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
   const events = [];
-  const child = new EventEmitter();
-  Object.assign(child, { pid: 12345, exitCode: null, signalCode: null, stderr: new PassThrough() });
-  child.kill = (signal) => {
-    events.push(signal);
-    child.signalCode = signal;
-    child.emit("exit", null, signal);
-    child.emit("close", null, signal);
-    return true;
-  };
+  const children = [];
+  const attempts = [];
   const browser = {
     contexts: () => [{
-      async setHTTPCredentials(credentials) { events.push("auth"); assert.equal(credentials.username, "workspace"); if (mode === "auth-error") throw Error("Authentication setup failed"); },
+      async setHTTPCredentials(credentials) { events.push("auth"); assert.equal(credentials.username, "workspace"); if (mode === "auth-error" || mode === "auth-unkillable") throw Error("Authentication setup failed"); },
       pages() { events.push("pages"); return [{ async bringToFront() { events.push("activate"); } }]; },
     }],
     async close() { events.push("disconnect"); },
   };
   let args;
-  const api = vm.runInNewContext(`${launch}; ({ launchNativeChromium, nativeDebugPort, stopOwnedChrome })`, {
-    fs, path, net, URL, ownedChromeChildren: new Set(), shuttingDown: false,
+  const api = vm.runInNewContext(`${launch}; ({ launchNativeChromium, nativeIdentity, nativeDebugPort, stopOwnedChrome })`, {
+    fs, path, net: startup.realNet ? net : { createServer() {
+      const server = new EventEmitter();
+      server.listen = (port, host, callback) => { server.port = port || 12345; queueMicrotask(callback); };
+      server.address = () => ({ port: server.port });
+      server.close = (callback) => queueMicrotask(callback);
+      return server;
+    } }, URL, ownedChromeChildren: new Set(), shuttingDown: false,
     browserRuntime: { headless: false, chromium_path: "/selected/chrome" },
     chromiumProxy: (proxy) => proxy,
+    os: { tmpdir: () => "/tmp/artis" },
+    inspectNativeIdentity: async () => ({ userAgent: "test" }),
     setTimeout: (fn, ms) => setTimeout(fn, Math.min(ms, 30)), clearTimeout,
     spawn(executable, supplied, options) {
       assert.equal(executable, "/selected/chrome");
       assert.equal(options.stdio[2], "pipe");
       args = Array.from(supplied);
+      attempts.push(args);
+      const child = new EventEmitter();
+      Object.assign(child, { pid: 12345, exitCode: null, signalCode: null, stderr: new PassThrough() });
+      child.kill = (signal) => {
+        events.push(signal);
+        child.signalCode = signal;
+        child.emit("exit", null, signal);
+        child.emit("close", null, signal);
+        return true;
+      };
+      if (mode === "auth-unkillable") child.kill = () => true;
+      children.push(child);
       queueMicrotask(() => {
-        if (mode === "exit") {
+        if (mode === "exit" || (mode === "sandbox-once" && attempts.length === 1)) {
           for (const chunk of startup.stderr || []) child.stderr.write(chunk);
           child.exitCode = startup.signal ? null : startup.code ?? 1;
           child.signalCode = startup.signal || null;
@@ -64,7 +77,7 @@ function fixture(t, mode = "ready", startup = {}) {
       return browser;
     } },
   });
-  return { api, profile, events, child, args: () => args };
+  return { api, profile, events, get child() { return children[0]; }, children, attempts, args: () => args };
 }
 
 test("native startup attaches only its emitted endpoint and retains auth and routing protections", async (t) => {
@@ -73,10 +86,27 @@ test("native startup attaches only its emitted endpoint and retains auth and rou
   assert.equal(runtime.ownedChrome, f.child);
   assert.deepEqual(f.events, ["connect", "auth", "pages", "activate"]);
   for (const argument of ["--remote-debugging-address=127.0.0.1", "--proxy-bypass-list=<-loopback>", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--ignore-certificate-errors", "--disable-quic"]) assert.equal(f.args().includes(argument), true);
+  for (const flag of ["--disable-back-forward-cache", "--disable-background-networking", "--disable-component-update", "--disable-sync", "--disable-default-apps", "--no-service-autorun", "--disable-client-side-phishing-detection", "--disable-breakpad", "--disable-component-extensions-with-background-pages", "--disable-popup-blocking", "--disable-prompt-on-repost", "--password-store=basic", "--use-mock-keychain", "--disable-dev-shm-usage", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--disable-hang-monitor", "--metrics-recording-only", "--disable-search-engine-choice-screen", "--no-first-run", "--no-default-browser-check"]) assert.ok(f.args().includes(flag), flag);
+  for (const flag of ["--enable-automation", "--disable-extensions", "--remote-debugging-pipe", "--disable-features", "--enable-features", "--disable-field-trial-config", "--force-color-profile", "--allow-pre-commit-input", "--no-sandbox"]) assert.equal(f.args().some((arg) => arg === flag || arg.startsWith(`${flag}=`)), false, flag);
+  assert.equal(runtime.sandbox_state, "enabled");
+  assert.equal(runtime.sandbox_reason, null);
   assert.equal(f.args().at(-1), "about:blank");
   assert.equal(f.args().some((value) => /remote-debugging-pipe|AutomationControlled|local-session/.test(value)), false);
   await f.api.stopOwnedChrome(f.child);
   assert.equal(f.child.signalCode, "SIGTERM");
+});
+
+test("identity probe uses the same behavior flags as a persistent launch", async (t) => {
+  const f = fixture(t);
+  const runtime = await f.api.launchNativeChromium(null, null, f.profile, null);
+  const persistentArgs = f.attempts[0];
+  await f.api.stopOwnedChrome(runtime.ownedChrome);
+  await f.api.nativeIdentity(null, null);
+  const probeArgs = f.attempts[1];
+  for (const flag of persistentArgs.filter((arg) => arg.startsWith("--")
+      && !arg.startsWith("--user-data-dir=") && !arg.startsWith("--remote-debugging-port="))) {
+    assert.ok(probeArgs.includes(flag), flag);
+  }
 });
 
 for (const mode of ["wrong-port", "exit", "auth-error"]) {
@@ -85,19 +115,24 @@ for (const mode of ["wrong-port", "exit", "auth-error"]) {
     await assert.rejects(f.api.launchNativeChromium({ username: "workspace" }, null, f.profile, null));
     assert.ok(f.child.exitCode != null || f.child.signalCode != null);
     if (mode !== "auth-error") assert.equal(f.events.includes("connect"), false);
+    assert.equal(f.attempts.length, 1);
   });
 }
 
-test("sandbox startup failures retain late diagnostics and narrow AppArmor guidance", async (t) => {
-  const f = fixture(t, "exit", { stderr: ["private startup detail\nNo usable "], lateStderr: "sandbox!\n" });
-  await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, null), (error) => {
-    assert.match(error.message, /exit code 1/);
-    assert.match(error.message, /sandbox initialization failed/);
-    assert.match(error.message, /allow user namespaces.*Chromium executable.*AppArmor profile/);
-    assert.doesNotMatch(error.message, /private startup detail|--no-sandbox/);
-    return true;
-  });
-  assert.equal(f.args().includes("--no-sandbox"), false);
+test("sandbox startup failures retry once, retain diagnostics, and cache the decision", async (t) => {
+  const f = fixture(t, "sandbox-once", { stderr: ["private startup detail\nNo usable "], lateStderr: "sandbox!\n" });
+  const runtime = await f.api.launchNativeChromium(null, null, f.profile, null);
+  assert.equal(f.attempts.length, 2);
+  assert.equal(f.attempts[0].includes("--no-sandbox"), false);
+  assert.equal(f.attempts[1].includes("--no-sandbox"), true);
+  assert.equal(runtime.sandbox_state, "disabled_fallback");
+  assert.match(runtime.sandbox_reason, /sandbox initialization failed.*\/selected\/chrome.*AppArmor profile/);
+  assert.doesNotMatch(runtime.sandbox_reason, /private startup detail/);
+  await f.api.stopOwnedChrome(runtime.ownedChrome);
+  const next = await f.api.launchNativeChromium(null, null, f.profile, null);
+  assert.equal(f.attempts.length, 3);
+  assert.equal(f.attempts[2].includes("--no-sandbox"), true);
+  await f.api.stopOwnedChrome(next.ownedChrome);
 });
 
 test("recognized startup failures survive bounded stderr truncation", async (t) => {
@@ -132,7 +167,7 @@ test("an occupied handoff port fails before launching a browser", async (t) => {
   const listener = net.createServer();
   await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => listener.close(resolve)));
-  const f = fixture(t);
+  const f = fixture(t, "ready", { realNet: true });
   await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, listener.address().port), { code: "EADDRINUSE" });
   assert.equal(f.args(), undefined);
 });
@@ -146,8 +181,7 @@ test("an unavailable artifacts directory fails before spawning another browser",
 
 
 test("failed native startup retains an unkillable owned runtime without serializing it", async (t) => {
-  const f = fixture(t, "auth-error");
-  f.child.kill = () => true;
+  const f = fixture(t, "auth-unkillable");
   await assert.rejects(f.api.launchNativeChromium({ username: "workspace" }, null, f.profile, null), (error) => {
     assert.equal(error.ownedRuntime.ownedChrome, f.child);
     assert.equal(error.ownedRuntime.profileDir, f.profile);
@@ -192,7 +226,7 @@ test("occupied-port errors remain numeric JSON-RPC errors and retain other profi
   const listener = net.createServer();
   await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => listener.close(resolve)));
-  const f = fixture(t);
+  const f = fixture(t, "ready", { realNet: true });
   const sessions = new Map([[1, {}], [2, {}]]);
   const messages = [];
   const handle = source.slice(source.indexOf("async function handle(req)"), source.indexOf("async function closeRuntime("));

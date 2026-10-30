@@ -52,6 +52,8 @@ pub struct BrowserInstallStatus {
     pub expected_chromium_version: Option<String>,
     pub node_path: Option<String>,
     pub install_hint: Option<String>,
+    pub sandbox_state: Option<String>,
+    pub sandbox_reason: Option<String>,
 }
 
 /// The worker owns browser discovery so diagnostics and launches use one policy.
@@ -120,6 +122,8 @@ pub struct BrowserSessionResource {
 pub struct BrowserStatus {
     pub sessions: Vec<BrowserSession>,
     pub resources: BrowserResources,
+    pub sandbox_state: Option<String>,
+    pub sandbox_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -933,6 +937,7 @@ pub struct BrowserService {
     profile_io: Mutex<()>,
     session_ops: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     worker: Mutex<Option<WorkerProcess>>,
+    sandbox: std::sync::Mutex<(Option<String>, Option<String>)>,
 }
 
 /// Inspect the installed browser runtime without starting the daemon, launching
@@ -1016,6 +1021,8 @@ fn browser_install_status(
         expected_chromium_version: runtime.expected_chromium_version.clone(),
         node_path: node_path.map(|path| path.display().to_string()),
         install_hint,
+        sandbox_state: None,
+        sandbox_reason: None,
     }
 }
 
@@ -1086,6 +1093,7 @@ impl BrowserService {
             profile_io: Mutex::new(()),
             session_ops: Mutex::new(HashMap::new()),
             worker: Mutex::new(None),
+            sandbox: std::sync::Mutex::new((None, None)),
         }
     }
 
@@ -1110,11 +1118,18 @@ impl BrowserService {
     }
 
     pub fn status(&self) -> BrowserInstallStatus {
-        browser_install_status(
+        let mut status = browser_install_status(
             self.node_path.as_deref(),
             self.worker_path.as_deref(),
             &self.runtime,
-        )
+        );
+        let sandbox = self
+            .sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        status.sandbox_state = sandbox.0.clone();
+        status.sandbox_reason = sandbox.1.clone();
+        status
     }
 
     pub async fn start(&self, project_id: ProjectId, url: String) -> DomainResult<BrowserSession> {
@@ -1825,9 +1840,15 @@ impl BrowserService {
             &sessions,
             &runtimes,
         )?;
+        let sandbox = self
+            .sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         Ok(BrowserStatus {
             sessions,
             resources,
+            sandbox_state: sandbox.0.clone(),
+            sandbox_reason: sandbox.1.clone(),
         })
     }
 
@@ -2420,11 +2441,6 @@ impl BrowserService {
                 .revoke_capture_session(project_id, runtime.capture_session_id)
                 .await;
         }
-        if self.runtime_sessions.lock().await.is_empty() {
-            if let Some(mut idle_worker) = self.worker.lock().await.take() {
-                idle_worker.terminate().await;
-            }
-        }
         self.session_ops.lock().await.remove(&session_id.get());
         match persistence_error {
             Some(error) => Err(DomainError::new(
@@ -2435,8 +2451,7 @@ impl BrowserService {
         }
     }
 
-    /// Stop every active browser in one project and release the worker when
-    /// the final session closes.
+    /// Stop every active browser in one project.
     pub async fn stop_project(&self, project_id: ProjectId) -> DomainResult<usize> {
         let _lifecycle = self.lifecycle.lock().await;
         let sessions = self
@@ -2461,7 +2476,17 @@ impl BrowserService {
             .iter()
             .map(|(id, runtime)| (runtime.project_id, BrowserSessionId(*id)))
             .collect::<Vec<_>>();
-        self.stop_sessions_inner(sessions).await
+        let result = self.stop_sessions_inner(sessions).await;
+        if self.runtime_sessions.lock().await.is_empty() {
+            if let Some(mut worker) = self.worker.lock().await.take() {
+                worker.terminate().await;
+            }
+            *self
+                .sandbox
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = (None, None);
+        }
+        result
     }
 
     /// Terminate the shared worker and mark every attached session interrupted.
@@ -2471,6 +2496,10 @@ impl BrowserService {
         if let Some(mut worker) = self.worker.lock().await.take() {
             worker.terminate().await;
         }
+        *self
+            .sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = (None, None);
         self.interrupt_runtime_sessions().await;
     }
 
@@ -2483,11 +2512,6 @@ impl BrowserService {
         for (project_id, session_id) in sessions {
             if let Err(error) = self.stop_inner(project_id, session_id).await {
                 first_error.get_or_insert(error);
-            }
-        }
-        if self.runtime_sessions.lock().await.is_empty() {
-            if let Some(mut idle_worker) = self.worker.lock().await.take() {
-                idle_worker.terminate().await;
             }
         }
         match first_error {
@@ -2508,6 +2532,10 @@ impl BrowserService {
         })?;
         let mut worker = self.worker.lock().await;
         if worker.is_none() {
+            *self
+                .sandbox
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = (None, None);
             *worker = Some(
                 WorkerProcess::spawn(
                     node_path,
@@ -2525,12 +2553,33 @@ impl BrowserService {
             .call(method, params)
             .await;
         match result {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                if method == "session.start" {
+                    if let Some(state) = value.get("sandbox_state").and_then(Value::as_str) {
+                        let mut sandbox = self
+                            .sandbox
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        *sandbox = (
+                            Some(state.to_owned()),
+                            value
+                                .get("sandbox_reason")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        );
+                    }
+                }
+                Ok(value)
+            }
             Err(WorkerCallFailure::Rpc(error)) => Err(error),
             Err(WorkerCallFailure::Transport(error)) => {
                 if let Some(mut failed) = worker.take() {
                     failed.terminate().await;
                 }
+                *self
+                    .sandbox
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = (None, None);
                 drop(worker);
                 self.interrupt_runtime_sessions().await;
                 Err(error)
@@ -4359,6 +4408,67 @@ mod tests {
             .create_browser_profile(project.id, "account1")
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_diagnostics_are_reported_and_worker_survives_idle() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("worker.sh");
+        std::fs::write(&script, r#"
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  case "$n" in
+    1) printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}' ;;
+    *) printf '{"id":%s,"result":{"sandbox_state":"disabled_fallback","sandbox_reason":"sandbox failed at /chromium"}}\n' "$n" ;;
+  esac
+done
+"#).unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "Sandbox status".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let mut service = BrowserService::new_with_proxy_and_ca(
+            db.clone(),
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        service.node_path = Some(PathBuf::from("/bin/sh"));
+        service.worker_path = Some(script);
+        assert!(service.status().sandbox_state.is_none());
+        service
+            .call_worker("session.start", json!({}))
+            .await
+            .unwrap();
+        let status = service.active_status(project.id).await.unwrap();
+        assert_eq!(status.sandbox_state.as_deref(), Some("disabled_fallback"));
+        assert_eq!(
+            status.sandbox_reason.as_deref(),
+            Some("sandbox failed at /chromium")
+        );
+        assert_eq!(service.status().sandbox_state, status.sandbox_state);
+        service.stop_project(project.id).await.unwrap();
+        assert!(service.worker.lock().await.is_some());
+        service.stop_all().await.unwrap();
+        assert!(service.worker.lock().await.is_none());
+        let restarted = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        assert!(restarted.status().sandbox_state.is_none());
     }
 
     #[cfg(unix)]

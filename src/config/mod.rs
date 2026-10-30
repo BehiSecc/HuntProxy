@@ -257,16 +257,7 @@ impl Config {
         {
             cfg.browser_worker_path = Some(PathBuf::from(path));
         }
-        if !cfg.node_path.as_deref().is_some_and(browser_node_supported) {
-            let managed_node = cfg.runtime_dir.join("node/bin/node");
-            cfg.node_path = if browser_node_supported(&managed_node) {
-                Some(managed_node)
-            } else if cfg.node_path.as_ref().is_none_or(|node| !node.is_file()) {
-                which_path("node").filter(|node| browser_node_supported(node))
-            } else {
-                None
-            };
-        }
+        cfg.node_path = select_browser_node(cfg.node_path, which_path("node"), &cfg.runtime_dir);
         cfg.validate()?;
         cfg.ensure_layout()?;
         cfg.write_default_config()?;
@@ -523,6 +514,21 @@ fn which_path(name: &str) -> Option<PathBuf> {
     })
 }
 
+fn select_browser_node(
+    configured: Option<PathBuf>,
+    system: Option<PathBuf>,
+    runtime_dir: &Path,
+) -> Option<PathBuf> {
+    configured
+        .into_iter()
+        .chain(system)
+        .chain([
+            crate::installation::managed_node_path(runtime_dir),
+            runtime_dir.join("node/bin/node"),
+        ])
+        .find(|node| browser_node_supported(node))
+}
+
 /// Playwright's minimum applies to every browser mode. Keep an older system
 /// Node usable for other software; use the installer's private runtime instead.
 pub fn browser_node_supported(node: &Path) -> bool {
@@ -623,7 +629,73 @@ mod tests {
         .unwrap();
 
         let config = Config::load(Some(data_dir)).unwrap();
-        assert_eq!(config.node_path.as_deref(), Some(node.as_path()));
+        let expected = which_path("node")
+            .filter(|path| browser_node_supported(path))
+            .unwrap_or(node);
+        assert_eq!(config.node_path.as_deref(), Some(expected.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_node_selection_covers_versioned_and_legacy_runtimes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../resources/release/node-runtimes.json"))
+                .unwrap();
+        let version = manifest["version"].as_str().unwrap();
+        for (versioned_exists, legacy_exists) in
+            [(true, false), (false, true), (true, true), (false, false)]
+        {
+            let parent = tempfile::tempdir().unwrap();
+            let runtime = parent.path().join("runtime");
+            let versioned = runtime.join(format!("node-{version}/bin/node"));
+            let legacy = runtime.join("node/bin/node");
+            for (path, exists) in [(&versioned, versioned_exists), (&legacy, legacy_exists)] {
+                if exists {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, b"#!/bin/sh\nprintf 'v22.23.2\\n'\n").unwrap();
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
+            let expected = if versioned_exists {
+                Some(versioned)
+            } else if legacy_exists {
+                Some(legacy)
+            } else {
+                None
+            };
+            assert_eq!(select_browser_node(None, None, &runtime), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_selection_prefers_configured_then_system_then_supported_managed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let runtime = parent.path().join("runtime");
+        let configured = parent.path().join("configured");
+        let system = parent.path().join("system");
+        let versioned = crate::installation::managed_node_path(&runtime);
+        let legacy = runtime.join("node/bin/node");
+        for path in [&configured, &system, &versioned, &legacy] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"#!/bin/sh\nprintf 'v22.23.2\\n'\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(
+            select_browser_node(Some(configured.clone()), Some(system.clone()), &runtime),
+            Some(configured.clone())
+        );
+        fs::write(&configured, b"#!/bin/sh\nprintf 'v18.0.0\\n'\n").unwrap();
+        assert_eq!(
+            select_browser_node(Some(configured), Some(system.clone()), &runtime),
+            Some(system)
+        );
+        fs::write(&versioned, b"#!/bin/sh\nprintf 'v18.0.0\\n'\n").unwrap();
+        assert_eq!(select_browser_node(None, None, &runtime), Some(legacy));
     }
 
     #[test]
@@ -650,10 +722,15 @@ mod tests {
         let managed = data.join("runtime/node/bin/node");
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
         let selected = parent.path().join("selected-node");
+        let system = which_path("node").filter(|node| browser_node_supported(node));
         for (selected_version, managed_version, expected) in [
-            ("18.19.1", "22.23.2", Some(&managed)),
-            ("20.20.0", "22.23.2", Some(&selected)),
-            ("18.19.1", "18.19.1", None),
+            (
+                "18.19.1",
+                "22.23.2",
+                system.clone().or_else(|| Some(managed.clone())),
+            ),
+            ("20.20.0", "22.23.2", Some(selected.clone())),
+            ("18.19.1", "18.19.1", system.clone()),
         ] {
             for (node, version) in [(&selected, selected_version), (&managed, managed_version)] {
                 std::fs::write(node, format!("#!/bin/sh\nprintf 'v{version}\\n'\n")).unwrap();
@@ -665,7 +742,7 @@ mod tests {
             )
             .unwrap();
             let config = Config::load(Some(data.clone())).unwrap();
-            assert_eq!(config.node_path.as_ref(), expected);
+            assert_eq!(config.node_path, expected);
         }
     }
 

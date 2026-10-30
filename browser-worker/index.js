@@ -754,12 +754,26 @@ function nativeChromeStartupFailure(stderr, executablePath) {
   return null;
 }
 
-async function spawnNativeChrome(proxy, caCertPath, profileDir, cdpPort, extraArgs = []) {
+const NATIVE_BEHAVIOR_ARGS = [
+  "--disable-back-forward-cache", "--disable-background-networking", "--disable-component-update",
+  "--disable-sync", "--disable-default-apps", "--no-service-autorun",
+  "--disable-client-side-phishing-detection", "--disable-breakpad",
+  "--disable-component-extensions-with-background-pages", "--disable-popup-blocking",
+  "--disable-prompt-on-repost", "--password-store=basic", "--use-mock-keychain",
+  "--disable-dev-shm-usage", "--disable-background-timer-throttling",
+  "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+  "--disable-hang-monitor", "--metrics-recording-only", "--disable-search-engine-choice-screen",
+  "--no-first-run", "--no-default-browser-check",
+];
+
+let nativeSandboxReason = null;
+
+async function spawnNativeChromeAttempt(proxy, caCertPath, profileDir, cdpPort, extraArgs = []) {
   const port = await nativeDebugPort(cdpPort);
   if (shuttingDown) throw new Error("Browser worker is shutting down");
   const args = [
     `--user-data-dir=${profileDir}`, `--remote-debugging-port=${port}`,
-    "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check",
+    "--remote-debugging-address=127.0.0.1", ...NATIVE_BEHAVIOR_ARGS,
     ...chromiumLaunchOptions(proxy, caCertPath).args,
     ...(cdpPort != null ? [`--remote-allow-origins=http://127.0.0.1:${port},https://chrome-devtools-frontend.appspot.com`] : []),
     ...(proxy?.server ? [`--proxy-server=${proxy.server}`] : []),
@@ -780,6 +794,9 @@ async function spawnNativeChrome(proxy, caCertPath, profileDir, cdpPort, extraAr
       clearTimeout(timer);
       child.removeListener("close", onClose);
       buffer = "";
+      if (error && startupFailure?.startsWith("Chromium sandbox initialization failed")) {
+        error.sandboxReason = startupFailure;
+      }
       error ? reject(error) : resolve(endpoint);
     };
     const onClose = (code, signal) => {
@@ -801,17 +818,50 @@ async function spawnNativeChrome(proxy, caCertPath, profileDir, cdpPort, extraAr
   return { child, endpoint };
 }
 
+async function spawnNativeChrome(proxy, caCertPath, profileDir, cdpPort, extraArgs = []) {
+  const start = async (disabled) => {
+    const attempt = await spawnNativeChromeAttempt(proxy, caCertPath, profileDir, cdpPort,
+      disabled ? [...extraArgs, "--no-sandbox"] : extraArgs);
+    try {
+      const endpoint = await attempt.endpoint;
+      return { child: attempt.child, endpoint };
+    } catch (error) {
+      try { await stopOwnedChrome(attempt.child); } catch (cleanupError) {
+        Object.defineProperty(cleanupError, "ownedRuntime", { value: {
+          browser: null, context: null, page: null, ownedChrome: attempt.child,
+          persistent: true, profileDir,
+        } });
+        throw cleanupError;
+      }
+      throw error;
+    }
+  };
+  if (nativeSandboxReason) return start(true);
+  try {
+    return await start(false);
+  } catch (error) {
+    if (!error.sandboxReason) throw error;
+    nativeSandboxReason = error.sandboxReason;
+    return start(true);
+  }
+}
+
 let nativeIdentityPromise;
 function nativeIdentity(proxy, caCertPath) {
   if (!nativeIdentityPromise) {
     nativeIdentityPromise = (async () => {
       const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "huntproxy-identity-"));
       let child;
+      let failedOwnedRuntime;
       try {
         const started = await spawnNativeChrome(proxy, caCertPath, profileDir, null,
-          ["--headless=new", "--disable-background-networking", "--disable-extensions"]);
+          ["--headless=new", "--disable-extensions"]);
         child = started.child;
         return await inspectNativeIdentity(await started.endpoint, browserRuntime.chromium_version);
+      } catch (error) {
+        failedOwnedRuntime = error.ownedRuntime;
+        if (failedOwnedRuntime) failedOwnedRuntime.probeProfile = true;
+        throw error;
       } finally {
         try { await stopOwnedChrome(child); } catch (error) {
           Object.defineProperty(error, "ownedRuntime", { value: {
@@ -820,7 +870,7 @@ function nativeIdentity(proxy, caCertPath) {
           } });
           throw error;
         }
-        fs.rmSync(profileDir, { recursive: true, force: true });
+        if (!failedOwnedRuntime) fs.rmSync(profileDir, { recursive: true, force: true });
       }
     })().catch((error) => { nativeIdentityPromise = null; throw error; });
   }
@@ -857,7 +907,8 @@ async function launchNativeChromium(proxy, caCertPath, profileDir, cdpPort) {
     const page = context.pages()[0] || await context.newPage();
     await page.bringToFront();
     identityController?.assertHealthy();
-    return { browser, context, page, persistent: true, profileDir, ownedChrome: child, identityController };
+    return { browser, context, page, persistent: true, profileDir, ownedChrome: child, identityController,
+      sandbox_state: nativeSandboxReason ? "disabled_fallback" : "enabled", sandbox_reason: nativeSandboxReason };
   } catch (error) {
     identityController?.beginClose();
     try { await browser?.close(); } catch {}
@@ -1702,6 +1753,8 @@ function sessionIdentity(sessionId, session) {
     active_profile: session.profile,
     profile_dir: session.profileDir,
     persistent: session.persistent,
+    sandbox_state: session.sandbox_state ?? null,
+    sandbox_reason: session.sandbox_reason ?? null,
   };
 }
 

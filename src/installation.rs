@@ -40,6 +40,10 @@ const WORKER_LOCK: &str = include_str!("../browser-worker/package-lock.json");
 const PLAYWRIGHT_MANIFEST: &[u8] = include_bytes!("../resources/release/playwright-core.json");
 const NODE_MANIFEST: &[u8] = include_bytes!("../resources/release/node-runtimes.json");
 
+pub(crate) fn managed_node_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(format!("node-{NODE_VERSION}/bin/node"))
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedInstallation {
     pub node_path: PathBuf,
@@ -73,13 +77,7 @@ pub fn inspect(config: &Config) -> Option<PreparedInstallation> {
         .node_path
         .clone()
         .or_else(|| marker_path("node"))
-        .or_else(|| {
-            Some(
-                config
-                    .runtime_dir
-                    .join(format!("node-{NODE_VERSION}/bin/node")),
-            )
-        })
+        .or_else(|| Some(managed_node_path(&config.runtime_dir)))
         .filter(|path| path.is_file())?
         .canonicalize()
         .ok()?;
@@ -392,9 +390,9 @@ async fn prepare_node(config: &Config) -> DomainResult<PathBuf> {
         .platforms
         .get(&key)
         .ok_or_else(|| install_error(format!("Node.js runtime is unavailable for {key}")))?;
-    let destination = config.runtime_dir.join(format!("node-{NODE_VERSION}"));
+    let node = managed_node_path(&config.runtime_dir);
+    let destination = node.parent().unwrap().parent().unwrap().to_path_buf();
     recover_directory_replace(&destination)?;
-    let node = destination.join("bin/node");
     if node.is_file() && validate_node(&node, Some(NODE_VERSION)).await.is_ok() {
         return node.canonicalize().map_err(storage_error);
     }
@@ -461,10 +459,7 @@ async fn prepare_node(config: &Config) -> DomainResult<PathBuf> {
     replace_directory(&staging, &destination)?;
     drop(staging_guard);
     drop(archive_guard);
-    destination
-        .join("bin/node")
-        .canonicalize()
-        .map_err(storage_error)
+    node.canonicalize().map_err(storage_error)
 }
 
 struct TemporaryFile(PathBuf);
@@ -816,7 +811,11 @@ fn private_path(node: &Path) -> std::ffi::OsString {
 }
 
 /// Launch an isolated browser worker and verify hello/start/stop RPCs.
-pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<()> {
+pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<serde_json::Value> {
+    let profile_dir =
+        std::env::temp_dir().join(format!("huntproxy-validation-{}", uuid::Uuid::new_v4()));
+    create_private_dir(&profile_dir)?;
+    let _profile_guard = TemporaryDirectory(profile_dir.clone());
     let mut command = Command::new(&prepared.node_path);
     command
         .arg(&prepared.worker_path)
@@ -826,6 +825,8 @@ pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<(
         )
         .env("HUNTPROXY_CHROME_EXECUTABLE", &prepared.chromium_path)
         .env("PLAYWRIGHT_BROWSERS_PATH", "0")
+        .env("HUNTPROXY_BROWSER_HEADLESS", "true")
+        .env("HUNTPROXY_BROWSER_HEADLESS_COMPAT", "true")
         .env("PATH", private_path(&prepared.node_path))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -868,7 +869,7 @@ pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<(
     let mut stdout = BufReader::new(stdout);
     let validation = tokio::time::timeout(Duration::from_secs(45), async {
         rpc_call(&mut stdin, &mut stdout, 1, "hello", None).await?;
-        rpc_call(
+        let started = rpc_call(
             &mut stdin,
             &mut stdout,
             2,
@@ -877,7 +878,9 @@ pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<(
                 "session_id": 1,
                 "engine": "chromium",
                 "url": "about:blank",
-                "persistent": false
+                "persistent": true,
+                "profile": "validation",
+                "profile_dir": profile_dir
             })),
         )
         .await?;
@@ -888,13 +891,31 @@ pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<(
             "session.stop",
             Some(serde_json::json!({"session_id": 1})),
         )
-        .await
+        .await?;
+        Ok::<_, DomainError>(started)
     })
     .await;
     drop(stdin);
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    let stderr = stderr_task.await.unwrap_or_default();
+    // Give the worker a chance to terminate any Chromium process still starting.
+    #[cfg(unix)]
+    if let Some(id) = child.id() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(id as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    if tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr_task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
     match validation {
         Err(_) => Err(install_error(format!(
             "browser validation timed out: {}",
@@ -904,7 +925,7 @@ pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<(
             "{error}: {}",
             bounded_text(&stderr, 4096)
         ))),
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(started)) => Ok(started),
     }
 }
 
@@ -914,7 +935,7 @@ async fn rpc_call(
     id: u64,
     method: &str,
     params: Option<serde_json::Value>,
-) -> DomainResult<()> {
+) -> DomainResult<serde_json::Value> {
     let mut request = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method});
     if let Some(params) = params {
         request["params"] = params;
@@ -963,7 +984,7 @@ async fn rpc_call(
                 "browser worker compatibility: {error}"
             )));
         }
-        return Ok(());
+        return Ok(value["result"].clone());
     }
 }
 
@@ -973,21 +994,39 @@ async fn validate_browser_once(
 ) -> DomainResult<()> {
     let marker = config.runtime_dir.join("browser-validation.json");
     let playwright = validate_playwright_directory(&prepared.playwright_core_path, None)?;
-    let identity = serde_json::to_vec(&serde_json::json!({
+    let mut identity = serde_json::json!({
         "schema_version": 1,
+        "validation_path": "persistent_native",
         "node": file_identity(&prepared.node_path)?,
         "worker": file_identity(&prepared.worker_path)?,
         "playwright": playwright.version,
         "chromium_revision": playwright.chromium_revision,
         "chromium_version": playwright.chromium_version,
         "chromium": file_identity(&prepared.chromium_path)?,
-    }))
-    .map_err(|error| install_error(format!("encode browser validation marker: {error}")))?;
-    if fs::read(&marker).ok().as_deref() == Some(identity.as_slice()) {
-        return Ok(());
+    });
+    if let Ok(bytes) = fs::read(&marker) {
+        if let Ok(mut previous) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(object) = previous.as_object_mut() {
+                object.remove("sandbox_state");
+                object.remove("sandbox_reason");
+            }
+            if previous == identity {
+                return Ok(());
+            }
+        }
     }
-    validate_browser(prepared).await?;
-    write_durable_private_file(&marker, &identity)
+    let started = validate_browser(prepared).await?;
+    identity["sandbox_state"] = started
+        .get("sandbox_state")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    identity["sandbox_reason"] = started
+        .get("sandbox_reason")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let encoded = serde_json::to_vec(&identity)
+        .map_err(|error| install_error(format!("encode browser validation marker: {error}")))?;
+    write_durable_private_file(&marker, &encoded)
 }
 
 fn file_identity(path: &Path) -> DomainResult<serde_json::Value> {
@@ -1515,6 +1554,46 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validation_uses_and_cleans_persistent_profile() {
+        let temporary = temporary_directory();
+        let worker = temporary.path().join("worker.sh");
+        fs::write(&worker, r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"hello"'*) echo '{"id":1,"result":{}}' ;;
+    *'"method":"session.start"'*)
+      case "$line" in *'"persistent":true'*'"profile":"validation"'*) ;; *) exit 2;; esac
+      profile=$(printf '%s' "$line" | sed -n 's/.*"profile_dir":"\([^"]*\)".*/\1/p')
+      [ -d "$profile" ] || exit 3
+      printf '%s' "$profile" > profile-path
+      if [ -e fail ]; then
+        echo '{"id":2,"error":{"message":"launch failed"}}'
+      else
+        echo '{"id":2,"result":{"sandbox_state":"disabled_fallback","sandbox_reason":"sandbox unavailable"}}'
+      fi ;;
+    *'"method":"session.stop"'*) echo '{"id":3,"result":{}}' ;;
+  esac
+done
+"#).unwrap();
+        let prepared = PreparedInstallation {
+            node_path: PathBuf::from("/bin/sh"),
+            worker_path: worker,
+            playwright_core_path: temporary.path().to_path_buf(),
+            chromium_path: temporary.path().join("chromium"),
+            preserved_plugins: vec![],
+        };
+        let result = validate_browser(&prepared).await.unwrap();
+        assert_eq!(result["sandbox_state"], "disabled_fallback");
+        let profile = fs::read_to_string(temporary.path().join("profile-path")).unwrap();
+        assert!(!Path::new(&profile).exists());
+        fs::write(temporary.path().join("fail"), b"").unwrap();
+        assert!(validate_browser(&prepared).await.is_err());
+        let profile = fs::read_to_string(temporary.path().join("profile-path")).unwrap();
+        assert!(!Path::new(&profile).exists());
+    }
+
     fn hashes(files: &[(&str, &[u8])]) -> BTreeMap<String, String> {
         files
             .iter()
@@ -1532,15 +1611,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unsupported_node_falls_back_to_the_pinned_runtime() {
+    async fn unsupported_node_falls_back_and_provisioning_reuses_the_pinned_runtime() {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = temporary_directory();
         let data_dir = temporary.path().join("data");
         let old_node = temporary.path().join("old-node");
-        let pinned_node = data_dir
-            .join("runtime")
-            .join(format!("node-{NODE_VERSION}/bin/node"));
+        let pinned_node = managed_node_path(&data_dir.join("runtime"));
         fs::create_dir_all(pinned_node.parent().unwrap()).unwrap();
         for (node, version) in [(&old_node, "18.19.1"), (&pinned_node, NODE_VERSION)] {
             fs::write(node, format!("#!/bin/sh\nprintf 'v{version}\\n'\n")).unwrap();
@@ -1553,9 +1630,15 @@ mod tests {
         .unwrap();
 
         let config = Config::load(Some(data_dir)).unwrap();
-        assert_eq!(config.node_path, None);
+        let selected = config.node_path.as_ref().unwrap();
         assert_eq!(
             prepare_node(&config).await.unwrap(),
+            selected.canonicalize().unwrap()
+        );
+        let mut without_selected_node = config;
+        without_selected_node.node_path = None;
+        assert_eq!(
+            prepare_node(&without_selected_node).await.unwrap(),
             pinned_node.canonicalize().unwrap()
         );
     }

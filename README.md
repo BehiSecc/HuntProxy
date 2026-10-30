@@ -378,7 +378,7 @@ A proxy can reduce bot checks, but it cannot prevent every CAPTCHA. When one sti
 
 ### Browser sandbox error on Ubuntu 24.04+
 
-On Ubuntu 24.04 and newer, AppArmor can block the user namespaces Chromium's sandbox needs. If `browser_start` reports a sandbox failure, allow the managed Chromium in an AppArmor profile (the error names the exact executable), then load it with `sudo apparmor_parser -r /etc/apparmor.d/huntproxy-chromium`:
+On Ubuntu 24.04 and newer, AppArmor can block the user namespaces Chromium's sandbox needs. HuntProxy falls back to running without the sandbox and reports this in `HuntProxy doctor`. To keep the sandbox enabled, allow the reported Chromium executable in an AppArmor profile, then load it with `sudo apparmor_parser -r /etc/apparmor.d/huntproxy-chromium`:
 
 ```
 abi <abi/4.0>,

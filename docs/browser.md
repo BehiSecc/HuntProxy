@@ -8,4 +8,6 @@ Set `HUNTPROXY_CHROME_EXECUTABLE=/absolute/path/to/chrome` to select an installe
 
 Set environment variables before starting the daemon; existing sessions retain their process until restarted. `HuntProxy doctor` and browser status report the browser path, version, and mode.
 
+If Chromium's sandbox cannot start, HuntProxy retries without it and reports the fallback in browser status and `HuntProxy doctor`.
+
 The proxy verifies origin certificates using combined Chromium and Mozilla roots. Chromium root loading does not implement Chrome's additional root-policy or certificate-transparency checks.
