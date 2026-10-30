@@ -462,7 +462,7 @@ fn request_rules_tool_def() -> Value {
 
 pub(crate) fn tool_defs() -> Value {
     json!([
-        {"name":"projects","description":"List projects, create one, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope"],"description":"list needs no project_id; create needs name and target_url; usage needs project_id; set_scope needs project_id; omitted scope resets to defaults."},"project_id":{"type":"integer","description":"Required for usage and set_scope."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"],"additionalProperties":false}},
+        {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults."},"project_id":{"type":"integer","description":"Optional for list; required for usage and set_scope."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List compact installed-extension summaries and any rejected packages. Use extension_describe for schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and requested/effective limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
         {"name":"extension_preview","description":"Run the real extension planner without creating a job or sending requests. Returns stage-scoped request, candidate, runtime, and mode estimates plus a bounded planning_summary with selection/exclusion details when supplied by the plugin.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer"},"input":{"type":"object","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
@@ -501,7 +501,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"huntproxy_restart","description":"Restart or recover HuntProxy without reconnecting the agent's MCP session. Preserves saved projects, traffic, findings, Reply/Fuzzer state, and browser profiles. Active browsers close and can be resumed using browser_start. Running jobs are interrupted; memory-only plugin results/checkpoints are lost. Use when the user asks to restart or to continue after HuntProxy has stopped.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply byte transforms, including gzip_decode/gunzip and brotli_decode","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string","enum":["utf8","base64","hex"],"default":"utf8"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
         {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
-        {"name":"project_transfer","description":"Import or export a project bundle or HAR through a local file. Sanitized export is the default; include_secrets enables credentials; browser state also requires include_chromium_profile=true. Returns a summary/path, never archive bytes.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export","import"]},"format":{"type":"string","enum":["huntproxy","har"]},"project_id":{"type":"integer","description":"Required for export and HAR import."},"file_path":{"type":"string","description":"Required for import; optional export destination. Defaults to the configured exports directory."},"include_secrets":{"type":"boolean","default":false},"include_chromium_profile":{"type":"boolean","default":false}},"required":["action","format"],"additionalProperties":false}},
+        {"name":"project_transfer","description":"Import or export a project bundle or HAR through a local file. By default HAR omits sensitive headers including cookies but keeps URLs, queries, and bodies; project bundles omit credentials, bodies, replay and browser state. include_secrets includes credentials; browser state also requires include_chromium_profile=true. Returns a summary/path, never archive bytes.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export","import"]},"format":{"type":"string","enum":["huntproxy","har"]},"project_id":{"type":"integer","description":"Required for export and HAR import."},"file_path":{"type":"string","description":"Required for import; optional export destination. Defaults to the configured exports directory."},"include_secrets":{"type":"boolean","default":false},"include_chromium_profile":{"type":"boolean","default":false}},"required":["action","format"],"additionalProperties":false}},
         {"name":"exchange_annotate","description":"Replace an exchange title, note, and labels; omitted fields are cleared","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
     ])
 }
@@ -1212,7 +1212,30 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(|v| v.as_str())
                 .unwrap_or("list");
             match action {
-                "list" => Ok(json!(state.db.list_projects().await?)),
+                "list" => {
+                    if args.get("project_id").is_some() {
+                        Ok(json!(
+                            state.db.get_project(require_project_id(&args)?).await?
+                        ))
+                    } else {
+                        let projects = state.db.list_projects().await?;
+                        Ok(Value::Array(
+                            projects
+                                .into_iter()
+                                .map(|project| {
+                                    let mut value = json!(project);
+                                    value.as_object_mut().unwrap().retain(|key, _| {
+                                        matches!(
+                                            key.as_str(),
+                                            "id" | "name" | "target_url" | "updated_at"
+                                        )
+                                    });
+                                    value
+                                })
+                                .collect(),
+                        ))
+                    }
+                }
                 "create" => {
                     let pname = args
                         .get("name")
@@ -2845,17 +2868,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             .join(format!("huntproxy-project-{}.har", project_id.get()))
                     });
                     let har = state.db.export_har(project_id, include_secrets).await?;
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(true)
-                        .write(true)
-                        .open(&path)
-                        .map_err(|error| {
-                            DomainError::new(ErrorCode::StorageError, error.to_string())
-                        })?;
-                    serde_json::to_writer(file, &har).map_err(|error| {
-                        DomainError::new(ErrorCode::StorageError, error.to_string())
-                    })?;
+                    crate::har::write_har_file(&path, &har)?;
                     state
                         .db
                         .audit(
@@ -2938,6 +2951,54 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn projects_list_returns_summaries_and_optional_full_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: directory.path().to_path_buf(),
+            spool_dir: directory.path().join("spool"),
+            export_dir: directory.path().join("exports"),
+            runtime_dir: directory.path().join("runtime"),
+            plugin_dir: directory.path().join("plugins"),
+            ..Config::default()
+        };
+        let state = crate::app::bootstrap_state(config).await.unwrap();
+        let project = state
+            .db
+            .create_project(CreateProjectRequest {
+                name: "Example".into(),
+                target_url: "https://example.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let list = call_tool(state.clone(), "projects", json!({"action":"list"}))
+            .await
+            .unwrap();
+        let item = &list.as_array().unwrap()[0];
+        let keys = item
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["id", "name", "target_url", "updated_at"]);
+        assert_eq!(item["id"], project.id.get());
+        let full = call_tool(
+            state.clone(),
+            "projects",
+            json!({"action":"list", "project_id":project.id.get()}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(full, json!(project));
+        assert!(
+            call_tool(state, "projects", json!({"action":"list", "project_id":-1}))
+                .await
+                .is_err()
+        );
+    }
 
     fn history_call(arguments: Value) -> JsonRpcRequest {
         JsonRpcRequest {

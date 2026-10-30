@@ -10,6 +10,30 @@ use std::path::Path;
 pub const MAX_HAR_FILE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_HAR_ENTRIES: usize = 100_000;
 
+/// Write an exported HAR with owner-only permissions on Unix.
+pub fn write_har_file(path: &Path, har: &Har) -> DomainResult<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+    }
+    file.set_len(0)
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+    serde_json::to_writer(file, har)
+        .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Har {
     pub log: HarLog,
@@ -552,12 +576,23 @@ mod tests {
             cache_provenance: CacheProvenance::None,
             transport_provenance: None,
             transport_profile: None,
-            request_headers: vec![HeaderEntry {
-                name: "X-Test".into(),
-                value: vec![0, 255],
+            request_headers: vec![
+                HeaderEntry {
+                    name: "X-Test".into(),
+                    value: vec![0, 255],
+                    ordinal: 0,
+                },
+                HeaderEntry {
+                    name: "Cookie".into(),
+                    value: b"session=secret".to_vec(),
+                    ordinal: 1,
+                },
+            ],
+            response_headers: vec![HeaderEntry {
+                name: "Set-Cookie".into(),
+                value: b"session=secret".to_vec(),
                 ordinal: 0,
             }],
-            response_headers: vec![],
             request_body: Some(vec![0, 1, 255]),
             response_body: Some(vec![9, 8, 7]),
             duration_ms: Some(3),
@@ -567,11 +602,48 @@ mod tests {
         })
         .await
         .unwrap();
+        let sanitized = db.export_har(source.id, false).await.unwrap();
+        let entry = &sanitized.log.entries[0];
+        assert!(entry.request.url.ends_with("?a=1&a=2"));
+        assert_eq!(entry.request.query_string.len(), 2);
+        assert_eq!(entry.request.post_data.as_ref().unwrap().text, "AAH/");
+        assert_eq!(entry.response.content.text.as_deref(), Some("CQgH"));
+        assert!(!entry.request.headers.iter().any(|h| h.name == "Cookie"));
+        assert!(!entry
+            .response
+            .headers
+            .iter()
+            .any(|h| h.name == "Set-Cookie"));
         let har = db.export_har(source.id, true).await.unwrap();
+        assert!(har.log.entries[0]
+            .request
+            .headers
+            .iter()
+            .any(|h| h.name == "Cookie"));
         assert_eq!(har.log.entries[0].request.query_string.len(), 2);
         let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         let path = directory.path().join("history.har");
-        serde_json::to_writer(std::fs::File::create(&path).unwrap(), &har).unwrap();
+        write_har_file(&path, &har).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+            write_har_file(&path, &har).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let target = db
             .create_project(CreateProjectRequest {
                 name: "target".into(),

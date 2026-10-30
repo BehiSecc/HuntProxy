@@ -19,6 +19,7 @@ const MAX_DAEMON_LOG_BYTES: u64 = 5 * 1024 * 1024;
     about = "A web security workbench built for AI agents"
 )]
 struct Cli {
+    /// Directory for HuntProxy data and configuration.
     #[arg(long, global = true, env = "HUNTPROXY_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
@@ -32,6 +33,7 @@ enum Commands {
     Init,
     /// Run the daemon (API, proxy, private socket).
     Serve {
+        /// Run the daemon in the foreground.
         #[arg(long, default_value_t = true)]
         foreground: bool,
     },
@@ -61,6 +63,7 @@ enum Commands {
     ReleaseInfo,
     #[command(hide = true)]
     InstallRelease {
+        /// Path to the release executable.
         #[arg(long)]
         executable: PathBuf,
     },
@@ -90,25 +93,19 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ProjectCmd {
-    Create {
-        name: String,
-        target_url: String,
-    },
+    /// Create a project.
+    Create { name: String, target_url: String },
+    /// List projects.
     List,
-    Rename {
-        id: i64,
-        name: String,
-    },
-    Delete {
-        id: i64,
-    },
-    Usage {
-        id: i64,
-    },
+    /// Rename a project.
+    Rename { id: i64, name: String },
+    /// Delete a project.
+    Delete { id: i64 },
+    /// Show project usage.
+    Usage { id: i64 },
     /// Recalculate persisted usage counters (all projects when ID is omitted).
-    Reconcile {
-        id: Option<i64>,
-    },
+    Reconcile { id: Option<i64> },
+    /// Export a project bundle.
     Export {
         id: i64,
         output: PathBuf,
@@ -119,23 +116,22 @@ enum ProjectCmd {
         #[arg(long, requires = "include_secrets")]
         include_chromium_profile: bool,
     },
-    Import {
-        input: PathBuf,
-    },
+    /// Import a project bundle or archive.
+    Import { input: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
 enum HarCmd {
+    /// Export project HTTP history as HAR 1.2.
     Export {
         project_id: i64,
         output: PathBuf,
+        /// Include sensitive headers, including cookies. URLs, queries, and bodies are always included.
         #[arg(long)]
         include_secrets: bool,
     },
-    Import {
-        project_id: i64,
-        input: PathBuf,
-    },
+    /// Import HAR 1.2 HTTP history into a project.
+    Import { project_id: i64, input: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -143,6 +139,7 @@ enum HistoryCmd {
     /// Delete exchanges strictly older than an RFC 3339 timestamp.
     Clear {
         project_id: i64,
+        /// Remove exchanges older than this RFC 3339 timestamp.
         #[arg(long)]
         before: String,
     },
@@ -352,11 +349,19 @@ async fn run(cli: Cli) -> DomainResult<()> {
             if let Some(hint) = &browser.install_hint {
                 println!("  browser:    {hint}");
             }
+            let mut active_sandbox = false;
             if cfg.socket_path().exists() {
                 match daemon_get(&cfg, "/api/v1/doctor").await {
                     Ok(status) => {
                         println!("  daemon:     running");
                         if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status) {
+                            if let Some(state) = status["browser"]["sandbox_state"].as_str() {
+                                println!("  sandbox:    {state}");
+                                active_sandbox = true;
+                            }
+                            if let Some(reason) = status["browser"]["sandbox_reason"].as_str() {
+                                println!("  sandbox:    {reason}");
+                            }
                             if let Some(profile) = status["transport"]["profile"].as_str() {
                                 println!("  active transport: {profile}");
                             }
@@ -369,6 +374,18 @@ async fn run(cli: Cli) -> DomainResult<()> {
                 }
             } else {
                 println!("  daemon:     not running");
+            }
+            if !active_sandbox {
+                if let Ok(data) = std::fs::read(cfg.runtime_dir.join("browser-validation.json")) {
+                    if let Ok(validation) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        if let Some(state) = validation["sandbox_state"].as_str() {
+                            println!("  sandbox (installation validation): {state}");
+                            if let Some(reason) = validation["sandbox_reason"].as_str() {
+                                println!("  sandbox (installation validation): {reason}");
+                            }
+                        }
+                    }
+                }
             }
             if let Some(output) = read_log_tail(&cfg.daemon_startup_log_path(), 4 * 1024) {
                 println!("  last startup output:\n{output}");
@@ -612,20 +629,10 @@ async fn run(cli: Cli) -> DomainResult<()> {
                     let har = db
                         .export_har(huntproxy::domain::ProjectId(project_id), include_secrets)
                         .await?;
-                    if let Some(parent) = output.parent() {
+                    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
                         huntproxy::config::create_private_dir(parent)?;
                     }
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(true)
-                        .write(true)
-                        .open(&output)
-                        .map_err(|error| {
-                            DomainError::new(ErrorCode::StorageError, error.to_string())
-                        })?;
-                    serde_json::to_writer(file, &har).map_err(|error| {
-                        DomainError::new(ErrorCode::StorageError, error.to_string())
-                    })?;
+                    huntproxy::har::write_har_file(&output, &har)?;
                     println!("Exported HAR to {}", output.display());
                 }
                 HarCmd::Import { project_id, input } => {
