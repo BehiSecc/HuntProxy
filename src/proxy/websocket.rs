@@ -1,4 +1,7 @@
-use super::{full_body, header_entries, is_own_api_target, request_url, ProxyBody};
+use super::{
+    full_body, header_entries, is_own_api_target, request_url, ProxyBody, PROJECT_HINT_HEADER,
+    PROXY_ERROR_HEADER,
+};
 use crate::app::{AppEvent, AppState};
 use crate::domain::*;
 use crate::policy::scope::{resolve_validated_dial, url_is_in_scope, TargetRef};
@@ -80,7 +83,10 @@ pub(super) async fn handle(
     );
     // Compression extensions are not supported by the existing frame relay.
     // Preserve the browser's nonce, cookies, Origin and subprotocol list.
-    request_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("sec-websocket-extensions"));
+    request_headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("sec-websocket-extensions")
+            && !name.eq_ignore_ascii_case(PROJECT_HINT_HEADER)
+    });
     validate_request_headers(&request_headers)?;
     let cap = usize::try_from(project.limits.capture_body_bytes).unwrap_or(usize::MAX);
     let websocket_config = WebSocketConfig::default()
@@ -219,6 +225,8 @@ pub(super) async fn handle(
         for (name, value) in response_headers {
             if !name.eq_ignore_ascii_case("transfer-encoding")
                 && !name.eq_ignore_ascii_case("content-length")
+                && !name.eq_ignore_ascii_case(PROXY_ERROR_HEADER)
+                && !name.eq_ignore_ascii_case(PROJECT_HINT_HEADER)
             {
                 response = response.header(name, value);
             }
@@ -322,7 +330,11 @@ pub(super) async fn handle(
 
     let mut response = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
     for (name, value) in response_headers {
-        response = response.header(name, value);
+        if !name.eq_ignore_ascii_case(PROXY_ERROR_HEADER)
+            && !name.eq_ignore_ascii_case(PROJECT_HINT_HEADER)
+        {
+            response = response.header(name, value);
+        }
     }
     response
         .body(full_body(Bytes::new()))

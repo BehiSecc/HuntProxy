@@ -13,6 +13,7 @@ use crate::storage::{extract_proxy_token, NewExchange};
 use crate::transport::{
     OutboundBody, OutboundRequest, ProtocolMode, StreamingOutboundResponse, TransportIdentity,
 };
+use base64::Engine as _;
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
@@ -76,6 +77,7 @@ const CHROME_BACKGROUND_REQUESTS: &[(&str, &str, &str, bool, bool)] = &[
     ),
 ];
 static SKIPPED_CHROME_REQUESTS: AtomicU64 = AtomicU64::new(0);
+const PROJECT_HINT_HEADER: &str = "x-huntproxy-project-id";
 
 fn is_chrome_background_request(
     session: &CaptureSession,
@@ -138,7 +140,21 @@ fn is_own_api_target(target: &TargetRef, listener: SocketAddr) -> bool {
             && std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok())
 }
 
+fn pin_api_dial(mut dial: ValidatedDial, listener: SocketAddr) -> Option<ValidatedDial> {
+    dial.approved_socket_addrs.retain(|addr| {
+        if listener.ip().is_unspecified() {
+            addr.is_ipv4() == listener.is_ipv4()
+                && (addr.ip().is_loopback()
+                    || std::net::UdpSocket::bind(SocketAddr::new(addr.ip(), 0)).is_ok())
+        } else {
+            addr.ip() == listener.ip()
+        }
+    });
+    (!dial.approved_socket_addrs.is_empty()).then_some(dial)
+}
+
 type ProxyBody = UnsyncBoxBody<Bytes, Infallible>;
+const PROXY_ERROR_HEADER: &str = "x-huntproxy-proxy-error";
 
 fn full_body(bytes: Bytes) -> ProxyBody {
     Full::new(bytes).boxed_unsync()
@@ -244,10 +260,11 @@ async fn handle_authenticated(
 
 async fn forward_request(
     state: Arc<AppState>,
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     session: CaptureSession,
     forced_scheme: Option<&str>,
 ) -> DomainResult<Response<ProxyBody>> {
+    request.headers_mut().remove(PROJECT_HINT_HEADER);
     if websocket::is_upgrade(&request) {
         return websocket::handle(state, request, session, forced_scheme).await;
     }
@@ -257,33 +274,71 @@ async fn forward_request(
         take_internal_crawler_marker(&mut parts.headers, session.is_browser_bound);
     let browser_origin = take_browser_origin_marker(&mut parts.headers, session.is_browser_bound)?;
     let mut url = request_url(&parts, forced_scheme)?;
+    let original_url = url.clone();
+    let original_target = TargetRef::from_url(&url)?;
     enforce_browser_request_origin(browser_origin.as_deref(), &url, false)?;
     let mut applied_rules =
         crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut url).await?;
     enforce_browser_request_origin(browser_origin.as_deref(), &url, true)?;
     let target = TargetRef::from_url(&url)?;
-    let rotation = state
-        .db
-        .next_ip_rotation_route(session.project_id, &url)
-        .await?;
+    // Requests to this daemon stay on its listener, independent of project
+    // egress settings. A rewrite to or from another target is not internal.
+    let api_listen = state.config.api_listen;
+    let api_dial = if is_own_api_target(&original_target, api_listen)
+        && is_own_api_target(&target, api_listen)
+    {
+        let original_dial =
+            resolve_validated_dial(&original_url, &project.scope, Duration::from_secs(60)).await?;
+        let target_dial = if original_url == url {
+            original_dial.clone()
+        } else {
+            resolve_validated_dial(&url, &project.scope, Duration::from_secs(60)).await?
+        };
+        if pin_api_dial(original_dial, api_listen).is_some() {
+            pin_api_dial(target_dial, api_listen)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let rotation = if api_dial.is_some() {
+        None
+    } else {
+        state
+            .db
+            .next_ip_rotation_route(session.project_id, &url)
+            .await?
+    };
     let wire_url = match &rotation {
         Some(route) => route.wire_url(&url)?,
         None => url.clone(),
     };
     let wire_target = TargetRef::from_url(&wire_url)?;
-    let upstream_proxy = state
-        .db
-        .resolve_upstream_proxy(
-            session.project_id,
-            &state.config.upstream_proxies,
-            &wire_target.host,
-            None,
-        )
-        .await?;
+    let upstream_proxy = if api_dial.is_some() {
+        None
+    } else {
+        state
+            .db
+            .resolve_upstream_proxy(
+                session.project_id,
+                &state.config.upstream_proxies,
+                &wire_target.host,
+                None,
+            )
+            .await?
+    };
     let capture = url_is_in_scope(&url, &project.scope)?
         && !is_own_api_target(&target, state.config.api_listen)
         && !is_own_api_target(&wire_target, state.config.api_listen);
-    let dial = resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?;
+    let hint_project = api_dial.is_some()
+        && parts.method == Method::GET
+        && original_target.path == "/api/v1/projects"
+        && target.path == "/api/v1/projects";
+    let dial = match api_dial {
+        Some(dial) => dial,
+        None => resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?,
+    };
     let method = parts.method.clone();
     let mut headers = parts
         .headers
@@ -328,6 +383,7 @@ async fn forward_request(
         )
         .await?,
     );
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(PROJECT_HINT_HEADER));
     let mut wire_headers = headers.clone();
     if rotation.is_some() {
         wire_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
@@ -401,7 +457,8 @@ async fn forward_request(
     if let Some(route) = &rotation {
         outbound.transport_profile = route.transport_profile(&outbound.transport_profile);
     }
-    streaming_response(
+    let project_id = session.project_id;
+    let mut response = streaming_response(
         state,
         session,
         target,
@@ -414,7 +471,19 @@ async fn forward_request(
         capture,
         internal_crawler_request,
         applied_rules,
-    )
+    )?;
+    response.headers_mut().remove(PROJECT_HINT_HEADER);
+    if hint_project && response.status() == StatusCode::OK {
+        response.headers_mut().insert(
+            PROJECT_HINT_HEADER,
+            project_id
+                .get()
+                .to_string()
+                .parse()
+                .expect("numeric project ID"),
+        );
+    }
+    Ok(response)
 }
 
 async fn spool_request_body(
@@ -672,6 +741,7 @@ fn streaming_response(
             || name.eq_ignore_ascii_case("connection")
             || name.eq_ignore_ascii_case("proxy-connection")
             || name.eq_ignore_ascii_case("keep-alive")
+            || name.eq_ignore_ascii_case(PROXY_ERROR_HEADER)
         {
             continue;
         }
@@ -1133,11 +1203,15 @@ async fn capture_session_active(state: &AppState, session: &CaptureSession) -> b
 
 fn proxy_error_response(error: DomainError) -> Response<ProxyBody> {
     if error.code() == ErrorCode::ProxyAuthRequired {
+        let message = "Proxy authentication required";
         return Response::builder()
             .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .header(PROXY_ERROR_HEADER, proxy_error_marker(message))
+            .header("Cache-Control", "no-store")
+            .header("Content-Type", "text/plain; charset=utf-8")
             .header("Proxy-Authenticate", "Basic realm=\"HuntProxy\"")
             .header("Proxy-Authenticate", "Bearer")
-            .body(full_body(Bytes::from("Proxy authentication required")))
+            .body(full_body(Bytes::from_static(message.as_bytes())))
             .expect("static proxy auth response");
     }
     let status = match error.code() {
@@ -1146,10 +1220,60 @@ fn proxy_error_response(error: DomainError) -> Response<ProxyBody> {
         ErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     };
+    let message = proxy_error_message(&error);
     Response::builder()
         .status(status)
-        .body(full_body(Bytes::from(error.to_string())))
+        .header(PROXY_ERROR_HEADER, proxy_error_marker(&message))
+        .header("Cache-Control", "no-store")
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(full_body(Bytes::from(message)))
         .expect("static proxy error response")
+}
+
+fn proxy_error_marker(message: &str) -> String {
+    format!(
+        "v1:{}",
+        base64::engine::general_purpose::STANDARD.encode(message)
+    )
+}
+
+fn proxy_error_message(error: &DomainError) -> String {
+    if let DomainError::App {
+        details: Some(details),
+        ..
+    } = error
+    {
+        if let Some(detail) = details.get(crate::transport::UPSTREAM_PROXY_ERROR_DETAIL) {
+            let host = detail
+                .get("host")
+                .and_then(|value| value.as_str())
+                .and_then(|value| url::Host::parse(value).ok());
+            let port = detail
+                .get("port")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u16::try_from(value).ok());
+            if let (Some(host), Some(port)) = (host, port) {
+                let mut message = format!("upstream proxy {host}:{port} error");
+                if let Some(code) = detail
+                    .get("os_error")
+                    .and_then(|value| value.as_i64())
+                    .and_then(|value| i32::try_from(value).ok())
+                {
+                    message.push_str(&format!(": {}", std::io::Error::from_raw_os_error(code)));
+                }
+                return message;
+            }
+        }
+    }
+    match error.code() {
+        ErrorCode::ScopeDenied => "request denied by scope".into(),
+        ErrorCode::DnsBlocked => "DNS lookup failed".into(),
+        ErrorCode::BodyTooLarge => "request body too large".into(),
+        ErrorCode::Timeout => "request timed out".into(),
+        ErrorCode::Unavailable => "upstream unavailable".into(),
+        ErrorCode::ProtocolError => "upstream protocol error".into(),
+        code => format!("proxy request failed ({})", code.as_str()),
+    }
 }
 
 struct MitmAuthority {
@@ -1473,6 +1597,176 @@ mod tests {
             &TargetRef::from_url("http://192.0.2.11:17890/").unwrap(),
             wildcard
         ));
+    }
+
+    #[tokio::test]
+    async fn project_hint_is_bound_to_own_api_and_spoofed_headers_are_removed() {
+        use crate::request_rules::{
+            RequestRuleInput, RequestRuleMatchKind, RequestRuleOperation, RequestRuleTarget,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        async fn send(proxy: SocketAddr, url: &str, token: &str) -> String {
+            let mut socket = TcpStream::connect(proxy).await.unwrap();
+            socket.write_all(format!(
+                "GET {url} HTTP/1.1\r\nHost: {}\r\nProxy-Authorization: Bearer {token}\r\nX-HuntProxy-Project-Id: 999\r\nConnection: close\r\n\r\n",
+                url::Url::parse(url).unwrap().authority()
+            ).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap().to_ascii_lowercase()
+        }
+
+        async fn run_origin(listener: TcpListener, seen: mpsc::UnboundedSender<String>) {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                seen.send(String::from_utf8(request).unwrap().to_ascii_lowercase())
+                    .unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nX-HuntProxy-Project-Id: 999\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, project, session) = proxy_test_fixture(&directory).await;
+        let own = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own_addr = own.local_addr().unwrap();
+        let external = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let external_addr = external.local_addr().unwrap();
+        Arc::get_mut(&mut state).unwrap().config.api_listen = own_addr;
+        let (own_tx, mut own_rx) = mpsc::unbounded_channel();
+        let (external_tx, mut external_rx) = mpsc::unbounded_channel();
+        let own_server = tokio::spawn(run_origin(own, own_tx));
+        let external_server = tokio::spawn(run_origin(external, external_tx));
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        let token = session.token_once.as_deref().unwrap();
+        let own_base = format!("http://localhost:{}", own_addr.port());
+        let external_base = format!("http://{external_addr}");
+
+        // Internal UI requests work even if the project's upstream is unavailable.
+        state
+            .db
+            .set_project_upstream_proxy(project.id, Some("http://127.0.0.1:9".into()))
+            .await
+            .unwrap();
+        for path in ["/", "/api/v1/projects/1", "/api/v1/projects"] {
+            let response = send(proxy_addr, &format!("{own_base}{path}"), token).await;
+            assert!(response.starts_with("http/1.1 200"), "{response}");
+            let hints: Vec<_> = response
+                .lines()
+                .filter(|line| line.starts_with("x-huntproxy-project-id:"))
+                .collect();
+            if path == "/api/v1/projects" {
+                assert_eq!(
+                    hints,
+                    vec![format!("x-huntproxy-project-id: {}", project.id.get())]
+                );
+            } else {
+                assert!(hints.is_empty(), "{response}");
+            }
+            assert!(!own_rx
+                .recv()
+                .await
+                .unwrap()
+                .contains("x-huntproxy-project-id:"));
+        }
+        let response = send(
+            proxy_addr,
+            &format!("{external_base}/api/v1/projects"),
+            token,
+        )
+        .await;
+        assert!(
+            !response.starts_with("http/1.1 200"),
+            "external traffic bypassed its upstream"
+        );
+
+        // A URL rewrite in either direction must not turn external traffic into
+        // trusted daemon traffic or bypass the configured upstream.
+        for (from, to) in [
+            (
+                format!("{own_base}/api/v1/projects"),
+                format!("{external_base}/api/v1/projects"),
+            ),
+            (
+                format!("{external_base}/api/v1/projects"),
+                format!("{own_base}/api/v1/projects"),
+            ),
+        ] {
+            let rule = state
+                .db
+                .create_request_rule(
+                    project.id,
+                    RequestRuleInput {
+                        name: "route test".into(),
+                        enabled: true,
+                        position: 0,
+                        host_pattern: None,
+                        target: RequestRuleTarget::Url,
+                        operation: RequestRuleOperation::Replace,
+                        header_name: None,
+                        match_kind: RequestRuleMatchKind::Literal,
+                        pattern: from.clone(),
+                        replacement: Some(to),
+                        replace_all: true,
+                    },
+                )
+                .await
+                .unwrap();
+            let response = send(proxy_addr, &from, token).await;
+            assert!(
+                !response.starts_with("http/1.1 200"),
+                "rewrite bypassed its upstream"
+            );
+            assert!(!response.contains("x-huntproxy-project-id:"));
+            state
+                .db
+                .delete_request_rule(project.id, rule.id)
+                .await
+                .unwrap();
+        }
+
+        state
+            .db
+            .set_project_upstream_proxy(project.id, None)
+            .await
+            .unwrap();
+        let response = send(
+            proxy_addr,
+            &format!("{external_base}/api/v1/projects"),
+            token,
+        )
+        .await;
+        assert!(response.starts_with("http/1.1 200"), "{response}");
+        assert!(!response.contains("x-huntproxy-project-id:"));
+        assert!(!external_rx
+            .recv()
+            .await
+            .unwrap()
+            .contains("x-huntproxy-project-id:"));
+
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
+        own_server.abort();
+        external_server.abort();
     }
 
     #[tokio::test]
@@ -2284,6 +2578,215 @@ mod tests {
             .map(|value| value.to_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(challenges, vec!["Basic realm=\"HuntProxy\"", "Bearer"]);
+        assert_eq!(
+            response.headers()[PROXY_ERROR_HEADER],
+            proxy_error_marker("Proxy authentication required")
+        );
+    }
+
+    #[tokio::test]
+    async fn synthetic_proxy_errors_expose_only_safe_diagnostics() {
+        let secret = "http://fixture-user:fixture-password@proxy.example:8080";
+        let errors = vec![
+            DomainError::new(ErrorCode::DnsBlocked, secret),
+            DomainError::new(ErrorCode::BodyTooLarge, secret),
+            DomainError::new(ErrorCode::Timeout, secret),
+            DomainError::new(ErrorCode::Unavailable, secret),
+            DomainError::new(ErrorCode::ProtocolError, secret),
+            DomainError::Other(anyhow::anyhow!("nested cause: {secret}").context("outer error")),
+            DomainError::with_details(
+                ErrorCode::Unavailable,
+                secret,
+                serde_json::json!({ (crate::transport::UPSTREAM_PROXY_ERROR_DETAIL): {
+                    "host": "fixture-user:fixture-password@proxy.example", "port": 8080,
+                    "os_error": 111,
+                }}),
+            ),
+        ];
+        for error in errors {
+            let response = proxy_error_response(error);
+            let marker = response.headers()[PROXY_ERROR_HEADER]
+                .to_str()
+                .unwrap()
+                .strip_prefix("v1:")
+                .unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(marker)
+                .unwrap();
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(decoded.as_slice(), body.as_ref());
+            let message = std::str::from_utf8(&body).unwrap();
+            assert!(!message.contains("fixture-user"), "{message}");
+            assert!(!message.contains("fixture-password"), "{message}");
+            assert!(!message.contains("nested cause"), "{message}");
+        }
+        let safe = DomainError::with_details(
+            ErrorCode::Unavailable,
+            secret,
+            serde_json::json!({ (crate::transport::UPSTREAM_PROXY_ERROR_DETAIL): {
+                "host": "127.0.0.1", "port": 8080, "os_error": 111,
+            }}),
+        );
+        let response = proxy_error_response(safe);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let message = std::str::from_utf8(&body).unwrap();
+        assert!(message.contains("upstream proxy 127.0.0.1:8080 error"));
+        assert!(message.contains(&std::io::Error::from_raw_os_error(111).to_string()));
+        assert!(!message.contains("fixture-password"));
+    }
+
+    #[tokio::test]
+    async fn origin_response_cannot_spoof_proxy_error_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _, session) = proxy_test_fixture(&directory).await;
+        let response = streaming_response(
+            state,
+            session,
+            TargetRef::from_url("https://example.com/").unwrap(),
+            Method::GET,
+            vec![],
+            None,
+            StreamingOutboundResponse {
+                status: StatusCode::BAD_GATEWAY,
+                headers: vec![
+                    ("X-HuntProxy-Proxy-Error".into(), b"v1:Zm9yZ2Vk".to_vec()),
+                    ("content-type".into(), b"text/plain".to_vec()),
+                ],
+                body: Box::pin(futures::stream::iter(vec![Ok(Bytes::from_static(
+                    b"origin failure",
+                ))])),
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::ProtocolProfileOnly,
+                transport_profile: "test".into(),
+            },
+            1024,
+            std::time::Instant::now(),
+            false,
+            false,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key(PROXY_ERROR_HEADER));
+        assert_eq!(response.headers()["content-type"], "text/plain");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "origin failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the installed Chromium browser runtime"]
+    async fn browser_navigation_reports_real_proxy_failures_without_credentials() {
+        use crate::browser::BrowserAction;
+        use futures::FutureExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (state, project, _) = proxy_test_fixture(&directory).await;
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = origin.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let service = service_fn(|request: Request<Incoming>| async move {
+                        let status = match request.uri().path() {
+                            "/missing" => StatusCode::NOT_FOUND,
+                            "/server-error" => StatusCode::BAD_GATEWAY,
+                            _ => StatusCode::OK,
+                        };
+                        let response = Response::builder()
+                            .status(status)
+                            .header(PROXY_ERROR_HEADER, "v1:Zm9yZ2Vk")
+                            .header("cache-control", "no-store")
+                            .body(Full::new(Bytes::from_static(b"local fixture")))
+                            .unwrap();
+                        Ok::<_, Infallible>(response)
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy_task = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        let service = BrowserService::new_with_proxy_and_ca(
+            state.db.clone(),
+            None,
+            Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("browser-worker/index.js")),
+            format!("http://{proxy_addr}"),
+            Some(state.config.ca_cert_path()),
+            directory.path().join("profiles"),
+        );
+        let session = service
+            .start_ephemeral(project.id, "about:blank".into())
+            .await
+            .unwrap();
+        let outcome = std::panic::AssertUnwindSafe(async {
+            for (path, status) in [("/missing", 404), ("/server-error", 502)] {
+                let result = service
+                    .action(
+                        project.id,
+                        session.id,
+                        BrowserAction::Navigate {
+                            url: format!("http://{origin_addr}{path}"),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.ok);
+                assert_eq!(result.data.unwrap()["status"], status);
+            }
+            let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let upstream_addr = unavailable.local_addr().unwrap();
+            drop(unavailable);
+            state
+                .db
+                .set_project_upstream_proxy(
+                    project.id,
+                    Some(format!(
+                        "http://fixture-user:fixture-password@{upstream_addr}"
+                    )),
+                )
+                .await
+                .unwrap();
+            let error = service
+                .action(
+                    project.id,
+                    session.id,
+                    BrowserAction::Navigate {
+                        url: format!("http://{origin_addr}/failure"),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unavailable);
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("upstream proxy {upstream_addr} error")),
+                "{message}"
+            );
+            assert!(message.contains("Connection refused"), "{message}");
+            assert!(!message.contains("fixture-user"), "{message}");
+            assert!(!message.contains("fixture-password"), "{message}");
+        })
+        .catch_unwind()
+        .await;
+        let _ = service.stop(project.id, session.id).await;
+        cancel.cancel();
+        let _ = proxy_task.await;
+        origin_task.abort();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]

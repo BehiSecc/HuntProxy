@@ -1364,7 +1364,7 @@ async function performPages(session, action) {
     session.page = page;
     await page.bringToFront();
     if (action.url && action.url !== "about:blank") {
-      await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await navigateWithProxyCheck(page, () => page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30_000 }));
       await reconcileCurrentOriginStorage(session);
     }
     return { message: "browser page opened", data: {
@@ -1652,6 +1652,49 @@ async function performBrowserRequest(session, action) {
   return { message: "browser request completed", data: result };
 }
 
+function proxyErrorMarker(response) {
+  const marker = response?.headers()["x-huntproxy-proxy-error"];
+  return typeof marker === "string" && marker.startsWith("v1:") ? marker : null;
+}
+
+async function navigateWithProxyCheck(page, operation) {
+  const context = page.context();
+  const workerResponses = [];
+  let notify;
+  const onResponse = (response) => {
+    if (!response.fromServiceWorker() && response.request().serviceWorker() && proxyErrorMarker(response)) {
+      workerResponses.push(response);
+      notify?.();
+    }
+  };
+  context.on("response", onResponse);
+  try {
+    const response = await operation();
+    const marker = proxyErrorMarker(response);
+    if (!marker) return response;
+    let source = response;
+    if (response.fromServiceWorker()) {
+      const match = () => workerResponses.find((candidate) => candidate.url() === response.url()
+        && candidate.request().method() === response.request().method() && proxyErrorMarker(candidate) === marker);
+      source = match();
+      if (!source) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, 150);
+          notify = () => { if (match()) { clearTimeout(timer); resolve(); } };
+        });
+        source = match();
+      }
+      if (!source) return response;
+    }
+    const message = Buffer.from(marker.slice(3), "base64").toString("utf8").trim().slice(0, 4096);
+    throw rpcError(-32000, message
+      ? `HuntProxy proxy error: ${message}`
+      : `HuntProxy proxy error (HTTP ${source.status()})`);
+  } finally {
+    context.off("response", onResponse);
+  }
+}
+
 const PAGE_ACTIONS = new Set([
   "navigate", "snapshot", "click", "fill", "select", "upload", "inspect",
   "scroll", "screenshot", "press", "wait", "back", "forward",
@@ -1665,12 +1708,12 @@ async function executeAction(session, action = {}) {
   if (PAGE_ACTIONS.has(action.type)) await page.bringToFront();
   switch (action.type) {
     case "navigate": {
-      await page.goto(action.url, {
+      const response = await navigateWithProxyCheck(page, () => page.goto(action.url, {
         waitUntil: "domcontentloaded",
         timeout: action.timeout_ms || 30_000,
-      });
+      }));
       await reconcileCurrentOriginStorage(session);
-      return { message: "navigation completed", data: { url: page.url() } };
+      return { message: "navigation completed", data: { url: page.url(), status: response?.status() ?? null } };
     }
     case "snapshot": {
       let content;
@@ -1728,14 +1771,16 @@ async function executeAction(session, action = {}) {
         message: "wait completed",
         data: await performWait(page, action.for_what, action.value),
       };
-    case "back":
-      await page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 });
+    case "back": {
+      const response = await navigateWithProxyCheck(page, () => page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }));
       await reconcileCurrentOriginStorage(session);
-      return { message: "went back", data: { url: page.url() } };
-    case "forward":
-      await page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      return { message: "went back", data: { url: page.url(), status: response?.status() ?? null } };
+    }
+    case "forward": {
+      const response = await navigateWithProxyCheck(page, () => page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 }));
       await reconcileCurrentOriginStorage(session);
-      return { message: "went forward", data: { url: page.url() } };
+      return { message: "went forward", data: { url: page.url(), status: response?.status() ?? null } };
+    }
     default:
       throw rpcError(-32602, `unsupported browser action: ${action.type || "missing"}`);
   }
@@ -1835,10 +1880,10 @@ async function handle(req) {
             await session.context.addCookies(params.cookies);
           }
           if (params.url && params.url !== "about:blank") {
-            await session.page.goto(params.url, {
+            await navigateWithProxyCheck(session.page, () => session.page.goto(params.url, {
               waitUntil: "domcontentloaded",
               timeout: params.timeout_ms || 30_000,
-            });
+            }));
             await reconcileCurrentOriginStorage(session);
           }
           const checkpoint = await extractCheckpoint(session);

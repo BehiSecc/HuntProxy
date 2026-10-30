@@ -668,31 +668,40 @@ fn wreq_error_code(error: &wreq::Error) -> ErrorCode {
 }
 
 fn map_wreq_error(error: wreq::Error) -> DomainError {
-    DomainError::new(wreq_error_code(&error), error.to_string())
+    let code = wreq_error_code(&error);
+    DomainError::new(code, error.without_uri().to_string())
 }
+
+pub(crate) const UPSTREAM_PROXY_ERROR_DETAIL: &str = "huntproxy_upstream_proxy_error";
 
 fn map_wreq_execute_error(error: wreq::Error, proxy: Option<&str>) -> DomainError {
     let endpoint = proxy
         .filter(|_| error.is_proxy_connect())
         .and_then(|proxy| url::Url::parse(proxy).ok())
-        .and_then(|url| Some(format!("{}:{}", url.host()?, url.port_or_known_default()?)));
-    let Some(endpoint) = endpoint else {
+        .and_then(|url| Some((url.host()?.to_string(), url.port_or_known_default()?)));
+    let Some((host, port)) = endpoint else {
         return map_wreq_error(error);
     };
 
-    let mut message = format!("upstream proxy {endpoint} error");
+    let mut message = format!("upstream proxy {host}:{port} error");
     let mut source = std::error::Error::source(&error);
+    let mut os_error = None;
     while let Some(cause) = source {
         if let Some(code) = cause
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error)
         {
             message.push_str(&format!(": {}", std::io::Error::from_raw_os_error(code)));
+            os_error = Some(code);
             break;
         }
         source = cause.source();
     }
-    DomainError::new(wreq_error_code(&error), message)
+    DomainError::with_details(
+        wreq_error_code(&error),
+        message,
+        serde_json::json!({ (UPSTREAM_PROXY_ERROR_DETAIL): { "host": host, "port": port, "os_error": os_error } }),
+    )
 }
 
 // Measured GET navigation shapes from native Chromium146/149: direct and
@@ -1810,7 +1819,40 @@ mod tests {
                 if proxy_scheme == "http" {
                     assert!(message.contains(&expected_cause), "{message}");
                 }
+                let DomainError::App {
+                    details: Some(details),
+                    ..
+                } = error
+                else {
+                    panic!("proxy connection error is missing safe endpoint details");
+                };
+                let detail = &details[UPSTREAM_PROXY_ERROR_DETAIL];
+                assert_eq!(detail["host"], "127.0.0.1");
+                assert_eq!(detail["port"], proxy_addr.port());
+                let serialized = details.to_string();
+                assert!(!serialized.contains("privateuser"));
+                assert!(!serialized.contains("privatepass"));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_expose_credentials_or_query_in_request_uri() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let dial = cache_dial(&address.to_string(), 1);
+        let mut request = cache_request();
+        request.url =
+            "http://fixture-user:fixture-password@cache.test/private?token=fixture-token".into();
+        let error = WreqTransport::new()
+            .send(&dial, request)
+            .await
+            .err()
+            .unwrap();
+        let message = error.to_string();
+        for secret in ["fixture-user", "fixture-password", "fixture-token"] {
+            assert!(!message.contains(secret), "{message}");
         }
     }
 
