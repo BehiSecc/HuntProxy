@@ -229,7 +229,7 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     assert_success(&installation, "coordinated current release installation");
     let installation_stdout = String::from_utf8_lossy(&installation.stdout);
     assert!(
-        installation_stdout.contains("Installed HuntProxy 0.2.0"),
+        installation_stdout.contains(concat!("Installed HuntProxy ", env!("CARGO_PKG_VERSION"))),
         "unexpected installation output: {installation_stdout}"
     );
     assert!(
@@ -247,7 +247,7 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     assert_success(&installed_version, "installed release version");
     assert_eq!(
         String::from_utf8_lossy(&installed_version.stdout).trim(),
-        "HuntProxy 0.2.0"
+        concat!("HuntProxy ", env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(
         sha256_file(&install_dir.join("HuntProxy.previous")),
