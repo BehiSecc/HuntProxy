@@ -228,6 +228,7 @@ fn locator_schema() -> Value {
 fn browser_action_schema() -> Value {
     // Keep descriptions compact: Codex removes them above its 5000-byte normalized budget.
     // https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/tools/src/json_schema/compaction.rs
+    // Keep the action flat: Codex renders allOf as unknown and hides its properties.
     json!({
         "type": "object",
         "description": "Playwright action.",
@@ -260,19 +261,6 @@ fn browser_action_schema() -> Value {
             "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Response preview bytes: 1..65536, default 4096."}
         },
         "required": ["type"],
-        "allOf": [
-            {"if":{"properties":{"type":{"const":"navigate"}},"required":["type"]},"then":{"required":["url"]}},
-            {"if":{"properties":{"type":{"enum":["click","fill","select","upload"]}},"required":["type"]},"then":{"required":["locator"]}},
-            {"if":{"properties":{"type":{"enum":["fill","select","wait"]}},"required":["type"]},"then":{"required":["value"]}},
-            {"if":{"properties":{"type":{"const":"upload"}},"required":["type"]},"then":{"required":["files"]}},
-            {"if":{"properties":{"type":{"const":"press"}},"required":["type"]},"then":{"required":["key"]}},
-            {"if":{"properties":{"type":{"const":"request"}},"required":["type"]},"then":{"required":["method","url"],"properties":{"timeout_ms":{"minimum":1000}}}},
-            {"if":{"properties":{"type":{"const":"inspect"}},"required":["type"]},"then":{"properties":{"max_bytes":{"maximum":65536}}}},
-            {"if":{"properties":{"type":{"const":"pages"}},"required":["type"]},"then":{"required":["op"]}},
-            {"if":{"properties":{"type":{"const":"pages"},"op":{"enum":["select","close"]}},"required":["type","op"]},"then":{"required":["page_id","runtime_generation"]}},
-            {"if":{"properties":{"type":{"const":"wait"}},"required":["type"]},"then":{"required":["for_what"]}},
-            {"if":{"properties":{"type":{"const":"events"},"after_sequence":{"minimum":1}},"required":["type","after_sequence"]},"then":{"required":["runtime_generation"]}}
-        ],
         "additionalProperties": false
     })
 }
@@ -2770,26 +2758,69 @@ mod tests {
     }
 
     #[test]
-    fn browser_action_schema_exposes_conditional_requirements() {
-        let schema = browser_action_schema();
-        let rules = schema["allOf"].as_array().unwrap();
-        for rule in [
-            json!({"if":{"properties":{"type":{"const":"pages"}},"required":["type"]},"then":{"required":["op"]}}),
-            json!({"if":{"properties":{"type":{"const":"pages"},"op":{"enum":["select","close"]}},"required":["type","op"]},"then":{"required":["page_id","runtime_generation"]}}),
-            json!({"if":{"properties":{"type":{"const":"wait"}},"required":["type"]},"then":{"required":["for_what"]}}),
-            json!({"if":{"properties":{"type":{"enum":["fill","select","wait"]}},"required":["type"]},"then":{"required":["value"]}}),
-            json!({"if":{"properties":{"type":{"const":"events"},"after_sequence":{"minimum":1}},"required":["type","after_sequence"]},"then":{"required":["runtime_generation"]}}),
-            json!({"if":{"properties":{"type":{"const":"request"}},"required":["type"]},"then":{"required":["method","url"],"properties":{"timeout_ms":{"minimum":1000}}}}),
-            json!({"if":{"properties":{"type":{"const":"inspect"}},"required":["type"]},"then":{"properties":{"max_bytes":{"maximum":65536}}}}),
+    fn browser_action_schema_stays_flat_for_codex() {
+        let definitions = tool_defs();
+        let tool = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "browser_action")
+            .unwrap();
+        let input = &tool["inputSchema"];
+        let action = &input["properties"]["action"];
+        for schema in [input, action] {
+            assert_eq!(schema["type"], "object");
+            for keyword in ["allOf", "anyOf", "oneOf", "$ref", "if", "then", "else"] {
+                assert!(schema.get(keyword).is_none(), "unexpected {keyword}");
+            }
+        }
+        assert_eq!(action["required"], json!(["type"]));
+        assert_eq!(action["additionalProperties"], false);
+        for field in [
+            "type",
+            "url",
+            "locator",
+            "value",
+            "files",
+            "via_chooser",
+            "timeout_ms",
+            "key",
+            "for_what",
+            "format",
+            "max_bytes",
+            "op",
+            "page_id",
+            "runtime_generation",
+            "after_sequence",
+            "limit",
+            "kinds",
+            "wait_ms",
+            "delta_x",
+            "delta_y",
+            "full_page",
+            "method",
+            "headers",
+            "body_text",
+            "body_base64",
+            "max_response_bytes",
         ] {
             assert!(
-                rules.contains(&rule),
-                "missing conditional contract: {rule}"
+                action["properties"][field].is_object(),
+                "missing action property {field}"
             );
         }
+    }
 
-        // These minimal forms must stay compatible with serde's required fields.
+    #[test]
+    fn browser_action_deserialization_enforces_required_fields() {
         for action in [
+            json!({"type":"navigate","url":"https://example.test/"}),
+            json!({"type":"click","locator":{"css":"button"}}),
+            json!({"type":"fill","locator":{"css":"input"},"value":"text"}),
+            json!({"type":"select","locator":{"css":"select"},"value":"one"}),
+            json!({"type":"upload","locator":{"css":"input"},"files":[]}),
+            json!({"type":"press","key":"Enter"}),
+            json!({"type":"request","method":"GET","url":"https://example.test/"}),
             json!({"type":"pages","op":"list"}),
             json!({"type":"pages","op":"new"}),
             json!({"type":"pages","op":"select","page_id":1,"runtime_generation":2}),
@@ -2805,6 +2836,8 @@ mod tests {
             );
         }
         for action in [
+            json!({"type":"navigate"}),
+            json!({"type":"click"}),
             json!({"type":"pages"}),
             json!({"type":"wait","value":"0"}),
             json!({"type":"wait","for_what":"timeout"}),
@@ -2813,6 +2846,7 @@ mod tests {
             json!({"type":"upload","locator":{"css":"input"}}),
             json!({"type":"press"}),
             json!({"type":"request","url":"https://example.test/"}),
+            json!({"type":"request","method":"GET"}),
         ] {
             assert!(
                 serde_json::from_value::<BrowserAction>(action.clone()).is_err(),
@@ -2848,6 +2882,10 @@ mod tests {
         }
         let properties = &inputs["properties"]["action"]["properties"];
         for (field, fragments) in [
+            ("url", vec!["Required for navigate/request"]),
+            ("locator", vec!["Required for click/fill/select/upload"]),
+            ("key", vec!["Required for press"]),
+            ("method", vec!["Required for request"]),
             (
                 "op",
                 vec![
@@ -2863,6 +2901,7 @@ mod tests {
             (
                 "value",
                 vec![
+                    "Required for fill/select/wait",
                     "0..60000",
                     "30000 ms",
                     "domcontentloaded",
@@ -2920,7 +2959,14 @@ mod tests {
             ("delta_y", vec!["-100000..100000", "default 0"]),
             (
                 "files",
-                vec!["<=16", "absolute", "readable", "<=4096", "chooser"],
+                vec![
+                    "Upload requires",
+                    "<=16",
+                    "absolute",
+                    "readable",
+                    "<=4096",
+                    "chooser",
+                ],
             ),
         ] {
             let description = properties[field]["description"].as_str().unwrap();
