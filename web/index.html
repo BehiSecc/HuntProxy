@@ -818,7 +818,7 @@ test
           body: JSON.stringify({ plugin_id: 'ip-rotate', action, input }),
         });
         const job = await waitForExtensionJob(projectId, queued.id);
-        if (job.state !== 'completed') throw new Error(job.error?.message || `IpRotate job ${job.state}`);
+        if (job.state !== 'completed') throw new Error(job.error || `IpRotate job ${job.state}`);
         const results = await api(`/api/v1/projects/${projectId}/extension-jobs/${job.id}/results?view=full&limit=1`);
         const operationError = results.result?.analysis?.result?.error;
         if (operationError) throw new Error(operationError.message || operationError.code || 'IpRotate operation failed');
