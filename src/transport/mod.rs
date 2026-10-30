@@ -484,7 +484,10 @@ impl WreqTransport {
                 if navigation { 255 } else { 219 },
                 true,
             ));
-        client.execute(request).await.map_err(map_wreq_error)
+        client
+            .execute(request)
+            .await
+            .map_err(|error| map_wreq_execute_error(error, req.upstream_proxy.as_deref()))
     }
 }
 
@@ -654,14 +657,42 @@ async fn collect_stream_body_partial(
     (out.freeze(), truncated, None)
 }
 
-fn map_wreq_error(error: wreq::Error) -> DomainError {
+fn wreq_error_code(error: &wreq::Error) -> ErrorCode {
     if error.is_timeout() {
-        DomainError::new(ErrorCode::Timeout, error.to_string())
+        ErrorCode::Timeout
     } else if error.is_connect() {
-        DomainError::new(ErrorCode::Unavailable, error.to_string())
+        ErrorCode::Unavailable
     } else {
-        DomainError::new(ErrorCode::ProtocolError, error.to_string())
+        ErrorCode::ProtocolError
     }
+}
+
+fn map_wreq_error(error: wreq::Error) -> DomainError {
+    DomainError::new(wreq_error_code(&error), error.to_string())
+}
+
+fn map_wreq_execute_error(error: wreq::Error, proxy: Option<&str>) -> DomainError {
+    let endpoint = proxy
+        .filter(|_| error.is_proxy_connect())
+        .and_then(|proxy| url::Url::parse(proxy).ok())
+        .and_then(|url| Some(format!("{}:{}", url.host()?, url.port_or_known_default()?)));
+    let Some(endpoint) = endpoint else {
+        return map_wreq_error(error);
+    };
+
+    let mut message = format!("upstream proxy {endpoint} error");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if let Some(code) = cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+        {
+            message.push_str(&format!(": {}", std::io::Error::from_raw_os_error(code)));
+            break;
+        }
+        source = cause.source();
+    }
+    DomainError::new(wreq_error_code(&error), message)
 }
 
 // Measured GET navigation shapes from native Chromium146/149: direct and
@@ -1734,6 +1765,53 @@ mod tests {
         assert_eq!(response.body, "proxied");
         let request = String::from_utf8(server.await.unwrap()).unwrap();
         assert!(request.starts_with("GET http://cache.test/proxy-check HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn proxy_connection_errors_show_endpoint_without_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let expected_cause = std::net::TcpStream::connect(proxy_addr)
+            .unwrap_err()
+            .to_string();
+        let dial = cache_dial("192.0.2.55:443", 1);
+        let transport = WreqTransport::new();
+
+        for (proxy_scheme, target_scheme) in [
+            ("http", "http"),
+            ("http", "https"),
+            ("socks5", "https"),
+            ("socks5h", "https"),
+        ] {
+            let mut request = cache_request();
+            request.url = format!("{target_scheme}://cache.test/");
+            request.upstream_proxy = Some(format!(
+                "{proxy_scheme}://privateuser:privatepass@{proxy_addr}"
+            ));
+
+            let errors = [
+                transport.send(&dial, request.clone()).await.err().unwrap(),
+                transport
+                    .send_stream(&dial, request.clone())
+                    .await
+                    .err()
+                    .unwrap(),
+                transport.send_upgrade(&dial, request).await.err().unwrap(),
+            ];
+            for error in errors {
+                let message = error.to_string();
+                assert!(
+                    message.contains(&format!("upstream proxy {proxy_addr}")),
+                    "{message}"
+                );
+                assert!(!message.contains("privateuser"), "{message}");
+                assert!(!message.contains("privatepass"), "{message}");
+                if proxy_scheme == "http" {
+                    assert!(message.contains(&expected_cause), "{message}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
