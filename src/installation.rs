@@ -854,10 +854,7 @@ pub async fn validate_browser(prepared: &PreparedInstallation) -> DomainResult<s
         let mut reader = BufReader::new(stderr);
         let mut captured = Vec::new();
         let mut chunk = [0u8; 1024];
-        loop {
-            let Ok(size) = reader.read(&mut chunk).await else {
-                break;
-            };
+        while let Ok(size) = reader.read(&mut chunk).await {
             if size == 0 {
                 break;
             }

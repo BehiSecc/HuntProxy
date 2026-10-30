@@ -41,7 +41,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "set
 # Semantic egress — exact-pinned upstream revisions (Apache-2.0).
 # Cookies, decompression, and system-proxy support intentionally stay disabled.
 wreq = { git = "https://github.com/0x676e67/wreq", rev = "307c60df0663dd3fb434c82777b3fe9a0158d82a", default-features = false, features = ["webpki-roots", "tokio-rt", "stream", "socks"] }
-wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "5715529002738f46eea86a7271f918f9374d3582", default-features = false, features = ["emulation", "tokio-rt", "emulation-chromium-pki"] }
+wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "4d21e3b65d6846187e02802172073438944e6399", default-features = false, features = ["emulation", "tokio-rt", "emulation-chromium-pki"] }
 
 # TLS / CA
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring"] }
@@ -64,7 +64,7 @@ toml = "0.8"
 base64 = "0.22"
 hex = "0.4"
 percent-encoding = "2"
-zstd = "0.13"
+zstd = "0.14.3"
 tar = "0.4"
 sha2 = "0.10"
 hmac = "0.12"
@@ -110,7 +110,6 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 wreq = { git = "https://github.com/0x676e67/wreq", rev = "307c60df0663dd3fb434c82777b3fe9a0158d82a", default-features = false, features = ["prefix-symbols"] }
 
 [dev-dependencies]
-rustls-pemfile = "2"
 proptest = "1"
 tempfile = "3"
 tokio-test = "0.4"
