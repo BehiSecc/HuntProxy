@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -39,6 +40,74 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+
+// Only Chrome background endpoints observed in History belong here: broad host
+// filters would discard evidence when a user tests a Google target.
+const CHROME_BACKGROUND_REQUESTS: &[(&str, &str, &str, bool, bool)] = &[
+    (
+        "POST",
+        "android.clients.google.com",
+        "/checkin",
+        false,
+        false,
+    ),
+    (
+        "POST",
+        "android.clients.google.com",
+        "/c2dm/register3",
+        false,
+        false,
+    ),
+    ("POST", "accounts.google.com", "/ListAccounts", false, true),
+    ("GET", "www.google.com", "/async/folae", false, false),
+    (
+        "GET",
+        "content-autofill.googleapis.com",
+        "/v1/pages/",
+        true,
+        false,
+    ),
+];
+static SKIPPED_CHROME_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+fn is_chrome_background_request(
+    session: &CaptureSession,
+    target: &TargetRef,
+    method: &Method,
+) -> bool {
+    session.browser_session_id.is_some()
+        && target.scheme == "https"
+        && target.port == 443
+        && CHROME_BACKGROUND_REQUESTS.iter().any(
+            |(allowed_method, host, path, prefix, chromium_source)| {
+                method.as_str() == *allowed_method
+                    && target.host == *host
+                    && (if *prefix {
+                        target.path.starts_with(path)
+                    } else {
+                        target.path == *path
+                    })
+                    && (!chromium_source
+                        || target.query.as_deref().is_some_and(|query| {
+                            url::form_urlencoded::parse(query.as_bytes())
+                                .any(|(key, value)| key == "source" && value == "ChromiumBrowser")
+                        }))
+            },
+        )
+}
+
+fn skip_chrome_background_request(
+    session: &CaptureSession,
+    target: &TargetRef,
+    method: &Method,
+) -> bool {
+    if !is_chrome_background_request(session, target, method) {
+        return false;
+    }
+    let count = SKIPPED_CHROME_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::debug!(count, "skipped Chrome background requests");
+    true
+}
 
 type ProxyBody = UnsyncBoxBody<Bytes, Infallible>;
 
@@ -386,6 +455,9 @@ async fn record_failed_exchange(
     applied_rules: &[crate::request_rules::AppliedRequestRule],
     rotation: Option<&crate::storage::IpRotationRoute>,
 ) {
+    if skip_chrome_background_request(session, target, method) {
+        return;
+    }
     let completion = completion_for_error(error);
     let request_path = request_spool
         .as_ref()
@@ -675,7 +747,7 @@ async fn pump_streaming_response(
     }
     drop(sender);
 
-    if !capture {
+    if !capture || skip_chrome_background_request(&session, &target, &method) {
         return;
     }
 
@@ -1249,6 +1321,190 @@ mod tests {
         .expect("streamed evidence should finalize promptly")
     }
 
+    #[tokio::test]
+    async fn chrome_background_matcher_is_narrow_and_session_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_, _, mut session) = proxy_test_fixture(&directory).await;
+        session.browser_session_id = Some(BrowserSessionId(1));
+        let cases = [
+            ("POST", "https://android.clients.google.com/checkin", true),
+            (
+                "POST",
+                "https://android.clients.google.com/c2dm/register3",
+                true,
+            ),
+            (
+                "POST",
+                "https://accounts.google.com/ListAccounts?foo=1&source=ChromiumBrowser",
+                true,
+            ),
+            ("GET", "https://www.google.com/async/folae", true),
+            (
+                "GET",
+                "https://content-autofill.googleapis.com/v1/pages/example",
+                true,
+            ),
+            ("POST", "https://android.clients.google.com/other", false),
+            ("POST", "https://accounts.google.com/ListAccounts", false),
+            (
+                "POST",
+                "https://accounts.google.com/ListAccounts?source=OtherChromiumBrowser",
+                false,
+            ),
+            ("GET", "https://android.clients.google.com/checkin", false),
+            ("POST", "http://android.clients.google.com/checkin", false),
+            (
+                "POST",
+                "https://accounts.google.com.evil.test/ListAccounts?source=ChromiumBrowser",
+                false,
+            ),
+            (
+                "GET",
+                "https://content-autofill.googleapis.com/v1/pages",
+                false,
+            ),
+            ("GET", "https://www.google.com:444/async/folae", false),
+        ];
+        for (method, url, expected) in cases {
+            assert_eq!(
+                is_chrome_background_request(
+                    &session,
+                    &TargetRef::from_url(url).unwrap(),
+                    &method.parse().unwrap()
+                ),
+                expected,
+                "{method} {url}"
+            );
+        }
+        session.browser_session_id = None;
+        assert!(!is_chrome_background_request(
+            &session,
+            &TargetRef::from_url("https://android.clients.google.com/checkin").unwrap(),
+            &Method::POST
+        ));
+    }
+
+    #[tokio::test]
+    async fn chrome_background_is_forwarded_but_only_external_capture_is_saved() {
+        use crate::storage::IpRotationGateway;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (state, project, external) = proxy_test_fixture(&directory).await;
+        let browser = state
+            .db
+            .create_browser_session(project.id, Some("default".into()))
+            .await
+            .unwrap();
+        let browser_capture = state
+            .db
+            .create_capture_session(CreateCaptureSession {
+                project_id: project.id,
+                browser_session_id: Some(browser.id),
+                browser_action_id: None,
+                is_browser_bound: true,
+                ttl: None,
+            })
+            .await
+            .unwrap();
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        state
+            .db
+            .activate_ip_rotation(
+                project.id,
+                "https://android.clients.google.com".into(),
+                "huntproxy".into(),
+                vec![IpRotationGateway {
+                    region: "local".into(),
+                    rest_api_id: "test-gateway".into(),
+                    endpoint: format!("http://{gateway_addr}/huntproxy"),
+                }],
+            )
+            .await
+            .unwrap();
+        let observed = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = gateway.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(String::from_utf8_lossy(&bytes)
+                    .starts_with("POST /huntproxy/checkin HTTP/1.1\r\n"));
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        let mut events = state.events.subscribe();
+        let usage_before = state.db.project_usage(project.id).await.unwrap();
+        for (index, session) in [&browser_capture, &external].iter().enumerate() {
+            let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+            client.write_all(format!("POST https://android.clients.google.com/checkin HTTP/1.1\r\nHost: android.clients.google.com\r\nProxy-Authorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", session.token_once.as_deref().unwrap()).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&response).contains("ok"));
+            if index == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let (items, _) = state
+                    .db
+                    .list_history(project.id, 10, None, None)
+                    .await
+                    .unwrap();
+                assert!(items.is_empty());
+                let usage_after = state.db.project_usage(project.id).await.unwrap();
+                assert_eq!(usage_before.quota_used_bytes, usage_after.quota_used_bytes);
+                assert_eq!(usage_after.exchange_count, 0);
+                assert!(events.try_recv().is_err());
+                assert_eq!(
+                    std::fs::read_dir(&state.config.spool_dir).unwrap().count(),
+                    0
+                );
+                let rows: (i64, i64) = state
+                    .db
+                    .with_conn(|conn| {
+                        Ok((
+                            conn.query_row("SELECT count(*) FROM search_fts", [], |row| row.get(0))
+                                .unwrap(),
+                            conn.query_row("SELECT count(*) FROM bodies", [], |row| row.get(0))
+                                .unwrap(),
+                        ))
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(rows, (0, 0));
+            }
+        }
+        let detail = wait_for_exchange(&state, project.id).await;
+        assert_eq!(detail.summary.path, "/checkin");
+        assert_eq!(detail.lineage.capture_session_id, Some(external.id));
+        observed.await.unwrap();
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
+    }
+
     #[test]
     fn absolute_and_origin_form_urls() {
         let request = Request::builder()
@@ -1681,9 +1937,10 @@ mod tests {
             session.token_once.as_deref().unwrap(),
         )
         .await;
+        use rustls::pki_types::pem::PemObject;
         let mut roots = rustls::RootCertStore::empty();
         let pem = std::fs::read(state.config.ca_cert_path()).unwrap();
-        for certificate in rustls_pemfile::certs(&mut pem.as_slice()) {
+        for certificate in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
             roots.add(certificate.unwrap()).unwrap();
         }
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(

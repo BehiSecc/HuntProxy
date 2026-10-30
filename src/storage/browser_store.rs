@@ -5,6 +5,17 @@ use crate::storage::projects::{now_rfc3339, parse_time};
 use crate::storage::Db;
 use rusqlite::params;
 
+pub(crate) fn browser_session_not_found(
+    project_id: ProjectId,
+    id: BrowserSessionId,
+) -> DomainError {
+    DomainError::not_found(format!(
+        "browser session {} not found in project {}; call browser_start or browser_manage status",
+        id.get(),
+        project_id.get()
+    ))
+}
+
 impl Db {
     pub async fn create_browser_session(
         &self,
@@ -94,7 +105,7 @@ impl Db {
                 )
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             if updated == 0 {
-                return Err(DomainError::not_found("browser session"));
+                return Err(browser_session_not_found(project_id, id));
             }
             Ok(())
         })
@@ -131,7 +142,7 @@ impl Db {
                 },
             )
             .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => DomainError::not_found("browser session"),
+                rusqlite::Error::QueryReturnedNoRows => browser_session_not_found(project_id, id),
                 other => DomainError::new(ErrorCode::StorageError, other.to_string()),
             })
         })

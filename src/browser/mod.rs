@@ -1234,7 +1234,12 @@ impl BrowserService {
                     .db
                     .get_named_cookie_profile(project_id, name)
                     .await?
-                    .ok_or_else(|| DomainError::not_found("cookie profile"))?;
+                    .ok_or_else(|| {
+                        DomainError::not_found(format!(
+                            "cookie profile {name} not found in project {}; create it with cookies",
+                            project_id.get()
+                        ))
+                    })?;
                 let mut cookie_override = CookieLaunchOverride::from_profile(&stored)?;
                 let seed = CookieSeed {
                     name: name.to_string(),
@@ -1980,7 +1985,9 @@ impl BrowserService {
                 DomainError::new(ErrorCode::Unavailable, "browser session is not active")
             })?;
         if runtime.project_id != project_id {
-            return Err(DomainError::not_found("browser session"));
+            return Err(crate::storage::browser_session_not_found(
+                project_id, session_id,
+            ));
         }
         if !runtime.persistent {
             return Err(DomainError::invalid(
@@ -2052,7 +2059,9 @@ impl BrowserService {
                 DomainError::new(ErrorCode::Unavailable, "browser session is not active")
             })?;
         if runtime.project_id != project_id {
-            return Err(DomainError::not_found("browser session"));
+            return Err(crate::storage::browser_session_not_found(
+                project_id, session_id,
+            ));
         }
         if runtime.cdp.is_none() {
             return Ok(cdp_status_view(project_id, None));
@@ -2320,7 +2329,7 @@ impl BrowserService {
             .get(&session_id.get())
             .is_some_and(|runtime| runtime.project_id == project_id);
         if !belongs_to_project {
-            return Err(DomainError::not_found("active browser session"));
+            return Err(DomainError::not_found(format!("active browser session {} not found in project {}; call browser_start or browser_manage status", session_id.get(), project_id.get())));
         }
         let operation_lock = self.session_operation_lock(session_id).await;
         let _operation_guard = operation_lock.lock().await;
@@ -3884,6 +3893,19 @@ mod tests {
             "dark"
         );
         assert_eq!(checkpoint.session_storage["csrf"], "secret");
+    }
+
+    #[tokio::test]
+    async fn unknown_browser_action_session_has_actionable_error() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let browser = BrowserService::new(db, None, None);
+        let action: BrowserAction = serde_json::from_value(json!({"type":"snapshot"})).unwrap();
+        let error = browser
+            .action(ProjectId(128), BrowserSessionId(0), action)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        assert_eq!(error.to_string(), "browser session 0 not found in project 128; call browser_start or browser_manage status");
     }
 
     #[tokio::test]
