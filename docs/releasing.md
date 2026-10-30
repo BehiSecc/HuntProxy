@@ -1,6 +1,6 @@
 # Preparing a HuntProxy release
 
-The v0.2.0 candidate is prepared on `release/v0.2.0`. Publication needs human approval. Do not push its tag or publish the GitHub release before the checks below pass.
+Prepare each release candidate on a `release/vX.Y.Z` branch. Publication needs human approval. Do not push its tag or publish the GitHub release before the checks below pass.
 
 ## Source and assets
 
@@ -44,7 +44,7 @@ The fixture creates real v0.1.1 project data and a full bundle, upgrades a runni
 
 The normal test gate includes `mcp_catalog_refresh`: a continuously connected bridge observes a synthetic daemon upgrade, advertises its new schemas, dispatches a call once, and retains the latest catalog while stopped. The real private metadata route must leave the daemon's idle timer unchanged.
 
-Push only the approved candidate branches. Pushing `release/v0.2.0` automatically runs **Build release candidate** on that exact core commit. Require the source checks and all four packaged platform builds to pass: Linux x86_64/ARM64 and macOS Intel/Apple Silicon. Local Linux tests do not replace these platform checks. Record the run URL and candidate commit. Any later source change requires a new candidate run.
+Push only the approved candidate branches. Pushing the `release/vX.Y.Z` branch automatically runs **Build release candidate** on that exact core commit. Require the source checks and all four packaged platform builds to pass: Linux x86_64/ARM64 and macOS Intel/Apple Silicon. Local Linux tests do not replace these platform checks. Record the run URL and candidate commit. Any later source change requires a new candidate run.
 
 The push trigger lets a new candidate workflow run before it is merged. Manual dispatch remains available once the workflow is registered on the default branch, as described in [GitHub's workflow documentation](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
 
@@ -52,9 +52,9 @@ Candidate CI checks the immutable catalog, provisions and launches Chromium, ver
 
 ## Publication checkpoint
 
-Confirm the approved candidate is on the intended default branch, the version is 0.2.0 in Cargo and plugin metadata, the release notes describe the one-time v0.1.1 stop/reconnect requirement, and no unrelated local changes are included.
+Confirm the approved candidate is on the intended default branch, the Cargo version matches the tag, `docs/releases/vX.Y.Z.md` exists and still describes the one-time v0.1.1 stop/reconnect requirement, and no unrelated local changes are included.
 
-After explicit approval, create and push `v0.2.0` at that validated commit. The tag workflow validates its version, rebuilds four binaries, verifies the two-member archive contract, and creates a **draft** GitHub release. Compare its assets with the validated candidate, verify `SHA256SUMS`, add the reviewed release notes, then publish the draft only within the approved scope.
+After explicit approval, create and push the `vX.Y.Z` tag at that validated commit. The tag workflow validates its version, rebuilds four binaries, verifies the two-member archive contract, and creates a **draft** GitHub release. Compare its assets with the validated candidate, verify `SHA256SUMS`, add the reviewed release notes, then publish the draft only within the approved scope.
 
 Never add a third member to an archive: v0.1.1 rejects it. The packaged `LICENSE` concatenates the project license, embedded-asset notices, and `RUST_THIRD_PARTY_NOTICES.txt`. Regenerate the Rust notices with `python3 scripts/prepare-rust-notices.py` after any `Cargo.lock` change; `scripts/check.sh` rejects stale or incomplete notices. Keep the combined file below 1 MiB so v0.1.1 can still extract it. Keep the existing v0.1.1 release and assets available.
 

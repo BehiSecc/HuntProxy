@@ -502,7 +502,7 @@ For native installations from v0.2 onward, the updater keeps projects and data, 
 
 `HuntProxy backup` copies only the SQLite database; for a full backup, stop HuntProxy and copy `~/.huntproxy` and any configured external paths.
 
-See [update details](docs/updating.md) and the [v0.2.0 release notes](docs/releases/v0.2.0.md).
+See [update details](docs/updating.md) and the [release notes](docs/releases/).
 
 ### Uninstall
 
