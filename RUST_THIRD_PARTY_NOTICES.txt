@@ -76,9 +76,9 @@ Locked production packages:
 - crypto-common 0.2.2 | MIT OR Apache-2.0 | https://static.crates.io/crates/crypto-common/crypto-common-0.2.2.crate | sha256 ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453
 - dashmap 6.2.1 | MIT | https://static.crates.io/crates/dashmap/dashmap-6.2.1.crate | sha256 e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c
 - data-encoding 2.11.0 | MIT | https://static.crates.io/crates/data-encoding/data-encoding-2.11.0.crate | sha256 a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8
-- deadpool 0.13.0 | MIT OR Apache-2.0 | https://static.crates.io/crates/deadpool/deadpool-0.13.0.crate | sha256 883466cb8db62725aee5f4a6011e8a5d42912b42632df32aad57fc91127c6e04
+- deadpool 0.13.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/deadpool/deadpool-0.13.1.crate | sha256 3e98a7e119cd347f4201e1159b19831029e203e2d8b790547708e8157b4acf1e
 - deadpool-runtime 0.3.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/deadpool-runtime/deadpool-runtime-0.3.1.crate | sha256 2657f61fb1dd8bf37a8d51093cc7cee4e77125b22f7753f49b289f831bec2bae
-- deadpool-sqlite 0.13.0 | MIT OR Apache-2.0 | https://static.crates.io/crates/deadpool-sqlite/deadpool-sqlite-0.13.0.crate | sha256 9cea80311362fbc476e1f9568f50d5ec576a8bbb9375b7cdc1856e3216870440
+- deadpool-sqlite 0.14.0 | MIT OR Apache-2.0 | https://static.crates.io/crates/deadpool-sqlite/deadpool-sqlite-0.14.0.crate | sha256 008b02743f8fad68dc9bb2851c0a4a1d63190d8e3885c5dea20f8a0a2a6bff9a
 - deadpool-sync 0.2.0 | MIT OR Apache-2.0 | https://static.crates.io/crates/deadpool-sync/deadpool-sync-0.2.0.crate | sha256 e385cc95d3d582c328b36d1ff90feac061102b001894b555e6b465a2e0eaabbf
 - der-parser 9.0.0 | MIT/Apache-2.0 | https://static.crates.io/crates/der-parser/der-parser-9.0.0.crate | sha256 5cd0a5c643689626bec213c4d8bd4d96acc8ffdb4ad4bb6bc16abf27d5f4b553
 - deranged 0.5.8 | MIT OR Apache-2.0 | https://static.crates.io/crates/deranged/deranged-0.5.8.crate | sha256 7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c
@@ -119,9 +119,8 @@ Locked production packages:
 - glob 0.3.4 | MIT OR Apache-2.0 | https://static.crates.io/crates/glob/glob-0.3.4.crate | sha256 e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b
 - h2 0.4.16 | MIT | https://static.crates.io/crates/h2/h2-0.4.16.crate | sha256 a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27
 - hashbrown 0.14.5 | MIT OR Apache-2.0 | https://static.crates.io/crates/hashbrown/hashbrown-0.14.5.crate | sha256 e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1
-- hashbrown 0.16.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/hashbrown/hashbrown-0.16.1.crate | sha256 841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100
 - hashbrown 0.17.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/hashbrown/hashbrown-0.17.1.crate | sha256 ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a
-- hashlink 0.11.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/hashlink/hashlink-0.11.1.crate | sha256 824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f
+- hashlink 0.12.2 | MIT OR Apache-2.0 | https://static.crates.io/crates/hashlink/hashlink-0.12.2.crate | sha256 a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb
 - hdrhistogram 7.6.0 | MIT/Apache-2.0 | https://static.crates.io/crates/hdrhistogram/hdrhistogram-7.6.0.crate | sha256 f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea
 - heck 0.5.0 | MIT OR Apache-2.0 | https://static.crates.io/crates/heck/heck-0.5.0.crate | sha256 2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea
 - hex 0.4.3 | MIT OR Apache-2.0 | https://static.crates.io/crates/hex/hex-0.4.3.crate | sha256 7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70
@@ -155,7 +154,7 @@ Locked production packages:
 - lazy_static 1.5.0 | MIT OR Apache-2.0 | https://static.crates.io/crates/lazy_static/lazy_static-1.5.0.crate | sha256 bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe
 - libc 0.2.189 | MIT OR Apache-2.0 | https://static.crates.io/crates/libc/libc-0.2.189.crate | sha256 3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2
 - libloading 0.8.9 | ISC | https://static.crates.io/crates/libloading/libloading-0.8.9.crate | sha256 d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55
-- libsqlite3-sys 0.36.0 | MIT | https://static.crates.io/crates/libsqlite3-sys/libsqlite3-sys-0.36.0.crate | sha256 95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a
+- libsqlite3-sys 0.38.2 | MIT | https://static.crates.io/crates/libsqlite3-sys/libsqlite3-sys-0.38.2.crate | sha256 f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8
 - linux-raw-sys 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://static.crates.io/crates/linux-raw-sys/linux-raw-sys-0.12.1.crate | sha256 32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53
 - litemap 0.8.2 | Unicode-3.0 | https://static.crates.io/crates/litemap/litemap-0.8.2.crate | sha256 92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0
 - lock_api 0.4.14 | MIT OR Apache-2.0 | https://static.crates.io/crates/lock_api/lock_api-0.4.14.crate | sha256 224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965
@@ -177,7 +176,6 @@ Locked production packages:
 - num-conv 0.2.2 | MIT OR Apache-2.0 | https://static.crates.io/crates/num-conv/num-conv-0.2.2.crate | sha256 521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441
 - num-integer 0.1.46 | MIT OR Apache-2.0 | https://static.crates.io/crates/num-integer/num-integer-0.1.46.crate | sha256 7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f
 - num-traits 0.2.19 | MIT OR Apache-2.0 | https://static.crates.io/crates/num-traits/num-traits-0.2.19.crate | sha256 071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841
-- num_cpus 1.17.0 | MIT OR Apache-2.0 | https://static.crates.io/crates/num_cpus/num_cpus-1.17.0.crate | sha256 91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b
 - oid-registry 0.7.1 | MIT OR Apache-2.0 | https://static.crates.io/crates/oid-registry/oid-registry-0.7.1.crate | sha256 a8d8034d9489cdaf79228eb9f6a3b8d7bb32ba00d6645ebd48eef4077ceb5bd9
 - once_cell 1.21.4 | MIT OR Apache-2.0 | https://static.crates.io/crates/once_cell/once_cell-1.21.4.crate | sha256 9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50
 - openssl-macros 0.1.1 | MIT/Apache-2.0 | https://static.crates.io/crates/openssl-macros/openssl-macros-0.1.1.crate | sha256 a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c
@@ -209,7 +207,7 @@ Locked production packages:
 - rquickjs 0.12.2 | MIT | https://static.crates.io/crates/rquickjs/rquickjs-0.12.2.crate | sha256 4e04e4eedfb060b503b5f0a2644abb890b0b3620d3fb674f9455f230014964e4
 - rquickjs-core 0.12.2 | MIT | https://static.crates.io/crates/rquickjs-core/rquickjs-core-0.12.2.crate | sha256 16e4f499ac5b943d97ee6dbc44f23c2c10426f420f7d2f1793d6318911b6608c
 - rquickjs-sys 0.12.2 | MIT | https://static.crates.io/crates/rquickjs-sys/rquickjs-sys-0.12.2.crate | sha256 a13ac243b86a74120814ef7e9e30ad5a2c1199b7b9963b1cf7c84e4cdc1cad99
-- rusqlite 0.38.0 | MIT | https://static.crates.io/crates/rusqlite/rusqlite-0.38.0.crate | sha256 f1c93dd1c9683b438c392c492109cb702b8090b2bfc8fed6f6e4eb4523f17af3
+- rusqlite 0.40.2 | MIT | https://static.crates.io/crates/rusqlite/rusqlite-0.40.2.crate | sha256 23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3
 - rust-embed 8.12.0 | MIT | https://static.crates.io/crates/rust-embed/rust-embed-8.12.0.crate | sha256 e9e7760e252aaba7b09f4be00e36476cf585bdb68a53552ac954cdf504ab4bc9
 - rust-embed-impl 8.12.0 | MIT | https://static.crates.io/crates/rust-embed-impl/rust-embed-impl-8.12.0.crate | sha256 3bcfc4d6f53af43755f7a723e4b6b8794fcce052a178dd8c6c1dadc5f5343097
 - rust-embed-utils 8.12.0 | MIT | https://static.crates.io/crates/rust-embed-utils/rust-embed-utils-8.12.0.crate | sha256 42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0
@@ -2067,7 +2065,6 @@ DEALINGS IN THE SOFTWARE.
 --- Text 023 (sha256 1626f2c950cee975b5809748e288468141d09aa420314c7c9b35e6e62b772b2d) ---
 Used by:
 - httparse 1.10.1 (LICENSE-MIT)
-- num_cpus 1.17.0 (LICENSE-MIT)
 
 Copyright (c) 2015-2025 Sean McArthur
 
@@ -4791,9 +4788,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 --- Text 069 (sha256 4af6c4852f45397d02e4460698de76d16c8fe5ba33de91d80a496e2a30e89af3) ---
 Used by:
-- deadpool 0.13.0 (LICENSE-MIT)
+- deadpool 0.13.1 (LICENSE-MIT)
 - deadpool-runtime 0.3.1 (LICENSE-MIT)
-- deadpool-sqlite 0.13.0 (LICENSE-MIT)
+- deadpool-sqlite 0.14.0 (LICENSE-MIT)
 - deadpool-sync 0.2.0 (LICENSE-MIT)
 
 The MIT License (MIT)
@@ -5171,9 +5168,9 @@ DEALINGS IN THE SOFTWARE.
 
 --- Text 076 (sha256 53775f8ffb7c8db44e50961acee60028caeea98546183cffcab47191d83d8621) ---
 Used by:
-- deadpool 0.13.0 (LICENSE-APACHE)
+- deadpool 0.13.1 (LICENSE-APACHE)
 - deadpool-runtime 0.3.1 (LICENSE-APACHE)
-- deadpool-sqlite 0.13.0 (LICENSE-APACHE)
+- deadpool-sqlite 0.14.0 (LICENSE-APACHE)
 - deadpool-sync 0.2.0 (LICENSE-APACHE)
 
                                  Apache License
@@ -7342,7 +7339,7 @@ THE SOFTWARE.
 
 --- Text 113 (sha256 8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90) ---
 Used by:
-- hashlink 0.11.1 (LICENSE-APACHE)
+- hashlink 0.12.2 (LICENSE-APACHE)
 - minimal-lexical 0.2.1 (LICENSE-APACHE)
 
                               Apache License
@@ -9838,7 +9835,6 @@ Used by:
 - form_urlencoded 1.2.2 (LICENSE-APACHE)
 - glob 0.3.4 (LICENSE-APACHE)
 - hashbrown 0.14.5 (LICENSE-APACHE)
-- hashbrown 0.16.1 (LICENSE-APACHE)
 - hashbrown 0.17.1 (LICENSE-APACHE)
 - hdrhistogram 7.6.0 (LICENSE-APACHE)
 - heck 0.5.0 (LICENSE-APACHE)
@@ -9855,7 +9851,6 @@ Used by:
 - num-bigint 0.4.8 (LICENSE-APACHE)
 - num-integer 0.1.46 (LICENSE-APACHE)
 - num-traits 0.2.19 (LICENSE-APACHE)
-- num_cpus 1.17.0 (LICENSE-APACHE)
 - oid-registry 0.7.1 (LICENSE-APACHE)
 - once_cell 1.21.4 (LICENSE-APACHE)
 - parking_lot 0.12.5 (LICENSE-APACHE)
@@ -11467,8 +11462,8 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 --- Text 174 (sha256 c10c1f27337546471e5f7e4e97fdd398b35b9d4e126115dcd22de8d8e65abf6f) ---
 Used by:
-- libsqlite3-sys 0.36.0 (LICENSE)
-- rusqlite 0.38.0 (LICENSE)
+- libsqlite3-sys 0.38.2 (LICENSE)
+- rusqlite 0.40.2 (LICENSE)
 
 Copyright (c) 2014 The rusqlite developers
 
@@ -13125,7 +13120,7 @@ SOFTWARE.
 
 --- Text 205 (sha256 ea4fcb309f14a22065e1ea45362d494d320012249ed865fe9c7c0946db754131) ---
 Used by:
-- libsqlite3-sys 0.36.0 (sqlcipher/LICENSE)
+- libsqlite3-sys 0.38.2 (sqlcipher/LICENSE)
 
 Copyright (c) 2008-2020 Zetetic LLC
 All rights reserved.
@@ -13557,7 +13552,7 @@ SOFTWARE.
 
 --- Text 215 (sha256 f1fa5f9e9d8f7827ae2235e742dd00bdf6106d4c5753df928e521d7541b7f9b6) ---
 Used by:
-- hashlink 0.11.1 (LICENSE-MIT)
+- hashlink 0.12.2 (LICENSE-MIT)
 
 This work is derived in part from the `linked-hash-map` crate, Copyright (c)
 2015 The Rust Project Developers
@@ -13811,7 +13806,6 @@ DEALINGS IN THE SOFTWARE.
 --- Text 222 (sha256 ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2) ---
 Used by:
 - hashbrown 0.14.5 (LICENSE-MIT)
-- hashbrown 0.16.1 (LICENSE-MIT)
 - hashbrown 0.17.1 (LICENSE-MIT)
 
 Copyright (c) 2016 Amanieu d'Antras

@@ -63,7 +63,13 @@ impl Db {
     }
 
     pub async fn open_in_memory() -> DomainResult<Self> {
-        let pool_cfg = PoolConfig::new(":memory:");
+        // Each SQLite :memory: connection is a separate database. Give this
+        // pool a private shared-memory database so every connection sees the
+        // migrated schema and the same data.
+        let pool_cfg = PoolConfig::new(format!(
+            "file:huntproxy-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        ));
         let pool = pool_cfg
             .create_pool(Runtime::Tokio1)
             .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
@@ -206,6 +212,43 @@ pub type DbHandle = Arc<Db>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_includes_unix_locking_and_wal_fixes() {
+        assert!(
+            rusqlite::version_number() >= 3_051_003,
+            "SQLite {} predates the Unix locking and WAL fixes",
+            rusqlite::version()
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_pool_shares_database_between_connections_but_not_pools() {
+        let db = Db::open_in_memory().await.unwrap();
+        let other = Db::open_in_memory().await.unwrap();
+        let first = db.pool().get().await.unwrap();
+        first.interact(|conn| {
+            conn.execute_batch("CREATE TABLE shared_fixture (value TEXT); INSERT INTO shared_fixture VALUES ('shared');")
+        }).await.unwrap().unwrap();
+        let second = db.pool().get().await.unwrap();
+        let value: String = second
+            .interact(|conn| {
+                conn.query_row("SELECT value FROM shared_fixture", [], |row| row.get(0))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, "shared");
+        assert!(other
+            .with_conn(|conn| {
+                conn.query_row("SELECT value FROM shared_fixture", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))
+            })
+            .await
+            .is_err());
+    }
 
     fn legacy_database(directory: &Path) -> Config {
         let config = Config {
