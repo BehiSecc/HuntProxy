@@ -33,6 +33,9 @@ echo "== browser worker syntax =="
 node --check browser-worker/index.js
 node --check browser-worker/headless.js
 
+echo "== web UI tests =="
+node --test tests/ui_project_selection.test.cjs
+
 if [[ $quick == true ]]; then
   echo "== release build skipped (--quick) =="
 else

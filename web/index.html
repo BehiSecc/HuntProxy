@@ -623,7 +623,7 @@ test
       bodies: { request: null, response: null },
     };
 
-    async function api(path, options = {}) {
+    async function api(path, options = {}, onResponse = null) {
       const response = await fetch(path, {
         ...options,
         headers: { 'content-type': 'application/json', ...(options.headers || {}) },
@@ -638,6 +638,7 @@ test
         error.status = response.status;
         throw error;
       }
+      if (onResponse) onResponse(response);
       return data;
     }
 
@@ -683,13 +684,56 @@ test
       } catch { $('health').textContent = 'disconnected'; }
     }
 
-    async function loadProjects(preferred) {
-      const result = await api('/api/v1/projects');
+    function savedProjectId() {
+      try { return localStorage.getItem('huntproxy.projectId'); } catch (_) { return null; }
+    }
+
+    function saveProjectId(id) {
+      try {
+        if (id) localStorage.setItem('huntproxy.projectId', String(id));
+        else localStorage.removeItem('huntproxy.projectId');
+      } catch (_) {}
+    }
+
+    function findProject(projects, id) {
+      if (!/^[1-9]\d*$/.test(String(id ?? ''))) return null;
+      const numericId = Number(id);
+      if (!Number.isSafeInteger(numericId)) return null;
+      return projects.find(project => project.id === numericId) || null;
+    }
+
+    function compareProjectUpdates(a, b) {
+      const timestamp = project => {
+        const value = project.updated_at || '';
+        const millis = Date.parse(value);
+        const fraction = /\.(\d+)(?:Z|[+-]\d\d:\d\d)$/i.exec(value)?.[1] || '';
+        return [Number.isFinite(millis) ? millis : -Infinity, Number(fraction.padEnd(9, '0').slice(3, 9))];
+      };
+      const left = timestamp(a);
+      const right = timestamp(b);
+      return left[0] - right[0] || left[1] - right[1] || a.id - b.id;
+    }
+
+    async function loadProjects(preferred, initial = false) {
+      let proxyProjectId = null;
+      const result = await api('/api/v1/projects', {}, response => {
+        if (!response.redirected && new URL(response.url).origin === location.origin) {
+          proxyProjectId = response.headers.get('x-huntproxy-project-id');
+        }
+      });
+      const projects = result.projects || [];
       const select = $('projectSelect');
-      const current = preferred || state.projectId;
-      select.innerHTML = (result.projects || []).map(p => `<option value="${p.id}">${p.id}: ${escapeHtml(p.name)}</option>`).join('');
-      if (current && result.projects?.some(p => Number(p.id) === Number(current))) select.value = current;
-      state.projectId = select.value ? Number(select.value) : null;
+      const candidates = initial
+        ? [proxyProjectId, new URLSearchParams(location.search).get('project'), savedProjectId()]
+        : [preferred, state.projectId, savedProjectId()];
+      const selected = candidates.map(id => findProject(projects, id)).find(Boolean)
+        || projects.reduce((latest, project) => {
+          return !latest || compareProjectUpdates(project, latest) > 0 ? project : latest;
+        }, null);
+      select.innerHTML = projects.map(p => `<option value="${p.id}">${p.id}: ${escapeHtml(p.name)}</option>`).join('');
+      if (selected) select.value = String(selected.id);
+      state.projectId = selected?.id ?? null;
+      saveProjectId(state.projectId);
       await projectChanged();
     }
 
@@ -759,7 +803,7 @@ test
       await Promise.allSettled([loadHistory(), loadSitemap(), loadRules(), loadFindings(), loadReplyTabs(), loadFuzzJobs(), loadWebSockets(), loadBrowserStatus(), loadCookies(), loadProjectUsage(), loadIpRotationStatus()]);
     }
 
-    $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; await projectChanged(); };
+    $('projectSelect').onchange = async e => { state.projectId = Number(e.target.value) || null; saveProjectId(state.projectId); await projectChanged(); };
     $('refreshProjects').onclick = () => loadProjects().catch(e => status('sideStatus', e.message, 'err'));
     $('toggleProjectTools').onclick = () => {
       const open = $('projectTools').classList.toggle('mobile-open');
@@ -2009,7 +2053,7 @@ test
     window.addEventListener('beforeunload', () => state.events?.close());
     (async () => {
       await refreshHealth();
-      try { await loadProjects(); } catch (e) { status('sideStatus', e.message, 'err'); }
+      try { await loadProjects(null, true); } catch (e) { status('sideStatus', e.message, 'err'); }
       const initialView = location.hash.slice(1);
       const validViews = [...document.querySelectorAll('nav button')].map(button => button.dataset.view);
       if (validViews.includes(initialView)) activateView(initialView, false);
