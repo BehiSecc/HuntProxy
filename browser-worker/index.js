@@ -744,6 +744,16 @@ async function stopOwnedChrome(child) {
   if (!await chromeExited(child, 1_000)) throw new Error("Owned Chromium did not exit; its profile remains in use");
 }
 
+function nativeChromeStartupFailure(stderr) {
+  if (/No usable sandbox!/i.test(stderr)) {
+    return "Chromium sandbox initialization failed; check host sandbox permissions. On Ubuntu, allow user namespaces for the selected Chromium executable in its AppArmor profile";
+  }
+  if (/Missing X server or \$DISPLAY|Failed to connect to (?:the )?Wayland display/i.test(stderr)) {
+    return "Chromium could not connect to a display; provide a working display or enable HUNTPROXY_BROWSER_HEADLESS=true";
+  }
+  return null;
+}
+
 async function spawnNativeChrome(proxy, caCertPath, profileDir, cdpPort, extraArgs = []) {
   const port = await nativeDebugPort(cdpPort);
   if (shuttingDown) throw new Error("Browser worker is shutting down");
@@ -762,22 +772,28 @@ async function spawnNativeChrome(proxy, caCertPath, profileDir, cdpPort, extraAr
   child.once("exit", () => ownedChromeChildren.delete(child));
   const endpoint = new Promise((resolve, reject) => {
     let buffer = "";
+    let startupFailure = null;
     let settled = false;
     const finish = (error, endpoint) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      child.removeListener("exit", onExit);
+      child.removeListener("close", onClose);
       buffer = "";
       error ? reject(error) : resolve(endpoint);
     };
-    const onExit = () => finish(new Error("Chromium exited before startup; check the executable, profile and selected browser mode"));
-    const timer = setTimeout(() => finish(new Error("Chromium debugging endpoint did not become ready")), 15_000);
+    const onClose = (code, signal) => {
+      const status = signal ? `signal ${signal}` : code != null ? `exit code ${code}` : "unknown exit status";
+      finish(new Error(`Chromium exited before startup (${status}); ${startupFailure || "check the executable, profile and selected browser mode"}`));
+    };
+    const timer = setTimeout(() => finish(new Error(`Chromium debugging endpoint did not become ready${startupFailure ? `; ${startupFailure}` : ""}`)), 15_000);
     child.on("error", () => finish(new Error("Could not start the selected Chromium executable")));
-    child.once("exit", onExit);
+    // close follows stderr draining, while exit can arrive before the final diagnostic.
+    child.once("close", onClose);
     child.stderr.on("data", (chunk) => {
       if (settled) return;
       buffer = (buffer + chunk.toString()).slice(-8_192);
+      startupFailure ||= nativeChromeStartupFailure(buffer);
       const match = buffer.match(/DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[A-Za-z0-9-]+)/);
       if (match && new URL(match[1]).port === String(port)) finish(null, match[1]);
     });

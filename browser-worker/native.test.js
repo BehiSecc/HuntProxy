@@ -9,7 +9,7 @@ import { test } from "node:test";
 
 const source = fs.readFileSync(new URL("./index.js", import.meta.url), "utf8");
 const launch = source.slice(source.indexOf("function chromiumLaunchOptions"), source.indexOf("async function launchChromium"));
-function fixture(t, mode = "ready") {
+function fixture(t, mode = "ready", startup = {}) {
   fs.mkdirSync("/tmp/artis", { recursive: true });
   const profile = fs.mkdtempSync("/tmp/artis/huntproxy-native-");
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
@@ -20,6 +20,7 @@ function fixture(t, mode = "ready") {
     events.push(signal);
     child.signalCode = signal;
     child.emit("exit", null, signal);
+    child.emit("close", null, signal);
     return true;
   };
   const browser = {
@@ -40,7 +41,15 @@ function fixture(t, mode = "ready") {
       assert.equal(options.stdio[2], "pipe");
       args = Array.from(supplied);
       queueMicrotask(() => {
-        if (mode === "exit") { child.exitCode = 1; child.emit("exit", 1, null); return; }
+        if (mode === "exit") {
+          for (const chunk of startup.stderr || []) child.stderr.write(chunk);
+          child.exitCode = startup.signal ? null : startup.code ?? 1;
+          child.signalCode = startup.signal || null;
+          child.emit("exit", child.exitCode, child.signalCode);
+          if (startup.lateStderr) child.stderr.write(startup.lateStderr);
+          child.emit("close", child.exitCode, child.signalCode);
+          return;
+        }
         const port = Number(args.find((value) => value.startsWith("--remote-debugging-port=")).split("=")[1]);
         child.stderr.write(`DevTools listening on ws://127.0.0.1:${mode === "wrong-port" ? port + 1 : port}/devtools/browser/owned-browser\n`);
       });
@@ -76,6 +85,46 @@ for (const mode of ["wrong-port", "exit", "auth-error"]) {
     await assert.rejects(f.api.launchNativeChromium({ username: "workspace" }, null, f.profile, null));
     assert.ok(f.child.exitCode != null || f.child.signalCode != null);
     if (mode !== "auth-error") assert.equal(f.events.includes("connect"), false);
+  });
+}
+
+test("sandbox startup failures retain late diagnostics and narrow AppArmor guidance", async (t) => {
+  const f = fixture(t, "exit", { stderr: ["private startup detail\nNo usable "], lateStderr: "sandbox!\n" });
+  await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, null), (error) => {
+    assert.match(error.message, /exit code 1/);
+    assert.match(error.message, /sandbox initialization failed/);
+    assert.match(error.message, /allow user namespaces.*Chromium executable.*AppArmor profile/);
+    assert.doesNotMatch(error.message, /private startup detail|--no-sandbox/);
+    return true;
+  });
+  assert.equal(f.args().includes("--no-sandbox"), false);
+});
+
+test("recognized startup failures survive bounded stderr truncation", async (t) => {
+  const f = fixture(t, "exit", { stderr: ["No usable sandbox!\n", "private startup detail".repeat(1_000)] });
+  await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, null), (error) => {
+    assert.match(error.message, /sandbox initialization failed/);
+    assert.doesNotMatch(error.message, /private startup detail/);
+    assert.ok(error.message.length < 512);
+    return true;
+  });
+});
+
+for (const diagnostic of ["Missing X server or $DISPLAY", "Failed to connect to Wayland display"]) {
+  test(`native startup identifies display failure: ${diagnostic}`, async (t) => {
+    const f = fixture(t, "exit", { stderr: [diagnostic] });
+    await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, null), /could not connect to a display.*HUNTPROXY_BROWSER_HEADLESS=true/);
+  });
+}
+
+for (const startup of [{ code: 23 }, { signal: "SIGTRAP" }]) {
+  test(`unknown native startup failures expose only ${startup.signal || "exit code"}`, async (t) => {
+    const f = fixture(t, "exit", { ...startup, stderr: ["private startup detail https://workspace:secret@example.test/"] });
+    await assert.rejects(f.api.launchNativeChromium(null, null, f.profile, null), (error) => {
+      assert.match(error.message, startup.signal ? /signal SIGTRAP/ : /exit code 23/);
+      assert.doesNotMatch(error.message, /private startup detail|workspace|secret|example\.test/);
+      return true;
+    });
   });
 }
 
