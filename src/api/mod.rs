@@ -12,7 +12,7 @@ use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use futures::stream::Stream;
 use futures::StreamExt;
@@ -142,6 +142,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route("/api/v1/projects/{id}/usage", get(project_usage))
+        .route(
+            "/api/v1/projects/{id}/upstream-proxy",
+            put(set_project_upstream_proxy).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
         .route("/api/v1/projects/{id}/export", get(export_project))
         .route("/api/v1/projects/{id}/bundle", get(export_bundle))
         .route(
@@ -1020,6 +1024,31 @@ async fn update_project_scope(
         .await
     {
         Ok(project) => Json(project).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ProjectUpstreamProxyBody {
+    proxy: serde_json::Value,
+}
+
+async fn set_project_upstream_proxy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<ProjectUpstreamProxyBody>,
+) -> Response {
+    let proxy = match body.proxy {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(proxy) => Some(proxy),
+        _ => return error_response(DomainError::invalid("proxy must be a URL string or null")),
+    };
+    match state
+        .db
+        .set_project_upstream_proxy(ProjectId(id), proxy)
+        .await
+    {
+        Ok(status) => Json(status).into_response(),
         Err(error) => error_response(error),
     }
 }

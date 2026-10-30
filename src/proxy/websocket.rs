@@ -51,11 +51,15 @@ pub(super) async fn handle(
     let target = TargetRef::from_url(&http_url)?;
     let capture = url_is_in_scope(&http_url, &project.scope)?;
     let dial = resolve_validated_dial(&http_url, &project.scope, Duration::from_secs(60)).await?;
-    let upstream_proxy = state.config.upstream_proxies.proxy_for_project(
-        session.project_id.get(),
-        &target.host,
-        None,
-    )?;
+    let upstream_proxy = state
+        .db
+        .resolve_upstream_proxy(
+            session.project_id,
+            &state.config.upstream_proxies,
+            &target.host,
+            None,
+        )
+        .await?;
     let websocket_url = websocket_url(&http_url)?;
     let mut request_headers = parts
         .headers

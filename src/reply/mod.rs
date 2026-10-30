@@ -982,11 +982,15 @@ impl ReplyService {
         let method = mat.method.parse::<http::Method>().map_err(|error| {
             DomainError::invalid(format!("invalid HTTP method {}: {error}", mat.method))
         })?;
-        let upstream_proxy = self.upstream_proxies.proxy_for_project(
-            project_id.get(),
-            &wire_target.host,
-            upstream_proxy_override,
-        )?;
+        let upstream_proxy = self
+            .db
+            .resolve_upstream_proxy(
+                project_id,
+                &self.upstream_proxies,
+                &wire_target.host,
+                upstream_proxy_override,
+            )
+            .await?;
         let req_headers: Vec<HeaderEntry> = mat
             .headers
             .iter()

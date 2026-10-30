@@ -269,6 +269,7 @@ const SCOPED_TABLES: &[&str] = &[
     "exchange_request_rules",
     "ip_rotation_profiles",
     "named_cookie_profiles",
+    "project_upstream_proxies",
 ];
 
 fn copy_project_snapshot(
@@ -356,6 +357,8 @@ fn sanitize_snapshot(path: &Path, secrets: SecretMode) -> DomainResult<()> {
         tx.execute("DELETE FROM project_cookies", [])
             .map_err(storage_error)?;
         tx.execute("DELETE FROM named_cookie_profiles", [])
+            .map_err(storage_error)?;
+        tx.execute("DELETE FROM project_upstream_proxies", [])
             .map_err(storage_error)?;
         tx.execute("DELETE FROM ip_rotation_profiles", [])
             .map_err(storage_error)?;
@@ -670,6 +673,7 @@ INSERT INTO annotations SELECT id+{annotation},{new},exchange_id,display_title,n
 INSERT INTO exchange_labels SELECT {new},exchange_id,label_id+{label} FROM hp_archive.exchange_labels WHERE project_id={old};
 INSERT INTO findings SELECT id+{finding},{new},exchange_id,title,description,created_at,updated_at FROM hp_archive.findings WHERE project_id={old};
 INSERT INTO project_cookies SELECT {new},host,target_url,cookie_header,names_json,created_at,updated_at FROM hp_archive.project_cookies WHERE project_id={old};
+INSERT INTO project_upstream_proxies SELECT {new},proxy FROM hp_archive.project_upstream_proxies WHERE project_id={old};
 INSERT INTO named_cookie_profiles SELECT {new},name,target_url,cookie_header,names_json,created_at,updated_at FROM hp_archive.named_cookie_profiles WHERE project_id={old};
 INSERT INTO javascript_provenance SELECT {new},javascript_url,javascript_host,javascript_path,source_page_url,source_page_host,CASE WHEN browser_session_id IS NULL THEN NULL ELSE browser_session_id+{browser} END,discovery_kind,created_at FROM hp_archive.javascript_provenance WHERE project_id={old};
 INSERT INTO audit_events SELECT id+{audit},{new},event_type,actor,target_type,target_id,metadata_json,created_at FROM hp_archive.audit_events WHERE project_id={old};
@@ -1271,7 +1275,7 @@ mod tests {
         let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
         archive
             .execute_batch(
-                "ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14;",
+                "DROP TABLE project_upstream_proxies; ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14;",
             )
             .unwrap();
         drop(archive);
@@ -1347,7 +1351,8 @@ mod tests {
         let manifest_path = unpacked.join("manifest.json");
         let mut manifest: BundleManifest =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        manifest.source_schema = 16;
+        let future_schema = crate::storage::current_schema_version() + 1;
+        manifest.source_schema = future_schema;
         manifest.database_sha256 = "00".repeat(32);
         write_private_file(
             &manifest_path,
@@ -1367,9 +1372,11 @@ mod tests {
         assert_no_import_staging(&destination_config);
 
         let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
-        archive.pragma_update(None, "user_version", 16).unwrap();
+        archive
+            .pragma_update(None, "user_version", future_schema)
+            .unwrap();
         drop(archive);
-        update_bundle_manifest(&unpacked, |manifest| manifest.source_schema = 16);
+        update_bundle_manifest(&unpacked, |manifest| manifest.source_schema = future_schema);
         let future = directory.path().join("future-schema.huntproxy");
         repack_bundle(&unpacked, &future);
         let error = destination_db

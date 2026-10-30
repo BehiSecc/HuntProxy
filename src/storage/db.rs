@@ -219,7 +219,7 @@ mod tests {
         config.ensure_layout().unwrap();
         let database = Connection::open(config.db_path()).unwrap();
         migrations::migrate(&database).unwrap();
-        database.execute_batch("ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14; CREATE TABLE saved_fixture(name TEXT); INSERT INTO saved_fixture VALUES ('Existing project');").unwrap();
+        database.execute_batch("DROP TABLE project_upstream_proxies; ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14; CREATE TABLE saved_fixture(name TEXT); INSERT INTO saved_fixture VALUES ('Existing project');").unwrap();
         config
     }
 
@@ -228,7 +228,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = legacy_database(directory.path());
         let database = Db::open(&config).await.unwrap();
-        assert_eq!(database.schema_version().await.unwrap(), 15);
+        assert_eq!(
+            database.schema_version().await.unwrap(),
+            migrations::current_schema_version()
+        );
         let backups = config.runtime_dir.join("migration-backups");
         let paths: Vec<_> = std::fs::read_dir(&backups)
             .unwrap()
