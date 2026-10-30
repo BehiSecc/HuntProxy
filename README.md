@@ -32,18 +32,19 @@ So HuntProxy was born to let me (and you) keep hunting from anywhere: locally or
 
 ## 📚 Table of Contents
 
-- [HuntProxy](#huntproxy)
-  - [ Installation](#-installation)
-  - [ Your First Project](#-your-first-project)
-  - [ Features](#-features)
-  - [ Example Prompts](#-example-prompts)
-  - [ CLI Reference](#-cli-reference)
-  - [ Plugins](#-plugins)
-  - [ Don't Be Afraid of CAPTCHAs](#captcha-and-bot-checks)
-  - [ FAQ](#-faq)
-  - [ Update & Uninstall](#-update--uninstall)
-  - [ Contribution](#-contribution)
-  - [ Contact](#-contact)
+- [Introduction](#introduction)
+- [Installation](#-installation)
+- [Your First Project](#-your-first-project)
+- [Features](#-features)
+- [Example Prompts](#-example-prompts)
+- [CLI Reference](#-cli-reference)
+- [Plugins](#-plugins)
+- [Don't Be Afraid of CAPTCHAs](#captcha-and-bot-checks)
+- [Troubleshooting](#-troubleshooting)
+- [FAQ](#-faq)
+- [Update & Uninstall](#-update--uninstall)
+- [Contribution](#-contribution)
+- [Contact](#-contact)
 
 ## 📥 Installation
 
@@ -55,18 +56,38 @@ curl -fsSL https://raw.githubusercontent.com/BehiSecc/HuntProxy/master/install.s
 
 The installer sets up HuntProxy, its browser runtime, and a private data directory at `~/.huntproxy`. The managed browser supports Debian 12/13, Ubuntu 22.04/24.04/26.04, and macOS 14+ on Intel or ARM64.
 
-On Ubuntu 24.04 and newer, AppArmor blocks the user namespaces Chromium's sandbox needs. If `browser_start` reports a sandbox failure, allow the managed Chromium in an AppArmor profile (the error names the exact executable), then load it with `sudo apparmor_parser -r /etc/apparmor.d/huntproxy-chromium`:
+### Connect HuntProxy to Your Agent
 
+HuntProxy speaks MCP over standard input/output. When your agent connects, the bridge starts the local HuntProxy daemon automatically and keeps the project available across prompts.
+
+#### Codex
+
+Add this to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.huntproxy]
+command = "/path/to/HuntProxy"
+args = ["mcp"]
 ```
-abi <abi/4.0>,
-include <tunables/global>
 
-profile huntproxy-chromium "/home/*/.huntproxy/runtime/playwright-core-*/.local-browsers/chromium-*/chrome-linux64/chrome" flags=(unconfined) {
-  userns,
+Restart Codex, then ask it to create a HuntProxy project.
+
+#### Other Clients
+
+Use this standard JSON configuration in any client that supports local stdio MCP servers:
+
+```json
+{
+  "mcpServers": {
+    "huntproxy": {
+      "command": "/path/to/HuntProxy",
+      "args": ["mcp"]
+    }
+  }
 }
 ```
 
-The normal HuntProxy workflow begins inside your AI agent. Connect HuntProxy through MCP, then start hunting with a prompt.
+Replace `/path/to/HuntProxy` with the absolute path to the binary. It is usually located at `~/.local/bin/HuntProxy`—for example, `/home/you/.local/bin/HuntProxy`.
 
 Check the installation at any time with:
 
@@ -91,7 +112,7 @@ docker run -d \
   huntproxy:local
 ```
 
-The image includes Node 22 and the pinned Playwright Chromium. Keep its non-root user and the supplied [Playwright 1.63 seccomp profile](https://github.com/microsoft/playwright/blob/v1.63.0/utils/docker/seccomp_profile.json) so Chromium can create its sandbox namespaces. Default native persistent workspaces keep Chromium's sandbox enabled.
+Keep the image's non-root user and the supplied [seccomp profile](docker/seccomp_profile.json), which Chromium needs for its sandbox.
 
 Connect your AI agent to the running container:
 
@@ -114,42 +135,6 @@ Optionally, open the web interface at [http://127.0.0.1:17890](http://127.0.0.1:
 
 > [!NOTE]
 > This setup uses host networking because HuntProxy listens on loopback by default. Host-network support is platform-dependent; the native installer is currently the simplest path on macOS.
-
-</details>
-
-<details>
-<summary><strong>Connect HuntProxy to Your Agent</strong></summary>
-
-HuntProxy speaks MCP over standard input/output. When your agent connects, the bridge starts the local HuntProxy daemon automatically and keeps the project available across prompts.
-
-### Codex
-
-Add this to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.huntproxy]
-command = "/path/to/HuntProxy"
-args = ["mcp"]
-```
-
-Restart Codex, then ask it to create a HuntProxy project.
-
-### Other Clients
-
-Use this standard JSON configuration in any client that supports local stdio MCP servers:
-
-```json
-{
-  "mcpServers": {
-    "huntproxy": {
-      "command": "/path/to/HuntProxy",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-Replace `/path/to/HuntProxy` with the absolute path to the binary. It is usually located at `~/.local/bin/HuntProxy`—for example, `/home/you/.local/bin/HuntProxy`.
 
 </details>
 
@@ -176,25 +161,10 @@ HuntProxy gives agents a complete hunting loop: build context → investigate �
 | **Projects** | Keep a target's traffic, browser state, cookies, notes, and test results together. |
 | **Capture proxy & History** | Record HTTP/HTTPS traffic and search it by host, path, method, status, source, labels, request content, and Boolean expressions. |
 | **Persistent browser profiles** | Run separate named Chromium identities in one project for cross-account testing. Each profile keeps its own cookies and site storage across restarts. |
+| **Browser actions** | Click, fill, upload, use tabs and events, take screenshots, send same-origin requests with the live session, and hand control to a person through CDP; up to two profiles can be open per project by default. |
 | **Sitemap** | Turn saved traffic into a host-and-route tree with methods, statuses, parameters, content types, and exchange counts. |
 | **JavaScript & page discovery** | Find JavaScript and the pages that loaded it, extract endpoints, URLs, emails, and request parameter names, and build target-specific wordlists. Page analysis follows same-origin JavaScript bundles listed in HTML script tags and Modern.js route manifests. |
 | **WebSockets** | Inspect captured connections and messages, then inject text or binary frames into a live connection. |
-
-Different browser profiles can remain open together up to the project's browser limit (two by default). Browser commands share one worker queue, and only one session can be handed to CDP at a time.
-
-Use `browser_manage(project_id=PROJECT_ID, op="status")` at profile or control transitions to inspect active persistent sessions and browser resources. Resource capacity also counts temporary browsers used by tools and extensions; per-session control indicates whether the agent or a person through CDP owns that browser, and the CDP occupancy flag covers the shared port across projects. Reuse a valid matching session when capacity is full. Suspend only an unnecessary idle session you own, preserving its profile; keep simultaneous-account workflows and operator handoffs intact. Retain the result between transitions instead of checking status before every browser action.
-
-For an ordinary file input, use `browser_action` with `action: {type: "upload", locator: {css: "input[type=file]"}, files: ["/absolute/path/monthly-summary.csv"]}`. Set `via_chooser: true` and select the Browse button when the application opens a file chooser. Paths belong to the HuntProxy machine; files must be readable regular files, with at most 16 per action. The default upload timeout is 10 seconds and can be set up to 30 seconds. An empty file list clears a direct input. Selection uses the existing browser and normal UI/capture flow.
-
-`action: {type: "inspect"}` returns passive page readiness, recent resource metadata and diagnostic locations; add `locator` for element state. Its `data.content` contains JSON when `truncated` is false. Increase `max_bytes` from the 4096-byte default up to 65536 when more detail is needed. Console message text, storage and credentials are excluded. These actions retain session ownership and respect a person's CDP handoff.
-
-Agents can keep routine browser work inside `browser_action`. Use `pages` to list, open, select, or close tabs; reuse a returned `page_id` only with its `runtime_generation`. Closing the last tab creates a clean `about:blank` page. Use `events` with its sequence cursor to observe bounded popup, navigation, dialog, request, response, console-error, and window-message metadata. Event payloads exclude message contents, headers, bodies, cookies, and storage. `scroll` accepts a locator or bounded wheel deltas. `screenshot` captures a viewport, element, or bounded full page; MCP clients receive the PNG as an image content block.
-
-`action: {type: "request", method: "POST", url: "https://target.example/api/items", body_text: "..."}` sends one request from a reusable isolated world on the active page. The URL must have that page's exact HTTP(S) origin, and HuntProxy rechecks the effective URL after request rules. The request uses the live browser cookie jar and normal browser CSP, service-worker, Origin, Referer, proxy, and capture behavior. Redirects and retries are disabled. Request bodies are limited to 2 MiB, response previews to 64 KiB, and Fetch-managed or duplicate headers are rejected instead of being silently changed. A completed response is drained so History can retain its normal full captured evidence even when the returned preview is short; a timeout is never retried and can leave explicitly incomplete evidence.
-
-`browser_cdp` remains available for operator handoff and for unusual interactions that the structured actions cannot express. While a CDP handoff is active, `browser_action` pauses as before. Returning control creates a new runtime generation, so list pages and restart event cursors before continuing.
-
-CDP handoff preserves every open tab, the selected tab, and each tab's session storage. Waiting for browser events releases the worker between polls so other sessions can keep working.
 
 ### Test Hypotheses
 
@@ -204,10 +174,6 @@ CDP handoff preserves every open tab, the selected tab, and each tab's session s
 | **Fuzzer** | Run sniper, battering ram, pitchfork, or cluster bomb jobs with wordlists, number ranges, and regex-bypass payloads; group responses to spot meaningful differences. |
 | **Request rules** | Apply ordered URL, header, and body rewrites across Proxy, Browser, Reply, Fuzzer, the crawler, and semantic plugin requests. Raw transports stay byte-exact. |
 | **Compare & utilities** | Diff saved exchanges, transform encodings, inspect large bodies in pages, and copy requests as runnable cURL or Python. |
-
-Reply and Fuzzer drafts accept a request-local `identity`: `{mode: "named", profile: "member"}` selects a saved cookie profile, `{mode: "anonymous"}` removes credential headers, and omitted/null or `{mode: "default"}` keeps existing behavior. Named selection removes inherited credentials and credential rewrites; deliberate non-Cookie credential overrides remain. Cookie overrides conflict with named selection, while a Cookie tombstone suppresses its selected cookie. Missing, expired or non-applicable profiles fail without falling back. The browser and default jar are unchanged, and named Fuzzer jobs pin their cookie selection at launch. Verify the actor through normal application behavior; returned identity metadata describes the selection only.
-
-Raw HTTP/1 replies preserve received bytes and status after a later connection error. Inspect `response_complete`, `truncated`, `read_outcome` and optional `transport_error` alongside the saved exchange. A framed response can be complete while the connection still reports an error. Raw HTTP/2 operations retain decoded stream evidence and identify transport errors on affected streams. Incomplete/error records remain evidence rather than clean results; no automatic retry is introduced.
 
 ### Keep the Proof and Extend the Hunt
 
@@ -297,12 +263,6 @@ Pass a query in `history_search`'s `q` argument. Keep each field, operator, and 
 | `time>2026-10-12T00:00:00Z time<=2026-10-13T00:00:00Z` | Exchanges within these timestamp bounds |
 | `duration>=1000 response_size>1024` | Duration of at least one second and response body larger than 1 KiB |
 
-`field:value` means equality; `field:~value` means contains. Comparisons use `>`, `>=`, `<`, `<=`, or `!=` directly after the field. Adjacent terms mean AND; Boolean precedence is NOT, AND, then OR. Double quotes keep spaces and parentheses inside a value. Bare words search summary fields, not request bodies. `path:/api/*`, `path:*.js`, and `path:*report*` select prefix, suffix, and contains matches.
-
-`duration` is milliseconds; `request_size` and `response_size` are body bytes. `time` compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the stored format for precise cutoffs. Use the tool schema's field names, and narrow full request searches with summary filters when practical. A query error is not an empty result: follow its returned repair guidance and rerun the corrected query before drawing conclusions.
-
-Search results identify exchanges but do not include full bodies. `reply_send` returns an `exchange_id` and a 4 KiB response preview; pass that ID to `exchange_body` with `side: "response"` to read the captured response, or `side: "request"` to read the captured request. Each call returns up to 1 MiB; continue at `next_offset` while `truncated` is true. The default UTF-8 preview replaces invalid byte sequences, so use `encoding: "base64"` when exact page bytes matter. Response bodies are decoded by default; set `raw: true` to read the captured response bytes before content decoding. This reads saved evidence and avoids replaying the request or fetching byte ranges from the target.
-
 Call `overview` with a `project_id` for exchange counts by source, captured replies sent, findings, distinct hosts, and the last exchange time.
 
 ## 💻 CLI Reference
@@ -350,25 +310,15 @@ HuntProxy plugins give the agent focused workflows for parameter discovery, auth
 
 Explore the maintained collection or learn how to build your own in [HuntProxy-Plugins](https://github.com/BehiSecc/HuntProxy-Plugins).
 
-Extension previews include a bounded `planning_summary` with the plugin's selection and exclusion details. Job results retain a host-owned `execution` summary in both compact and full views, including partial results after failure or cancellation. Its counts describe top-level planned, returned, skipped, and unobserved operations; error, not-tested, and evidence-limited counts can overlap. Compact results include `evidence_exchange_count`; full results retain the evidence IDs. Large planning details may be compacted or omitted to retain current execution evidence; `plan_result_omitted_reason` explains this. `observations_recorded` means observations returned, not that requests or controls were clean. Existing `operation_count` and `completed_operations` fields are request-weighted progress and do not count requests actually sent. Analysis retries preserve the execution summary without replaying operations.
-
 <a id="captcha-and-bot-checks"></a>
 
 ## 🛡️ Don't Be Afraid of CAPTCHAs
 
 ### How Can I Reduce CAPTCHAs and Bot Detection?
 
-HuntProxy keeps HTTPS capture in its MITM proxy. Origins therefore see the proxy's TLS and HTTP behavior, even when the browser uses a different engine. Semantic HTTP requests and secure WebSocket handshakes use the same Chrome transport profile, and connection pools are separated by project and browser session or replay credentials. Browser headers retain their values and intentional omissions. For GET navigations with standard browser headers, HuntProxy uses ordering measured from Chromium directly and through an authenticated proxy.
+HuntProxy's proxy traffic uses a Chrome TLS/HTTP profile matched to the bundled Chromium; unsupported browser versions fall back to Chrome153 and `HuntProxy doctor` reports the mismatch. A matching fingerprint does not guarantee access.
 
-Use `HuntProxy browser install` for the paired Chromium runtime. Startup selects a supported Chrome transport profile from the browser's major version (146, 149 or 153); other Chromium versions use the Chrome153 profile and report a mismatch in `HuntProxy doctor` and browser status. Chrome153 includes its measured signature algorithms and trust-anchor identifiers. Certificate verification remains enabled using the combined Chromium and Mozilla root certificates; loading Chromium roots does not implement Chrome's additional root-policy or certificate-transparency checks. Source builds require Rust 1.98; the transport dependencies are pinned to exact upstream revisions providing this support. A matching version label is an emulation choice, not a guarantee of access to a protected site.
-
-Browsers run headless by default. Persistent workspaces automatically use native compatibility mode without a display: the selected browser's own version, brands and platform metadata, a 1280×720 virtual screen, and normal browser APIs. Playwright diagnostics, proxy capture, History and request rules remain available. Set `HUNTPROXY_BROWSER_HEADLESS_COMPAT=false` in the daemon's environment to use the standard Playwright headless launch instead. Transient probes retain their existing launch behavior. This mode improves consistency; it does not guarantee acceptance by every website.
-
-Run `HuntProxy browser install` after upgrading an older installation to refresh the browser-worker dependencies. The pinned Playwright 1.63.0 runtime includes Chromium 153.0.8010.12 and requires Node.js 20 or newer. The installer supplies a private Node 22 runtime; an unsupported system Node can use that managed runtime without changing other software. Source installs can set `node_path` in `config.toml`. Browser installation uses the same selected Node as the worker. Missing dependencies, stale managed SDKs or unsupported native metadata fail visibly rather than silently switching modes.
-
-Set `HUNTPROXY_BROWSER_HEADLESS=false` to use a headed persistent workspace instead; Linux needs an available display, such as Xvfb. The compatibility default turns off automatically in headed mode. Use `HUNTPROXY_CHROME_EXECUTABLE=/absolute/path/to/chrome` to select an installed browser; otherwise the paired Chromium remains preferred. `HuntProxy doctor` and browser status report its path, version and selected mode without launching a browser. Apply these settings before starting the daemon; existing sessions keep their current process until restarted. Persistent headed and compatibility workspaces start an owned browser with a private loopback debugging port, then attach Playwright for control.
-
-Window-message observation runs in a separate JavaScript world without changing page HTML or CSP. Normal console and page-error events remain available; observer failures appear as diagnostics. The first inline script in a newly opened popup can run before its observer attaches.
+For browser runtime settings and manual installation, see [Browser configuration](docs/browser.md).
 
 CAPTCHAs and bot checks are common when hunting from a VPS because datacenter IP addresses are easier to recognize. Routing HuntProxy through a reputable residential proxy is usually the most effective fix.
 
@@ -423,6 +373,29 @@ A proxy can reduce bot checks, but it cannot prevent every CAPTCHA. When one sti
 
 - [Give the agent a logged-in session](#logged-in-session).
 - Ask the agent to hand you the browser through CDP, solve the CAPTCHA yourself, then return control so it can continue.
+
+## 🩺 Troubleshooting
+
+### Browser sandbox error on Ubuntu 24.04+
+
+On Ubuntu 24.04 and newer, AppArmor can block the user namespaces Chromium's sandbox needs. If `browser_start` reports a sandbox failure, allow the managed Chromium in an AppArmor profile (the error names the exact executable), then load it with `sudo apparmor_parser -r /etc/apparmor.d/huntproxy-chromium`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+
+profile huntproxy-chromium "/home/*/.huntproxy/runtime/playwright-core-*/.local-browsers/chromium-*/chrome-linux64/chrome" flags=(unconfined) {
+  userns,
+}
+```
+
+### Daemon did not become ready or something else looks wrong
+
+Run `HuntProxy doctor` and check `~/.huntproxy/runtime/daemon-startup.log`.
+
+### MCP tools look outdated after an update
+
+Reconnect your MCP client.
 
 ## 💡 FAQ
 
@@ -523,17 +496,13 @@ Update HuntProxy to the latest release:
 HuntProxy update
 ```
 
-For native installations from v0.2 onward, the updater prepares the matching browser runtime and official plugins, preserves project data, and restarts the daemon if it was running. Existing projects open normally; there is no re-export or conversion step. Older `.huntproxy` bundles are upgraded during ordinary import. Customized and third-party plugin folders are preserved; an incompatible preserved Racer package returns a clear compatibility error.
+For native installations from v0.2 onward, the updater keeps projects and data, prepares the browser runtime and official plugins, restarts the daemon if it was running, and attempts to restore the previous installation if an update fails.
 
-The v0.2 MCP bridge refreshes the daemon's tool catalog after later updates and sends the standard `tools/list_changed` notification, so clients that support it can discover new features on the same connection. It keeps the last validated catalog while the daemon is idle or stopped.
+**Upgrading from v0.1.1:** Run `HuntProxy stop` before `HuntProxy update`, then reconnect your MCP client.
 
-**Upgrading from v0.1.1:** its already-published updater requires `HuntProxy stop` and an MCP client reconnect after `HuntProxy update`. The new executable prepares its runtime and plugins automatically on first startup. This one-time limitation belongs to the old updater; subsequent updates use the coordinated workflow.
+`HuntProxy backup` copies only the SQLite database; for a full backup, stop HuntProxy and copy `~/.huntproxy` and any configured external paths.
 
-Updates keep a private database/configuration/plugin restore point and the previous executable. Failed preparation or activation restores the previous installation. Interrupted v0.2 updates recover before opening project data. A schema migration also keeps a private copy of the earlier database. Active browsers and jobs stop during replacement; saved projects, history, identities, and browser profile storage remain available.
-
-`HuntProxy backup` copies only SQLite; it omits configuration, the CA, plugins, and browser profiles. Update restore points also omit browser profiles and the CA because the updater preserves those in place. For a complete independent backup, stop HuntProxy and copy its data directory plus any configured external paths.
-
-See the [v0.2.0 release notes](docs/releases/v0.2.0.md) for the compatibility changes.
+See [update details](docs/updating.md) and the [v0.2.0 release notes](docs/releases/v0.2.0.md).
 
 ### Uninstall
 
