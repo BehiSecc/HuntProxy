@@ -17,10 +17,10 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn configuration() -> (TempDir, Config) {
-    std::fs::create_dir_all("/tmp/artis").unwrap();
+    std::fs::create_dir_all("/tmp/artis/upstream").unwrap();
     let directory = tempfile::Builder::new()
         .prefix("huntproxy-live-upstream-")
-        .tempdir_in("/tmp/artis")
+        .tempdir_in("/tmp/artis/upstream")
         .unwrap();
     let config = Config {
         data_dir: directory.path().to_path_buf(),
@@ -75,22 +75,31 @@ async fn live_routing_is_persistent_and_explicit_direct_overrides_all_static_rou
         Some("http://project.example:8080")
     );
     let proxy = "http://fixture-user:fixture-password@127.0.0.1:8081";
-    let status = db
-        .set_project_upstream_proxy(id, Some(proxy.into()))
+    db.set_project_upstream_proxy(id, Some(proxy.into()))
         .await
         .unwrap();
-    assert_eq!(
-        serde_json::to_value(status).unwrap(),
-        json!({"project_id":id.get(),"mode":"proxy"})
-    );
     let cloned = db.clone();
     assert_eq!(resolved(&cloned, id, &routes).await.as_deref(), Some(proxy));
     assert_eq!(
         resolved(&cloned, other, &routes).await.as_deref(),
         Some("http://host.example:8080")
     );
-    db.set_project_upstream_proxy(id, None).await.unwrap();
+    db.set_project_upstream_proxy(id, Some("direct".into()))
+        .await
+        .unwrap();
     assert!(resolved(&cloned, id, &routes).await.is_none());
+    let direct_rows: i64 = db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM project_upstream_proxies WHERE project_id=?1 AND proxy IS NULL",
+                [id.get()],
+                |row| row.get(0),
+            )
+            .map_err(|_| DomainError::new(ErrorCode::StorageError, "count failed"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(direct_rows, 1);
     let reopened = Db::open(&config).await.unwrap();
     assert!(resolved(&reopened, id, &routes).await.is_none());
     assert_eq!(
@@ -106,9 +115,45 @@ async fn live_routing_is_persistent_and_explicit_direct_overrides_all_static_rou
             .as_deref(),
         Some("http://override.example:8080")
     );
+    db.set_project_upstream_proxy(id, None).await.unwrap();
+    assert_eq!(
+        resolved(&cloned, id, &routes).await.as_deref(),
+        Some("http://project.example:8080")
+    );
+    assert_eq!(
+        resolved(&reopened, id, &routes).await.as_deref(),
+        Some("http://project.example:8080")
+    );
+    let default_routes = UpstreamProxyConfig {
+        default: routes.default.clone(),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved(&cloned, id, &default_routes).await.as_deref(),
+        Some("http://default.example:8080")
+    );
+    assert!(resolved(&cloned, id, &UpstreamProxyConfig::default())
+        .await
+        .is_none());
+    db.set_project_upstream_proxy(id, None).await.unwrap();
+    let cleared_rows: i64 = db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM project_upstream_proxies WHERE project_id=?1",
+                [id.get()],
+                |row| row.get(0),
+            )
+            .map_err(|_| DomainError::new(ErrorCode::StorageError, "count failed"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(cleared_rows, 0);
     let public = serde_json::to_string(&db.list_projects().await.unwrap()).unwrap();
     assert!(!public.contains("fixture-password"));
     assert!(!public.contains("fixture-user"));
+    db.set_project_upstream_proxy(id, Some(proxy.into()))
+        .await
+        .unwrap();
     db.delete_project(id).await.unwrap();
     let rows: i64 = db
         .with_conn(move |conn| {
@@ -161,20 +206,147 @@ async fn invalid_updates_do_not_change_existing_routing_or_expose_credentials() 
 }
 
 async fn state() -> (TempDir, Arc<AppState>, ProjectId) {
-    let (directory, config) = configuration();
+    let (directory, mut config) = configuration();
+    config.upstream_proxies.default =
+        Some("http://default-user:default-secret@default.example:8081".into());
     let state = bootstrap_state(config).await.unwrap();
     let id = project(&state.db, "API workspace").await;
     (directory, state, id)
+}
+
+fn assert_status(
+    status: &Value,
+    mode: &str,
+    proxy_host: Option<&str>,
+    effective_mode: &str,
+    effective_proxy_host: Option<&str>,
+) {
+    assert_eq!(status["mode"], mode);
+    assert_eq!(status["effective"]["host"], "127.0.0.1");
+    assert_eq!(status["effective"]["mode"], effective_mode);
+    for (value, expected_host) in [
+        (&status["proxy"], proxy_host),
+        (&status["effective"]["proxy"], effective_proxy_host),
+    ] {
+        match expected_host {
+            Some(host) => assert!(value.as_str().unwrap().contains(host)),
+            None => assert!(value.is_null()),
+        }
+    }
+    let text = status.to_string();
+    for credential in [
+        "fixture-user",
+        "fixture-secret",
+        "default-user",
+        "default-secret",
+    ] {
+        assert!(!text.contains(credential), "credential leaked in {text}");
+    }
+}
+
+async fn assert_project_details(state: &Arc<AppState>, id: ProjectId, expected: &Value) {
+    let response = huntproxy::api::router(state.clone())
+        .oneshot(
+            Request::get(format!("/api/v1/projects/{}", id.get()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let rest: Value = serde_json::from_slice(&bytes).unwrap();
+    let mcp = huntproxy::mcp::call_tool(
+        state.clone(),
+        "projects",
+        json!({"action":"list","project_id":id.get()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rest["id"], id.get());
+    assert_eq!(mcp["id"], id.get());
+    assert_eq!(&rest["upstream_proxy"], expected);
+    assert_eq!(&mcp["upstream_proxy"], expected);
+    for details in [&rest, &mcp] {
+        let text = details.to_string();
+        for credential in [
+            "fixture-user",
+            "fixture-secret",
+            "default-user",
+            "default-secret",
+        ] {
+            assert!(!text.contains(credential), "credential leaked in {text}");
+        }
+    }
 }
 
 #[tokio::test]
 async fn api_and_mcp_require_an_explicit_proxy_and_return_safe_status() {
     let (_directory, state, id) = state().await;
     let app = huntproxy::api::router(state.clone());
-    let proxy = "http://fixture-user:fixture-secret@127.0.0.1:8080";
+    let proxy = "http://fixture-user:fixture-secret@proxy.example:8080";
+    let cases = [
+        (
+            json!(proxy),
+            "proxy",
+            Some("proxy.example:8080"),
+            "proxy",
+            Some("proxy.example:8080"),
+        ),
+        (json!("direct"), "direct", None, "direct", None),
+        (
+            Value::Null,
+            "inherit",
+            None,
+            "proxy",
+            Some("default.example:8081"),
+        ),
+    ];
+    let initial = huntproxy::mcp::call_tool(
+        state.clone(),
+        "projects",
+        json!({"action":"list","project_id":id.get()}),
+    )
+    .await
+    .unwrap();
+    assert_status(
+        &initial["upstream_proxy"],
+        "inherit",
+        None,
+        "proxy",
+        Some("default.example:8081"),
+    );
+    assert_project_details(&state, id, &initial["upstream_proxy"]).await;
+
+    for (input, mode, proxy_host, effective_mode, effective_host) in &cases {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/v1/projects/{}/upstream-proxy", id.get()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"proxy":input}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_status(&result, mode, *proxy_host, effective_mode, *effective_host);
+        assert_project_details(&state, id, &result).await;
+    }
+    for (input, mode, proxy_host, effective_mode, effective_host) in &cases {
+        let mcp = huntproxy::mcp::call_tool(
+            state.clone(),
+            "projects",
+            json!({"action":"set_upstream_proxy","project_id":id.get(),"proxy":input}),
+        )
+        .await
+        .unwrap();
+        assert_status(&mcp, mode, *proxy_host, effective_mode, *effective_host);
+        assert_project_details(&state, id, &mcp).await;
+    }
     for (body, expected) in [
-        (json!({"proxy":proxy}), StatusCode::OK),
-        (json!({"proxy":null}), StatusCode::OK),
         (json!({}), StatusCode::UNPROCESSABLE_ENTITY),
         (json!({"proxy":123}), StatusCode::BAD_REQUEST),
         (
@@ -194,32 +366,8 @@ async fn api_and_mcp_require_an_explicit_proxy_and_return_safe_status() {
             .unwrap();
         assert_eq!(response.status(), expected);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains("fixture-secret"));
-        if expected == StatusCode::OK {
-            let result: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                result,
-                json!({"project_id":id.get(),"mode":if body["proxy"].is_null(){"direct"}else{"proxy"}})
-            );
-        }
+        assert!(!String::from_utf8_lossy(&bytes).contains("fixture-secret"));
     }
-    let result = huntproxy::mcp::call_tool(
-        state.clone(),
-        "projects",
-        json!({"action":"set_upstream_proxy","project_id":id.get(),"proxy":proxy}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result, json!({"project_id":id.get(),"mode":"proxy"}));
-    let result = huntproxy::mcp::call_tool(
-        state.clone(),
-        "projects",
-        json!({"action":"set_upstream_proxy","project_id":id.get(),"proxy":null}),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result["mode"], "direct");
     for args in [
         json!({"action":"set_upstream_proxy","project_id":id.get()}),
         json!({"action":"set_upstream_proxy","project_id":id.get(),"proxy":false}),
@@ -242,6 +390,60 @@ async fn api_and_mcp_require_an_explicit_proxy_and_return_safe_status() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn inherited_status_uses_target_host_rules_or_direct_fallback() {
+    let (_directory, mut config) = configuration();
+    config.upstream_proxies.rules.push(UpstreamProxyRule {
+        host: "127.0.0.1".into(),
+        proxy: "http://fixture-user:fixture-secret@host.example:8080".into(),
+    });
+    let state = bootstrap_state(config).await.unwrap();
+    let matched = project(&state.db, "Matched workspace").await;
+    let unmatched = state
+        .db
+        .create_project(CreateProjectRequest {
+            name: "Direct workspace".into(),
+            target_url: "http://other.example/".into(),
+            advanced: None,
+        })
+        .await
+        .unwrap()
+        .id;
+
+    let detail = huntproxy::mcp::call_tool(
+        state.clone(),
+        "projects",
+        json!({"action":"list","project_id":matched.get()}),
+    )
+    .await
+    .unwrap();
+    assert_status(
+        &detail["upstream_proxy"],
+        "inherit",
+        None,
+        "proxy",
+        Some("host.example:8080"),
+    );
+    assert_project_details(&state, matched, &detail["upstream_proxy"]).await;
+
+    let detail = huntproxy::mcp::call_tool(
+        state.clone(),
+        "projects",
+        json!({"action":"list","project_id":unmatched.get()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        detail["upstream_proxy"],
+        json!({
+            "mode":"inherit",
+            "proxy":null,
+            "effective":{"host":"other.example","mode":"direct","proxy":null}
+        })
+    );
+    assert_project_details(&state, unmatched, &detail["upstream_proxy"]).await;
 }
 
 #[derive(Default)]
@@ -312,6 +514,13 @@ async fn an_existing_reply_service_uses_runtime_updates_and_request_override_pri
         .send(id, None, None, &draft, ProtocolPreference::H1, 0)
         .await
         .unwrap();
+    db.set_project_upstream_proxy(id, Some("direct".into()))
+        .await
+        .unwrap();
+    reply
+        .send(id, None, None, &draft, ProtocolPreference::H1, 0)
+        .await
+        .unwrap();
     db.set_project_upstream_proxy(id, None).await.unwrap();
     reply
         .send(id, None, None, &draft, ProtocolPreference::H1, 0)
@@ -336,42 +545,54 @@ async fn an_existing_reply_service_uses_runtime_updates_and_request_override_pri
             Some("http://first.example:8080".into()),
             Some("http://second.example:8080".into()),
             None,
+            Some("http://static.example:8080".into()),
             Some("http://override.example:8080".into())
         ]
     );
 }
 
 #[tokio::test]
-async fn bundles_include_proxy_credentials_only_in_full_exports() {
+async fn bundles_preserve_overrides_only_in_full_exports() {
     let (_directory, config) = configuration();
     let db = Db::open(&config).await.unwrap();
     let id = project(&db, "Export workspace").await;
     let proxy = "http://fixture-user:fixture-secret@127.0.0.1:8080";
-    db.set_project_upstream_proxy(id, Some(proxy.into()))
-        .await
-        .unwrap();
-    for (name, mode, expected) in [
-        ("full", SecretMode::Full, Some(proxy)),
-        ("sanitized", SecretMode::Sanitized, None),
+    let configured = "http://default.example:8080";
+    let routes = UpstreamProxyConfig {
+        default: Some(configured.into()),
+        ..Default::default()
+    };
+    for (setting, override_value, full_expected) in [
+        ("proxy", Some(proxy), Some(proxy)),
+        ("direct", Some("direct"), None),
+        ("inherit", None, Some(configured)),
     ] {
-        let path = config.runtime_dir.join(format!("{name}.huntproxy"));
-        db.export_bundle(
-            &config,
-            id,
-            path.clone(),
-            BundleExportOptions {
-                secrets: mode,
-                include_chromium_profile: false,
-            },
-        )
-        .await
-        .unwrap();
-        let imported = db.import_bundle(&config, path, None).await.unwrap();
-        assert_eq!(
-            resolved(&db, imported.project.id, &UpstreamProxyConfig::default())
-                .await
-                .as_deref(),
-            expected
-        );
+        db.set_project_upstream_proxy(id, override_value.map(str::to_owned))
+            .await
+            .unwrap();
+        for (name, mode, expected) in [
+            ("full", SecretMode::Full, full_expected),
+            ("sanitized", SecretMode::Sanitized, Some(configured)),
+        ] {
+            let path = config
+                .runtime_dir
+                .join(format!("{setting}-{name}.huntproxy"));
+            db.export_bundle(
+                &config,
+                id,
+                path.clone(),
+                BundleExportOptions {
+                    secrets: mode,
+                    include_chromium_profile: false,
+                },
+            )
+            .await
+            .unwrap();
+            let imported = db.import_bundle(&config, path, None).await.unwrap();
+            assert_eq!(
+                resolved(&db, imported.project.id, &routes).await.as_deref(),
+                expected
+            );
+        }
     }
 }

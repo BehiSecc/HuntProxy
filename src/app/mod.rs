@@ -39,6 +39,33 @@ pub struct AppState {
     pub activity: ActivityTracker,
 }
 
+impl AppState {
+    pub async fn project_detail(&self, project_id: ProjectId) -> DomainResult<serde_json::Value> {
+        let project = self.db.get_project(project_id).await?;
+        let mut detail = serde_json::json!(project);
+        // The routing summary is informational; never let it hide the project.
+        match self
+            .db
+            .project_upstream_proxy_setting(&project, &self.config.upstream_proxies)
+            .await
+        {
+            Ok(setting) => detail["upstream_proxy"] = serde_json::json!(setting),
+            Err(error) => tracing::warn!(%error, "could not summarize project upstream proxy"),
+        }
+        Ok(detail)
+    }
+
+    pub async fn upstream_proxy_setting(
+        &self,
+        project_id: ProjectId,
+    ) -> DomainResult<crate::storage::ProjectUpstreamProxySetting> {
+        let project = self.db.get_project(project_id).await?;
+        self.db
+            .project_upstream_proxy_setting(&project, &self.config.upstream_proxies)
+            .await
+    }
+}
+
 /// The configured emulation is an approximation, not proof of a wire-identical
 /// browser handshake. Keep a custom browser's version mismatch visible.
 #[derive(Clone, Debug, Serialize)]

@@ -462,7 +462,7 @@ fn request_rules_tool_def() -> Value {
 
 pub(crate) fn tool_defs() -> Value {
     json!([
-        {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations. set_upstream_proxy persists live routing; proxy null explicitly selects direct traffic. Existing connections reconnect naturally.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope","set_upstream_proxy"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults; set_upstream_proxy needs project_id and an explicit proxy URL or null."},"project_id":{"type":"integer","description":"Optional for list; required for usage, set_scope and set_upstream_proxy."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}},"proxy":{"type":["string","null"],"description":"For set_upstream_proxy: http://, socks5:// or socks5h:// URL; null explicitly routes directly."}},"required":["action"],"additionalProperties":false}},
+        {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations. set_upstream_proxy persists live routing; proxy null inherits config.toml, direct selects direct traffic, and a URL selects that proxy. Existing connections reconnect naturally.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope","set_upstream_proxy"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults; set_upstream_proxy needs project_id and an explicit proxy URL, direct, or null."},"project_id":{"type":"integer","description":"Optional for list; required for usage, set_scope and set_upstream_proxy."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}},"proxy":{"type":["string","null"],"description":"For set_upstream_proxy: http://, socks5:// or socks5h:// URL, direct to route directly, or null to inherit config.toml."}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List compact installed-extension summaries and any rejected packages. Use extension_describe for schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and requested/effective limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
         {"name":"extension_preview","description":"Run the real extension planner without creating a job or sending requests. Returns stage-scoped request, candidate, runtime, and mode estimates plus a bounded planning_summary with selection/exclusion details when supplied by the plugin.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer"},"input":{"type":"object","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
@@ -1215,7 +1215,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 "list" => {
                     if args.get("project_id").is_some() {
                         Ok(json!(
-                            state.db.get_project(require_project_id(&args)?).await?
+                            state.project_detail(require_project_id(&args)?).await?
                         ))
                     } else {
                         let projects = state.db.list_projects().await?;
@@ -1294,16 +1294,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         Some(Value::String(proxy)) => Some(proxy.clone()),
                         _ => {
                             return Err(DomainError::invalid(
-                                "proxy must be an explicit URL string or null",
+                                "proxy must be an explicit URL string, direct, or null",
                             ))
                         }
                     };
-                    Ok(json!(
-                        state
-                            .db
-                            .set_project_upstream_proxy(project_id, proxy)
-                            .await?
-                    ))
+                    state
+                        .db
+                        .set_project_upstream_proxy(project_id, proxy)
+                        .await?;
+                    Ok(json!(state.upstream_proxy_setting(project_id).await?))
                 }
                 _ => Err(DomainError::invalid(
                     "action must be list|create|usage|set_scope|set_upstream_proxy",
@@ -3010,7 +3009,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(full, json!(project));
+        let mut expected = json!(project);
+        expected["upstream_proxy"] = json!({"mode":"inherit", "proxy":null, "effective":{"host":"example.test", "mode":"direct", "proxy":null}});
+        assert_eq!(full, expected);
         assert!(
             call_tool(state, "projects", json!({"action":"list", "project_id":-1}))
                 .await

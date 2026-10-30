@@ -677,7 +677,7 @@ async fn create_project(
 }
 
 async fn get_project(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
-    match state.db.get_project(ProjectId(id)).await {
+    match state.project_detail(ProjectId(id)).await {
         Ok(p) => Json(p).into_response(),
         Err(e) => error_response(e),
     }
@@ -1041,14 +1041,21 @@ async fn set_project_upstream_proxy(
     let proxy = match body.proxy {
         serde_json::Value::Null => None,
         serde_json::Value::String(proxy) => Some(proxy),
-        _ => return error_response(DomainError::invalid("proxy must be a URL string or null")),
+        _ => {
+            return error_response(DomainError::invalid(
+                "proxy must be a URL string, direct, or null",
+            ))
+        }
     };
     match state
         .db
         .set_project_upstream_proxy(ProjectId(id), proxy)
         .await
     {
-        Ok(status) => Json(status).into_response(),
+        Ok(_) => match state.upstream_proxy_setting(ProjectId(id)).await {
+            Ok(setting) => Json(setting).into_response(),
+            Err(error) => error_response(error),
+        },
         Err(error) => error_response(error),
     }
 }

@@ -367,7 +367,7 @@ proxy = "http://127.0.0.1:8080"
 
 `*.example.com` matches its subdomains, not `example.com` itself. Exact host rules take priority over wildcard rules.
 
-To switch a project's proxy without editing `config.toml` or restarting, ask your agent to set it, for example: "Route project 41 through socks5h://127.0.0.1:1080". New connections use it immediately; setting it to direct bypasses the configured proxy.
+To change a project's proxy without restarting, use the `projects` action `set_upstream_proxy` or `PUT /api/v1/projects/{id}/upstream-proxy`. Set `proxy` to a URL for an override, `"direct"` to bypass configured proxies, or `null` to inherit `config.toml`. New connections use the setting immediately. Project details show the setting and the effective route for the project target host, with proxy credentials removed.
 
 ### What If the Agent Still Faces a CAPTCHA?
 

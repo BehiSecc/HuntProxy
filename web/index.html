@@ -186,6 +186,7 @@
         <button class="btn" id="refreshProjects">Refresh</button>
         <button class="btn fit" id="toggleProjectTools" aria-expanded="false">Project tools</button>
       </div>
+      <div class="small muted" id="upstreamProxyStatus" style="margin-top:.4rem"></div>
 
       <div id="projectTools">
       <h3>Create project</h3>
@@ -692,7 +693,33 @@ test
       await projectChanged();
     }
 
+    function proxyHostLabel(value) {
+      if (typeof value !== 'string' || !value) return '';
+      try {
+        const url = new URL(value.includes('://') ? value : `http://${value}`);
+        return url.hostname ? `${url.hostname}${url.port ? `:${url.port}` : ''}` : '';
+      } catch (_) { return ''; }
+    }
+
+    function renderUpstreamProxyStatus(setting) {
+      const el = $('upstreamProxyStatus');
+      if (!setting || !['inherit', 'direct', 'proxy'].includes(setting.mode)) {
+        el.textContent = '';
+        return;
+      }
+      const configuredHost = proxyHostLabel(setting.proxy);
+      const effective = setting.effective || {};
+      const effectiveHost = proxyHostLabel(effective.proxy) || proxyHostLabel(effective.host);
+      const text = setting.mode === 'inherit'
+        ? `Upstream: Config → ${effective.mode === 'direct' ? 'Direct' : effective.mode === 'proxy' ? `Proxy${effectiveHost ? ` ${effectiveHost}` : ''}` : 'Unknown'}`
+        : setting.mode === 'direct'
+          ? 'Upstream: Direct override'
+          : `Upstream: Proxy override${configuredHost ? ` · ${configuredHost}` : ''}`;
+      el.textContent = text;
+    }
+
     async function projectChanged() {
+      renderUpstreamProxyStatus(null);
       state.selectedExchange = null;
       state.selectedDetail = null;
       state.websocketConnection = null;
@@ -720,6 +747,7 @@ test
         $('scopeHosts').value = (project.scope?.host_patterns || []).join(', ');
         $('scopeExcludedHosts').value = (project.scope?.excluded_host_patterns || []).join(', ');
         $('renameProjectName').value = project.name || '';
+        renderUpstreamProxyStatus(project.upstream_proxy);
         $('browserUrl').value = project.target_url || '';
         $('cookieTarget').value = project.target_url || '';
         try { $('ipRotationTarget').value = new URL(project.target_url).origin; } catch (_) { $('ipRotationTarget').value = ''; }
