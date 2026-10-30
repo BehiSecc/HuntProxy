@@ -744,9 +744,9 @@ async function stopOwnedChrome(child) {
   if (!await chromeExited(child, 1_000)) throw new Error("Owned Chromium did not exit; its profile remains in use");
 }
 
-function nativeChromeStartupFailure(stderr) {
+function nativeChromeStartupFailure(stderr, executablePath) {
   if (/No usable sandbox!/i.test(stderr)) {
-    return "Chromium sandbox initialization failed; check host sandbox permissions. On Ubuntu, allow user namespaces for the selected Chromium executable in its AppArmor profile";
+    return `Chromium sandbox initialization failed; check host sandbox permissions. On Ubuntu, allow user namespaces for the selected Chromium executable (${executablePath}) in its AppArmor profile`;
   }
   if (/Missing X server or \$DISPLAY|Failed to connect to (?:the )?Wayland display/i.test(stderr)) {
     return "Chromium could not connect to a display; provide a working display or enable HUNTPROXY_BROWSER_HEADLESS=true";
@@ -793,7 +793,7 @@ async function spawnNativeChrome(proxy, caCertPath, profileDir, cdpPort, extraAr
     child.stderr.on("data", (chunk) => {
       if (settled) return;
       buffer = (buffer + chunk.toString()).slice(-8_192);
-      startupFailure ||= nativeChromeStartupFailure(buffer);
+      startupFailure ||= nativeChromeStartupFailure(buffer, browserRuntime.chromium_path);
       const match = buffer.match(/DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[A-Za-z0-9-]+)/);
       if (match && new URL(match[1]).port === String(port)) finish(null, match[1]);
     });

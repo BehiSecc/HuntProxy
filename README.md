@@ -55,6 +55,17 @@ curl -fsSL https://raw.githubusercontent.com/BehiSecc/HuntProxy/master/install.s
 
 The installer sets up HuntProxy, its browser runtime, and a private data directory at `~/.huntproxy`. The managed browser supports Debian 12/13, Ubuntu 22.04/24.04/26.04, and macOS 14+ on Intel or ARM64.
 
+On Ubuntu 24.04 and newer, AppArmor blocks the user namespaces Chromium's sandbox needs. If `browser_start` reports a sandbox failure, allow the managed Chromium in an AppArmor profile (the error names the exact executable), then load it with `sudo apparmor_parser -r /etc/apparmor.d/huntproxy-chromium`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+
+profile huntproxy-chromium "/home/*/.huntproxy/runtime/playwright-core-*/.local-browsers/chromium-*/chrome-linux64/chrome" flags=(unconfined) {
+  userns,
+}
+```
+
 The normal HuntProxy workflow begins inside your AI agent. Connect HuntProxy through MCP, then start hunting with a prompt.
 
 Check the installation at any time with:
