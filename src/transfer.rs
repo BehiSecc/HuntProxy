@@ -67,12 +67,14 @@ impl Db {
         let staging = private_staging(&config.runtime_dir, "bundle-export")?;
         let profiles_root = config.browser_profiles_dir();
         let snapshot = staging.join("project.sqlite3");
-        self.backup_to(snapshot.clone()).await?;
-        let schema = self.schema_version().await?;
         let secrets = options.secrets;
+        let snapshot_for_copy = snapshot.clone();
+        let schema = self
+            .with_conn(move |conn| copy_project_snapshot(conn, &snapshot_for_copy, project_id))
+            .await?;
         tokio::task::spawn_blocking(move || {
             let result = (|| {
-                prune_snapshot(&snapshot, project_id, secrets)?;
+                sanitize_snapshot(&snapshot, secrets)?;
                 let database_sha256 = sha256_file(&snapshot)?;
                 let manifest = BundleManifest {
                     format: BUNDLE_FORMAT.into(),
@@ -123,9 +125,14 @@ impl Db {
                 }
                 let temporary = temporary_bundle_path(&destination)?;
                 let _temporary_guard = RemoveFileOnDrop(temporary.clone());
-                let output = std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
+                let mut options = std::fs::OpenOptions::new();
+                options.create_new(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let output = options
                     .open(&temporary)
                     .map_err(|error| storage_error(format!("create bundle: {error}")))?;
                 let encoder = zstd::Encoder::new(output, 3).map_err(storage_error)?;
@@ -235,27 +242,105 @@ impl Db {
     }
 }
 
-fn prune_snapshot(path: &Path, project_id: ProjectId, secrets: SecretMode) -> DomainResult<()> {
+// Only the attached staging database is written while the source is read.
+/// Tables copied by `project_id` into an export snapshot. Every table with a
+/// `project_id` column must be listed here; a test enforces this.
+const SCOPED_TABLES: &[&str] = &[
+    "capture_sessions",
+    "exchanges",
+    "message_headers",
+    "annotations",
+    "labels",
+    "exchange_labels",
+    "reply_workspaces",
+    "reply_tabs",
+    "fuzz_jobs",
+    "browser_sessions",
+    "browser_actions",
+    "audit_events",
+    "project_seq",
+    "project_cookies",
+    "findings",
+    "javascript_provenance",
+    "project_usage",
+    "websocket_connections",
+    "websocket_messages",
+    "request_rules",
+    "exchange_request_rules",
+    "ip_rotation_profiles",
+    "named_cookie_profiles",
+];
+
+fn copy_project_snapshot(
+    conn: &rusqlite::Connection,
+    path: &Path,
+    project_id: ProjectId,
+) -> DomainResult<i32> {
+    let target = rusqlite::Connection::open(path).map_err(storage_error)?;
+    let target_schema = migrate(&target)?;
+    drop(target);
+    secure_file(path)?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS hp_export",
+        params![path.to_string_lossy()],
+    )
+    .map_err(storage_error)?;
+    let result = (|| {
+        // Preserve references exactly, including nullable historical references.
+        conn.pragma_update(None, "foreign_keys", false)
+            .map_err(storage_error)?;
+        let tx = conn.unchecked_transaction().map_err(storage_error)?;
+        let source_schema = schema_version(&tx)?;
+        if source_schema != target_schema {
+            return Err(storage_error("source and export schema versions differ"));
+        }
+        let count = tx
+            .execute(
+                "INSERT INTO hp_export.projects SELECT * FROM main.projects WHERE id=?1",
+                params![project_id.get()],
+            )
+            .map_err(storage_error)?;
+        if count != 1 {
+            return Err(DomainError::invalid("project no longer exists"));
+        }
+        for table in SCOPED_TABLES {
+            let sql = format!(
+                "INSERT INTO hp_export.{table} SELECT * FROM main.{table} WHERE project_id=?1"
+            );
+            tx.execute(&sql, params![project_id.get()])
+                .map_err(storage_error)?;
+        }
+        for (table, predicate) in [
+            ("reply_revisions", "tab_id IN (SELECT id FROM main.reply_tabs WHERE project_id=?1)"),
+            ("fuzz_cases", "job_id IN (SELECT id FROM main.fuzz_jobs WHERE project_id=?1)"),
+            ("ip_rotation_gateways", "profile_id IN (SELECT id FROM main.ip_rotation_profiles WHERE project_id=?1)"),
+            ("bodies", "id IN (SELECT request_body_id FROM main.exchanges WHERE project_id=?1 AND request_body_id IS NOT NULL UNION SELECT response_body_id FROM main.exchanges WHERE project_id=?1 AND response_body_id IS NOT NULL)"),
+        ] {
+            let sql = format!("INSERT INTO hp_export.{table} SELECT * FROM main.{table} WHERE {predicate}");
+            tx.execute(&sql, params![project_id.get()]).map_err(storage_error)?;
+        }
+        tx.execute("INSERT INTO hp_export.search_fts(rowid,project_id,exchange_id,title,preview,labels) SELECT rowid,project_id,exchange_id,title,preview,labels FROM main.search_fts WHERE project_id=?1 OR project_id IS NULL", params![project_id.get()]).map_err(storage_error)?;
+        // The previous pruning path left AUTOINCREMENT sequences unchanged.
+        tx.execute_batch("DELETE FROM hp_export.sqlite_sequence; INSERT INTO hp_export.sqlite_sequence SELECT * FROM main.sqlite_sequence;").map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(source_schema)
+    })();
+    let restore = conn
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(storage_error);
+    let detach = conn
+        .execute_batch("DETACH DATABASE hp_export")
+        .map_err(storage_error);
+    restore?;
+    detach?;
+    result
+}
+
+fn sanitize_snapshot(path: &Path, secrets: SecretMode) -> DomainResult<()> {
     let conn = rusqlite::Connection::open(path).map_err(storage_error)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(storage_error)?;
     let tx = conn.unchecked_transaction().map_err(storage_error)?;
-    tx.execute(
-        "DELETE FROM projects WHERE id<>?1",
-        params![project_id.get()],
-    )
-    .map_err(storage_error)?;
-    tx.execute(
-        "DELETE FROM audit_events WHERE project_id IS NULL OR project_id<>?1",
-        params![project_id.get()],
-    )
-    .map_err(storage_error)?;
-    tx.execute(
-        "DELETE FROM search_fts WHERE project_id<>?1",
-        params![project_id.get()],
-    )
-    .map_err(storage_error)?;
-    tx.execute("DELETE FROM bodies WHERE id NOT IN (SELECT request_body_id FROM exchanges WHERE request_body_id IS NOT NULL UNION SELECT response_body_id FROM exchanges WHERE response_body_id IS NOT NULL)", []).map_err(storage_error)?;
     if secrets == SecretMode::Sanitized {
         let names = crate::policy::SENSITIVE_HEADERS
             .iter()
@@ -305,8 +390,9 @@ fn prune_snapshot(path: &Path, project_id: ProjectId, secrets: SecretMode) -> Do
         tx.execute("UPDATE exchanges SET capture_session_id=NULL, reply_tab_id=NULL, fuzz_job_id=NULL, fuzz_case_id=NULL", []).map_err(storage_error)?;
     }
     tx.commit().map_err(storage_error)?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
-        .map_err(storage_error)?;
+    if secrets == SecretMode::Sanitized {
+        conn.execute_batch("VACUUM;").map_err(storage_error)?;
+    }
     secure_file(path)
 }
 
@@ -769,6 +855,7 @@ mod tests {
     use super::*;
     use crate::cookies::validate_named_cookie_profile;
     use crate::storage::NewExchange;
+
     #[test]
     fn rejects_unsafe_paths() {
         assert!(validate_relative(Path::new("../secret")).is_err());
@@ -1022,6 +1109,34 @@ mod tests {
             .unwrap();
         assert_eq!(rotation.len(), 1);
         assert_eq!(rotation[0].gateways, vec![rotation_gateway()]);
+    }
+
+    #[tokio::test]
+    async fn every_project_scoped_table_is_exported() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path());
+        drop(Db::open(&config).await.unwrap());
+        let conn = rusqlite::Connection::open(config.db_path()).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT m.name FROM sqlite_master m, pragma_table_info(m.name) c
+                 WHERE m.type='table' AND c.name='project_id' ORDER BY m.name",
+            )
+            .unwrap();
+        let tables = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(tables.iter().any(|table| table == "exchanges"));
+        // search_fts is copied separately because it also keeps global rows.
+        let missing = tables
+            .iter()
+            .filter(|table| {
+                table.as_str() != "search_fts" && !SCOPED_TABLES.contains(&table.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "add to SCOPED_TABLES: {missing:?}");
     }
 
     #[tokio::test]
