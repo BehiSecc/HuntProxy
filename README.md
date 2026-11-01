@@ -127,14 +127,9 @@ Connect your AI agent to the running container:
 }
 ```
 
-The MCP bridge connects to the HuntProxy daemon already running inside the container.
-
 For Docker updates, rebuild the image and recreate the container with the same `huntproxy-data` volume. Reconnect MCP clients that use `docker exec` after recreating the container.
 
 Optionally, open the web interface at [http://127.0.0.1:17890](http://127.0.0.1:17890).
-
-> [!NOTE]
-> This setup uses host networking because HuntProxy listens on loopback by default. Host-network support is platform-dependent; the native installer is currently the simplest path on macOS.
 
 </details>
 
@@ -163,7 +158,7 @@ HuntProxy gives agents a complete hunting loop: build context → investigate �
 | **Persistent browser profiles** | Run separate named Chromium identities in one project for cross-account testing. Each profile keeps its own cookies and site storage across restarts. |
 | **Browser actions** | Click, fill, upload, use tabs and events, take screenshots, send same-origin requests with the live session, and hand control to a person through CDP; up to two profiles can be open per project by default. |
 | **Sitemap** | Turn saved traffic into a host-and-route tree with methods, statuses, parameters, content types, and exchange counts. |
-| **JavaScript & page discovery** | Find JavaScript and the pages that loaded it, extract endpoints, URLs, emails, and request parameter names, and build target-specific wordlists. Page analysis follows same-origin JavaScript bundles listed in HTML script tags and Modern.js route manifests. |
+| **JavaScript & page discovery** | Find JavaScript and the pages that loaded it, extract endpoints, URLs, emails, and request parameter names, and build target-specific wordlists. |
 | **WebSockets** | Inspect captured connections and messages, then inject text or binary frames into a live connection. |
 
 ### Test Hypotheses
@@ -172,7 +167,7 @@ HuntProxy gives agents a complete hunting loop: build context → investigate �
 | --- | --- |
 | **Reply** | Reuse and modify captured requests over HTTP/1.1 or HTTP/2, or preserve exact HTTP/1.1 bytes for advanced framing tests. |
 | **Fuzzer** | Run sniper, battering ram, pitchfork, or cluster bomb jobs with wordlists, number ranges, and regex-bypass payloads; group responses to spot meaningful differences. |
-| **Request rules** | Apply ordered URL, header, and body rewrites across Proxy, Browser, Reply, Fuzzer, the crawler, and semantic plugin requests. Raw transports stay byte-exact. |
+| **Request rules** | Apply ordered URL, header, and body rewrites across Proxy, Browser, Reply, Fuzzer, the crawler, and semantic plugin requests. |
 | **Compare & utilities** | Diff saved exchanges, transform encodings, inspect large bodies in pages, and copy requests as runnable cURL or Python. |
 
 ### Keep the Proof and Extend the Hunt
@@ -267,7 +262,7 @@ Call `overview` with a `project_id` for exchange counts by source, captured repl
 
 ## 💻 CLI Reference
 
-Most projects begin with a prompt, not a terminal command. MCP handles day-to-day hunting; the CLI handles setup, diagnostics, project maintenance and data transfer.
+MCP handles day-to-day hunting; the CLI handles setup, diagnostics, project maintenance and data transfer.
 
 | Command | Purpose |
 | --- | --- |
@@ -316,8 +311,6 @@ Explore the maintained collection or learn how to build your own in [HuntProxy-P
 
 ### How Can I Reduce CAPTCHAs and Bot Detection?
 
-HuntProxy's proxy traffic uses a Chrome TLS/HTTP profile matched to the bundled Chromium; unsupported browser versions fall back to Chrome153 and `HuntProxy doctor` reports the mismatch. A matching fingerprint does not guarantee access.
-
 For browser runtime settings and manual installation, see [Browser configuration](docs/browser.md).
 
 CAPTCHAs and bot checks are common when hunting from a VPS because datacenter IP addresses are easier to recognize. Routing HuntProxy through a reputable residential proxy is usually the most effective fix.
@@ -349,7 +342,7 @@ proxy = "socks5h://username:password@127.0.0.1:1080"
 ```
 
 Project rules route all traffic for that project and take priority over host
-rules and the default. A transient per-request override still takes priority.
+rules and the default.
 
 For selected hosts only:
 
@@ -367,11 +360,11 @@ proxy = "http://127.0.0.1:8080"
 
 `*.example.com` matches its subdomains, not `example.com` itself. Exact host rules take priority over wildcard rules.
 
-To change a project's proxy without restarting, use the `projects` action `set_upstream_proxy` or `PUT /api/v1/projects/{id}/upstream-proxy`. Set `proxy` to a URL for an override, `"direct"` to bypass configured proxies, or `null` to inherit `config.toml`. New connections use the setting immediately. Project details show the setting and the effective route for the project target host, with proxy credentials removed.
+To change a project's proxy without restarting, use the `projects` action `set_upstream_proxy` or `PUT /api/v1/projects/{id}/upstream-proxy`. Set `proxy` to a URL for an override, `"direct"` to bypass configured proxies, or `null` to inherit `config.toml`. New connections use the setting immediately.
 
 ### What If the Agent Still Faces a CAPTCHA?
 
-A proxy can reduce bot checks, but it cannot prevent every CAPTCHA. When one still appears:
+If a CAPTCHA still appears:
 
 - [Give the agent a logged-in session](#logged-in-session).
 - Ask the agent to hand you the browser through CDP, solve the CAPTCHA yourself, then return control so it can continue.
@@ -380,7 +373,7 @@ A proxy can reduce bot checks, but it cannot prevent every CAPTCHA. When one sti
 
 ### Browser sandbox error on Ubuntu 24.04+
 
-On Ubuntu 24.04 and newer, AppArmor can block the user namespaces Chromium's sandbox needs. HuntProxy falls back to running without the sandbox and reports this in `HuntProxy doctor`. To keep the sandbox enabled, allow the reported Chromium executable in an AppArmor profile, then load it with `sudo apparmor_parser -r /etc/apparmor.d/huntproxy-chromium`:
+On Ubuntu 24.04 and newer, AppArmor can block the user namespaces Chromium's sandbox needs. To keep the sandbox enabled, allow the reported Chromium executable in an AppArmor profile, then load it with `sudo apparmor_parser -r /etc/apparmor.d/huntproxy-chromium`:
 
 ```
 abi <abi/4.0>,
@@ -404,9 +397,7 @@ Reconnect your MCP client.
 <details>
 <summary><strong>Can HuntProxy replace Burp Suite for agent-driven testing?</strong></summary>
 
-HuntProxy is designed to be the primary web security workbench for an AI agent. It covers the capture, history, browser, replay, fuzzing, discovery, plugin, and evidence workflows agents need, but it is not a pixel-for-pixel Burp clone.
-
-Its defining difference is the operating model: the agent works through MCP, project state survives between prompts, and every important action remains inspectable. You can use HuntProxy on its own for agent-driven testing or alongside existing security tools.
+HuntProxy is designed to be the primary web security workbench for an AI agent. It covers the capture, history, browser, replay, fuzzing, discovery, plugin, and evidence workflows agents need.
 
 </details>
 
@@ -427,14 +418,14 @@ Yes. Run HuntProxy and your agent on a VPS, connect from your phone with [Tailsc
 <details>
 <summary><strong>Do I need to keep HuntProxy running?</strong></summary>
 
-Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an MCP-started daemon shuts down after one hour without MCP or UI control activity, while the inexpensive MCP bridge stays connected. The next tool call automatically recovers an idle or unexpectedly terminated daemon. After an explicit `huntproxy_stop`, call `huntproxy_restart` on the same connection. Run `HuntProxy serve` when you want the workbench to stay active until explicitly stopped.
+Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an MCP-started daemon shuts down after one hour without MCP or UI control activity. The next tool call automatically recovers an idle or unexpectedly terminated daemon. After an explicit `huntproxy_stop`, call `huntproxy_restart` on the same connection. Run `HuntProxy serve` when you want the workbench to stay active until explicitly stopped.
 
 </details>
 
 <details>
 <summary><strong>What survives between sessions?</strong></summary>
 
-Projects, captured traffic, findings, managed cookies, Reply and Fuzzer state, and every named Chromium profile's cookies and site storage are persisted locally. Starting a profile again resumes its saved workspace. Active browsers and running Fuzzer/plugin jobs are interrupted by a restart; memory-only plugin results and analysis checkpoints are lost, so collect those first. Plugin-generated History and saved findings remain available.
+Projects, captured traffic, findings, managed cookies, Reply and Fuzzer state, and every named Chromium profile's cookies and site storage are persisted locally. Starting a profile again resumes its saved workspace. Active browsers and running Fuzzer/plugin jobs are interrupted by a restart.
 
 </details>
 
@@ -498,7 +489,7 @@ Update HuntProxy to the latest release:
 HuntProxy update
 ```
 
-For native installations from v0.2 onward, the updater keeps projects and data, prepares the browser runtime and official plugins, restarts the daemon if it was running, and attempts to restore the previous installation if an update fails.
+The updater keeps your projects and data and restores the previous installation if the update fails.
 
 **Upgrading from v0.1.1:** Run `HuntProxy stop` before `HuntProxy update`, then reconnect your MCP client.
 
@@ -515,7 +506,7 @@ HuntProxy stop
 rm "$HOME/.local/bin/HuntProxy"
 ```
 
-This keeps your projects and configuration in `~/.huntproxy`. Before deleting that directory, copy it in full if you may need to recover anything. Deletion cannot be undone.
+This keeps your projects and configuration in `~/.huntproxy`.
 
 ## 🤝 Contribution
 
