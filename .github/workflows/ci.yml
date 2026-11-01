@@ -103,6 +103,10 @@ jobs:
       - name: Install pinned Chromium system dependencies
         run: npx --yes playwright@1.63.0 install-deps chromium
 
+      - name: Install browser worker dependencies
+        working-directory: browser-worker
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
       - name: Install Rust
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
