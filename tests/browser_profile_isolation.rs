@@ -1747,7 +1747,7 @@ async fn verify_browser_resources(h: &Harness) {
 
     let handed_off = h.service.enable_cdp(h.project, second.id).await.unwrap();
     let local = h.service.active_status(h.project).await.unwrap();
-    assert!(local.resources.cdp_port_in_use);
+    assert!(!local.resources.cdp_port_in_use);
     assert!(
         local
             .resources
@@ -1767,6 +1767,19 @@ async fn verify_browser_resources(h: &Harness) {
             .agent_control
     );
     assert_eq!(handed_off.session_id, Some(second.id));
+    let other_handoff = h.service.enable_cdp(h.project, first.id).await.unwrap();
+    assert_ne!(handed_off.endpoint, other_handoff.endpoint);
+    let status = h.service.cdp_status(h.project).await.unwrap();
+    assert_eq!(status.active_sessions.len(), 2);
+    assert!(status
+        .active_sessions
+        .iter()
+        .any(|entry| entry.session_id == first.id));
+    assert!(status
+        .active_sessions
+        .iter()
+        .any(|entry| entry.session_id == second.id));
+    h.service.disable_cdp(h.project, first.id).await.unwrap();
     h.service.disable_cdp(h.project, second.id).await.unwrap();
 
     h.service.stop(h.project, second.id).await.unwrap();
@@ -1798,12 +1811,29 @@ async fn verify_browser_resources(h: &Harness) {
         .start_with_profile(foreign.id, "about:blank".into(), "foreign-account")
         .await
         .unwrap();
-    h.service
-        .enable_cdp(foreign.id, foreign_session.id)
-        .await
-        .unwrap();
+    let (local_handoff, foreign_handoff) = tokio::join!(
+        h.service.enable_cdp(h.project, first.id),
+        h.service.enable_cdp(foreign.id, foreign_session.id),
+    );
+    let local_handoff = local_handoff.unwrap();
+    let foreign_handoff = foreign_handoff.unwrap();
+    assert_ne!(local_handoff.endpoint, foreign_handoff.endpoint);
+    assert_eq!(
+        h.service
+            .enable_cdp(h.project, first.id)
+            .await
+            .unwrap()
+            .endpoint,
+        local_handoff.endpoint
+    );
+    let stopped = h.service.disable_cdp(h.project, first.id).await.unwrap();
+    assert!(!stopped.active);
+    assert_eq!(stopped.session_id, Some(first.id));
+    let reused = h.service.enable_cdp(h.project, first.id).await.unwrap();
+    assert_eq!(reused.endpoint, local_handoff.endpoint);
+    h.service.disable_cdp(h.project, first.id).await.unwrap();
     let observed = h.service.active_status(h.project).await.unwrap();
-    assert!(observed.resources.cdp_port_in_use);
+    assert!(!observed.resources.cdp_port_in_use);
     assert!(observed.resources.sessions[0].agent_control);
     assert_eq!(observed.resources.sessions.len(), 1);
     assert_eq!(observed.resources.sessions[0].profile, "default");
@@ -1984,8 +2014,7 @@ async fn verify_named_profiles(h: &Harness) {
     assert_eq!(state["websocket"], "acc1-live");
     assert_saved(&h.click(second.id, "#read").await, "acc2");
 
-    // CDP's bounded handoff owns one port. Handing each session off in turn must
-    // expose only that profile's page and service worker targets.
+    // Each handoff exposes only that profile's page and service worker targets.
     for (session, profile, other) in [(restarted.id, "acc1", "acc2"), (second.id, "acc2", "acc1")] {
         let cdp = h.service.enable_cdp(h.project, session).await.unwrap();
         assert_eq!(cdp.session_id, Some(session));
@@ -2016,7 +2045,7 @@ async fn verify_named_profiles(h: &Harness) {
             .no_proxy()
             .build()
             .unwrap()
-            .get("http://127.0.0.1:9222/json/list")
+            .get(format!("{}/json/list", cdp.endpoint.as_deref().unwrap()))
             .send()
             .await
             .unwrap()

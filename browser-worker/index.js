@@ -1140,6 +1140,10 @@ async function relaunchSession(session, cdpPort) {
     throw error;
   }
   Object.assign(session, launched.runtime, { cdp: launched.cdp });
+  const activeContext = session.context;
+  activeContext.once("close", () => {
+    if (session.context === activeContext) session.cdp = null;
+  });
   await initializeSessionTracking(session, existingJavascriptFiles, nextGeneration);
   return launched.cdp;
 }
@@ -2055,17 +2059,22 @@ async function handle(req) {
         if (session.cdp) {
           return respond(id, { cdp: session.cdp, checkpoint: await extractCheckpoint(session) });
         }
-        const cdp = await relaunchSession(session, validateCdpPort(params.cdp_port));
         const checkpoint = await extractCheckpoint(session);
+        const cdp = await relaunchSession(session, validateCdpPort(params.cdp_port));
         logMeta("session.cdp_enable", { session_id: sessionId, port: cdp.port });
         return respond(id, { cdp, checkpoint });
+      }
+      case "session.cdp_state": {
+        const session = sessions.get(Number(params.session_id));
+        if (!session) throw rpcError(-32001, "session not found");
+        return respond(id, { cdp: session.cdp || null });
       }
       case "session.cdp_disable": {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        if (session.cdp) await relaunchSession(session, null);
         const checkpoint = await extractCheckpoint(session);
+        if (session.cdp) await relaunchSession(session, null);
         logMeta("session.cdp_disable", { session_id: sessionId });
         return respond(id, { cdp: null, checkpoint });
       }

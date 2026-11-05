@@ -16,12 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 const WORKER_PROTOCOL_VERSION: u64 = 1;
 const WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
 const BROWSER_CDP_PORT: u16 = 9222;
+const BROWSER_CDP_PORT_END: u16 = 9321;
+
+/// A project worker's last reported sandbox state and reason.
+type SandboxState = (Option<String>, Option<String>);
 const DEFAULT_BROWSER_PROFILE: &str = "default";
 const MAX_PERSISTENT_PROFILE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_BROWSER_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -99,7 +103,7 @@ pub struct BrowserProfileStatus {
 }
 
 /// Compact resource observations for transition-time reuse. No page or private
-/// browser state is included, and foreign CDP ownership is only a busy flag.
+/// browser state is included. The CDP flag indicates the entire port range is exhausted.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BrowserResources {
     pub project_id: ProjectId,
@@ -133,9 +137,42 @@ pub struct BrowserCdpStatus {
     pub agent_control: bool,
     pub session_id: Option<BrowserSessionId>,
     pub endpoint: Option<String>,
+    pub cdp_port: Option<u16>,
+    pub active_sessions: Vec<BrowserCdpActiveSession>,
     pub devtools_url: Option<String>,
     pub hosted_devtools_url: Option<String>,
     pub ssh_forward_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrowserCdpActiveSession {
+    pub session_id: BrowserSessionId,
+    pub port: u16,
+    pub endpoint: String,
+}
+
+struct CdpReservation<'a> {
+    reservations: &'a std::sync::Mutex<HashMap<i64, u16>>,
+    session_id: i64,
+    committed: bool,
+}
+
+impl Drop for CdpReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.reservations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.session_id);
+        }
+    }
+}
+
+fn free_cdp_port(reservations: &HashMap<i64, u16>) -> Option<u16> {
+    (BROWSER_CDP_PORT..=BROWSER_CDP_PORT_END).find(|port| {
+        !reservations.values().any(|reserved| reserved == port)
+            && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port)).is_ok()
+    })
 }
 
 /// Secret-bearing values live only in daemon memory. SQLite stores version/hash/status metadata.
@@ -704,6 +741,7 @@ struct WorkerProcess {
     stdout: BufReader<ChildStdout>,
     child: Child,
     next_id: u64,
+    rpc_timeout: Duration,
 }
 
 impl WorkerProcess {
@@ -731,6 +769,9 @@ impl WorkerProcess {
         }
         #[cfg(unix)]
         {
+            // Native Chromium inherits this group, so a hung worker's browser can be
+            // killed with it instead of keeping the project's profile locked.
+            command.process_group(0);
             // Browser crashes should not leave large core files on a VPS.
             unsafe {
                 command.pre_exec(|| {
@@ -769,6 +810,7 @@ impl WorkerProcess {
             stdout: BufReader::new(stdout),
             child,
             next_id: 1,
+            rpc_timeout: WORKER_RPC_TIMEOUT,
         };
         let hello = process.call("hello", json!({})).await?;
         let protocol = hello.get("protocol").and_then(Value::as_u64);
@@ -833,7 +875,7 @@ impl WorkerProcess {
         })?;
 
         let mut line = String::new();
-        let bytes_read = tokio::time::timeout(WORKER_RPC_TIMEOUT, self.stdout.read_line(&mut line))
+        let bytes_read = tokio::time::timeout(self.rpc_timeout, self.stdout.read_line(&mut line))
             .await
             .map_err(|_| {
                 WorkerCallFailure::Transport(DomainError::new(
@@ -897,11 +939,22 @@ impl WorkerProcess {
         {
             let _ = self.child.start_kill();
         }
+        #[cfg(unix)]
+        let group = self
+            .child
+            .id()
+            .map(|pid| nix::unistd::Pid::from_raw(pid as i32));
         match tokio::time::timeout(Duration::from_secs(6), self.child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(_)) | Err(_) => {
                 let _ = self.child.kill().await;
             }
+        }
+        // A healthy worker has stopped its browsers by now. A hung or crashed one
+        // cannot, and its surviving Chromium would keep the profile locked.
+        #[cfg(unix)]
+        if let Some(group) = group {
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
         }
     }
 }
@@ -931,13 +984,15 @@ pub struct BrowserService {
     profiles_root: PathBuf,
     runtime: BrowserRuntimeInspection,
     checkpoints: Mutex<HashMap<i64, Checkpoint>>,
-    runtime_sessions: Mutex<HashMap<i64, RuntimeSession>>,
+    runtime_sessions: Arc<Mutex<HashMap<i64, RuntimeSession>>>,
+    cdp_reservations: Arc<std::sync::Mutex<HashMap<i64, u16>>>,
     profile_leases: Mutex<HashSet<(i64, String)>>,
-    lifecycle: Mutex<()>,
+    lifecycle: RwLock<()>,
+    project_lifecycle: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     profile_io: Mutex<()>,
     session_ops: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
-    worker: Mutex<Option<WorkerProcess>>,
-    sandbox: std::sync::Mutex<(Option<String>, Option<String>)>,
+    workers: Mutex<HashMap<i64, Arc<Mutex<Option<WorkerProcess>>>>>,
+    sandbox: std::sync::Mutex<HashMap<i64, SandboxState>>,
 }
 
 /// Inspect the installed browser runtime without starting the daemon, launching
@@ -1087,13 +1142,15 @@ impl BrowserService {
             profiles_root,
             runtime,
             checkpoints: Mutex::new(HashMap::new()),
-            runtime_sessions: Mutex::new(HashMap::new()),
+            runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
+            cdp_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             profile_leases: Mutex::new(HashSet::new()),
-            lifecycle: Mutex::new(()),
+            lifecycle: RwLock::new(()),
+            project_lifecycle: Mutex::new(HashMap::new()),
             profile_io: Mutex::new(()),
             session_ops: Mutex::new(HashMap::new()),
-            worker: Mutex::new(None),
-            sandbox: std::sync::Mutex::new((None, None)),
+            workers: Mutex::new(HashMap::new()),
+            sandbox: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1127,8 +1184,14 @@ impl BrowserService {
             .sandbox
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        status.sandbox_state = sandbox.0.clone();
-        status.sandbox_reason = sandbox.1.clone();
+        if let Some((state, reason)) = sandbox
+            .iter()
+            .min_by_key(|(id, value)| (value.0.as_deref() != Some("disabled_fallback"), **id))
+            .map(|(_, value)| value)
+        {
+            status.sandbox_state = state.clone();
+            status.sandbox_reason = reason.clone();
+        }
         status
     }
 
@@ -1203,7 +1266,9 @@ impl BrowserService {
         profile: &StoredCookieProfile,
     ) -> DomainResult<BrowserSession> {
         let cookie_override = CookieLaunchOverride::from_profile(profile)?;
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         self.start_runtime_with_cookies(
             project_id,
             "about:blank".into(),
@@ -1227,7 +1292,9 @@ impl BrowserService {
         // atomic so a concurrent stop cannot terminate a worker between a new
         // session's launch and its registration, and concurrent starts cannot
         // race the per-project browser limit.
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         let mut cookie_override = match cookie_profile.as_deref() {
             Some(name) => {
                 let stored = self
@@ -1302,6 +1369,7 @@ impl BrowserService {
                     }
                     let result = self
                         .call_worker(
+                            project_id,
                             "session.set_cookies",
                             json!({
                                 "session_id": session_id.get(), "cookies": cookie_override.cookies,
@@ -1328,7 +1396,7 @@ impl BrowserService {
                             "return CDP control before navigating the profile",
                         ));
                     }
-                    let result = self.call_worker("session.action", json!({
+                    let result = self.call_worker(project_id, "session.action", json!({
                         "session_id": session_id.get(), "action": {"type":"navigate", "url":url},
                     })).await?;
                     self.save_cookie_checkpoint(project_id, session_id, &result)
@@ -1548,7 +1616,10 @@ impl BrowserService {
                 cdp: None,
             },
         );
-        let result = match self.call_worker("session.start", start_params).await {
+        let result = match self
+            .call_worker(project_id, "session.start", start_params)
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 self.cleanup_failed_start(project_id, &mut session, capture.id)
@@ -1659,8 +1730,7 @@ impl BrowserService {
             ));
         }
         let result = self
-            .call_worker(
-                "session.csrf_probe",
+            .call_worker(project_id, "session.csrf_probe",
                 json!({
                     "session_id": session_id.get(),
                     "target_url": target_url,
@@ -1680,16 +1750,20 @@ impl BrowserService {
         session: &mut BrowserSession,
         capture_session_id: CaptureSessionId,
     ) -> DomainResult<()> {
-        let cleanup_error = if self.worker.lock().await.is_some() {
-            self.call_worker("session.stop", json!({ "session_id": session.id.get() }))
-                .await
-                .err()
+        let cleanup_error = if self.worker_is_running(project_id).await {
+            self.call_worker(
+                project_id,
+                "session.stop",
+                json!({ "session_id": session.id.get() }),
+            )
+            .await
+            .err()
         } else {
             None
         };
         session.state = BrowserSessionState::Failed;
         if let Some(error) = cleanup_error {
-            if self.worker.lock().await.is_some() {
+            if self.worker_is_running(project_id).await {
                 session.checkpoint_status = Some("start_cleanup_failed".into());
                 let _ = self.db.update_browser_session(session).await;
                 return Err(DomainError::new(
@@ -1699,6 +1773,7 @@ impl BrowserService {
             }
         }
         self.runtime_sessions.lock().await.remove(&session.id.get());
+        self.reap_worker(project_id).await;
         session.checkpoint_status = Some("start_failed".into());
         let _ = self.db.update_browser_session(session).await;
         self.checkpoints.lock().await.remove(&session.id.get());
@@ -1749,6 +1824,7 @@ impl BrowserService {
             let _operation_guard = operation_lock.lock().await;
             let result = self
                 .call_worker(
+                    project_id,
                     "session.set_cookies",
                     json!({
                         "session_id": session_id.get(),
@@ -1782,6 +1858,7 @@ impl BrowserService {
             let _operation_guard = operation_lock.lock().await;
             let result = self
                 .call_worker(
+                    project_id,
                     "session.clear_cookies",
                     json!({
                         "session_id": session_id.get(),
@@ -1844,6 +1921,13 @@ impl BrowserService {
             project.limits.max_concurrent_browsers,
             &sessions,
             &runtimes,
+            free_cdp_port(
+                &self
+                    .cdp_reservations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+            .is_none(),
         )?;
         let sandbox = self
             .sandbox
@@ -1852,8 +1936,8 @@ impl BrowserService {
         Ok(BrowserStatus {
             sessions,
             resources,
-            sandbox_state: sandbox.0.clone(),
-            sandbox_reason: sandbox.1.clone(),
+            sandbox_state: sandbox.get(&project_id.get()).and_then(|v| v.0.clone()),
+            sandbox_reason: sandbox.get(&project_id.get()).and_then(|v| v.1.clone()),
         })
     }
 
@@ -1900,7 +1984,11 @@ impl BrowserService {
                     )
                 })?;
             let result = self
-                .call_worker("session.status", json!({"session_id":session_id.get()}))
+                .call_worker(
+                    project_id,
+                    "session.status",
+                    json!({"session_id":session_id.get()}),
+                )
                 .await?;
             verify_worker_identity(
                 &result,
@@ -1938,17 +2026,41 @@ impl BrowserService {
 
     pub async fn cdp_status(&self, project_id: ProjectId) -> DomainResult<BrowserCdpStatus> {
         self.db.get_project(project_id).await?;
-        let active = self
+        let ids = self
             .runtime_sessions
             .lock()
             .await
             .iter()
-            .find_map(|(session_id, runtime)| {
+            .filter_map(|(id, runtime)| {
+                (runtime.project_id == project_id && runtime.cdp.is_some())
+                    .then_some(BrowserSessionId(*id))
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            let operation = self.session_operation_lock(id).await;
+            let _guard = operation.lock().await;
+            self.reconcile_cdp_state(project_id, id).await;
+        }
+        let runtimes = self.runtime_sessions.lock().await;
+        let mut active = runtimes
+            .iter()
+            .filter_map(|(id, runtime)| {
                 (runtime.project_id == project_id)
-                    .then(|| runtime.cdp.clone().map(|cdp| (*session_id, cdp)))
+                    .then(|| runtime.cdp.clone().map(|cdp| (*id, cdp)))
                     .flatten()
-            });
-        Ok(cdp_status_view(project_id, active))
+            })
+            .collect::<Vec<_>>();
+        active.sort_by_key(|(id, cdp)| (cdp.port, *id));
+        let mut status = cdp_status_view(project_id, active.first().cloned());
+        status.active_sessions = active
+            .into_iter()
+            .map(|(id, cdp)| BrowserCdpActiveSession {
+                session_id: BrowserSessionId(id),
+                port: cdp.port,
+                endpoint: cdp.endpoint,
+            })
+            .collect();
+        Ok(status)
     }
 
     pub async fn cdp_status_for_session(
@@ -1956,7 +2068,10 @@ impl BrowserService {
         project_id: ProjectId,
         session_id: BrowserSessionId,
     ) -> DomainResult<BrowserCdpStatus> {
-        self.session_status(project_id, session_id).await?;
+        self.db.get_browser_session(project_id, session_id).await?;
+        let operation = self.session_operation_lock(session_id).await;
+        let _guard = operation.lock().await;
+        self.reconcile_cdp_state(project_id, session_id).await;
         let cdp = self
             .runtime_sessions
             .lock()
@@ -1997,49 +2112,112 @@ impl BrowserService {
         if let Some(cdp) = runtime.cdp {
             return Ok(cdp_status_view(project_id, Some((session_id.get(), cdp))));
         }
-        if let Some((active_session, _)) = self
-            .runtime_sessions
-            .lock()
-            .await
-            .iter()
-            .find(|(_, active)| active.cdp.is_some())
-        {
-            return Err(DomainError::new(
-                ErrorCode::ConcurrencyLimited,
-                format!(
-                    "CDP port {BROWSER_CDP_PORT} is already handed off by browser session {active_session}"
-                ),
-            ));
-        }
-        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, BROWSER_CDP_PORT)).map_err(
-            |error| {
+        let port = {
+            let mut reservations = self
+                .cdp_reservations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let port = free_cdp_port(&reservations).ok_or_else(|| {
                 DomainError::new(
-                    ErrorCode::Unavailable,
-                    format!("CDP port {BROWSER_CDP_PORT} is unavailable on 127.0.0.1: {error}"),
+                    ErrorCode::ConcurrencyLimited,
+                    "No CDP port is free in the loopback range 9222-9321",
                 )
-            },
-        )?;
-        let result = self
+            })?;
+            reservations.insert(session_id.get(), port);
+            port
+        };
+        let mut reservation = CdpReservation {
+            reservations: &self.cdp_reservations,
+            session_id: session_id.get(),
+            committed: false,
+        };
+        let result = match self
             .call_worker(
+                project_id,
                 "session.cdp_enable",
                 json!({
                     "session_id": session_id.get(),
-                    "cdp_port": BROWSER_CDP_PORT,
+                    "cdp_port": port,
                 }),
             )
-            .await?;
-        let cdp = parse_cdp_info(result.get("cdp"))?;
-        if let Some(runtime) = self
-            .runtime_sessions
-            .lock()
             .await
-            .get_mut(&session_id.get())
         {
-            runtime.cdp = Some(cdp.clone());
+            Ok(result) => result,
+            Err(error) => {
+                self.rollback_cdp_enable(project_id, session_id).await;
+                return Err(error);
+            }
+        };
+        let prepared = async {
+            let cdp = parse_cdp_info(result.get("cdp"), port)?;
+            self.save_cookie_checkpoint(project_id, session_id, &result)
+                .await?;
+            Ok::<_, DomainError>(cdp)
         }
-        self.save_cookie_checkpoint(project_id, session_id, &result)
-            .await?;
+        .await;
+        let cdp = match prepared {
+            Ok(cdp) => cdp,
+            Err(error) => {
+                self.rollback_cdp_enable(project_id, session_id).await;
+                return Err(error);
+            }
+        };
+        let recorded = {
+            let mut runtimes = self.runtime_sessions.lock().await;
+            if let Some(runtime) = runtimes.get_mut(&session_id.get()) {
+                runtime.cdp = Some(cdp.clone());
+                reservation.committed = true;
+                true
+            } else {
+                false
+            }
+        };
+        if !recorded {
+            self.rollback_cdp_enable(project_id, session_id).await;
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                "browser session stopped during CDP handoff",
+            ));
+        }
+        self.monitor_cdp_port(session_id, port, operation_lock.clone());
         Ok(cdp_status_view(project_id, Some((session_id.get(), cdp))))
+    }
+
+    fn monitor_cdp_port(&self, session_id: BrowserSessionId, port: u16, operation: Arc<Mutex<()>>) {
+        let runtimes = Arc::downgrade(&self.runtime_sessions);
+        let reservations = Arc::downgrade(&self.cdp_reservations);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let (Some(runtimes), Some(reservations)) =
+                    (runtimes.upgrade(), reservations.upgrade())
+                else {
+                    break;
+                };
+                let Ok(_operation) = operation.try_lock() else {
+                    continue;
+                };
+                let mut active = runtimes.lock().await;
+                let Some(runtime) = active.get_mut(&session_id.get()) else {
+                    break;
+                };
+                if runtime.cdp.as_ref().map(|cdp| cdp.port) != Some(port) {
+                    break;
+                }
+                // A live Chromium handoff holds the listening socket. Keeping the
+                // probe bound until bookkeeping is updated prevents port reuse racing cleanup.
+                if let Ok(_probe) =
+                    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                {
+                    runtime.cdp = None;
+                    let mut ports = reservations.lock().unwrap_or_else(|e| e.into_inner());
+                    if ports.get(&session_id.get()) == Some(&port) {
+                        ports.remove(&session_id.get());
+                    }
+                    break;
+                }
+            }
+        });
     }
 
     pub async fn disable_cdp(
@@ -2064,14 +2242,24 @@ impl BrowserService {
             ));
         }
         if runtime.cdp.is_none() {
-            return Ok(cdp_status_view(project_id, None));
+            let mut status = cdp_status_view(project_id, None);
+            status.session_id = Some(session_id);
+            return Ok(status);
         }
-        let result = self
+        let result = match self
             .call_worker(
+                project_id,
                 "session.cdp_disable",
                 json!({ "session_id": session_id.get() }),
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.reconcile_cdp_state(project_id, session_id).await;
+                return Err(error);
+            }
+        };
         if let Some(runtime) = self
             .runtime_sessions
             .lock()
@@ -2080,9 +2268,103 @@ impl BrowserService {
         {
             runtime.cdp = None;
         }
+        self.release_cdp_reservation(session_id.get());
         self.save_cookie_checkpoint(project_id, session_id, &result)
             .await?;
-        Ok(cdp_status_view(project_id, None))
+        let mut status = cdp_status_view(project_id, None);
+        status.session_id = Some(session_id);
+        Ok(status)
+    }
+
+    async fn reconcile_cdp_state(&self, project_id: ProjectId, session_id: BrowserSessionId) {
+        let entry = self.workers.lock().await.get(&project_id.get()).cloned();
+        let Some(entry) = entry else {
+            return;
+        };
+        let mut worker = entry.lock().await;
+        if !self
+            .runtime_sessions
+            .lock()
+            .await
+            .contains_key(&session_id.get())
+        {
+            return;
+        }
+        let Some(process) = worker.as_mut() else {
+            return;
+        };
+        match process
+            .call("session.cdp_state", json!({"session_id": session_id.get()}))
+            .await
+        {
+            Ok(value) if value.get("cdp").is_some_and(Value::is_null) => {
+                if let Some(runtime) = self
+                    .runtime_sessions
+                    .lock()
+                    .await
+                    .get_mut(&session_id.get())
+                {
+                    runtime.cdp = None;
+                }
+                self.release_cdp_reservation(session_id.get());
+            }
+            Err(WorkerCallFailure::Transport(_)) => {
+                if let Some(mut process) = worker.take() {
+                    process.terminate().await;
+                }
+                self.sandbox
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&project_id.get());
+                self.interrupt_runtime_sessions(Some(project_id)).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn rollback_cdp_enable(&self, project_id: ProjectId, session_id: BrowserSessionId) {
+        let entry = self.workers.lock().await.get(&project_id.get()).cloned();
+        let Some(entry) = entry else {
+            return;
+        };
+        let mut worker = entry.lock().await;
+        if !self
+            .runtime_sessions
+            .lock()
+            .await
+            .contains_key(&session_id.get())
+        {
+            return;
+        }
+        let Some(process) = worker.as_mut() else {
+            return;
+        };
+        if process
+            .call(
+                "session.cdp_disable",
+                json!({"session_id": session_id.get()}),
+            )
+            .await
+            .is_err()
+        {
+            // An unsuccessful rollback leaves ownership uncertain: terminate
+            // this worker before releasing the reservation.
+            if let Some(mut process) = worker.take() {
+                process.terminate().await;
+            }
+            self.sandbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&project_id.get());
+            self.interrupt_runtime_sessions(Some(project_id)).await;
+        }
+    }
+
+    fn release_cdp_reservation(&self, session_id: i64) {
+        self.cdp_reservations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
     }
 
     async fn session_persistent_profile(&self, session_id: BrowserSessionId) -> Option<String> {
@@ -2130,6 +2412,7 @@ impl BrowserService {
         }
         let result = self
             .call_worker(
+                project_id,
                 "session.authenticated_fetch",
                 json!({ "session_id": session_id.get(), "url": url }),
             )
@@ -2226,6 +2509,7 @@ impl BrowserService {
         let worker_result = loop {
             let result = self
                 .call_worker(
+                    project_id,
                     "session.action",
                     json!({
                         "session_id": session_id.get(),
@@ -2251,7 +2535,7 @@ impl BrowserService {
         let result = match worker_result {
             Ok(result) => result,
             Err(error) => {
-                session.state = if self.worker.lock().await.is_some() {
+                session.state = if self.worker_is_running(project_id).await {
                     BrowserSessionState::Ready
                 } else {
                     BrowserSessionState::Interrupted
@@ -2345,6 +2629,7 @@ impl BrowserService {
     ) -> DomainResult<Vec<BrowserJavascriptFile>> {
         let result = self
             .call_worker(
+                project_id,
                 "session.javascript_files",
                 json!({ "session_id": session_id.get() }),
             )
@@ -2384,7 +2669,9 @@ impl BrowserService {
         project_id: ProjectId,
         session_id: BrowserSessionId,
     ) -> DomainResult<()> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         self.stop_inner(project_id, session_id).await
     }
 
@@ -2405,9 +2692,13 @@ impl BrowserService {
         let mut persistence_error = None;
         if let Some(runtime) = &runtime {
             let result = self
-                .call_worker("session.stop", json!({ "session_id": session_id.get() }))
+                .call_worker(
+                    project_id,
+                    "session.stop",
+                    json!({ "session_id": session_id.get() }),
+                )
                 .await;
-            if result.is_err() && self.worker.lock().await.is_some() {
+            if result.is_err() && self.worker_is_running(project_id).await {
                 // A live worker reports cleanup failure while retaining the
                 // browser. Keep its runtime, profile lease and credentials so
                 // callers can retry rather than opening the profile twice.
@@ -2431,6 +2722,8 @@ impl BrowserService {
             }
         }
         self.runtime_sessions.lock().await.remove(&session_id.get());
+        self.release_cdp_reservation(session_id.get());
+        self.reap_worker(project_id).await;
         if let Some(profile) = runtime
             .as_ref()
             .filter(|runtime| runtime.persistent)
@@ -2462,7 +2755,9 @@ impl BrowserService {
 
     /// Stop every active browser in one project.
     pub async fn stop_project(&self, project_id: ProjectId) -> DomainResult<usize> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         let sessions = self
             .runtime_sessions
             .lock()
@@ -2472,12 +2767,14 @@ impl BrowserService {
                 (runtime.project_id == project_id).then_some((project_id, BrowserSessionId(*id)))
             })
             .collect::<Vec<_>>();
-        self.stop_sessions_inner(sessions).await
+        let result = self.stop_sessions_inner(sessions).await;
+        self.reap_worker(project_id).await;
+        result
     }
 
     /// Stop all active browsers across projects during daemon shutdown.
     pub async fn stop_all(&self) -> DomainResult<usize> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let _lifecycle = self.lifecycle.write().await;
         let sessions = self
             .runtime_sessions
             .lock()
@@ -2486,30 +2783,17 @@ impl BrowserService {
             .map(|(id, runtime)| (runtime.project_id, BrowserSessionId(*id)))
             .collect::<Vec<_>>();
         let result = self.stop_sessions_inner(sessions).await;
-        if self.runtime_sessions.lock().await.is_empty() {
-            if let Some(mut worker) = self.worker.lock().await.take() {
-                worker.terminate().await;
-            }
-            *self
-                .sandbox
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = (None, None);
-        }
+        self.terminate_all_workers().await;
+        self.interrupt_runtime_sessions(None).await;
         result
     }
 
-    /// Terminate the shared worker and mark every attached session interrupted.
+    /// Terminate all workers and mark every attached session interrupted.
     /// Used only when graceful shutdown exceeds its bound.
     pub async fn force_stop_all(&self) {
-        let _lifecycle = self.lifecycle.lock().await;
-        if let Some(mut worker) = self.worker.lock().await.take() {
-            worker.terminate().await;
-        }
-        *self
-            .sandbox
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = (None, None);
-        self.interrupt_runtime_sessions().await;
+        let _lifecycle = self.lifecycle.write().await;
+        self.terminate_all_workers().await;
+        self.interrupt_runtime_sessions(None).await;
     }
 
     async fn stop_sessions_inner(
@@ -2529,7 +2813,84 @@ impl BrowserService {
         }
     }
 
-    async fn call_worker(&self, method: &str, params: Value) -> DomainResult<Value> {
+    async fn project_lifecycle_lock(&self, project_id: ProjectId) -> Arc<Mutex<()>> {
+        self.project_lifecycle
+            .lock()
+            .await
+            .entry(project_id.get())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn worker_entry(&self, project_id: ProjectId) -> Arc<Mutex<Option<WorkerProcess>>> {
+        self.workers
+            .lock()
+            .await
+            .entry(project_id.get())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    }
+
+    async fn worker_is_running(&self, project_id: ProjectId) -> bool {
+        let entry = self.workers.lock().await.get(&project_id.get()).cloned();
+        match entry {
+            Some(entry) => entry.lock().await.is_some(),
+            None => false,
+        }
+    }
+
+    // Called while lifecycle is locked, so a new start cannot race the last stop.
+    async fn reap_worker(&self, project_id: ProjectId) {
+        let entry = self.workers.lock().await.get(&project_id.get()).cloned();
+        if let Some(entry) = entry {
+            // Starts register their session before locking the worker, so checking
+            // under this lock means a concurrent start either keeps this worker alive
+            // or waits here and then spawns a fresh one.
+            let mut worker = entry.lock().await;
+            if self
+                .runtime_sessions
+                .lock()
+                .await
+                .values()
+                .any(|runtime| runtime.project_id == project_id)
+            {
+                return;
+            }
+            if let Some(mut worker) = worker.take() {
+                worker.terminate().await;
+            }
+        }
+        self.sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&project_id.get());
+    }
+
+    async fn terminate_all_workers(&self) {
+        let entries = self
+            .workers
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            if let Some(mut worker) = entry.lock().await.take() {
+                worker.terminate().await;
+            }
+        }
+        self.sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    async fn call_worker(
+        &self,
+        project_id: ProjectId,
+        method: &str,
+        params: Value,
+    ) -> DomainResult<Value> {
         let node_path = self.node_path.as_deref().ok_or_else(|| {
             DomainError::new(ErrorCode::BrowserDisabled, "Node.js is not available")
         })?;
@@ -2539,21 +2900,28 @@ impl BrowserService {
                 "browser worker is not available",
             )
         })?;
-        let mut worker = self.worker.lock().await;
+        let worker_entry = self.worker_entry(project_id).await;
+        let mut worker = worker_entry.lock().await;
         if worker.is_none() {
-            *self
-                .sandbox
+            self.sandbox
                 .lock()
-                .unwrap_or_else(|error| error.into_inner()) = (None, None);
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&project_id.get());
             *worker = Some(
-                WorkerProcess::spawn(
+                match WorkerProcess::spawn(
                     node_path,
                     worker_path,
                     self.runtime.playwright_core_path.as_deref(),
                     self.runtime.chromium_path.as_deref(),
                 )
                 .await
-                .map_err(WorkerCallFailure::into_domain)?,
+                {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        self.interrupt_runtime_sessions(Some(project_id)).await;
+                        return Err(error.into_domain());
+                    }
+                },
             );
         }
         let result = worker
@@ -2569,12 +2937,15 @@ impl BrowserService {
                             .sandbox
                             .lock()
                             .unwrap_or_else(|error| error.into_inner());
-                        *sandbox = (
-                            Some(state.to_owned()),
-                            value
-                                .get("sandbox_reason")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
+                        sandbox.insert(
+                            project_id.get(),
+                            (
+                                Some(state.to_owned()),
+                                value
+                                    .get("sandbox_reason")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                            ),
                         );
                     }
                 }
@@ -2585,25 +2956,33 @@ impl BrowserService {
                 if let Some(mut failed) = worker.take() {
                     failed.terminate().await;
                 }
-                *self
-                    .sandbox
+                self.sandbox
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = (None, None);
-                drop(worker);
-                self.interrupt_runtime_sessions().await;
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&project_id.get());
+                self.interrupt_runtime_sessions(Some(project_id)).await;
                 Err(error)
             }
         }
     }
 
-    async fn interrupt_runtime_sessions(&self) {
+    async fn interrupt_runtime_sessions(&self, project_id: Option<ProjectId>) {
         let runtimes = {
             let mut active = self.runtime_sessions.lock().await;
-            std::mem::take(&mut *active)
+            let ids = active
+                .iter()
+                .filter_map(|(id, runtime)| {
+                    (project_id.is_none() || project_id == Some(runtime.project_id)).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| active.remove(&id).map(|runtime| (id, runtime)))
+                .collect::<Vec<_>>()
         };
-        self.checkpoints.lock().await.clear();
-        self.session_ops.lock().await.clear();
         for (session_id, runtime) in runtimes {
+            self.release_cdp_reservation(session_id);
+            self.checkpoints.lock().await.remove(&session_id);
+            self.session_ops.lock().await.remove(&session_id);
             if let Some(profile) = runtime.profile.as_ref().filter(|_| runtime.persistent) {
                 self.profile_leases
                     .lock()
@@ -2850,7 +3229,9 @@ impl BrowserService {
         &self,
         project_id: ProjectId,
     ) -> DomainResult<Vec<BrowserProfileStatus>> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         self.db.get_project(project_id).await?;
         let mut names = std::collections::BTreeSet::from([DEFAULT_BROWSER_PROFILE.to_string()]);
         for root in [
@@ -2932,7 +3313,9 @@ impl BrowserService {
         profile: &str,
     ) -> DomainResult<BrowserProfileStatus> {
         validate_browser_profile_name(profile)?;
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         self.db.get_project(project_id).await?;
         create_private_dir(&self.profile_directory(project_id, profile))?;
         let session_id =
@@ -2966,7 +3349,9 @@ impl BrowserService {
                 "the default browser profile cannot be deleted; use browser_manage reset_profile",
             ));
         }
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         self.db.get_project(project_id).await?;
         let lease = (project_id.get(), profile.to_string());
         {
@@ -3004,7 +3389,9 @@ impl BrowserService {
         profile: &str,
     ) -> DomainResult<bool> {
         validate_browser_profile_name(profile)?;
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         self.db.get_project(project_id).await?;
         let active_session =
             self.runtime_sessions
@@ -3063,7 +3450,9 @@ impl BrowserService {
     /// Atomically stop all browsers, remove every persistent identity, and
     /// delete the project while new browser starts remain blocked.
     pub async fn delete_project(&self, project_id: ProjectId) -> DomainResult<()> {
-        let _lifecycle = self.lifecycle.lock().await;
+        let _shutdown_guard = self.lifecycle.read().await;
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let _lifecycle = project_lock.lock().await;
         self.db.get_project(project_id).await?;
         let sessions = self
             .runtime_sessions
@@ -3397,7 +3786,7 @@ fn profile_cookie_identities(profile: &StoredCookieProfile) -> DomainResult<Vec<
         .collect())
 }
 
-fn parse_cdp_info(value: Option<&Value>) -> DomainResult<BrowserCdpInfo> {
+fn parse_cdp_info(value: Option<&Value>, port: u16) -> DomainResult<BrowserCdpInfo> {
     let info: BrowserCdpInfo = serde_json::from_value(value.cloned().ok_or_else(|| {
         DomainError::new(
             ErrorCode::ProtocolError,
@@ -3410,16 +3799,19 @@ fn parse_cdp_info(value: Option<&Value>) -> DomainResult<BrowserCdpInfo> {
             format!("browser worker returned invalid CDP details: {error}"),
         )
     })?;
-    if info.port != BROWSER_CDP_PORT
-        || info.endpoint != format!("http://127.0.0.1:{BROWSER_CDP_PORT}")
+    if info.port != port
+        || info.endpoint != format!("http://127.0.0.1:{port}")
         || info.devtools_url.len() > 4_096
         || info.hosted_devtools_url.len() > 4_096
         || !info.devtools_url.starts_with(&format!(
-            "http://127.0.0.1:{BROWSER_CDP_PORT}/devtools/inspector.html?ws=127.0.0.1:{BROWSER_CDP_PORT}/devtools/page/"
+            "http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/"
         ))
         || !info
             .hosted_devtools_url
             .starts_with("https://chrome-devtools-frontend.appspot.com/")
+        || !info
+            .hosted_devtools_url
+            .contains(&format!("ws=127.0.0.1:{port}/devtools/page/"))
     {
         return Err(DomainError::new(
             ErrorCode::ProtocolError,
@@ -3434,6 +3826,7 @@ fn browser_resources(
     max_concurrent_browsers: u32,
     sessions: &[BrowserSession],
     runtimes: &HashMap<i64, RuntimeSession>,
+    cdp_port_in_use: bool,
 ) -> DomainResult<BrowserResources> {
     let mut active_persistent = 0;
     let mut active_ephemeral = 0;
@@ -3497,7 +3890,7 @@ fn browser_resources(
         active_ephemeral,
         available_capacity: (max_concurrent_browsers as usize)
             .saturating_sub(active_persistent + active_ephemeral),
-        cdp_port_in_use: runtimes.values().any(|runtime| runtime.cdp.is_some()),
+        cdp_port_in_use,
         sessions: resources,
     })
 }
@@ -3512,10 +3905,12 @@ fn cdp_status_view(
             active: true,
             agent_control: false,
             session_id: Some(BrowserSessionId(session_id)),
+            cdp_port: Some(cdp.port),
+            active_sessions: Vec::new(),
             endpoint: Some(cdp.endpoint),
             devtools_url: Some(cdp.devtools_url),
             hosted_devtools_url: Some(cdp.hosted_devtools_url),
-            ssh_forward_command: ssh_forward_command(),
+            ssh_forward_command: ssh_forward_command(cdp.port),
         },
         None => BrowserCdpStatus {
             project_id,
@@ -3523,6 +3918,8 @@ fn cdp_status_view(
             agent_control: true,
             session_id: None,
             endpoint: None,
+            cdp_port: None,
+            active_sessions: Vec::new(),
             devtools_url: None,
             hosted_devtools_url: None,
             ssh_forward_command: None,
@@ -3530,14 +3927,14 @@ fn cdp_status_view(
     }
 }
 
-fn ssh_forward_command() -> Option<String> {
+fn ssh_forward_command(port: u16) -> Option<String> {
     let user = runtime_username()?;
     let ip = runtime_host_ip()?;
     let host = match ip {
         IpAddr::V4(ip) => ip.to_string(),
         IpAddr::V6(ip) => format!("[{ip}]"),
     };
-    Some(format!("ssh -N -L 9222:127.0.0.1:9222 {user}@{host}"))
+    Some(format!("ssh -N -L {port}:127.0.0.1:{port} {user}@{host}"))
 }
 
 fn runtime_username() -> Option<String> {
@@ -3996,7 +4393,8 @@ mod tests {
                 },
             ),
         ]);
-        let observed = browser_resources(project.id, 2, &[session.clone()], &runtimes).unwrap();
+        let observed =
+            browser_resources(project.id, 2, &[session.clone()], &runtimes, false).unwrap();
         assert_eq!(
             serde_json::to_value(observed).unwrap(),
             json!({
@@ -4005,31 +4403,33 @@ mod tests {
                 "active_persistent": 1,
                 "active_ephemeral": 1,
                 "available_capacity": 0,
-                "cdp_port_in_use": true,
+                "cdp_port_in_use": false,
                 "sessions": [{"session_id": session.id, "profile": "account1", "agent_control": true}],
             })
         );
 
         runtimes.remove(&(session.id.get() + 1));
         runtimes.remove(&999);
-        let observed = browser_resources(project.id, 2, &[session.clone()], &runtimes).unwrap();
+        let observed =
+            browser_resources(project.id, 2, &[session.clone()], &runtimes, false).unwrap();
         assert_eq!(observed.available_capacity, 1);
         assert!(!observed.cdp_port_in_use);
         runtimes.get_mut(&session.id.get()).unwrap().cdp = Some(cdp);
-        let observed = browser_resources(project.id, 0, &[session.clone()], &runtimes).unwrap();
+        let observed =
+            browser_resources(project.id, 0, &[session.clone()], &runtimes, false).unwrap();
         assert_eq!(observed.available_capacity, 0);
         assert!(!observed.sessions[0].agent_control);
-        assert!(observed.cdp_port_in_use);
+        assert!(!observed.cdp_port_in_use);
 
         let mut unverified = session.clone();
         unverified.active_profile = None;
-        assert!(browser_resources(project.id, 2, &[unverified], &runtimes).is_err());
+        assert!(browser_resources(project.id, 2, &[unverified], &runtimes, false).is_err());
         let mut mismatched = session.clone();
         mismatched.active_profile = Some("account2".into());
-        assert!(browser_resources(project.id, 2, &[mismatched], &runtimes).is_err());
-        assert!(browser_resources(project.id, 2, &[], &runtimes).is_err());
+        assert!(browser_resources(project.id, 2, &[mismatched], &runtimes, false).is_err());
+        assert!(browser_resources(project.id, 2, &[], &runtimes, false).is_err());
         runtimes.clear();
-        let error = browser_resources(project.id, 2, &[session], &runtimes).unwrap_err();
+        let error = browser_resources(project.id, 2, &[session], &runtimes, false).unwrap_err();
         assert_eq!(error.code(), ErrorCode::Unavailable);
     }
 
@@ -4124,6 +4524,94 @@ mod tests {
         assert_eq!(first, checkpoint_hash(&checkpoint).unwrap());
     }
 
+    #[tokio::test]
+    async fn cdp_monitor_releases_port_when_browser_socket_closes() {
+        let db = Db::open_in_memory().await.unwrap();
+        let service = BrowserService::new(Arc::new(db), None, None);
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let session_id = BrowserSessionId(12345);
+        service.runtime_sessions.lock().await.insert(
+            session_id.get(),
+            RuntimeSession {
+                project_id: ProjectId(1),
+                capture_session_id: CaptureSessionId(1),
+                persistent: true,
+                profile: Some("default".into()),
+                cdp: Some(BrowserCdpInfo {
+                    port,
+                    endpoint: format!("http://127.0.0.1:{port}"),
+                    devtools_url: String::new(),
+                    hosted_devtools_url: String::new(),
+                }),
+            },
+        );
+        service
+            .cdp_reservations
+            .lock()
+            .unwrap()
+            .insert(session_id.get(), port);
+        service.monitor_cdp_port(
+            session_id,
+            port,
+            service.session_operation_lock(session_id).await,
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(service
+            .cdp_reservations
+            .lock()
+            .unwrap()
+            .contains_key(&session_id.get()));
+        drop(listener);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !service
+                    .cdp_reservations
+                    .lock()
+                    .unwrap()
+                    .contains_key(&session_id.get())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .unwrap()
+            .cdp
+            .is_none());
+    }
+
+    #[test]
+    fn cdp_port_reservations_skip_busy_ports_and_release_on_failure() {
+        let reservations = std::sync::Mutex::new(HashMap::new());
+        let first = free_cdp_port(&reservations.lock().unwrap()).expect("a free port in CDP range");
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, first)).unwrap();
+        let second = free_cdp_port(&reservations.lock().unwrap()).unwrap();
+        assert!(second > first);
+        drop(listener);
+        reservations.lock().unwrap().insert(1, first);
+        {
+            let _reservation = CdpReservation {
+                reservations: &reservations,
+                session_id: 1,
+                committed: false,
+            };
+            assert_ne!(free_cdp_port(&reservations.lock().unwrap()), Some(first));
+        }
+        assert_eq!(free_cdp_port(&reservations.lock().unwrap()), Some(first));
+        let all: HashMap<i64, u16> = (BROWSER_CDP_PORT..=BROWSER_CDP_PORT_END)
+            .map(|port| (i64::from(port), port))
+            .collect();
+        assert_eq!(free_cdp_port(&all), None);
+    }
+
     #[test]
     fn cdp_details_are_bounded_and_status_makes_control_ownership_explicit() {
         let info = parse_cdp_info(Some(&json!({
@@ -4131,7 +4619,7 @@ mod tests {
             "endpoint": "http://127.0.0.1:9222",
             "devtools_url": "http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/1",
             "hosted_devtools_url": "https://chrome-devtools-frontend.appspot.com/serve_rev/@abc/inspector.html?ws=127.0.0.1:9222/devtools/page/1"
-        })))
+        })), 9222)
         .unwrap();
         let handed_off = cdp_status_view(ProjectId(7), Some((9, info)));
         assert!(handed_off.active);
@@ -4144,12 +4632,15 @@ mod tests {
         let available = cdp_status_view(ProjectId(7), None);
         assert!(!available.active);
         assert!(available.agent_control);
-        assert!(parse_cdp_info(Some(&json!({
-            "port": 9223,
-            "endpoint": "http://127.0.0.1:9223",
-            "devtools_url": "https://example.test/",
-            "hosted_devtools_url": "https://example.test/"
-        })))
+        assert!(parse_cdp_info(
+            Some(&json!({
+                "port": 9223,
+                "endpoint": "http://127.0.0.1:9223",
+                "devtools_url": "https://example.test/",
+                "hosted_devtools_url": "https://example.test/"
+            })),
+            9223
+        )
         .is_err());
     }
 
@@ -4473,7 +4964,7 @@ done
         service.worker_path = Some(script);
         assert!(service.status().sandbox_state.is_none());
         service
-            .call_worker("session.start", json!({}))
+            .call_worker(project.id, "session.start", json!({}))
             .await
             .unwrap();
         let status = service.active_status(project.id).await.unwrap();
@@ -4484,9 +4975,9 @@ done
         );
         assert_eq!(service.status().sandbox_state, status.sandbox_state);
         service.stop_project(project.id).await.unwrap();
-        assert!(service.worker.lock().await.is_some());
+        assert!(!service.worker_is_running(project.id).await);
         service.stop_all().await.unwrap();
-        assert!(service.worker.lock().await.is_none());
+        assert!(!service.worker_is_running(project.id).await);
         let restarted = BrowserService::new_with_proxy_and_ca(
             db,
             None,
@@ -4539,7 +5030,7 @@ done
             );
             service.node_path = Some(PathBuf::from("/bin/sh"));
             service.worker_path = Some(script.clone());
-            *service.worker.lock().await = Some(
+            *service.worker_entry(project.id).await.lock().await = Some(
                 WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
                     .await
                     .unwrap_or_else(|_| panic!("start cleanup fixture worker")),
@@ -5110,6 +5601,121 @@ done
             Some(Path::new("/profiles/acc1"))
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_timeout_interrupts_only_its_project() {
+        let directory = tempfile::tempdir_in("/tmp/artis").unwrap();
+        let script = directory.path().join("worker.sh");
+        std::fs::write(&script, r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"hello"'*) printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}' ;;
+    *'"method":"fail"'*) sleep 2 ;;
+    *) printf '%s\n' '{"id":2,"result":{"ok":true}}' ;;
+  esac
+done
+"#).unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let mut projects = Vec::new();
+        for name in ["First worker", "Second worker"] {
+            projects.push(
+                db.create_project(CreateProjectRequest {
+                    name: name.into(),
+                    target_url: "https://example.test".into(),
+                    advanced: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        let mut service = BrowserService::new_with_proxy_and_ca(
+            db.clone(),
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        service.node_path = Some(PathBuf::from("/bin/sh"));
+        service.worker_path = Some(script);
+        let mut ids = Vec::new();
+        for project in &projects {
+            let session = db.create_browser_session(project.id, None).await.unwrap();
+            let capture = db
+                .create_capture_session(CreateCaptureSession {
+                    project_id: project.id,
+                    browser_session_id: Some(session.id),
+                    browser_action_id: None,
+                    is_browser_bound: true,
+                    ttl: None,
+                })
+                .await
+                .unwrap();
+            service.runtime_sessions.lock().await.insert(
+                session.id.get(),
+                RuntimeSession {
+                    project_id: project.id,
+                    capture_session_id: capture.id,
+                    persistent: false,
+                    profile: None,
+                    cdp: None,
+                },
+            );
+            ids.push(session.id);
+        }
+        service
+            .cdp_reservations
+            .lock()
+            .unwrap()
+            .insert(ids[0].get(), 9222);
+        service
+            .cdp_reservations
+            .lock()
+            .unwrap()
+            .insert(ids[1].get(), 9223);
+        service
+            .call_worker(projects[1].id, "ok", json!({}))
+            .await
+            .unwrap();
+        let entry = service.worker_entry(projects[0].id).await;
+        let mut fixture = WorkerProcess::spawn(
+            Path::new("/bin/sh"),
+            service.worker_path.as_deref().unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("start timeout fixture"));
+        fixture.rpc_timeout = Duration::from_millis(50);
+        *entry.lock().await = Some(fixture);
+        let error = service
+            .call_worker(projects[0].id, "fail", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        assert!(!service
+            .runtime_sessions
+            .lock()
+            .await
+            .contains_key(&ids[0].get()));
+        assert!(service
+            .runtime_sessions
+            .lock()
+            .await
+            .contains_key(&ids[1].get()));
+        assert!(service.worker_is_running(projects[1].id).await);
+        assert!(!service
+            .cdp_reservations
+            .lock()
+            .unwrap()
+            .contains_key(&ids[0].get()));
+        assert_eq!(
+            service.cdp_reservations.lock().unwrap().get(&ids[1].get()),
+            Some(&9223)
+        );
+        service.force_stop_all().await;
     }
 
     #[test]

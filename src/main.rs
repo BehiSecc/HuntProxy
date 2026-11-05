@@ -162,11 +162,11 @@ enum BrowserCmd {
 
 #[derive(Subcommand, Debug)]
 enum BrowserCdpCmd {
-    /// Expose this active browser on loopback port 9222.
+    /// Expose this active browser on an available loopback port (9222–9321).
     Enable { project_id: i64, session_id: i64 },
     /// Show the project's current handoff state and DevTools URL.
     Status { project_id: i64 },
-    /// Close CDP port 9222 and return browser control to agents.
+    /// Close the session’s CDP port and return browser control to agents.
     Disable { project_id: i64, session_id: i64 },
 }
 

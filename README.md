@@ -60,6 +60,8 @@ The installer sets up HuntProxy, its browser runtime, and a private data directo
 
 HuntProxy speaks MCP over standard input/output. When your agent connects, the bridge starts the local HuntProxy daemon automatically and keeps the project available across prompts.
 
+Set `HUNTPROXY_MCP_DISABLE_LIFECYCLE=1` on the MCP bridge to hide and reject `huntproxy_stop` and `huntproxy_restart`. The operator's `HuntProxy stop` command remains available.
+
 #### Codex
 
 Add this to `~/.codex/config.toml`:
@@ -278,6 +280,9 @@ MCP handles day-to-day hunting; the CLI handles setup, diagnostics, project main
 | `HuntProxy backup <file>` | Create a consistent SQLite backup. |
 | `HuntProxy history clear …` | Remove saved exchanges older than a chosen timestamp. |
 | `HuntProxy browser cdp …` | Hand an active browser to Chrome DevTools or return it to the agent. |
+
+CDP handoffs use the lowest available loopback port in 9222–9321. `browser_cdp` status accepts an optional `session_id`; without it, `active_sessions` lists the project’s handoffs. `resources.cdp_port_in_use` is true when no CDP port in the range is free.
+
 
 Use `HuntProxy --help` or `HuntProxy <command> --help` for the complete command reference.
 
