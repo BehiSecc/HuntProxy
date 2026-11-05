@@ -145,7 +145,7 @@ impl ReplyService {
         )
         .await
         .map_err(|_| DomainError::new(ErrorCode::Timeout, "upstream connection timed out"))??;
-        io = connect_tls_h2(io, &target.host).await?;
+        io = connect_tls_h2(io, &target.host, self.verify_upstream_tls).await?;
 
         let started = Instant::now();
         let (prefix, release) = encode_connection(&prepared, options.final_data_together)?;
@@ -716,15 +716,9 @@ async fn write_all_bounded(stream: &mut Pin<Box<dyn RawIo>>, bytes: &[u8]) -> Do
 async fn connect_tls_h2(
     stream: Pin<Box<dyn RawIo>>,
     host: &str,
+    verify_upstream_tls: bool,
 ) -> DomainResult<Pin<Box<dyn RawIo>>> {
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let mut config = crate::transport::tls::raw_client_config(verify_upstream_tls)?;
     config.alpn_protocols = vec![b"h2".to_vec()];
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| DomainError::invalid(format!("invalid TLS server name: {host}")))?;

@@ -398,13 +398,7 @@ async fn prepare_node(config: &Config) -> DomainResult<PathBuf> {
     }
 
     let url = format!("{}/{}", manifest.source.trim_end_matches('/'), asset.asset);
-    let client = wreq::Client::builder()
-        .redirect(wreq::redirect::Policy::limited(5))
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(180))
-        .https_only(true)
-        .build()
-        .map_err(|error| install_error(format!("build Node.js download client: {error}")))?;
+    let client = node_download_client()?;
     let response = client
         .get(&url)
         .header(
@@ -468,6 +462,17 @@ impl Drop for TemporaryFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
+}
+
+// Runtime downloads have their own strict client, independent of target policy.
+fn node_download_client() -> DomainResult<wreq::Client> {
+    wreq::Client::builder()
+        .redirect(wreq::redirect::Policy::limited(5))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(180))
+        .https_only(true)
+        .build()
+        .map_err(|error| install_error(format!("build Node.js download client: {error}")))
 }
 
 async fn validate_node(path: &Path, exact: Option<&str>) -> DomainResult<()> {
@@ -1541,6 +1546,29 @@ fn storage_error(error: impl std::fmt::Display) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upstream_tls_option_does_not_disable_runtime_download_verification() {
+        use crate::transport::test_tls::{
+            assert_certificate_error, assert_target_connects, configuration, CertificateKind,
+            TlsOrigin, WireProtocol,
+        };
+        let (_directory, config) = configuration(Some(false));
+        let origin = TlsOrigin::start(
+            CertificateKind::SelfSigned,
+            WireProtocol::Http1,
+            &rustls::version::TLS13,
+        )
+        .await;
+        assert_target_connects(&config, &origin).await;
+        let error = node_download_client()
+            .unwrap()
+            .get(&origin.url)
+            .send()
+            .await
+            .unwrap_err();
+        assert_certificate_error(&error);
+    }
 
     fn temporary_directory() -> tempfile::TempDir {
         tempfile::Builder::new()

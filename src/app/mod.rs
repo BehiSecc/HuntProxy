@@ -349,9 +349,11 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
     if let Some(warning) = &transport_status.warning {
         tracing::warn!(%warning, "browser and upstream transport profile differ");
     }
-    let transport: Arc<dyn SemanticTransport> = Arc::new(WreqTransport::with_chrome_major(
-        transport_status.chrome_major,
-    )?);
+    let transport: Arc<dyn SemanticTransport> =
+        Arc::new(WreqTransport::with_chrome_major_and_tls_verification(
+            transport_status.chrome_major,
+            config.verify_upstream_tls,
+        )?);
     let key_bytes = std::fs::read(config.placeholder_key_path()).unwrap_or_else(|_| {
         let key = PlaceholderKey::load_or_create(&config.placeholder_key_path())
             .map(|_| ())
@@ -370,6 +372,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         transport: transport.clone(),
         placeholder_key: PlaceholderKey::from_bytes(key_bytes.clone()),
         upstream_proxies: config.upstream_proxies.clone(),
+        verify_upstream_tls: config.verify_upstream_tls,
     });
     let fuzzer = Arc::new(FuzzerService::new(
         db.clone(),

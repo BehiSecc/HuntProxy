@@ -238,7 +238,7 @@ impl ReplyService {
         .await
         .map_err(|_| DomainError::new(ErrorCode::Timeout, "upstream connection timed out"))??;
         if target.scheme == "https" {
-            stream = connect_tls(stream, &target.host).await?;
+            stream = connect_tls(stream, &target.host, self.verify_upstream_tls).await?;
         }
         wait_for_start_barrier(options.start_barrier.as_ref()).await?;
         let response_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
@@ -639,8 +639,12 @@ async fn connect_any(
     ))
 }
 
-async fn connect_tls(stream: Pin<Box<dyn RawIo>>, host: &str) -> DomainResult<Pin<Box<dyn RawIo>>> {
-    let config = raw_tls_client_config()?;
+async fn connect_tls(
+    stream: Pin<Box<dyn RawIo>>,
+    host: &str,
+    verify_upstream_tls: bool,
+) -> DomainResult<Pin<Box<dyn RawIo>>> {
+    let config = crate::transport::tls::raw_client_config(verify_upstream_tls)?;
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| DomainError::invalid(format!("invalid TLS server name: {host}")))?;
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
@@ -654,16 +658,6 @@ async fn connect_tls(stream: Pin<Box<dyn RawIo>>, host: &str) -> DomainResult<Pi
         DomainError::new(ErrorCode::ProtocolError, format!("TLS handshake: {error}"))
     })?;
     Ok(Box::pin(tls))
-}
-
-fn raw_tls_client_config() -> DomainResult<rustls::ClientConfig> {
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))
-    .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
 }
 
 fn io_error(error: io::Error) -> DomainError {
@@ -1675,7 +1669,7 @@ mod tests {
 
     #[test]
     fn detects_content_length_and_chunked_completion() {
-        raw_tls_client_config().unwrap();
+        crate::transport::tls::raw_client_config(true).unwrap();
         assert!(response_is_complete(
             b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest",
             false,
