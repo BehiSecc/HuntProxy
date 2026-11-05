@@ -176,6 +176,67 @@ impl Drop for Agent {
 }
 
 #[tokio::test]
+async fn lifecycle_lockdown_hides_and_rejects_tools_in_bridge() {
+    let directory = tempfile::Builder::new()
+        .prefix("hp-mcp-lockdown-")
+        .tempdir()
+        .unwrap();
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_HuntProxy"))
+        .args(["mcp", "--data-dir"])
+        .arg(directory.path())
+        .env("HUNTPROXY_MCP_DISABLE_LIFECYCLE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = bridge.stdin.take().unwrap();
+    let mut output = BufReader::new(bridge.stdout.take().unwrap()).lines();
+    for (id, method, params) in [
+        (1, "tools/list", json!({})),
+        (
+            2,
+            "tools/call",
+            json!({"name": "huntproxy_stop", "arguments": {}}),
+        ),
+        (
+            3,
+            "tools/call",
+            json!({"name": "huntproxy_restart", "arguments": {}}),
+        ),
+    ] {
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        input
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        input.flush().await.unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(10), output.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], id);
+        if id == 1 {
+            let tools = response["result"]["tools"].as_array().unwrap();
+            assert!(tools.iter().any(|tool| tool["name"] == "projects"));
+            for name in ["huntproxy_stop", "huntproxy_restart"] {
+                assert!(!tools.iter().any(|tool| tool["name"] == name));
+            }
+        } else {
+            assert!(
+                response["error"]
+                    .to_string()
+                    .contains("HUNTPROXY_MCP_DISABLE_LIFECYCLE"),
+                "{response}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn agent_continues_after_idle_explicit_stop_restart_and_crash() {
     let mut agent = Agent::start(true).await;
     let initialized = agent.rpc("initialize", json!({})).await;
