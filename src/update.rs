@@ -1366,6 +1366,34 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    async fn upstream_tls_option_does_not_disable_update_checks_or_download_verification() {
+        use crate::transport::test_tls::{
+            assert_certificate_error, assert_target_connects, configuration, CertificateKind,
+            TlsOrigin, WireProtocol,
+        };
+        let (directory, config) = configuration(Some(false));
+        let origin = TlsOrigin::start(
+            CertificateKind::SelfSigned,
+            WireProtocol::Http1,
+            &rustls::version::TLS13,
+        )
+        .await;
+        assert_target_connects(&config, &origin).await;
+        let client = update_client(false).unwrap();
+        assert_certificate_error(&client.get(&origin.url).send().await.unwrap_err());
+        let source = ReleaseSource::test_source(&origin.url).unwrap();
+        assert!(resolve_release(&client, &source, None).await.is_err());
+        assert!(download_bytes(&client, &origin.url, 1024).await.is_err());
+        let archive = directory.path().join("release.tar.gz");
+        assert!(
+            download_file(&client, &origin.url, File::create(&archive).unwrap(), 1024)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::metadata(archive).unwrap().len(), 0);
+    }
+
     fn script(version: &str) -> Vec<u8> {
         format!("#!/bin/sh\nprintf 'HuntProxy {version}\\n'\n").into_bytes()
     }

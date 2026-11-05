@@ -313,6 +313,8 @@ Explore the maintained collection or learn how to build your own in [HuntProxy-P
 
 For browser runtime settings and manual installation, see [Browser configuration](docs/browser.md).
 
+For targets with untrusted or invalid TLS certificates, see the [`verify_upstream_tls` setting](docs/browser.md). Certificate verification is enabled by default; changes require a restart.
+
 CAPTCHAs and bot checks are common when hunting from a VPS because datacenter IP addresses are easier to recognize. Routing HuntProxy through a reputable residential proxy is usually the most effective fix.
 
 Choose one configuration and add it to `~/.huntproxy/config.toml`. Then run `HuntProxy restart` (or call `huntproxy_restart` from the connected agent) and verify with `HuntProxy doctor`.

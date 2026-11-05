@@ -486,6 +486,7 @@ async fn an_existing_reply_service_uses_runtime_updates_and_request_override_pri
         db: db.clone(),
         transport: recorder.clone(),
         placeholder_key: PlaceholderKey::from_bytes(vec![9; 32]),
+        verify_upstream_tls: true,
         upstream_proxies: UpstreamProxyConfig {
             default: Some("http://static.example:8080".into()),
             ..Default::default()

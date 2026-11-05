@@ -51,6 +51,8 @@ pub struct Config {
     /// Stop an inactive auto-started daemon and its browsers. The MCP bridge
     /// stays connected and can recover the daemon. Zero disables idle shutdown.
     pub idle_timeout_seconds: u64,
+    /// Verify target server certificates. Read at startup; restart to apply changes.
+    pub verify_upstream_tls: bool,
     /// Optional default and host-specific upstream proxies for outbound requests.
     pub upstream_proxies: UpstreamProxyConfig,
 }
@@ -226,6 +228,7 @@ impl Default for Config {
             plugin_dir: data_dir.join("plugins"),
             auto_start_daemon: true,
             idle_timeout_seconds: 60 * 60,
+            verify_upstream_tls: true,
             upstream_proxies: UpstreamProxyConfig::default(),
         }
     }
@@ -298,6 +301,9 @@ impl Config {
         }
         if let Some(v) = f.idle_timeout_seconds {
             self.idle_timeout_seconds = v;
+        }
+        if let Some(v) = f.verify_upstream_tls {
+            self.verify_upstream_tls = v;
         }
         if let Some(v) = f.node_path {
             self.node_path = Some(PathBuf::from(v));
@@ -412,6 +418,7 @@ impl Config {
             max_body_bytes: Some(self.max_body_bytes),
             auto_start_daemon: Some(self.auto_start_daemon),
             idle_timeout_seconds: Some(self.idle_timeout_seconds),
+            verify_upstream_tls: Some(self.verify_upstream_tls),
             node_path: self.node_path.as_ref().map(|p| p.display().to_string()),
             browser_worker_path: self
                 .browser_worker_path
@@ -440,6 +447,7 @@ struct ConfigFile {
     max_body_bytes: Option<u64>,
     auto_start_daemon: Option<bool>,
     idle_timeout_seconds: Option<u64>,
+    verify_upstream_tls: Option<bool>,
     node_path: Option<String>,
     browser_worker_path: Option<String>,
     plugin_dir: Option<String>,
@@ -595,6 +603,36 @@ mod tests {
         }
         assert!(config.data_dir.join(CONFIG_FILE_NAME).is_file());
         assert_eq!(config.idle_timeout_seconds, 60 * 60);
+        assert!(config.verify_upstream_tls);
+        let encoded = fs::read_to_string(config.data_dir.join(CONFIG_FILE_NAME)).unwrap();
+        assert_eq!(
+            toml::from_str::<ConfigFile>(&encoded)
+                .unwrap()
+                .verify_upstream_tls,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn upstream_tls_setting_is_written_and_rejects_non_boolean_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: directory.path().to_owned(),
+            verify_upstream_tls: false,
+            ..Config::default()
+        };
+        config.write_default_config().unwrap();
+        assert!(
+            !Config::load(Some(directory.path().to_owned()))
+                .unwrap()
+                .verify_upstream_tls
+        );
+        fs::write(
+            directory.path().join(CONFIG_FILE_NAME),
+            "verify_upstream_tls = 'false'\n",
+        )
+        .unwrap();
+        assert!(Config::load(Some(directory.path().to_owned())).is_err());
     }
 
     #[test]

@@ -125,6 +125,7 @@ impl Fixture {
             transport: recorder.clone(),
             placeholder_key: PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         Self {
             db,
@@ -508,6 +509,7 @@ async fn real_semantic_transport_keeps_anonymous_redirect_request_credential_fre
         transport: Arc::new(huntproxy::transport::WreqTransport::new()),
         placeholder_key: f.reply.placeholder_key.clone(),
         upstream_proxies: Default::default(),
+        verify_upstream_tls: true,
     };
     reply
         .send(

@@ -657,6 +657,7 @@ pub struct ReplyService {
     pub transport: Arc<dyn SemanticTransport>,
     pub placeholder_key: PlaceholderKey,
     pub upstream_proxies: crate::config::UpstreamProxyConfig,
+    pub verify_upstream_tls: bool,
 }
 
 impl ReplyService {
@@ -1393,6 +1394,7 @@ mod tests {
             transport: Arc::new(CannedTransport),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         };
 
         let error = service
@@ -1549,6 +1551,7 @@ mod tests {
             }),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         };
 
         service
@@ -1679,6 +1682,7 @@ mod tests {
             }),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         };
         let result = service
             .send(
@@ -1779,6 +1783,7 @@ mod tests {
             transport: Arc::new(CannedTransport),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         };
 
         let result = service
@@ -2120,6 +2125,7 @@ mod tests {
             transport: Arc::new(GzipTransport),
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         };
         let result = service
             .send(
