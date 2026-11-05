@@ -206,7 +206,7 @@ test("cleanup failure retains the session and shutdown closes independent browse
       await second;
     },
     async stopOwnedChrome(child) { events.push(child); },
-    logMeta() {}, process: { exit: (code) => events.push(code) },
+    logMeta() {}, process: { exit: (code) => events.push(code) }, setTimeout, clearTimeout,
   });
   await assert.rejects(api.closeSession(1));
   assert.equal(sessions.has(1), true);
@@ -219,6 +219,62 @@ test("cleanup failure retains the session and shutdown closes independent browse
   assert.equal(sessions.has(1), true);
   assert.equal(sessions.has(2), false);
   assert.equal(events.at(-1), 1);
+});
+
+test("daemon EOF stops browsers without waiting for a stalled RPC", async () => {
+  const readline = new EventEmitter();
+  const events = [];
+  const process = new EventEmitter();
+  process.exit = (code) => events.push(code);
+  vm.runInNewContext(source.slice(source.indexOf("let queue =")), {
+    createInterface: () => readline, process, shuttingDown: false,
+    sessions: new Map([[1, {}]]), ownedChromeChildren: new Set(),
+    handle: () => new Promise(() => {}),
+    async closeSession(id) { events.push(id); },
+    stopOwnedChrome() {}, respond() {}, rpcError() {}, setTimeout, clearTimeout,
+  });
+  readline.emit("line", '{"id":1,"method":"session.action"}');
+  await new Promise((resolve) => setImmediate(resolve));
+  readline.emit("close");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, [1, 0]);
+});
+
+test("stalled shutdown force-stops native children and reaches Playwright exit cleanup", async () => {
+  const events = [];
+  let deadline;
+  const shutdown = source.slice(source.indexOf("async function shutdown("), source.indexOf('readline.on("close"'));
+  const api = vm.runInNewContext(`${shutdown}; ({shutdown})`, {
+    sessions: new Map([[1, {}]]), shuttingDown: false,
+    ownedChromeChildren: new Set([{ kill: (signal) => events.push(signal) }]),
+    closeSession: () => new Promise(() => {}),
+    stopOwnedChrome: () => new Promise(() => {}),
+    setTimeout(callback, milliseconds) {
+      assert.equal(milliseconds, 5_000);
+      deadline = callback;
+      return { unref() {} };
+    },
+    clearTimeout() {}, process: { exit: (code) => events.push(code) },
+  });
+  void api.shutdown(143);
+  deadline();
+  assert.deepEqual(events, ["SIGKILL", 1]);
+});
+
+test("failed shutdown still kills remaining native children when a kill throws", async () => {
+  const events = [];
+  const shutdown = source.slice(source.indexOf("async function shutdown("), source.indexOf('readline.on("close"'));
+  const api = vm.runInNewContext(`${shutdown}; ({shutdown})`, {
+    sessions: new Map(), shuttingDown: false,
+    ownedChromeChildren: new Set([
+      { kill() { throw Error("already exited"); } },
+      { kill: (signal) => events.push(signal) },
+    ]),
+    closeSession() {}, stopOwnedChrome: async () => { throw Error("cleanup failed"); },
+    setTimeout, clearTimeout, process: { exit: (code) => events.push(code) },
+  });
+  await api.shutdown(0);
+  assert.deepEqual(events, ["SIGKILL", 1]);
 });
 
 

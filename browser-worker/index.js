@@ -2216,6 +2216,17 @@ readline.on("line", (line) => {
 async function shutdown(exitCode) {
   if (shuttingDown) return;
   shuttingDown = true;
+  const exit = (code) => {
+    for (const child of ownedChromeChildren) {
+      try { child.kill("SIGKILL"); } catch {}
+    }
+    // Playwright's exit handler also kills its detached browser groups.
+    process.exit(code);
+  };
+  // EOF can be the only notification after the daemon is killed. Do not let
+  // stalled browser control calls keep the worker and its profiles alive.
+  const deadline = setTimeout(() => exit(1), 5_000);
+  deadline.unref();
   const registered = new Set([...sessions.values()].map((session) => session.ownedChrome));
   // Close independent browsers together, including a native child whose
   // startup has not reached session registration yet. One failure must not
@@ -2224,12 +2235,12 @@ async function shutdown(exitCode) {
     ...[...sessions.keys()].map(closeSession),
     ...[...ownedChromeChildren].filter((child) => !registered.has(child)).map(stopOwnedChrome),
   ]);
-  process.exit(results.some((result) => result.status === "rejected") ? 1 : exitCode);
+  clearTimeout(deadline);
+  exit(results.some((result) => result.status === "rejected") ? 1 : exitCode);
 }
 
-readline.on("close", async () => {
-  await queue;
-  await shutdown(0);
+readline.on("close", () => {
+  void shutdown(0);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

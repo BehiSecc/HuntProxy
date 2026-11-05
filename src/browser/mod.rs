@@ -740,6 +740,9 @@ struct WorkerProcess {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     child: Child,
+    #[cfg(unix)]
+    process_group: nix::unistd::Pid,
+    terminated: bool,
     next_id: u64,
     rpc_timeout: Duration,
 }
@@ -793,6 +796,10 @@ impl WorkerProcess {
                 format!("start browser worker: {error}"),
             ))
         })?;
+        #[cfg(unix)]
+        let process_group = nix::unistd::Pid::from_raw(
+            child.id().expect("newly spawned worker has a process ID") as i32,
+        );
         let stdin = child.stdin.take().ok_or_else(|| {
             WorkerCallFailure::Transport(DomainError::new(
                 ErrorCode::ProtocolError,
@@ -809,6 +816,9 @@ impl WorkerProcess {
             stdin,
             stdout: BufReader::new(stdout),
             child,
+            #[cfg(unix)]
+            process_group,
+            terminated: false,
             next_id: 1,
             rpc_timeout: WORKER_RPC_TIMEOUT,
         };
@@ -928,6 +938,9 @@ impl WorkerProcess {
     }
 
     async fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
         #[cfg(unix)]
         if let Some(pid) = self.child.id() {
             let _ = nix::sys::signal::kill(
@@ -939,11 +952,6 @@ impl WorkerProcess {
         {
             let _ = self.child.start_kill();
         }
-        #[cfg(unix)]
-        let group = self
-            .child
-            .id()
-            .map(|pid| nix::unistd::Pid::from_raw(pid as i32));
         match tokio::time::timeout(Duration::from_secs(6), self.child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(_)) | Err(_) => {
@@ -953,21 +961,18 @@ impl WorkerProcess {
         // A healthy worker has stopped its browsers by now. A hung or crashed one
         // cannot, and its surviving Chromium would keep the profile locked.
         #[cfg(unix)]
-        if let Some(group) = group {
-            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
-        }
+        let _ = nix::sys::signal::killpg(self.process_group, nix::sys::signal::Signal::SIGKILL);
+        self.terminated = true;
     }
 }
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.child.id() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+        if self.terminated {
+            return;
         }
+        #[cfg(unix)]
+        let _ = nix::sys::signal::killpg(self.process_group, nix::sys::signal::Signal::SIGKILL);
         #[cfg(not(unix))]
         {
             let _ = self.child.start_kill();
@@ -1627,68 +1632,64 @@ impl BrowserService {
                 return Err(error);
             }
         };
-        if let Err(error) =
-            verify_worker_identity(&result, session.id, profile_name, profile_dir.as_deref())
-        {
+        // Interruption removes ownership before writing Interrupted. Keep the
+        // runtime lock through finalization so Ready cannot overwrite it.
+        let runtimes = self.runtime_sessions.lock().await;
+        if !runtimes.get(&session.id.get()).is_some_and(|runtime| {
+            runtime.project_id == project_id && runtime.capture_session_id == capture.id
+        }) {
+            drop(runtimes);
+            return Err(self.startup_interrupted(project_id).await);
+        }
+        let prepared = async {
+            verify_worker_identity(&result, session.id, profile_name, profile_dir.as_deref())?;
+            let checkpoint = result.get("checkpoint").ok_or_else(|| {
+                DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
+            })?;
+            let saved = self
+                .save_checkpoint(
+                    project_id,
+                    session.id,
+                    checkpoint,
+                    checkpoint_status,
+                    profile_name,
+                )
+                .await?;
+            session.engine = BrowserEngine::Chromium;
+            session.current_url = saved.url;
+            session.current_title = saved.title;
+            session.state = BrowserSessionState::Ready;
+            session.active_profile = profile.clone();
+            session.checkpoint_status = Some(checkpoint_status.into());
+            session.checkpoint_hash = Some(saved.hash);
+            self.db.update_browser_session(&session).await?;
+            if let Some(profile_name) = profile_name {
+                self.record_cookie_seed(project_id, profile_name, cookie_seed)
+                    .await?;
+            }
+            Ok::<(), DomainError>(())
+        }
+        .await;
+        drop(runtimes);
+        if let Err(error) = prepared {
             self.cleanup_failed_start(project_id, &mut session, capture.id)
                 .await?;
             return Err(error);
-        }
-        let checkpoint = match result.get("checkpoint") {
-            Some(checkpoint) => checkpoint,
-            None => {
-                self.cleanup_failed_start(project_id, &mut session, capture.id)
-                    .await?;
-                return Err(DomainError::new(
-                    ErrorCode::ProtocolError,
-                    "worker omitted checkpoint",
-                ));
-            }
-        };
-        let saved = match self
-            .save_checkpoint(
-                project_id,
-                session.id,
-                checkpoint,
-                checkpoint_status,
-                profile_name,
-            )
-            .await
-        {
-            Ok(saved) => saved,
-            Err(error) => {
-                self.cleanup_failed_start(project_id, &mut session, capture.id)
-                    .await?;
-                return Err(error);
-            }
-        };
-        session.engine = BrowserEngine::Chromium;
-        session.current_url = saved.url;
-        session.current_title = saved.title;
-        session.state = BrowserSessionState::Ready;
-        session.active_profile = profile.clone();
-        session.checkpoint_status = Some(checkpoint_status.into());
-        session.checkpoint_hash = Some(saved.hash);
-        if let Err(error) = self.db.update_browser_session(&session).await {
-            self.cleanup_failed_start(project_id, &mut session, capture.id)
-                .await?;
-            return Err(error);
-        }
-        if let Some(profile_name) = profile_name {
-            if let Err(error) = self
-                .record_cookie_seed(project_id, profile_name, cookie_seed)
-                .await
-            {
-                self.cleanup_failed_start(project_id, &mut session, capture.id)
-                    .await?;
-                return Err(error);
-            }
         }
         if let Err(error) = self
             .persist_javascript_files(project_id, session.id, session.current_url.as_deref())
             .await
         {
             tracing::warn!(%error, session_id = session.id.get(), "could not persist JavaScript provenance");
+        }
+        let still_active = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session.id.get())
+            .is_some_and(|runtime| runtime.project_id == project_id);
+        if !still_active {
+            return Err(self.startup_interrupted(project_id).await);
         }
         schedule_page_title_association(self.db.clone(), &session);
         Ok(session)
@@ -1761,9 +1762,18 @@ impl BrowserService {
         } else {
             None
         };
+        let worker_running = cleanup_error.is_some() && self.worker_is_running(project_id).await;
+        let mut runtimes = self.runtime_sessions.lock().await;
+        if !runtimes.get(&session.id.get()).is_some_and(|runtime| {
+            runtime.project_id == project_id && runtime.capture_session_id == capture_session_id
+        }) {
+            // A worker interruption already removed the session, revoked its
+            // capture, and recorded Interrupted.
+            return Ok(());
+        }
         session.state = BrowserSessionState::Failed;
         if let Some(error) = cleanup_error {
-            if self.worker_is_running(project_id).await {
+            if worker_running {
                 session.checkpoint_status = Some("start_cleanup_failed".into());
                 let _ = self.db.update_browser_session(session).await;
                 return Err(DomainError::new(
@@ -1772,7 +1782,8 @@ impl BrowserService {
                 ));
             }
         }
-        self.runtime_sessions.lock().await.remove(&session.id.get());
+        runtimes.remove(&session.id.get());
+        drop(runtimes);
         self.reap_worker(project_id).await;
         session.checkpoint_status = Some("start_failed".into());
         let _ = self.db.update_browser_session(session).await;
@@ -2367,15 +2378,6 @@ impl BrowserService {
             .remove(&session_id);
     }
 
-    async fn session_persistent_profile(&self, session_id: BrowserSessionId) -> Option<String> {
-        self.runtime_sessions
-            .lock()
-            .await
-            .get(&session_id.get())
-            .filter(|runtime| runtime.persistent)
-            .and_then(|runtime| runtime.profile.clone())
-    }
-
     async fn session_operation_lock(&self, session_id: BrowserSessionId) -> Arc<Mutex<()>> {
         self.session_ops
             .lock()
@@ -2429,9 +2431,21 @@ impl BrowserService {
         let checkpoint = result.get("checkpoint").ok_or_else(|| {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
-        let profile = self.session_persistent_profile(session_id).await;
+        let runtimes = self.runtime_sessions.lock().await;
+        let Some(runtime) = runtimes
+            .get(&session_id.get())
+            .filter(|runtime| runtime.project_id == project_id)
+        else {
+            drop(runtimes);
+            self.wait_for_worker_interruption(project_id).await;
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                "browser session is not active",
+            ));
+        };
+        let profile = runtime.profile.as_deref().filter(|_| runtime.persistent);
         let saved = self
-            .save_checkpoint(project_id, session_id, checkpoint, "ok", profile.as_deref())
+            .save_checkpoint(project_id, session_id, checkpoint, "ok", profile)
             .await?;
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
         session.current_url = saved.url;
@@ -2473,13 +2487,12 @@ impl BrowserService {
                 "browser session is not active",
             ));
         }
-        let runtime = self
-            .runtime_sessions
-            .lock()
-            .await
+        let runtimes = self.runtime_sessions.lock().await;
+        let Some(runtime) = runtimes
             .get(&session_id.get())
-            .cloned();
-        let Some(runtime) = runtime else {
+            .filter(|runtime| runtime.project_id == project_id)
+            .cloned()
+        else {
             return Err(DomainError::new(
                 ErrorCode::Unavailable,
                 "browser runtime is not attached; start a new browser session",
@@ -2493,6 +2506,7 @@ impl BrowserService {
         }
         session.state = BrowserSessionState::Busy;
         self.db.update_browser_session(&session).await?;
+        drop(runtimes);
         let event_wait_ms = match &action {
             BrowserAction::Events { wait_ms, .. } => *wait_ms,
             _ => 0,
@@ -2535,15 +2549,32 @@ impl BrowserService {
         let result = match worker_result {
             Ok(result) => result,
             Err(error) => {
-                session.state = if self.worker_is_running(project_id).await {
-                    BrowserSessionState::Ready
+                let runtimes = self.runtime_sessions.lock().await;
+                if runtimes
+                    .get(&session_id.get())
+                    .is_some_and(|runtime| runtime.project_id == project_id)
+                {
+                    session.state = BrowserSessionState::Ready;
+                    let _ = self.db.update_browser_session(&session).await;
                 } else {
-                    BrowserSessionState::Interrupted
-                };
-                let _ = self.db.update_browser_session(&session).await;
+                    drop(runtimes);
+                    self.wait_for_worker_interruption(project_id).await;
+                }
                 return Err(error);
             }
         };
+        let runtimes = self.runtime_sessions.lock().await;
+        if !runtimes
+            .get(&session_id.get())
+            .is_some_and(|runtime| runtime.project_id == project_id)
+        {
+            drop(runtimes);
+            self.wait_for_worker_interruption(project_id).await;
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                "browser session is not active",
+            ));
+        }
         let checkpoint = result.get("checkpoint").ok_or_else(|| {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
@@ -2563,11 +2594,25 @@ impl BrowserService {
         session.checkpoint_status = Some(checkpoint_status.into());
         session.checkpoint_hash = Some(saved.hash);
         self.db.update_browser_session(&session).await?;
+        drop(runtimes);
         if let Err(error) = self
             .persist_javascript_files(project_id, session_id, session.current_url.as_deref())
             .await
         {
             tracing::warn!(%error, session_id = session_id.get(), "could not persist JavaScript provenance");
+        }
+        let still_active = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&session_id.get())
+            .is_some_and(|runtime| runtime.project_id == project_id);
+        if !still_active {
+            self.wait_for_worker_interruption(project_id).await;
+            return Err(DomainError::new(
+                ErrorCode::Unavailable,
+                "browser session is not active",
+            ));
         }
         schedule_page_title_association(self.db.clone(), &session);
 
@@ -2839,6 +2884,21 @@ impl BrowserService {
         }
     }
 
+    async fn startup_interrupted(&self, project_id: ProjectId) -> DomainError {
+        self.wait_for_worker_interruption(project_id).await;
+        DomainError::new(
+            ErrorCode::Unavailable,
+            "browser worker failed during startup",
+        )
+    }
+
+    async fn wait_for_worker_interruption(&self, project_id: ProjectId) {
+        // Interruption removes the runtime before recording its final state and
+        // revoking its capture. The worker lock is held until both complete.
+        let entry = self.worker_entry(project_id).await;
+        let _worker = entry.lock().await;
+    }
+
     // Called while lifecycle is locked, so a new start cannot race the last stop.
     async fn reap_worker(&self, project_id: ProjectId) {
         let entry = self.workers.lock().await.get(&project_id.get()).cloned();
@@ -2902,6 +2962,28 @@ impl BrowserService {
         })?;
         let worker_entry = self.worker_entry(project_id).await;
         let mut worker = worker_entry.lock().await;
+        if let Some(session_id) = params
+            .get("session_id")
+            .and_then(Value::as_i64)
+            .filter(|_| method.starts_with("session."))
+        {
+            // A request may have waited here while a previous RPC failed and
+            // interrupted this session. Never send it to a replacement worker.
+            let active = self
+                .runtime_sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .is_some_and(|runtime| runtime.project_id == project_id);
+            if !active {
+                let message = if method == "session.start" {
+                    "browser worker failed during startup"
+                } else {
+                    "browser session is not active"
+                };
+                return Err(DomainError::new(ErrorCode::Unavailable, message));
+            }
+        }
         if worker.is_none() {
             self.sandbox
                 .lock()
@@ -5605,6 +5687,234 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn queued_start_does_not_launch_after_worker_interruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("worker.sh");
+        let spawns = directory.path().join("spawns");
+        let failing = directory.path().join("failing");
+        let launches = directory.path().join("launches");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+printf 'spawn\n' >> '{}'
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  case "$request" in
+    *'"method":"hello"'*) printf '%s\n' '{{"id":1,"result":{{"protocol":1,"capabilities":["profile_isolation"]}}}}' ;;
+    *'"method":"fail"'*) : > '{}'; sleep 10 ;;
+    *'"method":"session.start"'*)
+      : >> '{}'
+      session=$(printf '%s\n' "$request" | sed -n 's/.*"session_id":\([0-9][0-9]*\).*/\1/p')
+      printf '{{"id":%s,"result":{{"session_id":%s,"requested_profile":null,"active_profile":null,"profile_dir":null,"persistent":false,"checkpoint":{{"url":"about:blank","_private":{{}}}}}}}}\n' "$n" "$session" ;;
+    *'"method":"session.action"'*) printf '{{"id":%s,"result":{{"ok":true,"checkpoint":{{"url":"about:blank","_private":{{}}}}}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*) printf '{{"id":%s,"result":{{"files":[]}}}}\n' "$n" ;;
+    *) printf '{{"id":%s,"result":{{"stopped":true}}}}\n' "$n" ;;
+  esac
+done
+"#,
+                spawns.display(),
+                failing.display(),
+                launches.display(),
+            ),
+        )
+        .unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "Queued browser start".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let mut service = BrowserService::new_with_proxy_and_ca(
+            db.clone(),
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        service.node_path = Some(PathBuf::from("/bin/sh"));
+        service.worker_path = Some(script.clone());
+        service.runtime.playwright_core_path = Some(directory.path().to_path_buf());
+        service.runtime.chromium_path = Some(PathBuf::from("/bin/sh"));
+        service.runtime.compatibility_error = None;
+        let mut existing = db.create_browser_session(project.id, None).await.unwrap();
+        existing.state = BrowserSessionState::Ready;
+        db.update_browser_session(&existing).await.unwrap();
+        let existing_capture = db
+            .create_capture_session(CreateCaptureSession {
+                project_id: project.id,
+                browser_session_id: Some(existing.id),
+                browser_action_id: None,
+                is_browser_bound: true,
+                ttl: None,
+            })
+            .await
+            .unwrap();
+        service.runtime_sessions.lock().await.insert(
+            existing.id.get(),
+            RuntimeSession {
+                project_id: project.id,
+                capture_session_id: existing_capture.id,
+                persistent: false,
+                profile: None,
+                cdp: None,
+            },
+        );
+        let mut worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
+            .await
+            .unwrap_or_else(|_| panic!("start fixture worker"));
+        worker.rpc_timeout = Duration::from_millis(1_500);
+        *service.worker_entry(project.id).await.lock().await = Some(worker);
+        let service = Arc::new(service);
+        let failing_call = {
+            let service = service.clone();
+            tokio::spawn(async move { service.call_worker(project.id, "fail", json!({})).await })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !failing.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture did not receive the failing request");
+        let queued_action = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                let action = serde_json::from_value(json!({"type":"snapshot"})).unwrap();
+                service.action(project.id, existing.id, action).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if db
+                    .get_browser_session(project.id, existing.id)
+                    .await
+                    .unwrap()
+                    .state
+                    == BrowserSessionState::Busy
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("action did not queue while the worker was busy");
+        let queued_start = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .start_ephemeral(project.id, "about:blank".into())
+                    .await
+            })
+        };
+        let session_id = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(id) = service
+                    .runtime_sessions
+                    .lock()
+                    .await
+                    .keys()
+                    .copied()
+                    .find(|id| *id != existing.id.get())
+                {
+                    break BrowserSessionId(id);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("start did not register while the worker was busy");
+        assert_eq!(
+            failing_call.await.unwrap().unwrap_err().code(),
+            ErrorCode::Timeout
+        );
+        assert_eq!(
+            queued_start.await.unwrap().unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+        assert_eq!(
+            queued_action.await.unwrap().unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+        let interrupted = db
+            .get_browser_session(project.id, session_id)
+            .await
+            .unwrap();
+        assert_eq!(interrupted.state, BrowserSessionState::Interrupted);
+        assert_eq!(
+            interrupted.checkpoint_status.as_deref(),
+            Some("worker_interrupted")
+        );
+        assert!(!service
+            .runtime_sessions
+            .lock()
+            .await
+            .contains_key(&session_id.get()));
+        let existing_after = db
+            .get_browser_session(project.id, existing.id)
+            .await
+            .unwrap();
+        assert_eq!(existing_after.state, BrowserSessionState::Interrupted);
+        assert_eq!(
+            existing_after.checkpoint_status.as_deref(),
+            Some("worker_interrupted")
+        );
+        let checkpoint = json!({"checkpoint":{"url":"about:blank","_private":{}}});
+        assert_eq!(
+            service
+                .save_cookie_checkpoint(project.id, existing.id, &checkpoint)
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::Unavailable
+        );
+        let existing_after = db
+            .get_browser_session(project.id, existing.id)
+            .await
+            .unwrap();
+        assert_eq!(existing_after.state, BrowserSessionState::Interrupted);
+        assert_eq!(
+            existing_after.checkpoint_status.as_deref(),
+            Some("worker_interrupted")
+        );
+        let captures = db.list_capture_sessions(project.id).await.unwrap();
+        assert_eq!(captures.len(), 2);
+        assert!(captures.iter().all(|capture| capture.revoked_at.is_some()));
+        assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+        assert!(!launches.exists());
+
+        // A fresh start is still allowed after the interrupted request completes.
+        let active = service
+            .start_ephemeral(project.id, "about:blank".into())
+            .await
+            .unwrap();
+        assert_eq!(active.state, BrowserSessionState::Ready);
+        assert!(service
+            .runtime_sessions
+            .lock()
+            .await
+            .contains_key(&active.id.get()));
+        assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 2);
+        assert!(launches.exists());
+        let action = serde_json::from_value(json!({"type":"snapshot"})).unwrap();
+        assert!(
+            service
+                .action(project.id, active.id, action)
+                .await
+                .unwrap()
+                .ok
+        );
+        service.stop(project.id, active.id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn worker_timeout_interrupts_only_its_project() {
         let directory = tempfile::tempdir_in("/tmp/artis").unwrap();
         let script = directory.path().join("worker.sh");
@@ -5730,5 +6040,133 @@ done
             std::fs::read_to_string(worker_dir.join("headless.js")).unwrap(),
             EMBEDDED_WORKER_HEADLESS
         );
+    }
+
+    #[cfg(unix)]
+    async fn lifecycle_worker() -> (WorkerProcess, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("worker.sh");
+        std::fs::write(
+            &script,
+            r#"
+IFS= read -r request || exit 1
+printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}'
+IFS= read -r request
+"#,
+        )
+        .unwrap();
+        let worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
+            .await
+            .unwrap_or_else(|_| panic!("start lifecycle fixture"));
+        (worker, directory)
+    }
+
+    #[cfg(unix)]
+    fn lifecycle_group_member(group: nix::unistd::Pid) -> Child {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "IFS= read -r request"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(group.as_raw())
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        assert_eq!(
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(child.id().unwrap() as i32)))
+                .unwrap(),
+            group
+        );
+        child
+    }
+
+    #[cfg(unix)]
+    async fn assert_group_member_killed(member: &mut Child) {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = tokio::time::timeout(Duration::from_secs(5), member.wait())
+            .await
+            .expect("group member did not exit")
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_lifecycle_terminate_kills_group_after_leader_is_reaped() {
+        let (mut worker, _directory) = lifecycle_worker().await;
+        let mut member = lifecycle_group_member(worker.process_group);
+        worker.stdin.write_all(b"exit\n").await.unwrap();
+        worker.stdin.flush().await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), worker.child.wait())
+            .await
+            .expect("worker leader did not exit")
+            .unwrap();
+        assert!(status.success());
+        assert!(worker.child.id().is_none());
+        assert!(member.try_wait().unwrap().is_none());
+
+        worker.terminate().await;
+
+        assert_group_member_killed(&mut member).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_lifecycle_dropping_unterminated_worker_kills_group() {
+        let (worker, _directory) = lifecycle_worker().await;
+        let mut member = lifecycle_group_member(worker.process_group);
+        assert!(member.try_wait().unwrap().is_none());
+
+        drop(worker);
+
+        assert_group_member_killed(&mut member).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_lifecycle_dropping_terminated_worker_does_not_kill_reassigned_group() {
+        let (mut worker, _directory) = lifecycle_worker().await;
+        worker.terminate().await;
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf 'ready\\n'; IFS= read -r request; printf 'alive\\n'; IFS= read -r request",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut unrelated = command.spawn().unwrap();
+        let mut unrelated_stdin = unrelated.stdin.take().unwrap();
+        let mut unrelated_stdout = BufReader::new(unrelated.stdout.take().unwrap());
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            unrelated_stdout.read_line(&mut line),
+        )
+        .await
+        .expect("unrelated group did not start")
+        .unwrap();
+        assert_eq!(line, "ready\n");
+        worker.process_group = nix::unistd::Pid::from_raw(unrelated.id().unwrap() as i32);
+
+        drop(worker);
+
+        unrelated_stdin.write_all(b"ping\n").await.unwrap();
+        unrelated_stdin.flush().await.unwrap();
+        line.clear();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            unrelated_stdout.read_line(&mut line),
+        )
+        .await
+        .expect("unrelated group did not respond")
+        .unwrap();
+        assert_eq!(line, "alive\n");
+        unrelated.kill().await.unwrap();
     }
 }
