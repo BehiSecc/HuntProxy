@@ -1024,15 +1024,22 @@ function cookieIdentityKey(cookie) {
 async function checkpointRuntimePages(session) {
   const active = await activePage(session);
   const pages = [];
+  const live = [];
   let activeIndex = 0;
   for (const page of session.context.pages()) {
     if (page.isClosed()) continue;
-    const url = page.url() || "about:blank";
+    let url = page.url() || "about:blank";
     let parsed;
     try {
       parsed = new URL(url);
     } catch {
       throw rpcError(-32000, "CDP handoff could not preserve an open tab URL");
+    }
+    // A tab that ended on Chromium's error page (for example a navigation the
+    // caller aborted) has nothing to restore, so it comes back as a blank tab.
+    if (parsed.protocol === "chrome-error:") {
+      url = "about:blank";
+      parsed = new URL(url);
     }
     if (!new Set(["http:", "https:", "about:"]).has(parsed.protocol)) {
       throw rpcError(-32000, `CDP handoff cannot preserve an open ${parsed.protocol} tab`);
@@ -1049,12 +1056,50 @@ async function checkpointRuntimePages(session) {
       } catch {
         throw rpcError(-32000, "CDP handoff could not preserve session storage for every open tab");
       }
+      live.push({ origin: parsed.origin, values: sessionStorage, active: page === active });
     }
     if (page === active) activeIndex = pages.length;
     pages.push({ url, session_storage: sessionStorage });
   }
   if (!pages.length) pages.push({ url: "about:blank", session_storage: {} });
-  return { pages, active_index: activeIndex };
+  // A tab's live values replace what was saved for its origin (the active tab
+  // wins when several share one), so a value the app changed or removed is
+  // never brought back; origins no tab is on keep their saved values.
+  const saved = savedSessionStorage(session);
+  const storage = {};
+  if (saved) {
+    for (const entry of [...live.filter((item) => !item.active), ...live.filter((item) => item.active)]) {
+      if (Object.keys(entry.values).length) saved[entry.origin] = { ...entry.values };
+      else delete saved[entry.origin];
+    }
+    for (const [origin, values] of Object.entries(saved)) storage[origin] = { ...values };
+  }
+  return { pages, active_index: activeIndex, storage };
+}
+
+// Chromium drops sessionStorage on exit, and a tab sitting on about:blank has
+// none to hand back, so write every other saved origin's sessionStorage into
+// the tab before CDP control is returned: a helper that navigates the tab to
+// the app afterwards finds it again. A tab's own origin is restored from its
+// captured values instead. Best effort: nothing reaches a target, errors carry
+// no values, and the seeding route is removed even when a write fails.
+async function restoreSavedOrigins(runtime, page, saved, tabUrl) {
+  let own = null;
+  try { own = new URL(tabUrl).origin; } catch {}
+  let wrote = false;
+  for (const [origin, values] of Object.entries(saved || {})) {
+    if (origin === own || !validStorageSeedOrigin(origin)) continue;
+    const items = Object.entries(values || {}).map(([name, value]) => ({ name, value }));
+    if (!items.length) continue;
+    try {
+      await seedBrowserStorage({ context: runtime.context, transientSeed: true },
+        { origins: [{ origin, session_storage: items, keep_local: true }] }, page);
+      wrote = true;
+    } catch {}
+  }
+  if (wrote && (!tabUrl || tabUrl === "about:blank")) {
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS }).catch(() => {});
+  }
 }
 
 async function restoreRuntimePages(runtime, pageState) {
@@ -1067,6 +1112,7 @@ async function restoreRuntimePages(runtime, pageState) {
     const state = states[index];
     const page = index === 0 ? first : await runtime.context.newPage();
     pages.push(page);
+    await restoreSavedOrigins(runtime, page, pageState?.storage, state.url);
     if (state.url && state.url !== "about:blank") {
       // Write the tab's sessionStorage before the app's first load: an app
       // that checks it on startup would otherwise bounce to its login page.
@@ -1251,6 +1297,14 @@ async function reconcileCurrentOriginStorage(session) {
   }
 }
 
+// The sessionStorage saved for every origin the profile has seen: the seeded
+// session object, then whatever a handoff last captured from a live tab.
+function savedSessionStorage(session) {
+  if (session.transientSeed) return null;
+  if (session.restoreState) return (session.restoreState.session_storage ??= {});
+  return (session.handoffSessionStorage ??= {});
+}
+
 const STORAGE_SEED_STEP_MS = 10_000;
 const STORAGE_SEED_TOTAL_MS = 60_000;
 
@@ -1377,18 +1431,18 @@ async function seedBrowserStorage(session, seed, pageOverride = null) {
   if (failure) throw failure;
   // The seed wins over any older checkpoint restored for these origins.
   const state = session.restoreState;
+  const savedSession = savedSessionStorage(session);
   for (const target of targets) {
     session.restoredOrigins?.add(target.origin);
-    if (!state) continue;
-    state.local_storage ??= {};
-    state.session_storage ??= {};
-    if (target.local.length || target.session.length) {
-      if (!target.keepLocal) state.local_storage[target.origin] = Object.fromEntries(target.local);
-      state.session_storage[target.origin] = Object.fromEntries(target.session);
-    } else if (!target.keepLocal) {
-      delete state.local_storage[target.origin];
-      delete state.session_storage[target.origin];
+    const hasValues = target.local.length || target.session.length;
+    if (savedSession) {
+      if (hasValues) savedSession[target.origin] = Object.fromEntries(target.session);
+      else if (!target.keepLocal) delete savedSession[target.origin];
     }
+    if (!state || target.keepLocal) continue;
+    state.local_storage ??= {};
+    if (hasValues) state.local_storage[target.origin] = Object.fromEntries(target.local);
+    else delete state.local_storage[target.origin];
   }
   return { returnTo };
 }
