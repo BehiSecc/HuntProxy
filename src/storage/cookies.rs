@@ -1,5 +1,5 @@
 use crate::cookies::{
-    CookieProfileStatus, ManagedCookie, StoredCookieProfile, ValidatedCookieProfile,
+    CookieProfileStatus, ManagedCookie, StorageOrigin, StoredCookieProfile, ValidatedCookieProfile,
 };
 use crate::domain::{DomainError, DomainResult, ErrorCode, ProjectId};
 use crate::storage::projects::now_rfc3339;
@@ -19,6 +19,7 @@ impl Db {
         let now = now_rfc3339();
         let names_json = cookie_metadata_json(&profile)?;
         let cookie_count = profile.cookie_count();
+        let origin_count = profile.origins.len();
         self.with_conn(move |connection| {
             let created_at = connection
                 .query_row(
@@ -53,6 +54,7 @@ impl Db {
                 target_url: profile.target_url,
                 names: profile.names.clone(),
                 cookie_count,
+                origin_count,
                 created_at,
                 updated_at: now,
             })
@@ -138,6 +140,7 @@ impl Db {
             serde_json::to_string(&CookieMetadata::Structured {
                 names: profile.names.clone(),
                 managed_cookies: managed_cookies.clone(),
+                origins: Vec::new(),
             })
         } else {
             serde_json::to_string(&CookieMetadata::Legacy(profile.names.clone()))
@@ -327,6 +330,7 @@ impl Db {
                 cookie_header,
                 names,
                 managed_cookies: Some(cookies),
+                origins: Vec::new(),
                 created_at,
                 updated_at,
             }))
@@ -387,6 +391,7 @@ fn cookie_metadata_json(profile: &ValidatedCookieProfile) -> DomainResult<String
         Some(managed_cookies) => CookieMetadata::Structured {
             names: profile.names.clone(),
             managed_cookies: managed_cookies.clone(),
+            origins: profile.origins.clone(),
         },
         None => CookieMetadata::Legacy(profile.names.clone()),
     };
@@ -407,12 +412,13 @@ fn row_to_named_profile(
     let metadata: CookieMetadata = serde_json::from_str(&names_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    let (names, managed_cookies) = match metadata {
-        CookieMetadata::Legacy(names) => (names, None),
+    let (names, managed_cookies, origins) = match metadata {
+        CookieMetadata::Legacy(names) => (names, None, Vec::new()),
         CookieMetadata::Structured {
             names,
             managed_cookies,
-        } => (names, Some(managed_cookies)),
+            origins,
+        } => (names, Some(managed_cookies), origins),
     };
     Ok(StoredCookieProfile {
         project_id,
@@ -421,6 +427,7 @@ fn row_to_named_profile(
         cookie_header: row.get(2)?,
         names,
         managed_cookies,
+        origins,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
     })
@@ -450,12 +457,13 @@ fn row_to_profile(
     let metadata: CookieMetadata = serde_json::from_str(&names_json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    let (names, managed_cookies) = match metadata {
-        CookieMetadata::Legacy(names) => (names, None),
+    let (names, managed_cookies, origins) = match metadata {
+        CookieMetadata::Legacy(names) => (names, None, Vec::new()),
         CookieMetadata::Structured {
             names,
             managed_cookies,
-        } => (names, Some(managed_cookies)),
+            origins,
+        } => (names, Some(managed_cookies), origins),
     };
     Ok(StoredCookieProfile {
         project_id,
@@ -464,6 +472,7 @@ fn row_to_profile(
         cookie_header: row.get(2)?,
         names,
         managed_cookies,
+        origins,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
     })
@@ -476,6 +485,11 @@ enum CookieMetadata {
     Structured {
         names: Vec<String>,
         managed_cookies: Vec<ManagedCookie>,
+        /// Browser storage seed. Stored beside the cookies it accompanies, so
+        /// it shares their at-rest treatment and travels in project bundles
+        /// without a schema change; older binaries ignore the unknown field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        origins: Vec<StorageOrigin>,
     },
 }
 
@@ -757,5 +771,72 @@ mod tests {
         assert_eq!(status.cookie_count, 2);
         let listed = db.list_named_cookie_profiles(project.id).await.unwrap();
         assert_eq!(listed[0].1.cookie_count, 2);
+        assert_eq!(listed[0].1.origin_count, 0);
+    }
+
+    #[tokio::test]
+    async fn named_profile_storage_round_trips_and_status_never_lists_values() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "storage".into(),
+                target_url: "https://app.example".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let input = r#"{"cookies":[{"name":"sid","value":"c","domain":"app.example"}],
+            "origins":[{"origin":"https://app.example","localStorage":[{"name":"token","value":"tok-secret"}],
+                        "sessionStorage":[{"name":"csrf","value":"csrf-secret"}]}]}"#;
+        let status = db
+            .upsert_named_cookie_profile(
+                project.id,
+                "member",
+                crate::cookies::validate_named_cookie_profile("https://app.example", input.into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!((status.cookie_count, status.origin_count), (1, 1));
+        let stored = db
+            .get_named_cookie_profile(project.id, "member")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.origins[0].local_storage[0].value, "tok-secret");
+        assert_eq!(stored.origins[0].session_storage[0].value, "csrf-secret");
+        let listed =
+            serde_json::to_string(&db.list_named_cookie_profiles(project.id).await.unwrap())
+                .unwrap();
+        assert!(listed.contains("\"origin_count\":1"));
+        assert!(!listed.contains("tok-secret") && !listed.contains("csrf-secret"));
+
+        // Replacing with a cookie-only file drops the stored storage.
+        db.upsert_named_cookie_profile(
+            project.id,
+            "member",
+            crate::cookies::validate_named_cookie_profile("https://app.example", "sid=c".into())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let stored = db
+            .get_named_cookie_profile(project.id, "member")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.origins.is_empty());
+    }
+
+    #[test]
+    fn rows_written_before_storage_seeding_still_load() {
+        let legacy: CookieMetadata = serde_json::from_str(r#"["sid"]"#).unwrap();
+        assert!(matches!(legacy, CookieMetadata::Legacy(_)));
+        let structured: CookieMetadata =
+            serde_json::from_str(r#"{"names":["sid"],"managed_cookies":[]}"#).unwrap();
+        assert!(matches!(
+            structured,
+            CookieMetadata::Structured { origins, .. } if origins.is_empty()
+        ));
     }
 }

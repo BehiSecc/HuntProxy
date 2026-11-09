@@ -1072,6 +1072,18 @@ mod tests {
             .await
             .unwrap();
         source_db
+            .upsert_named_cookie_profile(
+                project.id,
+                "tokens",
+                validate_named_cookie_profile(
+                    "https://example.test/",
+                    r#"{"origins":[{"origin":"https://example.test","localStorage":[{"name":"token","value":"tok"}],"sessionStorage":[{"name":"csrf","value":"c"}]}]}"#.into(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        source_db
             .activate_ip_rotation(
                 project.id,
                 "https://example.test".into(),
@@ -1107,6 +1119,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(named.cookie_header, "sid=account-one");
+        let tokens = destination_db
+            .get_named_cookie_profile(imported.project.id, "tokens")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tokens.origins.len(), 1);
+        assert_eq!(tokens.origins[0].local_storage[0].value, "tok");
+        assert_eq!(tokens.origins[0].session_storage[0].value, "c");
         let rotation = destination_db
             .list_ip_rotation_profiles(imported.project.id)
             .await

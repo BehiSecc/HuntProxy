@@ -1241,6 +1241,153 @@ async function reconcileCurrentOriginStorage(session) {
   }
 }
 
+const STORAGE_SEED_STEP_MS = 10_000;
+const STORAGE_SEED_TOTAL_MS = 60_000;
+
+// Errors here name the origin and a fixed reason only; storage keys and values
+// never appear in messages.
+function storageSeedError(origin, reason) {
+  return rpcError(-32000, `browser storage seed failed for ${origin}: ${reason}`);
+}
+
+function validStorageSeedOrigin(value) {
+  try {
+    const parsed = new URL(String(value));
+    return new Set(["http:", "https:"]).has(parsed.protocol) && parsed.origin === value ? parsed.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+function storageSeedNavigationReason(error) {
+  if (error?.name === "TimeoutError") return "timed out opening the origin";
+  const code = String(error?.message || "").match(/net::ERR_[A-Z_]+/)?.[0];
+  return code ? `could not open the origin, ${code}` : "could not open the origin";
+}
+
+// Write localStorage/sessionStorage for each origin on the session's main tab
+// before the app's first real load. Every request in the window is fulfilled
+// locally with an empty page, so nothing reaches the target (or its service
+// worker), and the route is always removed afterwards. The tab is left on the
+// last seeded origin; callers navigate on afterwards.
+async function seedBrowserStorage(session, seed) {
+  const origins = Array.isArray(seed?.origins) ? seed.origins : [];
+  const clearOrigins = Array.isArray(seed?.clear_origins) ? seed.clear_origins : [];
+  if (!origins.length && !clearOrigins.length) return null;
+  const targets = [];
+  const seen = new Set();
+  for (const entry of origins) {
+    const origin = validStorageSeedOrigin(entry?.origin);
+    const pairs = (items) => (Array.isArray(items) ? items : [])
+      .map((item) => [String(item?.name ?? ""), String(item?.value ?? "")]);
+    if (!origin || seen.has(origin)) throw rpcError(-32602, "storage_seed origins must be unique exact http(s) origins");
+    seen.add(origin);
+    targets.push({ origin, local: pairs(entry.local_storage), session: pairs(entry.session_storage) });
+  }
+  for (const value of clearOrigins) {
+    const origin = validStorageSeedOrigin(value);
+    if (!origin || seen.has(origin)) throw rpcError(-32602, "storage_seed clear_origins must be unique exact http(s) origins");
+    seen.add(origin);
+    targets.push({ origin, local: [], session: [] });
+  }
+  const page = await activePage(session);
+  const returnTo = page.url() || "about:blank";
+  const deadline = Date.now() + STORAGE_SEED_TOTAL_MS;
+  const step = (origin) => {
+    const left = deadline - Date.now();
+    if (left <= 0) throw storageSeedError(origin, "timed out");
+    return Math.min(STORAGE_SEED_STEP_MS, left);
+  };
+  const fulfil = (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: "<!doctype html><title>storage seed</title>",
+  });
+  let cdp;
+  let routed = false;
+  let failure;
+  try {
+    // Leave the live document first so its background requests cannot be
+    // answered by the seeding route.
+    if (returnTo !== "about:blank") {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS });
+    }
+    // A service worker already controlling the origin would answer the
+    // navigation itself and the real app would load.
+    cdp = await session.context.newCDPSession(page);
+    await cdp.send("Network.setBypassServiceWorker", { bypass: true });
+    await page.route("**/*", fulfil);
+    routed = true;
+    for (const target of targets) {
+      try {
+        await page.goto(`${target.origin}/`, { waitUntil: "domcontentloaded", timeout: step(target.origin) });
+      } catch (error) {
+        throw error?.code === -32000 ? error : storageSeedError(target.origin, storageSeedNavigationReason(error));
+      }
+      if (page.url() !== `${target.origin}/`) throw storageSeedError(target.origin, "the origin did not load");
+      const write = page.evaluate(({ local, sessionItems }) => {
+        try {
+          localStorage.clear();
+          sessionStorage.clear();
+          for (const [key, value] of local) localStorage.setItem(key, value);
+          for (const [key, value] of sessionItems) sessionStorage.setItem(key, value);
+          return "ok";
+        } catch (error) {
+          try { localStorage.clear(); sessionStorage.clear(); } catch {}
+          return String(error?.name || "Error");
+        }
+      }, { local: target.local, sessionItems: target.session });
+      write.catch(() => {});
+      let timer;
+      const outcome = await Promise.race([
+        write,
+        new Promise((resolve) => { timer = setTimeout(() => resolve("timed out"), step(target.origin)); }),
+      ]).finally(() => clearTimeout(timer));
+      if (outcome !== "ok") throw storageSeedError(target.origin, `storage rejected the write (${outcome})`);
+    }
+  } catch (error) {
+    failure = typeof error?.code === "number" && typeof error?.message === "string"
+      ? error
+      : rpcError(-32000, "browser storage seed failed before any origin was written");
+  } finally {
+    if (routed) await page.unroute("**/*", fulfil).catch(() => {});
+    if (cdp) {
+      await cdp.send("Network.setBypassServiceWorker", { bypass: false }).catch(() => {});
+      await cdp.detach().catch(() => {});
+    }
+  }
+  if (failure) throw failure;
+  // The seed wins over any older checkpoint restored for these origins.
+  const state = session.restoreState;
+  for (const target of targets) {
+    session.restoredOrigins?.add(target.origin);
+    if (!state) continue;
+    state.local_storage ??= {};
+    state.session_storage ??= {};
+    if (target.local.length || target.session.length) {
+      state.local_storage[target.origin] = Object.fromEntries(target.local);
+      state.session_storage[target.origin] = Object.fromEntries(target.session);
+    } else {
+      delete state.local_storage[target.origin];
+      delete state.session_storage[target.origin];
+    }
+  }
+  return { returnTo };
+}
+
+// After seeding: continue to the requested url, or return to the page the tab
+// was on (about:blank when there was none).
+async function navigateAfterSeed(session, seeded, url) {
+  const page = await activePage(session);
+  const target = url && url !== "about:blank" ? url : seeded.returnTo;
+  if (!target || target === "about:blank") {
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS });
+    return;
+  }
+  await navigateWithProxyCheck(page, () => page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 }));
+  await reconcileCurrentOriginStorage(session);
+}
+
 async function extractCheckpoint(session) {
   const page = await activePage(session);
   const url = page.url();
@@ -1883,6 +2030,10 @@ async function handle(req) {
           if (Array.isArray(params.cookies) && params.cookies.length) {
             await session.context.addCookies(params.cookies);
           }
+          const seeded = await seedBrowserStorage(session, params.storage_seed);
+          if (seeded && !(params.url && params.url !== "about:blank")) {
+            await navigateAfterSeed(session, { returnTo: "about:blank" }, null);
+          }
           if (params.url && params.url !== "about:blank") {
             await navigateWithProxyCheck(session.page, () => session.page.goto(params.url, {
               waitUntil: "domcontentloaded",
@@ -2005,8 +2156,9 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        if (!Array.isArray(params.cookies) || !params.cookies.length) {
-          throw rpcError(-32602, "cookies must be a non-empty array");
+        const seedsStorage = Boolean(params.storage_seed?.origins?.length || params.storage_seed?.clear_origins?.length);
+        if (!Array.isArray(params.cookies) || (!params.cookies.length && !seedsStorage)) {
+          throw rpcError(-32602, "cookies must be a non-empty array unless storage_seed is provided");
         }
         await clearCookieIdentities(session.context, params.clear_cookies, "clear_cookies");
         if (Array.isArray(params.clear_names) && params.clear_names.length) {
@@ -2020,7 +2172,9 @@ async function handle(req) {
             expires: 1,
           })));
         }
-        await session.context.addCookies(params.cookies);
+        if (params.cookies.length) await session.context.addCookies(params.cookies);
+        const seeded = await seedBrowserStorage(session, params.storage_seed);
+        if (seeded) await navigateAfterSeed(session, seeded, params.url);
         return respond(id, { checkpoint: await extractCheckpoint(session) });
       }
       case "session.clear_cookies": {
