@@ -307,6 +307,18 @@ test("a handoff restore failure is best effort and leaves no seeding route", {
   assert.equal(await runtimeLike.page.title(), "real");
 });
 
+test("a handoff puts a blank tab back on about:blank even if Chromium reopened the previous page", {
+  skip: available ? false : "Playwright and Chromium are required for the browser regression",
+  timeout: 60_000,
+}, async (t) => {
+  const { context, page, origin } = await harness(t);
+  const { restoreRuntimePages } = handoff();
+  await page.goto(`${origin}/`);
+  const runtimeLike = { context };
+  await restoreRuntimePages(runtimeLike, { pages: [{ url: "about:blank", session_storage: {} }], active_index: 0, storage: {} });
+  assert.equal(runtimeLike.page.url(), "about:blank");
+});
+
 test("a chrome-error tab is captured as about:blank and other unsupported tabs are still refused", {
   skip: available ? false : "Playwright and Chromium are required for the browser regression",
   timeout: 60_000,

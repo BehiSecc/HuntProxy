@@ -1113,6 +1113,10 @@ async function restoreRuntimePages(runtime, pageState) {
     const page = index === 0 ? first : await runtime.context.newPage();
     pages.push(page);
     await restoreSavedOrigins(runtime, page, pageState?.storage, state.url);
+    // Chromium may reopen the previous run's tab (even an error page).
+    if ((!state.url || state.url === "about:blank") && page.url() !== "about:blank") {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS }).catch(() => {});
+    }
     if (state.url && state.url !== "about:blank") {
       // Write the tab's sessionStorage before the app's first load: an app
       // that checks it on startup would otherwise bounce to its login page.
@@ -1148,6 +1152,27 @@ async function restoreRuntimePages(runtime, pageState) {
   await runtime.page.bringToFront();
 }
 
+// A proxy challenge is answered by the worker's own CDP credentials. Once a
+// client such as Playwright's page.route enables Fetch with auth handling, it
+// receives that challenge instead and, having no credentials, cancels the
+// request (net::ERR_INVALID_AUTH_CREDENTIALS). Chromium reuses proxy credentials
+// it has already accepted, so authenticate once here, before control is
+// returned. The name is reserved (.invalid never resolves): HuntProxy rejects it
+// while resolving the destination, so no target is contacted and nothing is
+// captured. Best effort; a throwaway tab leaves the restored tabs untouched.
+const PROXY_AUTH_PRIME_URL = "http://huntproxy-auth-prime.invalid/";
+
+async function primeProxyAuth(runtime, proxy) {
+  if (!proxy?.username && !proxy?.password) return;
+  let page;
+  try {
+    page = await runtime.context.newPage();
+    await page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
+  } catch {} finally {
+    if (page) await page.close({ runBeforeUnload: false }).catch(() => {});
+  }
+}
+
 async function launchSessionRuntime(session, cdpPort, pageState, sessionCookies = []) {
   const runtime = await launchChromium(
     session.proxy || null,
@@ -1157,6 +1182,7 @@ async function launchSessionRuntime(session, cdpPort, pageState, sessionCookies 
   );
   try {
     if (sessionCookies.length) await runtime.context.addCookies(sessionCookies);
+    if (cdpPort != null) await primeProxyAuth(runtime, session.proxy);
     await restoreRuntimePages(runtime, pageState);
     const cdp = cdpPort == null ? null : await discoverCdp(runtime.page, cdpPort);
     return { runtime, cdp };
