@@ -1142,7 +1142,7 @@ async function restoreRuntimePages(runtime, pageState) {
   }
   for (const page of initialPages) {
     if (!pages.includes(page) && !page.isClosed()) {
-      await page.close({ runBeforeUnload: false });
+      await closePageWithin(page);
     }
   }
   const activeIndex = Number.isInteger(pageState?.active_index)
@@ -1159,17 +1159,29 @@ async function restoreRuntimePages(runtime, pageState) {
 // it has already accepted, so authenticate once here, before control is
 // returned. The name is reserved (.invalid never resolves): HuntProxy rejects it
 // while resolving the destination, so no target is contacted and nothing is
-// captured. Best effort; a throwaway tab leaves the restored tabs untouched.
+// captured. Best effort. It uses the runtime's own tab and leaves it for
+// restoreRuntimePages to put back: closing a throwaway tab here stalled
+// intermittently (Page.close never completed while the tab's proxy-auth
+// request was in flight), which hung the whole handoff.
 const PROXY_AUTH_PRIME_URL = "http://huntproxy-auth-prime.invalid/";
 
 async function primeProxyAuth(runtime, proxy) {
   if (!proxy?.username && !proxy?.password) return;
-  let page;
   try {
-    page = await runtime.context.newPage();
-    await page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
+    await runtime.page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
+  } catch {}
+}
+
+// Closing a tab can stall in Chromium; a handoff must never wait on it.
+async function closePageWithin(page, milliseconds = 5_000) {
+  let timer;
+  try {
+    await Promise.race([
+      page.close({ runBeforeUnload: false }),
+      new Promise((resolve) => { timer = setTimeout(resolve, milliseconds); }),
+    ]);
   } catch {} finally {
-    if (page) await page.close({ runBeforeUnload: false }).catch(() => {});
+    clearTimeout(timer);
   }
 }
 

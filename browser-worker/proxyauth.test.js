@@ -18,28 +18,33 @@ const available = runtime.chromium_path && runtime.playwright_core_path;
 
 function prime() {
   const code = source.slice(source.indexOf("const PROXY_AUTH_PRIME_URL"), source.indexOf("async function launchSessionRuntime"));
-  return vm.runInNewContext(`${code}\n({ primeProxyAuth, PROXY_AUTH_PRIME_URL });`, { Promise });
+  return vm.runInNewContext(`${code}\n({ primeProxyAuth, closePageWithin, PROXY_AUTH_PRIME_URL });`, { Promise, setTimeout, clearTimeout });
 }
 
 test("priming the proxy credentials is a no-op without credentials and never fails the handoff", async () => {
   const { primeProxyAuth, PROXY_AUTH_PRIME_URL } = prime();
   const calls = [];
-  const context = {
-    async newPage() {
-      calls.push("newPage");
-      return {
-        async goto(url) { calls.push(`goto ${url}`); throw new Error("net::ERR_SECRET_DETAIL"); },
-        async close() { calls.push("close"); },
-      };
-    },
+  const runtimeLike = {
+    page: { async goto(url) { calls.push(`goto ${url}`); throw new Error("net::ERR_SECRET_DETAIL"); } },
+    context: { async newPage() { calls.push("newPage"); throw new Error("a tab must not be opened"); } },
   };
-  await primeProxyAuth({ context }, null);
-  await primeProxyAuth({ context }, { server: "http://127.0.0.1:1" });
+  await primeProxyAuth(runtimeLike, null);
+  await primeProxyAuth(runtimeLike, { server: "http://127.0.0.1:1" });
   assert.deepEqual(calls, []);
-  await primeProxyAuth({ context }, { server: "http://127.0.0.1:1", username: "u", password: "p" });
-  assert.deepEqual(calls, ["newPage", `goto ${PROXY_AUTH_PRIME_URL}`, "close"]);
+  await primeProxyAuth(runtimeLike, { server: "http://127.0.0.1:1", username: "u", password: "p" });
+  assert.deepEqual(calls, [`goto ${PROXY_AUTH_PRIME_URL}`]);
   assert.match(PROXY_AUTH_PRIME_URL, /^http:\/\/[^/]+\.invalid\/$/);
-  await primeProxyAuth({ context: { newPage: async () => { throw new Error("no page"); } } }, { password: "p" });
+});
+
+test("closing a tab is bounded so a stalled Page.close cannot hold up a handoff", async () => {
+  const { closePageWithin } = prime();
+  const started = Date.now();
+  await closePageWithin({ close: () => new Promise(() => {}) }, 50);
+  assert.ok(Date.now() - started < 2_000);
+  await closePageWithin({ close: async () => { throw new Error("already closed"); } }, 50);
+  let closed = false;
+  await closePageWithin({ close: async () => { closed = true; } }, 50);
+  assert.ok(closed);
 });
 
 function selfSigned(dir) {
@@ -48,6 +53,49 @@ function selfSigned(dir) {
   const made = spawnSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
     "-days", "2", "-subj", "/CN=target.test", "-addext", "subjectAltName=DNS:target.test"], { encoding: "utf8" });
   return made.status === 0 ? { key: fs.readFileSync(key), cert: fs.readFileSync(cert), certPath: cert } : null;
+}
+
+// Every wait in the integration test is bounded, and the worker with its Chromium
+// processes is always killed, so a stalled step fails the test instead of leaving
+// `node --test` waiting on live children.
+function within(promise, milliseconds, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not finish within ${milliseconds} ms`)), milliseconds); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function processTable() {
+  const table = [];
+  let entries = [];
+  try { entries = fs.readdirSync("/proc").filter((name) => /^\d+$/.test(name)); } catch {}
+  for (const name of entries) {
+    try {
+      const stat = fs.readFileSync(`/proc/${name}/stat`, "utf8");
+      const parent = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+      const command = fs.readFileSync(`/proc/${name}/cmdline`, "utf8");
+      table.push({ pid: Number(name), parent, command });
+    } catch {}
+  }
+  return table;
+}
+
+// The worker's descendants plus anything started on this test's own directory.
+function killWorkerTree(worker, dir) {
+  const table = processTable();
+  const doomed = new Set(table.filter((entry) => entry.command.includes(dir)).map((entry) => entry.pid));
+  const queue = worker?.pid ? [worker.pid] : [];
+  while (queue.length) {
+    const parent = queue.pop();
+    for (const entry of table) {
+      if (entry.parent === parent && !doomed.has(entry.pid)) { doomed.add(entry.pid); queue.push(entry.pid); }
+    }
+  }
+  for (const pid of doomed) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  try { worker?.kill("SIGKILL"); } catch {}
+  worker?.stdin.destroy();
+  worker?.stdout.destroy();
 }
 
 test("after a CDP handoff a page.route client's first navigation authenticates to the proxy, over HTTP and CONNECT", {
@@ -98,6 +146,8 @@ test("after a CDP handoff a page.route client's first navigation authenticates t
     stdio: ["pipe", "pipe", "ignore"],
     env: { ...process.env, HUNTPROXY_PLAYWRIGHT_CORE_PATH: runtime.playwright_core_path, HUNTPROXY_CHROME_EXECUTABLE: runtime.chromium_path },
   });
+  // Runs even when the test's own timeout fires.
+  t.after(() => killWorkerTree(worker, dir));
   const pending = new Map();
   let nextId = 1;
   let buffer = "";
@@ -112,11 +162,11 @@ test("after a CDP handoff a page.route client's first navigation authenticates t
       } catch {}
     }
   });
-  const call = (method, params) => new Promise((resolve, reject) => {
+  const call = (method, params, milliseconds = 45_000) => within(new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, (message) => (message.error ? reject(new Error(message.error.message)) : resolve(message.result)));
     worker.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-  });
+  }), milliseconds, `worker ${method}`);
   const require = createRequire(path.join(runtime.playwright_core_path, "package.json"));
   const { chromium } = require(runtime.playwright_core_path);
   const probe = net.createServer();
@@ -128,7 +178,7 @@ test("after a CDP handoff a page.route client's first navigation authenticates t
       session_id: 1, engine: "chromium", persistent: true, profile: "p", profile_dir: path.join(dir, "profile"),
       proxy: { server: `http://127.0.0.1:${proxy.address().port}`, username: "workspace", password: "s3cret" },
       ca_cert_path: tls?.certPath || null, url: "about:blank",
-    });
+    }, 60_000);
     const targets = [["http", "http://target.test/app", /plain target/]];
     if (tls) targets.push(["https", "https://target.test/app", /secure target/]);
     for (let cycle = 1; cycle <= 2; cycle += 1) {
@@ -137,27 +187,28 @@ test("after a CDP handoff a page.route client's first navigation authenticates t
         const before = log.length;
         const { cdp } = await call("session.cdp_enable", { session_id: 1, cdp_port: cdpPort });
         assert.ok(!log.slice(before).some((host) => host === "target.test"), `${label}: enabling reached the target`);
-        const browser = await chromium.connectOverCDP(cdp.endpoint);
+        const browser = await within(chromium.connectOverCDP(cdp.endpoint, { timeout: 15_000 }), 20_000, `${label} connectOverCDP`);
         try {
           const context = browser.contexts()[0];
           const page = context.pages()[0] || await context.newPage();
           assert.equal(page.url(), "about:blank", `${label}: the tab was moved`);
           // A client that routes requests receives the proxy challenge itself.
-          await page.route("**/*", (route) => route.continue());
+          await within(page.route("**/*", (route) => route.continue()), 10_000, `${label} route`);
           const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
           assert.equal(response.status(), 200, label);
-          assert.match(await page.evaluate(() => document.body.textContent), text, label);
-          await page.unroute("**/*");
-          await page.goto("about:blank");
+          assert.match(await within(page.evaluate(() => document.body.textContent), 10_000, `${label} evaluate`), text, label);
+          await within(page.unroute("**/*"), 10_000, `${label} unroute`);
+          await page.goto("about:blank", { timeout: 15_000 });
         } finally {
-          await browser.close();
+          await within(browser.close(), 10_000, `${label} browser.close`).catch(() => {});
         }
         await call("session.cdp_disable", { session_id: 1 });
       }
     }
   } finally {
-    await call("session.stop", { session_id: 1 }).catch(() => {});
+    await call("session.stop", { session_id: 1 }, 10_000).catch(() => {});
     worker.stdin.end();
-    await new Promise((resolve) => { worker.once("exit", resolve); setTimeout(() => { worker.kill("SIGKILL"); resolve(); }, 8_000); });
+    await within(new Promise((resolve) => worker.once("exit", resolve)), 5_000, "worker exit").catch(() => {});
+    killWorkerTree(worker, dir);
   }
 });
