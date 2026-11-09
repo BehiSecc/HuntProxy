@@ -9010,6 +9010,7 @@ mod tests {
                 managed_cookies: profile.managed_cookies,
                 created_at: String::new(),
                 updated_at: String::new(),
+                origins: Vec::new(),
             }),
         );
         assert_eq!(
@@ -9050,6 +9051,7 @@ mod tests {
             managed_cookies: None,
             created_at: String::new(),
             updated_at: String::new(),
+            origins: Vec::new(),
         };
         let mut duplicate_resolved = HashMap::new();
         duplicate_resolved.insert(

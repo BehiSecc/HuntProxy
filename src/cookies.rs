@@ -7,7 +7,35 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_COOKIE_HEADER_BYTES: usize = 64 * 1024;
-pub const MAX_COOKIE_INPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_COOKIE_INPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound on seeded origins; each costs one browser navigation.
+pub const MAX_STORAGE_ORIGINS: usize = 64;
+
+/// One localStorage or sessionStorage entry carried by a session file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageItem {
+    pub name: String,
+    pub value: String,
+}
+
+/// Browser storage for one exact http(s) origin. Playwright's storageState
+/// shape plus an optional `sessionStorage`; other per-origin keys are ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageOrigin {
+    pub origin: String,
+    #[serde(default, alias = "localStorage")]
+    pub local_storage: Vec<StorageItem>,
+    #[serde(default, alias = "sessionStorage")]
+    pub session_storage: Vec<StorageItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionObjectInput {
+    #[serde(default)]
+    cookies: Vec<ExportedCookie>,
+    #[serde(default)]
+    origins: Vec<StorageOrigin>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +77,7 @@ pub struct ManagedCookie {
 struct NormalizedCookieInput {
     cookie_header: String,
     managed_cookies: Option<Vec<ManagedCookie>>,
+    origins: Vec<StorageOrigin>,
 }
 
 fn default_cookie_path() -> String {
@@ -69,6 +98,7 @@ pub struct ValidatedCookieProfile {
     pub pairs: Vec<CookiePair>,
     pub names: Vec<String>,
     pub managed_cookies: Option<Vec<ManagedCookie>>,
+    pub origins: Vec<StorageOrigin>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +109,7 @@ pub struct StoredCookieProfile {
     pub cookie_header: String,
     pub names: Vec<String>,
     pub managed_cookies: Option<Vec<ManagedCookie>>,
+    pub origins: Vec<StorageOrigin>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -90,6 +121,10 @@ pub struct CookieProfileStatus {
     pub target_url: String,
     pub names: Vec<String>,
     pub cookie_count: usize,
+    /// Origins whose localStorage/sessionStorage seed a browser profile. Keys
+    /// and values are never listed.
+    #[serde(default)]
+    pub origin_count: usize,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -108,6 +143,7 @@ impl StoredCookieProfile {
             target_url: self.target_url.clone(),
             names: self.names.clone(),
             cookie_count: self.cookie_count(),
+            origin_count: self.origins.len(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         }
@@ -167,6 +203,7 @@ impl ValidatedCookieProfile {
             cookie_header: self.cookie_header.clone(),
             names: self.names.clone(),
             managed_cookies: self.managed_cookies.clone(),
+            origins: Vec::new(),
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -205,7 +242,12 @@ fn validate_cookie_profile_scope(
     let normalized = parse_cookie_input(target_url, &cookie_input, preserve_site_subhosts)?;
     let (host, target_url) = normalize_target(target_url)?;
     let cookie_header = normalized.cookie_header;
-    let pairs = parse_cookie_header(&cookie_header)?;
+    // A storage-only session file has no cookies and so no Cookie header.
+    let pairs = if cookie_header.is_empty() && !normalized.origins.is_empty() {
+        Vec::new()
+    } else {
+        parse_cookie_header(&cookie_header)?
+    };
     let names = pairs
         .iter()
         .map(|pair| pair.name.clone())
@@ -219,6 +261,7 @@ fn validate_cookie_profile_scope(
         pairs,
         names,
         managed_cookies: normalized.managed_cookies,
+        origins: normalized.origins,
     })
 }
 
@@ -246,19 +289,31 @@ fn parse_cookie_input(
         return Ok(NormalizedCookieInput {
             cookie_header: input.to_string(),
             managed_cookies: None,
+            origins: Vec::new(),
         });
     }
-    if detection_value.starts_with('{') {
-        return Err(DomainError::invalid(
-            "JSON cookie input must be an array of cookie objects",
-        ));
-    }
-
-    let cookies: Vec<ExportedCookie> = serde_json::from_str(detection_value)
-        .map_err(|_| DomainError::invalid("invalid JSON cookie array"))?;
-    if cookies.is_empty() {
-        return Err(DomainError::invalid("JSON cookie array cannot be empty"));
-    }
+    // Serde errors can quote the offending value, so report fixed messages.
+    let (cookies, origins) = if detection_value.starts_with('{') {
+        let object: SessionObjectInput = serde_json::from_str(detection_value).map_err(|_| {
+            DomainError::invalid(
+                "invalid JSON session object; expected {\"cookies\": [...], \"origins\": [...]}",
+            )
+        })?;
+        let origins = normalize_storage_origins(object.origins)?;
+        if object.cookies.is_empty() && origins.is_empty() {
+            return Err(DomainError::invalid(
+                "JSON session object needs a non-empty cookies array or origins array",
+            ));
+        }
+        (object.cookies, origins)
+    } else {
+        let cookies: Vec<ExportedCookie> = serde_json::from_str(detection_value)
+            .map_err(|_| DomainError::invalid("invalid JSON cookie array"))?;
+        if cookies.is_empty() {
+            return Err(DomainError::invalid("JSON cookie array cannot be empty"));
+        }
+        (cookies, Vec::new())
+    };
 
     let target = parse_cookie_target(target_url)?;
     let target_host = target
@@ -342,9 +397,17 @@ fn parse_cookie_input(
     }
 
     if managed_cookies.is_empty() {
-        return Err(DomainError::invalid(
-            "JSON cookie array has no live cookies for the target domain",
-        ));
+        if origins.is_empty() {
+            return Err(DomainError::invalid(
+                "JSON cookie array has no live cookies for the target domain",
+            ));
+        }
+        // A storage-only session file: tokens live in browser storage.
+        return Ok(NormalizedCookieInput {
+            cookie_header: String::new(),
+            managed_cookies: Some(Vec::new()),
+            origins,
+        });
     }
     let header = managed_cookies
         .iter()
@@ -355,7 +418,64 @@ fn parse_cookie_input(
     Ok(NormalizedCookieInput {
         cookie_header: header,
         managed_cookies: Some(managed_cookies),
+        origins,
     })
+}
+
+/// Validate each origin as an exact http(s) origin and canonicalize the
+/// entries: origins sorted and unique, storage keys sorted with the last
+/// duplicate winning. Canonical form keeps the seed hash stable.
+fn normalize_storage_origins(origins: Vec<StorageOrigin>) -> DomainResult<Vec<StorageOrigin>> {
+    if origins.len() > MAX_STORAGE_ORIGINS {
+        return Err(DomainError::invalid(format!(
+            "session file lists more than {MAX_STORAGE_ORIGINS} storage origins"
+        )));
+    }
+    let mut by_origin = std::collections::BTreeMap::new();
+    for entry in origins {
+        let origin = canonical_storage_origin(&entry.origin)?;
+        let dedupe = |items: Vec<StorageItem>| {
+            items
+                .into_iter()
+                .map(|item| (item.name, item.value))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(name, value)| StorageItem { name, value })
+                .collect::<Vec<_>>()
+        };
+        let normalized = StorageOrigin {
+            origin: origin.clone(),
+            local_storage: dedupe(entry.local_storage),
+            session_storage: dedupe(entry.session_storage),
+        };
+        if by_origin.insert(origin, normalized).is_some() {
+            return Err(DomainError::invalid(
+                "session file lists the same storage origin twice",
+            ));
+        }
+    }
+    Ok(by_origin.into_values().collect())
+}
+
+fn canonical_storage_origin(value: &str) -> DomainResult<String> {
+    let invalid = || {
+        DomainError::invalid(
+            "storage origin must be an exact http(s) origin such as https://app.example, with no path, query, fragment, or credentials",
+        )
+    };
+    let parsed = url::Url::parse(value).map_err(|_| invalid())?;
+    let authority_only = value
+        .to_ascii_lowercase()
+        .strip_prefix(parsed.scheme())
+        .and_then(|rest| rest.strip_prefix("://"))
+        .is_some_and(|rest| !rest.contains(['/', '?', '#', '@', '\\']));
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !authority_only
+    {
+        return Err(invalid());
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn same_cookie_site(domain: &str, target_host: &str) -> bool {
@@ -377,10 +497,10 @@ fn same_cookie_site(domain: &str, target_host: &str) -> bool {
 pub fn cookie_input_from_json_value(value: &serde_json::Value) -> DomainResult<String> {
     match value {
         serde_json::Value::String(value) => Ok(value.clone()),
-        serde_json::Value::Array(_) => serde_json::to_string(value)
-            .map_err(|_| DomainError::invalid("invalid JSON cookie array")),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => serde_json::to_string(value)
+            .map_err(|_| DomainError::invalid("invalid JSON cookie input")),
         _ => Err(DomainError::invalid(
-            "cookie must be a raw Cookie header string or a JSON cookie array",
+            "cookie must be a raw Cookie header string, a JSON cookie array, or a session object with cookies and origins",
         )),
     }
 }
@@ -580,6 +700,13 @@ pub async fn set_project_cookie(
     cookie_header: String,
 ) -> DomainResult<CookieMutationResult> {
     let validated = validate_cookie_profile(target_url, cookie_header)?;
+    if !validated.origins.is_empty() {
+        return Err(DomainError::invalid(
+            "localStorage/sessionStorage origins can only be saved to a named profile; \
+             set profile_name to the browser profile that should receive them \
+             (project cookies have no browser to seed)",
+        ));
+    }
     let previous = state
         .db
         .get_cookie_profile_for_target(project_id, target_url)
@@ -910,6 +1037,7 @@ mod tests {
             managed_cookies: validated.managed_cookies,
             created_at: String::new(),
             updated_at: String::new(),
+            origins: Vec::new(),
         };
         assert_eq!(
             profile
@@ -940,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn public_cookie_argument_accepts_strings_and_arrays_only() {
+    fn public_cookie_argument_accepts_strings_arrays_and_session_objects() {
         assert_eq!(
             cookie_input_from_json_value(&serde_json::json!("sid=value")).unwrap(),
             "sid=value"
@@ -953,7 +1081,14 @@ mod tests {
             normalize_cookie_input("https://example.com", &array).unwrap(),
             "sid=value"
         );
-        assert!(cookie_input_from_json_value(&serde_json::json!({})).is_err());
+        let object = cookie_input_from_json_value(&serde_json::json!({
+            "origins": [{"origin": "https://app.example"}]
+        }))
+        .unwrap();
+        assert!(object.starts_with('{'));
+        // An empty object passes the type check but carries nothing to store.
+        let empty = cookie_input_from_json_value(&serde_json::json!({})).unwrap();
+        assert!(validate_named_cookie_profile("https://example.com", empty).is_err());
         assert!(cookie_input_from_json_value(&serde_json::Value::Null).is_err());
     }
 
@@ -990,5 +1125,154 @@ mod tests {
             "sid=value"
         );
         assert!(read_cookie_file(directory.path()).is_err());
+    }
+
+    fn session_object(origins: serde_json::Value) -> String {
+        serde_json::json!({
+            "cookies": [{"name": "sid", "value": "cookie-value", "domain": "app.example", "path": "/"}],
+            "origins": origins,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn session_object_carries_cookies_and_canonical_storage_origins() {
+        let input = session_object(serde_json::json!([
+            {
+                "origin": "https://idp.example",
+                "localStorage": [{"name": "b", "value": "2"}, {"name": "a", "value": "1"}, {"name": "a", "value": "last"}],
+                "indexedDB": [{"ignored": true}],
+                "extra": 1
+            },
+            {
+                "origin": "HTTPS://App.Example:443",
+                "localStorage": [{"name": "token", "value": "t"}],
+                "sessionStorage": [{"name": "csrf", "value": "c"}]
+            }
+        ]));
+        let profile = validate_named_cookie_profile("https://app.example/", input.clone()).unwrap();
+        assert_eq!(profile.cookie_count(), 1);
+        assert_eq!(profile.cookie_header, "sid=cookie-value");
+        let origins: Vec<_> = profile.origins.iter().map(|o| o.origin.as_str()).collect();
+        assert_eq!(origins, ["https://app.example", "https://idp.example"]);
+        let idp = &profile.origins[1];
+        assert_eq!(
+            idp.local_storage
+                .iter()
+                .map(|i| (i.name.as_str(), i.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("a", "last"), ("b", "2")]
+        );
+        assert!(idp.session_storage.is_empty());
+        assert_eq!(profile.origins[0].session_storage[0].name, "csrf");
+        let again = validate_named_cookie_profile("https://app.example/", input).unwrap();
+        assert_eq!(profile.origins, again.origins);
+    }
+
+    #[test]
+    fn session_object_may_be_storage_only() {
+        let input = serde_json::json!({
+            "cookies": [],
+            "origins": [{"origin": "http://localhost:8080", "localStorage": [{"name": "t", "value": "v"}]}]
+        })
+        .to_string();
+        let profile = validate_named_cookie_profile("http://localhost:8080/", input).unwrap();
+        assert_eq!(profile.cookie_count(), 0);
+        assert!(profile.cookie_header.is_empty());
+        assert_eq!(profile.origins.len(), 1);
+        let omitted = r#"{"origins":[{"origin":"https://a.example"}]}"#;
+        assert_eq!(
+            validate_named_cookie_profile("https://a.example/", omitted.into())
+                .unwrap()
+                .origins
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_object_rejects_bad_origins_and_empty_objects() {
+        for origin in [
+            "https://app.example/",
+            "https://app.example/path",
+            "https://app.example?x=1",
+            "https://app.example#f",
+            "https://user:pw@app.example",
+            "ftp://app.example",
+            "app.example",
+            "null",
+            "",
+        ] {
+            let input = session_object(serde_json::json!([{ "origin": origin }]));
+            let error = validate_named_cookie_profile("https://app.example/", input)
+                .expect_err(origin)
+                .to_string();
+            assert!(error.contains("exact http(s) origin"), "{origin}: {error}");
+        }
+        let duplicate = session_object(serde_json::json!([
+            {"origin": "https://a.example"}, {"origin": "https://a.example:443"}
+        ]));
+        assert!(validate_named_cookie_profile("https://app.example/", duplicate).is_err());
+        for input in ["{}", r#"{"cookies":[],"origins":[]}"#, r#"{"origins":"x"}"#] {
+            assert!(
+                validate_named_cookie_profile("https://app.example/", input.into()).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_errors_never_echo_values() {
+        let input = r#"{"origins":[{"origin":"https://a.example","localStorage":[{"name":"k","value":99999}]}]}"#;
+        let error = validate_named_cookie_profile("https://a.example/", input.into())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("99999"), "{error}");
+        let bad_origin =
+            session_object(serde_json::json!([{"origin": "https://a.example/secret-path-token"}]));
+        let error = validate_named_cookie_profile("https://app.example/", bad_origin)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret-path-token"), "{error}");
+    }
+
+    #[test]
+    fn existing_inputs_carry_no_storage() {
+        let raw = validate_named_cookie_profile("https://example.com/", "sid=a".into()).unwrap();
+        assert!(raw.origins.is_empty());
+        let array = validate_named_cookie_profile(
+            "https://example.com/",
+            r#"[{"name":"sid","value":"a"}]"#.into(),
+        )
+        .unwrap();
+        assert!(array.origins.is_empty());
+        let object = validate_named_cookie_profile(
+            "https://example.com/",
+            r#"{"cookies":[{"name":"sid","value":"a"}]}"#.into(),
+        )
+        .unwrap();
+        assert_eq!(object.cookie_header, array.cookie_header);
+    }
+
+    #[test]
+    fn four_mebibyte_input_is_accepted_and_larger_is_not() {
+        let value = "x".repeat(MAX_COOKIE_INPUT_BYTES - 1024);
+        let input = serde_json::json!({
+            "origins": [{"origin": "https://a.example", "localStorage": [{"name": "big", "value": value}]}]
+        })
+        .to_string();
+        assert!(input.len() > 3 * 1024 * 1024 && input.len() <= MAX_COOKIE_INPUT_BYTES);
+        let profile = validate_named_cookie_profile("https://a.example/", input).unwrap();
+        assert_eq!(profile.origins[0].local_storage[0].value.len(), value.len());
+        let too_big = format!(
+            r#"{{"origins":[{{"origin":"https://a.example","localStorage":[{{"name":"big","value":"{}"}}]}}]}}"#,
+            "x".repeat(MAX_COOKIE_INPUT_BYTES)
+        );
+        assert!(validate_named_cookie_profile("https://a.example/", too_big).is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        std::fs::write(&path, vec![b' '; MAX_COOKIE_INPUT_BYTES + 4]).unwrap();
+        assert!(read_cookie_file(&path).is_err());
     }
 }

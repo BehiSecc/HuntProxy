@@ -1,7 +1,7 @@
 //! Browser worker supervision, real actions, and private per-project browser state.
 
 use crate::config::{create_private_dir, write_private_file, Config};
-use crate::cookies::{CookiePair, StoredCookieProfile};
+use crate::cookies::{CookiePair, StorageOrigin, StoredCookieProfile};
 use crate::domain::*;
 use crate::storage::{CreateCaptureSession, Db};
 use base64::Engine as _;
@@ -211,12 +211,20 @@ struct CookieSeed {
     hash: String,
     #[serde(default)]
     identities: Vec<Value>,
+    /// Origins whose storage this seed wrote, so a later seed that drops one
+    /// can clear it. Absent in seeds saved before storage seeding existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    origins: Vec<String>,
 }
 
 struct CookieLaunchOverride {
     cookies: Vec<Value>,
     clear_cookies: Vec<Value>,
     seed: Option<CookieSeed>,
+    /// localStorage/sessionStorage to write before the first real navigation.
+    storage: Vec<StorageOrigin>,
+    /// Origins a previous seed wrote that this one no longer lists.
+    clear_origins: Vec<String>,
 }
 
 impl CookieLaunchOverride {
@@ -225,8 +233,36 @@ impl CookieLaunchOverride {
             cookies: browser_cookies(std::slice::from_ref(profile))?,
             clear_cookies: profile_cookie_identities(profile)?,
             seed: None,
+            storage: profile.origins.clone(),
+            clear_origins: Vec::new(),
         })
     }
+
+    fn has_storage_work(&self) -> bool {
+        !self.storage.is_empty() || !self.clear_origins.is_empty()
+    }
+
+    /// Worker `storage_seed` parameter; null when there is nothing to write.
+    fn storage_params(&self) -> Value {
+        if !self.has_storage_work() {
+            return Value::Null;
+        }
+        json!({ "origins": self.storage, "clear_origins": self.clear_origins })
+    }
+}
+
+/// Hash of everything a seed writes. Cookie-only seeds hash exactly as they
+/// did before storage seeding existed, so saved seeds do not spuriously refresh.
+fn cookie_seed_hash(cookies: &[Value], origins: &[StorageOrigin]) -> DomainResult<String> {
+    let internal =
+        |error: serde_json::Error| DomainError::new(ErrorCode::Internal, error.to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(cookies).map_err(internal)?);
+    if !origins.is_empty() {
+        hasher.update(b"\0origins\0");
+        hasher.update(serde_json::to_vec(origins).map_err(internal)?);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1312,33 +1348,11 @@ impl BrowserService {
                             project_id.get()
                         ))
                     })?;
-                let mut cookie_override = CookieLaunchOverride::from_profile(&stored)?;
-                let seed = CookieSeed {
-                    name: name.to_string(),
-                    identities: cookie_override.clear_cookies.clone(),
-                    hash: hex::encode(Sha256::digest(
-                        serde_json::to_vec(&cookie_override.cookies).map_err(|error| {
-                            DomainError::new(ErrorCode::Internal, error.to_string())
-                        })?,
-                    )),
-                };
                 let saved_seed = self
                     .load_persistent_profile(project_id, name)
                     .await?
                     .and_then(|state| state.cookie_seed);
-                if !refresh_cookies && saved_seed.as_ref() == Some(&seed) {
-                    None
-                } else {
-                    if let Some(previous) = saved_seed {
-                        for identity in previous.identities {
-                            if !cookie_override.clear_cookies.contains(&identity) {
-                                cookie_override.clear_cookies.push(identity);
-                            }
-                        }
-                    }
-                    cookie_override.seed = Some(seed);
-                    Some(cookie_override)
-                }
+                plan_cookie_seed(name, &stored, saved_seed, refresh_cookies)?
             }
             None => None,
         };
@@ -1359,6 +1373,7 @@ impl BrowserService {
                 let operation_lock = self.session_operation_lock(session_id).await;
                 let _operation_guard = operation_lock.lock().await;
                 let mut session = self.verified_session_status(project_id, session_id).await?;
+                let mut navigated_by_seed = false;
                 if let Some(cookie_override) = cookie_override.take() {
                     if self
                         .runtime_sessions
@@ -1372,6 +1387,11 @@ impl BrowserService {
                             "return CDP control before refreshing profile cookies",
                         ));
                     }
+                    // Storage must be written before the app's first load with
+                    // the new tokens, so the worker also performs the requested
+                    // navigation after seeding; it returns to the current page
+                    // when no url was requested.
+                    let seeds_storage = cookie_override.has_storage_work();
                     let result = self
                         .call_worker(
                             project_id,
@@ -1379,16 +1399,29 @@ impl BrowserService {
                             json!({
                                 "session_id": session_id.get(), "cookies": cookie_override.cookies,
                                 "clear_cookies": cookie_override.clear_cookies,
+                                "storage_seed": cookie_override.storage_params(),
+                                "url": if seeds_storage { json!(url) } else { Value::Null },
                             }),
                         )
                         .await?;
-                    self.save_cookie_checkpoint(project_id, session_id, &result)
+                    let saved = self
+                        .save_cookie_checkpoint(project_id, session_id, &result)
                         .await?;
-                    self.record_cookie_seed(project_id, profile_name, cookie_override.seed)
-                        .await?;
+                    self.record_cookie_seed(
+                        project_id,
+                        profile_name,
+                        cookie_override.seed,
+                        &cookie_override.storage,
+                        &cookie_override.clear_origins,
+                        saved.local_storage.keys().next().map(String::as_str),
+                    )
+                    .await?;
                     session = self.verified_session_status(project_id, session_id).await?;
+                    if seeds_storage {
+                        navigated_by_seed = true;
+                    }
                 }
-                if url != "about:blank" {
+                if url != "about:blank" && !navigated_by_seed {
                     if self
                         .runtime_sessions
                         .lock()
@@ -1548,6 +1581,14 @@ impl BrowserService {
         let cookie_seed = cookie_override
             .as_ref()
             .and_then(|cookies| cookies.seed.clone());
+        let storage_seed = cookie_override
+            .as_ref()
+            .map(CookieLaunchOverride::storage_params)
+            .unwrap_or(Value::Null);
+        let (seeded_storage, cleared_origins) = cookie_override
+            .as_ref()
+            .map(|cookies| (cookies.storage.clone(), cookies.clear_origins.clone()))
+            .unwrap_or_default();
         let cookies = self
             .cookies_for_launch(project_id, persistent, cookie_override)
             .await?;
@@ -1591,6 +1632,7 @@ impl BrowserService {
             "ca_cert_path": self.ca_cert_path.as_ref().map(|path| path.display().to_string()),
             "cookies": cookies,
             "clear_cookies": clear_cookies,
+            "storage_seed": storage_seed,
             "restore_state": restored_profile,
             "persistent": persistent,
             "profile": profile_name,
@@ -1655,6 +1697,7 @@ impl BrowserService {
                     profile_name,
                 )
                 .await?;
+            let checkpoint_origin = saved.local_storage.keys().next().cloned();
             session.engine = BrowserEngine::Chromium;
             session.current_url = saved.url;
             session.current_title = saved.title;
@@ -1664,8 +1707,15 @@ impl BrowserService {
             session.checkpoint_hash = Some(saved.hash);
             self.db.update_browser_session(&session).await?;
             if let Some(profile_name) = profile_name {
-                self.record_cookie_seed(project_id, profile_name, cookie_seed)
-                    .await?;
+                self.record_cookie_seed(
+                    project_id,
+                    profile_name,
+                    cookie_seed,
+                    &seeded_storage,
+                    &cleared_origins,
+                    checkpoint_origin.as_deref(),
+                )
+                .await?;
             }
             Ok::<(), DomainError>(())
         }
@@ -2025,10 +2075,14 @@ impl BrowserService {
         project_id: ProjectId,
         profile: &str,
         seed: Option<CookieSeed>,
+        storage: &[StorageOrigin],
+        cleared_origins: &[String],
+        checkpoint_origin: Option<&str>,
     ) -> DomainResult<()> {
         if let Some(seed) = seed {
             self.update_persistent_profile(project_id, profile, |state| {
-                state.cookie_seed = Some(seed)
+                state.cookie_seed = Some(seed);
+                apply_storage_seed(state, storage, cleared_origins, checkpoint_origin);
             })
             .await?;
         }
@@ -2427,7 +2481,7 @@ impl BrowserService {
         project_id: ProjectId,
         session_id: BrowserSessionId,
         result: &Value,
-    ) -> DomainResult<()> {
+    ) -> DomainResult<Checkpoint> {
         let checkpoint = result.get("checkpoint").ok_or_else(|| {
             DomainError::new(ErrorCode::ProtocolError, "worker omitted checkpoint")
         })?;
@@ -2448,11 +2502,12 @@ impl BrowserService {
             .save_checkpoint(project_id, session_id, checkpoint, "ok", profile)
             .await?;
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
-        session.current_url = saved.url;
-        session.current_title = saved.title;
+        session.current_url = saved.url.clone();
+        session.current_title = saved.title.clone();
         session.checkpoint_status = Some("ok".into());
-        session.checkpoint_hash = Some(saved.hash);
-        self.db.update_browser_session(&session).await
+        session.checkpoint_hash = Some(saved.hash.clone());
+        self.db.update_browser_session(&session).await?;
+        Ok(saved)
     }
 
     pub async fn action(
@@ -3769,6 +3824,77 @@ fn merge_persistent_profile(profile: &mut PersistentBrowserProfile, checkpoint: 
         profile
             .session_storage
             .insert(origin.clone(), checkpoint.session_storage.clone());
+    }
+}
+
+/// Decide whether a named cookie profile needs seeding. An unchanged seed is
+/// left alone, so newer browser values survive unless `refresh` is set.
+fn plan_cookie_seed(
+    name: &str,
+    stored: &StoredCookieProfile,
+    saved_seed: Option<CookieSeed>,
+    refresh: bool,
+) -> DomainResult<Option<CookieLaunchOverride>> {
+    let mut cookie_override = CookieLaunchOverride::from_profile(stored)?;
+    let seed = CookieSeed {
+        name: name.to_string(),
+        identities: cookie_override.clear_cookies.clone(),
+        hash: cookie_seed_hash(&cookie_override.cookies, &cookie_override.storage)?,
+        origins: cookie_override
+            .storage
+            .iter()
+            .map(|entry| entry.origin.clone())
+            .collect(),
+    };
+    if !refresh && saved_seed.as_ref() == Some(&seed) {
+        return Ok(None);
+    }
+    if let Some(previous) = saved_seed {
+        for identity in previous.identities {
+            if !cookie_override.clear_cookies.contains(&identity) {
+                cookie_override.clear_cookies.push(identity);
+            }
+        }
+        // Storage the previous seed wrote for an origin this one drops is
+        // stale in the same way.
+        cookie_override.clear_origins = previous
+            .origins
+            .into_iter()
+            .filter(|origin| !seed.origins.contains(origin))
+            .collect();
+    }
+    cookie_override.seed = Some(seed);
+    Ok(Some(cookie_override))
+}
+
+/// Persist seeded storage into the profile state. Chromium keeps localStorage
+/// natively but drops sessionStorage on exit, so a later launch restores it
+/// from here. The origin the worker just checkpointed holds the browser's own
+/// current values, so it is left to the checkpoint.
+fn apply_storage_seed(
+    state: &mut PersistentBrowserProfile,
+    storage: &[StorageOrigin],
+    cleared_origins: &[String],
+    checkpoint_origin: Option<&str>,
+) {
+    let stale = |origin: &str| checkpoint_origin != Some(origin);
+    for origin in cleared_origins.iter().filter(|origin| stale(origin)) {
+        state.local_storage.remove(origin);
+        state.session_storage.remove(origin);
+    }
+    for entry in storage.iter().filter(|entry| stale(&entry.origin)) {
+        let pairs = |items: &[crate::cookies::StorageItem]| {
+            items
+                .iter()
+                .map(|item| (item.name.clone(), item.value.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        state
+            .local_storage
+            .insert(entry.origin.clone(), pairs(&entry.local_storage));
+        state
+            .session_storage
+            .insert(entry.origin.clone(), pairs(&entry.session_storage));
     }
 }
 
@@ -5308,6 +5434,185 @@ done
             .is_none());
     }
 
+    fn named_profile(input: &str) -> StoredCookieProfile {
+        let validated =
+            crate::cookies::validate_named_cookie_profile("https://app.example/", input.into())
+                .unwrap();
+        StoredCookieProfile {
+            project_id: ProjectId(1),
+            host: validated.host,
+            target_url: validated.target_url,
+            cookie_header: validated.cookie_header,
+            names: validated.names,
+            managed_cookies: validated.managed_cookies,
+            origins: validated.origins,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    const COOKIES_ONLY: &str = r#"[{"name":"sid","value":"v1","domain":"app.example"}]"#;
+
+    fn with_storage(token: &str, origin: &str) -> String {
+        format!(
+            r#"{{"cookies":[{{"name":"sid","value":"v1","domain":"app.example"}}],
+                "origins":[{{"origin":"{origin}","localStorage":[{{"name":"token","value":"{token}"}}]}}]}}"#
+        )
+    }
+
+    fn saved_seed_of(plan: &CookieLaunchOverride) -> CookieSeed {
+        plan.seed.clone().unwrap()
+    }
+
+    #[test]
+    fn cookie_only_seed_hash_is_unchanged_by_storage_seeding() {
+        let profile = named_profile(COOKIES_ONLY);
+        let cookies = browser_cookies(std::slice::from_ref(&profile)).unwrap();
+        let legacy = hex::encode(Sha256::digest(serde_json::to_vec(&cookies).unwrap()));
+        assert_eq!(cookie_seed_hash(&cookies, &[]).unwrap(), legacy);
+        // A seed saved by an older build (no `origins` key) must not look changed.
+        let saved: CookieSeed = serde_json::from_value(json!({
+            "name": "member", "hash": legacy, "identities": profile_cookie_identities(&profile).unwrap()
+        }))
+        .unwrap();
+        assert!(plan_cookie_seed("member", &profile, Some(saved), false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn storage_changes_reseed_and_unchanged_storage_does_not() {
+        let first = named_profile(&with_storage("t1", "https://app.example"));
+        let plan = plan_cookie_seed("member", &first, None, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.storage.len(), 1);
+        assert!(plan.clear_origins.is_empty());
+        let saved = saved_seed_of(&plan);
+        assert_ne!(
+            saved.hash,
+            cookie_seed_hash(&plan.cookies, &[]).unwrap(),
+            "storage is part of the hash"
+        );
+        assert_eq!(saved.origins, ["https://app.example"]);
+
+        // Same file: nothing is written, so values the app changed survive.
+        assert!(
+            plan_cookie_seed("member", &first, Some(saved.clone()), false)
+                .unwrap()
+                .is_none()
+        );
+        // refresh_cookies re-applies it.
+        assert!(
+            plan_cookie_seed("member", &first, Some(saved.clone()), true)
+                .unwrap()
+                .is_some()
+        );
+        // Different value: reseeds.
+        let changed = named_profile(&with_storage("t2", "https://app.example"));
+        assert!(plan_cookie_seed("member", &changed, Some(saved), false)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn dropping_an_origin_clears_it_and_cookie_only_replacement_clears_all() {
+        let both = named_profile(
+            r#"{"origins":[{"origin":"https://app.example","localStorage":[{"name":"a","value":"1"}]},
+                          {"origin":"https://idp.example","localStorage":[{"name":"b","value":"2"}]}]}"#,
+        );
+        let saved = saved_seed_of(
+            &plan_cookie_seed("member", &both, None, false)
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(saved.origins.len(), 2);
+
+        let only_app = named_profile(&with_storage("t", "https://app.example"));
+        let plan = plan_cookie_seed("member", &only_app, Some(saved.clone()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.clear_origins, ["https://idp.example"]);
+        assert_eq!(
+            plan.storage_params()["clear_origins"],
+            json!(["https://idp.example"])
+        );
+
+        let cookie_only = named_profile(COOKIES_ONLY);
+        let plan = plan_cookie_seed("member", &cookie_only, Some(saved), false)
+            .unwrap()
+            .unwrap();
+        assert!(plan.storage.is_empty());
+        assert_eq!(
+            plan.clear_origins,
+            ["https://app.example", "https://idp.example"]
+        );
+        // Nothing to write or clear: no storage_seed is sent to the worker.
+        let plain = plan_cookie_seed("member", &cookie_only, None, false)
+            .unwrap()
+            .unwrap();
+        assert!(plain.storage_params().is_null());
+    }
+
+    #[test]
+    fn seeded_storage_is_persisted_and_the_checkpoint_origin_is_left_alone() {
+        let mut state = PersistentBrowserProfile::default();
+        state.local_storage.insert(
+            "https://old.example".into(),
+            BTreeMap::from([("stale".to_string(), "x".to_string())]),
+        );
+        state.session_storage.insert(
+            "https://old.example".into(),
+            BTreeMap::from([("stale".to_string(), "x".to_string())]),
+        );
+        state.local_storage.insert(
+            "https://app.example".into(),
+            BTreeMap::from([("token".to_string(), "from-app".to_string())]),
+        );
+        let profile = named_profile(
+            r#"{"origins":[{"origin":"https://app.example","localStorage":[{"name":"token","value":"seed"}],"sessionStorage":[{"name":"csrf","value":"c"}]},
+                          {"origin":"https://idp.example","sessionStorage":[{"name":"s","value":"1"}]}]}"#,
+        );
+        // app.example is the page the worker checkpointed: browser values win.
+        apply_storage_seed(
+            &mut state,
+            &profile.origins,
+            &["https://old.example".to_string()],
+            Some("https://app.example"),
+        );
+        assert_eq!(
+            state.local_storage["https://app.example"]["token"],
+            "from-app"
+        );
+        assert!(!state.session_storage.contains_key("https://app.example"));
+        assert_eq!(state.session_storage["https://idp.example"]["s"], "1");
+        assert!(state.local_storage["https://idp.example"].is_empty());
+        assert!(!state.local_storage.contains_key("https://old.example"));
+        assert!(!state.session_storage.contains_key("https://old.example"));
+
+        // Without a checkpointed origin every seeded origin is persisted.
+        apply_storage_seed(&mut state, &profile.origins, &[], None);
+        assert_eq!(state.local_storage["https://app.example"]["token"], "seed");
+        assert_eq!(state.session_storage["https://app.example"]["csrf"], "c");
+
+        // A later checkpoint for an origin replaces the seeded values.
+        let checkpoint = Checkpoint {
+            local_storage: BTreeMap::from([(
+                "https://app.example".to_string(),
+                BTreeMap::from([("token".to_string(), "rotated".to_string())]),
+            )]),
+            session_storage: BTreeMap::from([("csrf".to_string(), "c2".to_string())]),
+            ..Checkpoint::default()
+        };
+        merge_persistent_profile(&mut state, &checkpoint);
+        assert_eq!(
+            state.local_storage["https://app.example"]["token"],
+            "rotated"
+        );
+        assert_eq!(state.session_storage["https://app.example"]["csrf"], "c2");
+        assert_eq!(state.session_storage["https://idp.example"]["s"], "1");
+    }
+
     #[test]
     fn browser_cookie_import_is_host_only_and_last_duplicate_wins() {
         let profile = StoredCookieProfile {
@@ -5319,6 +5624,7 @@ done
             managed_cookies: None,
             created_at: String::new(),
             updated_at: String::new(),
+            origins: Vec::new(),
         };
         let cookies = browser_cookies(&[profile]).unwrap();
         assert_eq!(cookies.len(), 2);
@@ -5336,6 +5642,7 @@ done
             managed_cookies: None,
             created_at: String::new(),
             updated_at: String::new(),
+            origins: Vec::new(),
         })
         .unwrap();
         assert_eq!(
@@ -5360,6 +5667,7 @@ done
             managed_cookies: validated.managed_cookies,
             created_at: String::new(),
             updated_at: String::new(),
+            origins: Vec::new(),
         };
         let launch_override = CookieLaunchOverride::from_profile(&profile).unwrap();
         let cookies = launch_override.cookies;
@@ -5398,6 +5706,7 @@ done
                 managed_cookies: validated.managed_cookies,
                 created_at: String::new(),
                 updated_at: String::new(),
+                origins: Vec::new(),
             }
         };
         let cookies = browser_cookies(&[make_profile("older"), make_profile("newer")]).unwrap();
@@ -5425,6 +5734,7 @@ done
             managed_cookies: validated.managed_cookies,
             created_at: String::new(),
             updated_at: String::new(),
+            origins: Vec::new(),
         };
         let cookies = browser_cookies(&[stored]).unwrap();
         assert_eq!(cookies.len(), 2);

@@ -1024,15 +1024,22 @@ function cookieIdentityKey(cookie) {
 async function checkpointRuntimePages(session) {
   const active = await activePage(session);
   const pages = [];
+  const live = [];
   let activeIndex = 0;
   for (const page of session.context.pages()) {
     if (page.isClosed()) continue;
-    const url = page.url() || "about:blank";
+    let url = page.url() || "about:blank";
     let parsed;
     try {
       parsed = new URL(url);
     } catch {
       throw rpcError(-32000, "CDP handoff could not preserve an open tab URL");
+    }
+    // A tab that ended on Chromium's error page (for example a navigation the
+    // caller aborted) has nothing to restore, so it comes back as a blank tab.
+    if (parsed.protocol === "chrome-error:") {
+      url = "about:blank";
+      parsed = new URL(url);
     }
     if (!new Set(["http:", "https:", "about:"]).has(parsed.protocol)) {
       throw rpcError(-32000, `CDP handoff cannot preserve an open ${parsed.protocol} tab`);
@@ -1049,12 +1056,50 @@ async function checkpointRuntimePages(session) {
       } catch {
         throw rpcError(-32000, "CDP handoff could not preserve session storage for every open tab");
       }
+      live.push({ origin: parsed.origin, values: sessionStorage, active: page === active });
     }
     if (page === active) activeIndex = pages.length;
     pages.push({ url, session_storage: sessionStorage });
   }
   if (!pages.length) pages.push({ url: "about:blank", session_storage: {} });
-  return { pages, active_index: activeIndex };
+  // A tab's live values replace what was saved for its origin (the active tab
+  // wins when several share one), so a value the app changed or removed is
+  // never brought back; origins no tab is on keep their saved values.
+  const saved = savedSessionStorage(session);
+  const storage = {};
+  if (saved) {
+    for (const entry of [...live.filter((item) => !item.active), ...live.filter((item) => item.active)]) {
+      if (Object.keys(entry.values).length) saved[entry.origin] = { ...entry.values };
+      else delete saved[entry.origin];
+    }
+    for (const [origin, values] of Object.entries(saved)) storage[origin] = { ...values };
+  }
+  return { pages, active_index: activeIndex, storage };
+}
+
+// Chromium drops sessionStorage on exit, and a tab sitting on about:blank has
+// none to hand back, so write every other saved origin's sessionStorage into
+// the tab before CDP control is returned: a helper that navigates the tab to
+// the app afterwards finds it again. A tab's own origin is restored from its
+// captured values instead. Best effort: nothing reaches a target, errors carry
+// no values, and the seeding route is removed even when a write fails.
+async function restoreSavedOrigins(runtime, page, saved, tabUrl) {
+  let own = null;
+  try { own = new URL(tabUrl).origin; } catch {}
+  let wrote = false;
+  for (const [origin, values] of Object.entries(saved || {})) {
+    if (origin === own || !validStorageSeedOrigin(origin)) continue;
+    const items = Object.entries(values || {}).map(([name, value]) => ({ name, value }));
+    if (!items.length) continue;
+    try {
+      await seedBrowserStorage({ context: runtime.context, transientSeed: true },
+        { origins: [{ origin, session_storage: items, keep_local: true }] }, page);
+      wrote = true;
+    } catch {}
+  }
+  if (wrote && (!tabUrl || tabUrl === "about:blank")) {
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS }).catch(() => {});
+  }
 }
 
 async function restoreRuntimePages(runtime, pageState) {
@@ -1067,7 +1112,22 @@ async function restoreRuntimePages(runtime, pageState) {
     const state = states[index];
     const page = index === 0 ? first : await runtime.context.newPage();
     pages.push(page);
+    await restoreSavedOrigins(runtime, page, pageState?.storage, state.url);
+    // Chromium may reopen the previous run's tab (even an error page).
+    if ((!state.url || state.url === "about:blank") && page.url() !== "about:blank") {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS }).catch(() => {});
+    }
     if (state.url && state.url !== "about:blank") {
+      // Write the tab's sessionStorage before the app's first load: an app
+      // that checks it on startup would otherwise bounce to its login page.
+      const items = Object.entries(state.session_storage || {}).map(([name, value]) => ({ name, value }));
+      const tabOrigin = validStorageSeedOrigin(new URL(state.url).origin);
+      if (tabOrigin && items.length) {
+        try {
+          await seedBrowserStorage({ context: runtime.context },
+            { origins: [{ origin: tabOrigin, session_storage: items, keep_local: true }] }, page);
+        } catch {}
+      }
       await page.goto(state.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       await page.evaluate((values) => {
         sessionStorage.clear();
@@ -1082,7 +1142,7 @@ async function restoreRuntimePages(runtime, pageState) {
   }
   for (const page of initialPages) {
     if (!pages.includes(page) && !page.isClosed()) {
-      await page.close({ runBeforeUnload: false });
+      await closePageWithin(page);
     }
   }
   const activeIndex = Number.isInteger(pageState?.active_index)
@@ -1090,6 +1150,39 @@ async function restoreRuntimePages(runtime, pageState) {
     ? pageState.active_index : 0;
   runtime.page = pages[activeIndex];
   await runtime.page.bringToFront();
+}
+
+// A proxy challenge is answered by the worker's own CDP credentials. Once a
+// client such as Playwright's page.route enables Fetch with auth handling, it
+// receives that challenge instead and, having no credentials, cancels the
+// request (net::ERR_INVALID_AUTH_CREDENTIALS). Chromium reuses proxy credentials
+// it has already accepted, so authenticate once here, before control is
+// returned. The name is reserved (.invalid never resolves): HuntProxy rejects it
+// while resolving the destination, so no target is contacted and nothing is
+// captured. Best effort. It uses the runtime's own tab and leaves it for
+// restoreRuntimePages to put back: closing a throwaway tab here stalled
+// intermittently (Page.close never completed while the tab's proxy-auth
+// request was in flight), which hung the whole handoff.
+const PROXY_AUTH_PRIME_URL = "http://huntproxy-auth-prime.invalid/";
+
+async function primeProxyAuth(runtime, proxy) {
+  if (!proxy?.username && !proxy?.password) return;
+  try {
+    await runtime.page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
+  } catch {}
+}
+
+// Closing a tab can stall in Chromium; a handoff must never wait on it.
+async function closePageWithin(page, milliseconds = 5_000) {
+  let timer;
+  try {
+    await Promise.race([
+      page.close({ runBeforeUnload: false }),
+      new Promise((resolve) => { timer = setTimeout(resolve, milliseconds); }),
+    ]);
+  } catch {} finally {
+    clearTimeout(timer);
+  }
 }
 
 async function launchSessionRuntime(session, cdpPort, pageState, sessionCookies = []) {
@@ -1101,6 +1194,7 @@ async function launchSessionRuntime(session, cdpPort, pageState, sessionCookies 
   );
   try {
     if (sessionCookies.length) await runtime.context.addCookies(sessionCookies);
+    if (cdpPort != null) await primeProxyAuth(runtime, session.proxy);
     await restoreRuntimePages(runtime, pageState);
     const cdp = cdpPort == null ? null : await discoverCdp(runtime.page, cdpPort);
     return { runtime, cdp };
@@ -1239,6 +1333,192 @@ async function reconcileCurrentOriginStorage(session) {
     session.restoredOrigins?.add(origin);
     if (changed) await session.page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
   }
+}
+
+// The sessionStorage saved for every origin the profile has seen: the seeded
+// session object, then whatever a handoff last captured from a live tab.
+function savedSessionStorage(session) {
+  if (session.transientSeed) return null;
+  if (session.restoreState) return (session.restoreState.session_storage ??= {});
+  return (session.handoffSessionStorage ??= {});
+}
+
+const STORAGE_SEED_STEP_MS = 10_000;
+const STORAGE_SEED_TOTAL_MS = 60_000;
+
+// Errors here name the origin and a fixed reason only; storage keys and values
+// never appear in messages.
+function storageSeedError(origin, reason) {
+  return rpcError(-32000, `browser storage seed failed for ${origin}: ${reason}`);
+}
+
+function validStorageSeedOrigin(value) {
+  try {
+    const parsed = new URL(String(value));
+    return new Set(["http:", "https:"]).has(parsed.protocol) && parsed.origin === value ? parsed.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+function storageSeedNavigationReason(error) {
+  if (error?.name === "TimeoutError") return "timed out opening the origin";
+  const code = String(error?.message || "").match(/net::ERR_[A-Z_]+/)?.[0];
+  return code ? `could not open the origin, ${code}` : "could not open the origin";
+}
+
+// Write localStorage/sessionStorage for each origin on the session's main tab
+// before the app's first real load. Every request in the window is fulfilled
+// locally with an empty page, so nothing reaches the target (or its service
+// worker), and the route is always removed afterwards. The tab is left on the
+// last seeded origin; callers navigate on afterwards.
+async function seedBrowserStorage(session, seed, pageOverride = null) {
+  const origins = Array.isArray(seed?.origins) ? seed.origins : [];
+  const clearOrigins = Array.isArray(seed?.clear_origins) ? seed.clear_origins : [];
+  if (!origins.length && !clearOrigins.length) return null;
+  const targets = [];
+  const seen = new Set();
+  for (const entry of origins) {
+    const origin = validStorageSeedOrigin(entry?.origin);
+    const pairs = (items) => (Array.isArray(items) ? items : [])
+      .map((item) => [String(item?.name ?? ""), String(item?.value ?? "")]);
+    if (!origin || seen.has(origin)) throw rpcError(-32602, "storage_seed origins must be unique exact http(s) origins");
+    seen.add(origin);
+    targets.push({
+      origin,
+      local: pairs(entry.local_storage),
+      session: pairs(entry.session_storage),
+      // Restoring a relaunched profile: Chromium already holds localStorage.
+      keepLocal: Boolean(entry.keep_local),
+    });
+  }
+  for (const value of clearOrigins) {
+    const origin = validStorageSeedOrigin(value);
+    if (!origin || seen.has(origin)) throw rpcError(-32602, "storage_seed clear_origins must be unique exact http(s) origins");
+    seen.add(origin);
+    targets.push({ origin, local: [], session: [], keepLocal: false });
+  }
+  const page = pageOverride || await activePage(session);
+  const returnTo = page.url() || "about:blank";
+  const deadline = Date.now() + STORAGE_SEED_TOTAL_MS;
+  const step = (origin) => {
+    const left = deadline - Date.now();
+    if (left <= 0) throw storageSeedError(origin, "timed out");
+    return Math.min(STORAGE_SEED_STEP_MS, left);
+  };
+  const fulfil = (route) => route.fulfill({
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: "<!doctype html><title>storage seed</title>",
+  });
+  let cdp;
+  let routed = false;
+  let failure;
+  try {
+    // Leave the live document first so its background requests cannot be
+    // answered by the seeding route.
+    if (returnTo !== "about:blank") {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS });
+    }
+    // A service worker already controlling the origin would answer the
+    // navigation itself and the real app would load.
+    // (Chromium ignores the bypass unless the session has enabled Network.)
+    cdp = await session.context.newCDPSession(page);
+    await cdp.send("Network.enable");
+    await cdp.send("Network.setBypassServiceWorker", { bypass: true });
+    await page.route("**/*", fulfil);
+    routed = true;
+    for (const target of targets) {
+      try {
+        await page.goto(`${target.origin}/`, { waitUntil: "domcontentloaded", timeout: step(target.origin) });
+      } catch (error) {
+        throw error?.code === -32000 ? error : storageSeedError(target.origin, storageSeedNavigationReason(error));
+      }
+      if (page.url() !== `${target.origin}/`) throw storageSeedError(target.origin, "the origin did not load");
+      const write = page.evaluate(({ local, sessionItems, keepLocal }) => {
+        try {
+          if (!keepLocal) localStorage.clear();
+          sessionStorage.clear();
+          if (!keepLocal) for (const [key, value] of local) localStorage.setItem(key, value);
+          for (const [key, value] of sessionItems) sessionStorage.setItem(key, value);
+          return "ok";
+        } catch (error) {
+          try { if (!keepLocal) localStorage.clear(); sessionStorage.clear(); } catch {}
+          return String(error?.name || "Error");
+        }
+      }, { local: target.local, sessionItems: target.session, keepLocal: target.keepLocal });
+      write.catch(() => {});
+      let timer;
+      const outcome = await Promise.race([
+        write,
+        new Promise((resolve) => { timer = setTimeout(() => resolve("timed out"), step(target.origin)); }),
+      ]).finally(() => clearTimeout(timer));
+      if (outcome !== "ok") throw storageSeedError(target.origin, `storage rejected the write (${outcome})`);
+    }
+  } catch (error) {
+    failure = typeof error?.code === "number" && typeof error?.message === "string"
+      ? error
+      : rpcError(-32000, "browser storage seed failed before any origin was written");
+  } finally {
+    if (routed) await page.unroute("**/*", fulfil).catch(() => {});
+    if (cdp) {
+      await cdp.send("Network.setBypassServiceWorker", { bypass: false }).catch(() => {});
+      await cdp.detach().catch(() => {});
+    }
+  }
+  if (failure) throw failure;
+  // The seed wins over any older checkpoint restored for these origins.
+  const state = session.restoreState;
+  const savedSession = savedSessionStorage(session);
+  for (const target of targets) {
+    session.restoredOrigins?.add(target.origin);
+    const hasValues = target.local.length || target.session.length;
+    if (savedSession) {
+      if (hasValues) savedSession[target.origin] = Object.fromEntries(target.session);
+      else if (!target.keepLocal) delete savedSession[target.origin];
+    }
+    if (!state || target.keepLocal) continue;
+    state.local_storage ??= {};
+    if (hasValues) state.local_storage[target.origin] = Object.fromEntries(target.local);
+    else delete state.local_storage[target.origin];
+  }
+  return { returnTo };
+}
+
+// Chromium drops sessionStorage on exit, so a relaunched profile gets it back
+// from the saved checkpoint. Restoring it only after the first load lets an app
+// that checks for it on startup bounce to its login page first, so write it
+// (and, for a fresh Chromium directory, localStorage) before that load.
+function pendingStorageRestore(session, url) {
+  const state = session.restoreState;
+  if (!state || !url || url === "about:blank") return null;
+  let origin;
+  try {
+    const parsed = new URL(url);
+    if (!new Set(["http:", "https:"]).has(parsed.protocol)) return null;
+    origin = parsed.origin;
+  } catch {
+    return null;
+  }
+  if (session.restoredOrigins?.has(origin)) return null;
+  const entries = (values) => Object.entries(values || {}).map(([name, value]) => ({ name, value }));
+  const sessionItems = entries(state.session_storage?.[origin]);
+  const localItems = session.preferProfileState ? [] : entries(state.local_storage?.[origin]);
+  if (!sessionItems.length && !localItems.length) return null;
+  return { origin, local_storage: localItems, session_storage: sessionItems, keep_local: !localItems.length };
+}
+
+// After seeding: continue to the requested url, or return to the page the tab
+// was on (about:blank when there was none).
+async function navigateAfterSeed(session, seeded, url) {
+  const page = await activePage(session);
+  const target = url && url !== "about:blank" ? url : seeded.returnTo;
+  if (!target || target === "about:blank") {
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: STORAGE_SEED_STEP_MS });
+    return;
+  }
+  await navigateWithProxyCheck(page, () => page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 }));
+  await reconcileCurrentOriginStorage(session);
 }
 
 async function extractCheckpoint(session) {
@@ -1883,6 +2163,15 @@ async function handle(req) {
           if (Array.isArray(params.cookies) && params.cookies.length) {
             await session.context.addCookies(params.cookies);
           }
+          let seeded = await seedBrowserStorage(session, params.storage_seed);
+          const restore = pendingStorageRestore(session, params.url);
+          if (restore) {
+            // Best effort: on failure the post-load reconciliation still runs.
+            try { seeded = await seedBrowserStorage(session, { origins: [restore] }) || seeded; } catch {}
+          }
+          if (seeded && !(params.url && params.url !== "about:blank")) {
+            await navigateAfterSeed(session, { returnTo: "about:blank" }, null);
+          }
           if (params.url && params.url !== "about:blank") {
             await navigateWithProxyCheck(session.page, () => session.page.goto(params.url, {
               waitUntil: "domcontentloaded",
@@ -2005,8 +2294,9 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        if (!Array.isArray(params.cookies) || !params.cookies.length) {
-          throw rpcError(-32602, "cookies must be a non-empty array");
+        const seedsStorage = Boolean(params.storage_seed?.origins?.length || params.storage_seed?.clear_origins?.length);
+        if (!Array.isArray(params.cookies) || (!params.cookies.length && !seedsStorage)) {
+          throw rpcError(-32602, "cookies must be a non-empty array unless storage_seed is provided");
         }
         await clearCookieIdentities(session.context, params.clear_cookies, "clear_cookies");
         if (Array.isArray(params.clear_names) && params.clear_names.length) {
@@ -2020,7 +2310,9 @@ async function handle(req) {
             expires: 1,
           })));
         }
-        await session.context.addCookies(params.cookies);
+        if (params.cookies.length) await session.context.addCookies(params.cookies);
+        const seeded = await seedBrowserStorage(session, params.storage_seed);
+        if (seeded) await navigateAfterSeed(session, seeded, params.url);
         return respond(id, { checkpoint: await extractCheckpoint(session) });
       }
       case "session.clear_cookies": {
