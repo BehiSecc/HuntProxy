@@ -1068,6 +1068,16 @@ async function restoreRuntimePages(runtime, pageState) {
     const page = index === 0 ? first : await runtime.context.newPage();
     pages.push(page);
     if (state.url && state.url !== "about:blank") {
+      // Write the tab's sessionStorage before the app's first load: an app
+      // that checks it on startup would otherwise bounce to its login page.
+      const items = Object.entries(state.session_storage || {}).map(([name, value]) => ({ name, value }));
+      const tabOrigin = validStorageSeedOrigin(new URL(state.url).origin);
+      if (tabOrigin && items.length) {
+        try {
+          await seedBrowserStorage({ context: runtime.context },
+            { origins: [{ origin: tabOrigin, session_storage: items, keep_local: true }] }, page);
+        } catch {}
+      }
       await page.goto(state.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       await page.evaluate((values) => {
         sessionStorage.clear();
@@ -1270,7 +1280,7 @@ function storageSeedNavigationReason(error) {
 // locally with an empty page, so nothing reaches the target (or its service
 // worker), and the route is always removed afterwards. The tab is left on the
 // last seeded origin; callers navigate on afterwards.
-async function seedBrowserStorage(session, seed) {
+async function seedBrowserStorage(session, seed, pageOverride = null) {
   const origins = Array.isArray(seed?.origins) ? seed.origins : [];
   const clearOrigins = Array.isArray(seed?.clear_origins) ? seed.clear_origins : [];
   if (!origins.length && !clearOrigins.length) return null;
@@ -1296,7 +1306,7 @@ async function seedBrowserStorage(session, seed) {
     seen.add(origin);
     targets.push({ origin, local: [], session: [], keepLocal: false });
   }
-  const page = await activePage(session);
+  const page = pageOverride || await activePage(session);
   const returnTo = page.url() || "about:blank";
   const deadline = Date.now() + STORAGE_SEED_TOTAL_MS;
   const step = (origin) => {
