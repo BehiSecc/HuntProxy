@@ -452,7 +452,22 @@ There are three common ways:
 - **Log in through the browser:** Ask the agent to hand you the project's Chromium browser through CDP. Complete the login, CAPTCHA, or two-factor authentication yourself, then tell the agent to take control back and continue.
 - **Provide the credentials:** Give the agent the username and password and ask it to sign in through the managed browser.
 
-The cookie file must be on the same machine as HuntProxy. A raw cookie file should contain only the value, for example `sid=...; csrf=...`, without the `Cookie:` prefix. Credentials shared directly in a prompt pass through your AI client, so prefer a temporary or test account when possible.
+The cookie file must be on the same machine as HuntProxy and can be up to 4 MiB. A raw cookie file should contain only the value, for example `sid=...; csrf=...`, without the `Cookie:` prefix.
+
+For apps that keep their tokens in browser storage, the file can instead be a session object, which is Playwright's `storageState` plus an optional per-origin `sessionStorage`:
+
+```json
+{
+  "cookies": [],
+  "origins": [{
+    "origin": "https://app.example",
+    "localStorage": [{"name": "token", "value": "..."}],
+    "sessionStorage": [{"name": "csrf", "value": "..."}]
+  }]
+}
+```
+
+`cookies` may be empty, and each origin must be an exact `http(s)` origin without a path. Storage requires a named profile (`profile_name`), because project cookies have no browser to seed. `browser_start(cookie_profile=...)` writes it on the main tab before the first navigation, without any request to the target, so the app's JavaScript sees the tokens on first load. Unchanged storage is not rewritten on later starts unless `refresh_cookies=true`, and `cookies(action="list")` reports only an origin count. `sessionStorage` is seeded on the main tab only; tabs opened later start without it. Credentials shared directly in a prompt pass through your AI client, so prefer a temporary or test account when possible.
 
 </details>
 

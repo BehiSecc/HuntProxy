@@ -242,7 +242,7 @@
       <h3>Session cookies</h3>
       <label for="cookieTarget">Target URL</label>
       <input id="cookieTarget" placeholder="https://app.example.com" />
-      <label for="cookieValue">Cookie header or JSON cookie array</label>
+      <label for="cookieValue">Cookie header, JSON cookie array, or session object with storage</label>
       <textarea id="cookieValue" class="mono" style="min-height:70px" placeholder='session=...; csrf=...  or  [{"name":"session","value":"...","domain":".example.com"}]'></textarea>
       <label for="cookieFile">Or load a cookie file</label>
       <input id="cookieFile" type="file" accept=".txt,.json,text/plain,application/json" />
@@ -1009,7 +1009,7 @@ test
       $('namedCookieNames').innerHTML = state.namedCookieProfiles
         .map(({ name }) => `<option value="${escapeHtml(name)}"></option>`).join('');
       $('namedCookieProfiles').innerHTML = state.namedCookieProfiles.length
-        ? state.namedCookieProfiles.map(({ name, profile }) => `<div class="card"><strong>${escapeHtml(name)}</strong><div class="muted">${escapeHtml(profile.host)} · ${escapeHtml((profile.names || []).join(', ') || 'no live cookies')}</div></div>`).join('')
+        ? state.namedCookieProfiles.map(({ name, profile }) => `<div class="card"><strong>${escapeHtml(name)}</strong><div class="muted">${escapeHtml(profile.host)} · ${escapeHtml((profile.names || []).join(', ') || 'no live cookies')}${profile.origin_count ? ` · storage for ${profile.origin_count} origin(s)` : ''}</div></div>`).join('')
         : '<div class="muted">No named profiles.</div>';
       updateBrowserCookieSeeds();
       const managed = profiles.length
