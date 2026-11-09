@@ -1282,13 +1282,19 @@ async function seedBrowserStorage(session, seed) {
       .map((item) => [String(item?.name ?? ""), String(item?.value ?? "")]);
     if (!origin || seen.has(origin)) throw rpcError(-32602, "storage_seed origins must be unique exact http(s) origins");
     seen.add(origin);
-    targets.push({ origin, local: pairs(entry.local_storage), session: pairs(entry.session_storage) });
+    targets.push({
+      origin,
+      local: pairs(entry.local_storage),
+      session: pairs(entry.session_storage),
+      // Restoring a relaunched profile: Chromium already holds localStorage.
+      keepLocal: Boolean(entry.keep_local),
+    });
   }
   for (const value of clearOrigins) {
     const origin = validStorageSeedOrigin(value);
     if (!origin || seen.has(origin)) throw rpcError(-32602, "storage_seed clear_origins must be unique exact http(s) origins");
     seen.add(origin);
-    targets.push({ origin, local: [], session: [] });
+    targets.push({ origin, local: [], session: [], keepLocal: false });
   }
   const page = await activePage(session);
   const returnTo = page.url() || "about:blank";
@@ -1314,7 +1320,9 @@ async function seedBrowserStorage(session, seed) {
     }
     // A service worker already controlling the origin would answer the
     // navigation itself and the real app would load.
+    // (Chromium ignores the bypass unless the session has enabled Network.)
     cdp = await session.context.newCDPSession(page);
+    await cdp.send("Network.enable");
     await cdp.send("Network.setBypassServiceWorker", { bypass: true });
     await page.route("**/*", fulfil);
     routed = true;
@@ -1325,18 +1333,18 @@ async function seedBrowserStorage(session, seed) {
         throw error?.code === -32000 ? error : storageSeedError(target.origin, storageSeedNavigationReason(error));
       }
       if (page.url() !== `${target.origin}/`) throw storageSeedError(target.origin, "the origin did not load");
-      const write = page.evaluate(({ local, sessionItems }) => {
+      const write = page.evaluate(({ local, sessionItems, keepLocal }) => {
         try {
-          localStorage.clear();
+          if (!keepLocal) localStorage.clear();
           sessionStorage.clear();
-          for (const [key, value] of local) localStorage.setItem(key, value);
+          if (!keepLocal) for (const [key, value] of local) localStorage.setItem(key, value);
           for (const [key, value] of sessionItems) sessionStorage.setItem(key, value);
           return "ok";
         } catch (error) {
-          try { localStorage.clear(); sessionStorage.clear(); } catch {}
+          try { if (!keepLocal) localStorage.clear(); sessionStorage.clear(); } catch {}
           return String(error?.name || "Error");
         }
-      }, { local: target.local, sessionItems: target.session });
+      }, { local: target.local, sessionItems: target.session, keepLocal: target.keepLocal });
       write.catch(() => {});
       let timer;
       const outcome = await Promise.race([
@@ -1365,14 +1373,37 @@ async function seedBrowserStorage(session, seed) {
     state.local_storage ??= {};
     state.session_storage ??= {};
     if (target.local.length || target.session.length) {
-      state.local_storage[target.origin] = Object.fromEntries(target.local);
+      if (!target.keepLocal) state.local_storage[target.origin] = Object.fromEntries(target.local);
       state.session_storage[target.origin] = Object.fromEntries(target.session);
-    } else {
+    } else if (!target.keepLocal) {
       delete state.local_storage[target.origin];
       delete state.session_storage[target.origin];
     }
   }
   return { returnTo };
+}
+
+// Chromium drops sessionStorage on exit, so a relaunched profile gets it back
+// from the saved checkpoint. Restoring it only after the first load lets an app
+// that checks for it on startup bounce to its login page first, so write it
+// (and, for a fresh Chromium directory, localStorage) before that load.
+function pendingStorageRestore(session, url) {
+  const state = session.restoreState;
+  if (!state || !url || url === "about:blank") return null;
+  let origin;
+  try {
+    const parsed = new URL(url);
+    if (!new Set(["http:", "https:"]).has(parsed.protocol)) return null;
+    origin = parsed.origin;
+  } catch {
+    return null;
+  }
+  if (session.restoredOrigins?.has(origin)) return null;
+  const entries = (values) => Object.entries(values || {}).map(([name, value]) => ({ name, value }));
+  const sessionItems = entries(state.session_storage?.[origin]);
+  const localItems = session.preferProfileState ? [] : entries(state.local_storage?.[origin]);
+  if (!sessionItems.length && !localItems.length) return null;
+  return { origin, local_storage: localItems, session_storage: sessionItems, keep_local: !localItems.length };
 }
 
 // After seeding: continue to the requested url, or return to the page the tab
@@ -2030,7 +2061,12 @@ async function handle(req) {
           if (Array.isArray(params.cookies) && params.cookies.length) {
             await session.context.addCookies(params.cookies);
           }
-          const seeded = await seedBrowserStorage(session, params.storage_seed);
+          let seeded = await seedBrowserStorage(session, params.storage_seed);
+          const restore = pendingStorageRestore(session, params.url);
+          if (restore) {
+            // Best effort: on failure the post-load reconciliation still runs.
+            try { seeded = await seedBrowserStorage(session, { origins: [restore] }) || seeded; } catch {}
+          }
           if (seeded && !(params.url && params.url !== "about:blank")) {
             await navigateAfterSeed(session, { returnTo: "about:blank" }, null);
           }

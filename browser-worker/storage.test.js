@@ -16,7 +16,7 @@ const available = runtime.chromium_path && runtime.playwright_core_path;
 
 function seeding() {
   const code = source.slice(source.indexOf("const STORAGE_SEED_STEP_MS"), source.indexOf("async function extractCheckpoint"));
-  return vm.runInNewContext(`${code}\n({ seedBrowserStorage, navigateAfterSeed });`, {
+  return vm.runInNewContext(`${code}\n({ seedBrowserStorage, navigateAfterSeed, pendingStorageRestore });`, {
     URL, Date, Set, Object, String, Array, Boolean, Promise, setTimeout, clearTimeout,
     rpcError: (code, message) => ({ code, message }),
     activePage: async (session) => session.page,
@@ -127,6 +127,8 @@ test("storage seed is not intercepted by a service worker and returns to the pre
   });
   assert.equal(seeded.returnTo, `${origin}/plain`);
   assert.equal(requests().length, before, "neither the network nor the worker's origin saw the seed");
+  // The seeding document is the locally fulfilled one, not the worker's page.
+  assert.equal(await page.title(), "storage seed");
   await navigateAfterSeed(session, seeded, null);
   assert.equal(page.url(), `${origin}/plain`);
   assert.deepEqual((await read(page)).local, { token: "sw-token" });
@@ -173,4 +175,34 @@ test("storage seed on an origin whose storage is disabled fails fast instead of 
   // The route was removed even though the write failed.
   await page.goto(`${origin}/`);
   assert.deepEqual(requests(), ["/"]);
+});
+
+test("a relaunched profile gets its saved storage back before the first load", {
+  skip: available ? false : "Playwright and Chromium are required for the browser regression",
+  timeout: 60_000,
+}, async (t) => {
+  const { requests, context, page, origin } = await harness(t);
+  const { seedBrowserStorage, pendingStorageRestore } = seeding();
+  const state = {
+    local_storage: { [origin]: { token: "saved" } },
+    session_storage: { [origin]: { csrf: "saved-csrf" } },
+  };
+  const session = { context, page, restoreState: state, restoredOrigins: new Set(), preferProfileState: true };
+  // An initialized Chromium profile keeps localStorage itself: only sessionStorage is restored.
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const restore = plain(pendingStorageRestore(session, `${origin}/app`));
+  assert.deepEqual(restore, { origin, local_storage: [], session_storage: [{ name: "csrf", value: "saved-csrf" }], keep_local: true });
+  await page.goto(`${origin}/`);
+  await page.evaluate(() => localStorage.setItem("native", "kept"));
+  const before = requests().length;
+  await seedBrowserStorage(session, { origins: [restore] });
+  assert.equal(requests().length, before);
+  await page.goto(`${origin}/`);
+  assert.deepEqual(await read(page), { local: { native: "kept" }, session: { csrf: "saved-csrf" } });
+  assert.equal(pendingStorageRestore(session, `${origin}/app`), null, "each origin is restored once");
+  // A fresh Chromium directory restores localStorage from the checkpoint too.
+  const fresh = { ...session, preferProfileState: false, restoredOrigins: new Set() };
+  assert.deepEqual(plain(pendingStorageRestore(fresh, `${origin}/`).local_storage), [{ name: "token", value: "saved" }]);
+  assert.equal(pendingStorageRestore(fresh, "about:blank"), null);
+  assert.equal(pendingStorageRestore({ ...fresh, restoreState: null }, `${origin}/`), null);
 });
