@@ -1242,6 +1242,9 @@ struct PreparedCase {
 struct PrepareError {
     message: String,
     payloads: Vec<FuzzCasePayload>,
+            // An insertion point this case leaves untouched (Sniper) must not
+            // reach the target as a literal `§name§` marker.
+            clear_marker(&mut draft, point);
 }
 
 fn prepare_case(
@@ -1265,6 +1268,42 @@ fn prepare_case(
             }
         };
         payloads.push(display_payload(point, &transformed));
+/// Replaces the point's marker with an empty string wherever the point's
+/// location holds it. Insertion points carry no default value, so empty is the
+/// neutral fill for a point a case does not mutate.
+fn clear_marker(draft: &mut ReplyDraft, point: &InsertionPoint) {
+    let marker = format!("§{}§", point.name);
+    match point.location.as_str() {
+        "body" => {
+            if let Some(body) = draft.body_override.as_mut() {
+                if contains_bytes(body, marker.as_bytes()) {
+                    *body = replace_bytes(body, marker.as_bytes(), b"");
+                }
+            }
+        }
+        "url" => {
+            if let Some(url) = draft.url.as_mut() {
+                if url.contains(&marker) {
+                    *url = url.replace(&marker, "");
+                }
+            }
+        }
+        location if location.starts_with("header:") => {
+            let header_name = location.trim_start_matches("header:");
+            if let Some(header) = draft
+                .header_overrides
+                .iter_mut()
+                .find(|header| header.name.eq_ignore_ascii_case(header_name))
+            {
+                if contains_bytes(&header.value, marker.as_bytes()) {
+                    header.value = replace_bytes(&header.value, marker.as_bytes(), b"");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
         if let Err(error) = apply_insertion(&mut draft, point, &transformed) {
             return Err(PrepareError {
                 message: error.to_string(),
@@ -1555,6 +1594,67 @@ mod tests {
             estimate_combinations(FuzzStrategy::BatteringRam, 2, &[3]),
             3
         );
+    #[test]
+    fn sniper_clears_markers_of_untouched_points_in_built_request() {
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("https://example.test/?a=§a§&b=§b§".into()),
+                body_override: Some("x=§c§".as_bytes().to_vec()),
+                header_overrides: vec![HeaderPatch {
+                    name: "X-D".into(),
+                    value: "v-§d§".as_bytes().to_vec(),
+                }],
+                ..Default::default()
+            },
+            insertion_points: ["a", "b", "c", "d"]
+                .iter()
+                .zip(["url", "url", "body", "header:X-D"])
+                .map(|(name, location)| InsertionPoint {
+                    name: (*name).into(),
+                    location: location.into(),
+                })
+                .collect(),
+            wordlists: vec![vec!["P".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+        };
+        let cases = CaseIterator::new(
+            template.strategy,
+            template.insertion_points.len(),
+            vec![vec!["P".into()]; 4],
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(cases.len(), 4);
+        let built = cases
+            .iter()
+            .map(|case| prepare_case(&template, case).unwrap().draft)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            built[0].url.as_deref(),
+            Some("https://example.test/?a=P&b=")
+        );
+        assert_eq!(
+            built[1].url.as_deref(),
+            Some("https://example.test/?a=&b=P")
+        );
+        assert_eq!(built[2].body_override.as_deref(), Some(b"x=P".as_slice()));
+        assert_eq!(built[2].url.as_deref(), Some("https://example.test/?a=&b="));
+        assert_eq!(built[3].header_overrides[0].value, "v-P".as_bytes());
+        assert_eq!(built[3].body_override.as_deref(), Some(b"x=".as_slice()));
+        for draft in &built {
+            let all = format!(
+                "{} {:?} {:?}",
+                draft.url.as_deref().unwrap_or(""),
+                draft.body_override,
+                draft.header_overrides
+            );
+            assert!(!all.contains('§'), "literal marker left in {all}");
+        }
+    }
+
         assert_eq!(
             estimate_combinations(FuzzStrategy::Pitchfork, 2, &[5, 3]),
             3

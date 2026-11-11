@@ -874,6 +874,75 @@ async fn fuzzer_number_generator_runs_through_http_api() {
 }
 
 #[tokio::test]
+async fn sniper_fuzzing_never_sends_literal_markers_for_untouched_points() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let (_directory, state, project_id) = test_state().await;
+    let response = huntproxy::api::router(state.clone())
+        .oneshot(
+            Request::post(format!("/api/v1/projects/{}/fuzz-jobs", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "template": {
+                            "draft": {
+                                "url": format!("{}/item?a=§a§&b=§b§", server.uri()),
+                                "header_overrides": [{"name": "X-Probe", "value": "v-§h§"}]
+                            },
+                            "insertion_points": [
+                                {"name": "a", "location": "url"},
+                                {"name": "b", "location": "url"},
+                                {"name": "h", "location": "header:X-Probe"}
+                            ],
+                            "wordlists": [["P"]]
+                        },
+                        "confirm": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let job = json_response(response).await;
+    for _ in 0..100 {
+        let current = state
+            .db
+            .get_fuzz_job(project_id, FuzzJobId(job["id"].as_i64().unwrap()))
+            .await
+            .unwrap();
+        if current.state == FuzzJobState::Completed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut seen = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let probe = request
+                .headers
+                .get("x-probe")
+                .map(|value| value.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            assert!(!probe.contains('§'), "literal marker in header: {probe}");
+            format!("{}|{probe}", request.url.query().unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    seen.sort();
+    assert_eq!(seen, ["a=&b=P|v-", "a=&b=|v-P", "a=P&b=|v-"]);
+}
+
+#[tokio::test]
 async fn page_analyzer_extracts_saved_response_findings_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let mut captured = exchange(project_id, "GET", "/app.js");
