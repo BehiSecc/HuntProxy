@@ -4444,9 +4444,14 @@ fn first_existing_worker(candidates: Vec<PathBuf>) -> Option<PathBuf> {
         .map(|path| path.canonicalize().unwrap_or(path))
 }
 
+const WORKER_DIRECTORY_PREFIX: &str = "browser-worker-";
+
 fn browser_worker_path(data_dir: &Path) -> PathBuf {
     data_dir
-        .join(format!("browser-worker-{}", env!("CARGO_PKG_VERSION")))
+        .join(format!(
+            "{WORKER_DIRECTORY_PREFIX}{}",
+            env!("CARGO_PKG_VERSION")
+        ))
         .join("index.js")
 }
 
@@ -4480,7 +4485,88 @@ fn materialize_embedded_worker(data_dir: &Path) -> std::io::Result<PathBuf> {
     )?;
     write_if_changed(&package_path, EMBEDDED_WORKER_PACKAGE.as_bytes())?;
     write_if_changed(&lock_path, EMBEDDED_WORKER_LOCK.as_bytes())?;
+    prune_old_worker_directories(data_dir, env!("CARGO_PKG_VERSION"));
     Ok(worker_path)
+}
+
+/// A plain `MAJOR.MINOR.PATCH` release: decimal numbers without signs or
+/// leading zeros.
+fn parse_release(version: &str) -> Option<[u64; 3]> {
+    let mut parts = version.split('.');
+    let mut release = [0; 3];
+    for number in &mut release {
+        let part = parts.next()?;
+        let plain = !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && (part == "0" || !part.starts_with('0'));
+        if !plain {
+            return None;
+        }
+        *number = part.parse().ok()?;
+    }
+    parts.next().is_none().then_some(release)
+}
+
+/// Removes the worker directories of releases older than the previous one.
+///
+/// Only real directories named exactly `browser-worker-MAJOR.MINOR.PATCH` are
+/// considered. The current release, newer ones and anything else stay. So does
+/// the previous release: an installer can run the new binary before it commits
+/// to it, and rolling back then needs the old worker. Failing to remove a
+/// directory only costs disk space, so it is logged and never propagated.
+fn prune_old_worker_directories(data_dir: &Path, current_version: &str) {
+    let Some(current) = current_version
+        .split(['-', '+'])
+        .next()
+        .and_then(parse_release)
+    else {
+        return;
+    };
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, directory = %data_dir.display(), "could not list old browser worker directories");
+            return;
+        }
+    };
+    let mut older = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, directory = %data_dir.display(), "could not read a data directory entry");
+                continue;
+            }
+        };
+        let Some(release) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix(WORKER_DIRECTORY_PREFIX))
+            .and_then(parse_release)
+            .filter(|release| *release < current)
+        else {
+            continue;
+        };
+        // A symlink is not a directory here, so a link is never followed.
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => older.push((release, entry.path())),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %entry.path().display(), "could not inspect an old browser worker directory");
+            }
+        }
+    }
+    older.sort();
+    older.pop();
+    for (_, path) in older {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "could not remove an old browser worker directory");
+            }
+        }
+    }
 }
 
 fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
@@ -6923,6 +7009,180 @@ done
             std::fs::read_to_string(worker_dir.join("headless.js")).unwrap(),
             EMBEDDED_WORKER_HEADLESS
         );
+    }
+
+    #[test]
+    fn worker_releases_are_plain_numeric_triples() {
+        assert_eq!(parse_release("0.3.0"), Some([0, 3, 0]));
+        assert_eq!(parse_release("12.0.104"), Some([12, 0, 104]));
+        for rejected in [
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.x",
+            "1..3",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "+1.2.3",
+            "-1.2.3",
+            "1.2.3-rc.1",
+            "1.2.3+build",
+            " 1.2.3",
+            "1.2.3 ",
+            "99999999999999999999.0.0",
+        ] {
+            assert_eq!(parse_release(rejected), None, "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn only_worker_directories_older_than_the_previous_release_are_pruned() {
+        let data = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let directory = |name: &str| {
+            let path = data.path().join(name);
+            std::fs::create_dir_all(path.join("node_modules")).unwrap();
+            std::fs::write(path.join("index.js"), "worker").unwrap();
+            path
+        };
+        let stale = [
+            directory("browser-worker-0.1.0"),
+            directory("browser-worker-0.1.5"),
+            directory("browser-worker-0.0.9"),
+        ];
+        let kept = [
+            // The previous release, the current one and newer ones.
+            directory("browser-worker-0.2.0"),
+            directory("browser-worker-0.3.0"),
+            directory("browser-worker-0.4.0"),
+            // 10 is newer than 3, which a text comparison would get wrong.
+            directory("browser-worker-0.10.0"),
+            // Not exactly browser-worker-MAJOR.MINOR.PATCH, whatever they hold.
+            directory("browser-worker-0.1.0.bak"),
+            directory("browser-worker-0.1.0-rc.1"),
+            directory("browser-worker-01.0.0"),
+            directory("browser-worker-1.0"),
+            directory("browser-worker-old"),
+            directory("browser-worker-"),
+            directory("browser-workers-0.1.0"),
+            directory(".browser-worker.old.k3j2h1"),
+            directory("worker-0.1.0"),
+            directory("runtime"),
+        ];
+        // Neither a file nor a link to a directory is a worker directory.
+        let file = data.path().join("browser-worker-0.0.1");
+        std::fs::write(&file, "not a directory").unwrap();
+        std::fs::write(outside.path().join("keep"), "precious").unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = data.path().join("browser-worker-0.0.2");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            link
+        };
+
+        prune_old_worker_directories(data.path(), "0.3.0");
+
+        for path in &stale {
+            assert!(!path.exists(), "{} should be pruned", path.display());
+        }
+        for path in &kept {
+            assert!(
+                path.join("index.js").is_file(),
+                "{} should stay",
+                path.display()
+            );
+        }
+        assert!(file.is_file());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+            "precious"
+        );
+        #[cfg(unix)]
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+
+        // Pruning again, or pruning from the oldest release, removes nothing more.
+        prune_old_worker_directories(data.path(), "0.3.0");
+        prune_old_worker_directories(data.path(), "0.0.1");
+        for path in &kept {
+            assert!(path.join("index.js").is_file(), "{}", path.display());
+        }
+        // An unusable current version prunes nothing.
+        let before = std::fs::read_dir(data.path()).unwrap().count();
+        for current in ["", "dev", "0.3", "0.3.0.1"] {
+            prune_old_worker_directories(data.path(), current);
+        }
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), before);
+    }
+
+    #[test]
+    fn a_pre_release_build_prunes_by_its_release_number() {
+        let data = tempfile::tempdir().unwrap();
+        for name in ["0.1.0", "0.2.0", "0.3.0"] {
+            std::fs::create_dir(data.path().join(format!("browser-worker-{name}"))).unwrap();
+        }
+        prune_old_worker_directories(data.path(), "0.3.0-rc.1");
+        assert!(!data.path().join("browser-worker-0.1.0").exists());
+        assert!(data.path().join("browser-worker-0.2.0").exists());
+        assert!(data.path().join("browser-worker-0.3.0").exists());
+    }
+
+    #[test]
+    fn materializing_the_worker_prunes_the_old_ones_after_writing_it() {
+        let data = tempfile::tempdir().unwrap();
+        let old = |version: &str| {
+            let path = data.path().join(format!("browser-worker-{version}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let (oldest, previous) = (old("0.0.1"), old("0.0.2"));
+        let worker = materialize_embedded_worker(data.path()).unwrap();
+        assert!(worker.is_file());
+        assert!(!oldest.exists());
+        assert!(previous.is_dir());
+
+        // Nothing is pruned when the current worker could not be written.
+        let data = tempfile::tempdir().unwrap();
+        let blocked = browser_worker_path(data.path());
+        std::fs::write(blocked.parent().unwrap(), "in the way").unwrap();
+        let stale = data.path().join("browser-worker-0.0.0");
+        std::fs::create_dir(&stale).unwrap();
+        assert!(materialize_embedded_worker(data.path()).is_err());
+        assert!(stale.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_removed_does_not_stop_the_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        let old = |version: &str| {
+            let path = data.path().join(format!("browser-worker-{version}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        // The directory that cannot be removed comes first, so pruning must
+        // carry on after the failure to reach the removable one.
+        let (stuck, removable, previous) = (old("0.0.0"), old("0.0.1"), old("0.0.2"));
+        // Entries of a read-only directory cannot be unlinked (except by root).
+        let locked = stuck.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("file"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = materialize_embedded_worker(data.path());
+
+        if locked.exists() {
+            // Removable again, so the temporary directory can be cleaned up.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        } else {
+            eprintln!("permissions do not block removal here (root); failure path not exercised");
+        }
+        let worker = result.expect("a failed cleanup must not fail the worker");
+        assert!(worker.is_file());
+        assert!(previous.is_dir());
+        assert!(!removable.exists(), "pruning carries on after a failure");
     }
 
     #[cfg(unix)]
