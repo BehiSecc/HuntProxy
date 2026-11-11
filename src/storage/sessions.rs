@@ -361,7 +361,7 @@ pub fn extract_proxy_token(header_value: &str) -> Option<String> {
         let s = String::from_utf8(decoded).ok()?;
         // username:password — password is the token
         if let Some((user, pass)) = s.split_once(':') {
-            if user == BASIC_USER || user == "bb" {
+            if user == BASIC_USER {
                 return Some(pass.to_string());
             }
             // also accept password-only style if username empty
@@ -500,14 +500,15 @@ mod tests {
     }
 
     #[test]
-    fn proxy_basic_auth_uses_huntproxy_and_accepts_legacy_username() {
+    fn proxy_basic_auth_takes_the_token_from_the_password() {
         assert_eq!(
             extract_proxy_token(&basic("huntproxy:token")),
             Some("token".into())
         );
         assert_eq!(
-            extract_proxy_token(&basic("bb:legacy")),
-            Some("legacy".into())
+            extract_proxy_token(&basic("any-user:token")),
+            Some("token".into())
         );
+        assert_eq!(extract_proxy_token(&basic("any-user:")), None);
     }
 }

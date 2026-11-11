@@ -13,7 +13,6 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 fn local_browser_fixture() -> PathBuf {
     for name in [
         "HUNTPROXY_CHROME_EXECUTABLE",
-        "BB_CHROME_EXECUTABLE",
         "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
     ] {
         if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
