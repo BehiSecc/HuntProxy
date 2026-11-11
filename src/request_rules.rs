@@ -3,11 +3,10 @@
 use crate::domain::*;
 use crate::storage::{now_rfc3339, Db};
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 const MAX_RULES: usize = 100;
@@ -15,7 +14,7 @@ const MAX_PATTERN_BYTES: usize = 4096;
 const MAX_REPLACEMENT_BYTES: usize = 64 * 1024;
 pub const MAX_REWRITE_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-static CACHE: Lazy<DashMap<String, Arc<Vec<CompiledRule>>>> = Lazy::new(DashMap::new);
+static CACHE: LazyLock<DashMap<String, Arc<Vec<CompiledRule>>>> = LazyLock::new(DashMap::new);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
