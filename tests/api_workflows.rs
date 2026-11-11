@@ -1831,6 +1831,84 @@ async fn bootstrap_fails_instead_of_using_an_unpersisted_placeholder_key() {
 }
 
 #[tokio::test]
+async fn body_paging_reuses_one_prepared_body_and_survives_extreme_offsets() {
+    use base64::Engine;
+
+    let (_directory, state, project_id) = test_state().await;
+    let payload = (0..10_000u32)
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<u8>>();
+    let mut captured = exchange(project_id, "GET", "/large");
+    captured.response_body = Some(payload.clone());
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+    let app = huntproxy::api::router(state.clone());
+
+    let mut reassembled = Vec::new();
+    let mut sha = None;
+    while reassembled.len() < payload.len() {
+        let page = json_response(
+            app.clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/projects/{}/exchanges/{}/body?side=response&offset={}&max_bytes=16384",
+                        project_id.get(),
+                        exchange_id.get(),
+                        reassembled.len()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(page["total_length"], payload.len());
+        let sha = sha.get_or_insert_with(|| page["sha256"].clone());
+        assert_eq!(&page["sha256"], sha);
+        reassembled.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(page["data"].as_str().unwrap())
+                .unwrap(),
+        );
+    }
+    assert_eq!(reassembled, payload);
+
+    let first = state
+        .prepared_body(project_id, exchange_id, MessageSide::Response, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = state
+        .prepared_body(project_id, exchange_id, MessageSide::Response, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "pages must share one prepared body"
+    );
+
+    // offset + max_bytes would overflow usize.
+    let past_end = json_response(
+        app.oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/body?side=response&offset={}&max_bytes=65536",
+                project_id.get(),
+                exchange_id.get(),
+                usize::MAX
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(past_end["length"], 0);
+    assert_eq!(past_end["truncated"], false);
+}
+
+#[tokio::test]
 async fn sitemap_and_findings_work_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let mut first = exchange(project_id, "GET", "/z-route");

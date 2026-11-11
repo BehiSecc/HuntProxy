@@ -1934,50 +1934,24 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(|v| v.as_u64())
                 .unwrap_or(4096)
                 .clamp(1, 1024 * 1024) as usize;
-            let stored_body = state
-                .db
-                .load_raw_body(project_id, ExchangeId(eid), side)
+            let prepared = state
+                .prepared_body(
+                    project_id,
+                    ExchangeId(eid),
+                    side,
+                    args.get("raw").and_then(Value::as_bool).unwrap_or(false),
+                )
                 .await?;
-            let available = stored_body.is_some();
-            let mut body = stored_body.unwrap_or_default();
-            let raw_total = body.len();
-            let mut content_encoding = None;
-            let mut decoded = false;
-            let detail = state
-                .db
-                .get_exchange_detail(project_id, ExchangeId(eid), PresentationOptions::default())
-                .await?;
-            if side == MessageSide::Request {
-                if detail.protocol == "HTTP/1.1 raw" {
-                    body = crate::reply::redact_raw_request_headers(&body);
-                }
-            } else if !args.get("raw").and_then(Value::as_bool).unwrap_or(false) {
-                if detail.protocol == "HTTP/1.1 raw" {
-                    body = crate::reply::presented_raw_response_body(&body);
-                }
-                let headers = state
-                    .db
-                    .load_raw_headers(project_id, ExchangeId(eid), MessageSide::Response)
-                    .await?;
-                let encodings = headers
-                    .iter()
-                    .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
-                    .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
-                    .filter(|encoding| {
-                        !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
-                    })
-                    .collect::<Vec<_>>();
-                if !encodings.is_empty() {
-                    let encoding = encodings.join(", ");
-                    body = crate::codec::decode_content_encodings(
-                        &body,
-                        &encoding,
-                        crate::codec::MAX_DECODED_BODY_OUTPUT,
-                    )?;
-                    content_encoding = Some(encoding);
-                    decoded = true;
-                }
-            }
+            let available = prepared.is_some();
+            let (body, raw_total, content_encoding, decoded) = match &prepared {
+                Some(prepared) => (
+                    prepared.data.as_slice(),
+                    prepared.raw_total,
+                    prepared.content_encoding.clone(),
+                    prepared.decoded,
+                ),
+                None => (&[][..], 0, None, false),
+            };
             let end = offset.saturating_add(max).min(body.len());
             let slice = if offset >= body.len() {
                 &body[..0]

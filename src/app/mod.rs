@@ -1,5 +1,8 @@
 //! Application service wiring, daemon lifecycle, graceful shutdown.
 
+mod body_cache;
+pub use body_cache::{BodyCache, PreparedBody};
+
 use crate::browser::BrowserService;
 use crate::config::Config;
 use crate::crawler::CrawlerService;
@@ -37,6 +40,7 @@ pub struct AppState {
     pub events: broadcast::Sender<AppEvent>,
     pub shutdown: CancellationToken,
     pub activity: ActivityTracker,
+    pub body_cache: BodyCache,
 }
 
 impl AppState {
@@ -395,6 +399,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         events,
         shutdown: CancellationToken::new(),
         activity: ActivityTracker::new(),
+        body_cache: BodyCache::default(),
     }))
 }
 

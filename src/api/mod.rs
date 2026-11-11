@@ -1615,74 +1615,13 @@ async fn get_body(
     let offset = q.offset.unwrap_or(0);
     let max_bytes = q.max_bytes.unwrap_or(64 * 1024).min(1024 * 1024);
     match state
-        .db
-        .load_raw_body(ProjectId(id), ExchangeId(eid), side)
+        .prepared_body(ProjectId(id), ExchangeId(eid), side, q.raw.unwrap_or(false))
         .await
     {
-        Ok(Some(mut body)) => {
-            let raw_total = body.len();
-            let mut content_encoding = None;
-            let mut decoded = false;
-            if side == MessageSide::Request {
-                if let Ok(detail) = state
-                    .db
-                    .get_exchange_detail(
-                        ProjectId(id),
-                        ExchangeId(eid),
-                        PresentationOptions::default(),
-                    )
-                    .await
-                {
-                    if detail.protocol == "HTTP/1.1 raw" {
-                        body = crate::reply::redact_raw_request_headers(&body);
-                    }
-                }
-            } else if !q.raw.unwrap_or(false) {
-                if let Ok(detail) = state
-                    .db
-                    .get_exchange_detail(
-                        ProjectId(id),
-                        ExchangeId(eid),
-                        PresentationOptions::default(),
-                    )
-                    .await
-                {
-                    if detail.protocol == "HTTP/1.1 raw" {
-                        body = crate::reply::presented_raw_response_body(&body);
-                    }
-                }
-                let headers = match state
-                    .db
-                    .load_raw_headers(ProjectId(id), ExchangeId(eid), MessageSide::Response)
-                    .await
-                {
-                    Ok(headers) => headers,
-                    Err(error) => return error_response(error),
-                };
-                let encodings = headers
-                    .iter()
-                    .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
-                    .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
-                    .filter(|encoding| {
-                        !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
-                    })
-                    .collect::<Vec<_>>();
-                if !encodings.is_empty() {
-                    let encoding = encodings.join(", ");
-                    body = match crate::codec::decode_content_encodings(
-                        &body,
-                        &encoding,
-                        crate::codec::MAX_DECODED_BODY_OUTPUT,
-                    ) {
-                        Ok(body) => body,
-                        Err(error) => return error_response(error),
-                    };
-                    content_encoding = Some(encoding);
-                    decoded = true;
-                }
-            }
+        Ok(Some(prepared)) => {
+            let body = &prepared.data;
             let total = body.len();
-            let end = (offset + max_bytes).min(total);
+            let end = offset.saturating_add(max_bytes).min(total);
             let slice = if offset >= total {
                 &body[..0]
             } else {
@@ -1694,13 +1633,13 @@ async fn get_body(
                 "offset": offset,
                 "length": slice.len(),
                 "truncated": end < total,
-                "sha256": crate::storage::sha256_hex(&body),
+                "sha256": prepared.sha256,
                 "encoding": "base64",
                 "data": b64,
                 "untrusted": true,
-                "decoded": decoded,
-                "content_encoding": content_encoding,
-                "raw_total_length": raw_total,
+                "decoded": prepared.decoded,
+                "content_encoding": prepared.content_encoding,
+                "raw_total_length": prepared.raw_total,
             }))
             .into_response()
         }

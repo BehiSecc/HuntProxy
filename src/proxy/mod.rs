@@ -1432,6 +1432,7 @@ mod tests {
             events,
             shutdown: CancellationToken::new(),
             activity: crate::app::ActivityTracker::new(),
+            body_cache: crate::app::BodyCache::default(),
         });
         let project = db
             .create_project(CreateProjectRequest {
