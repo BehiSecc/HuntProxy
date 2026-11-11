@@ -205,6 +205,34 @@ struct PersistentBrowserProfile {
     session_storage: BTreeMap<String, BTreeMap<String, String>>,
 }
 
+/// What this process last wrote to a profile's `state.json`: the checkpoint it
+/// holds and the file's size and modification time, so a file that was removed
+/// or replaced behind our back is read again instead of being trusted.
+struct PersistedProfileState {
+    checkpoint_hash: String,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl PersistedProfileState {
+    /// `None` when the file cannot be inspected.
+    fn of(path: &Path, checkpoint_hash: &str) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            checkpoint_hash: checkpoint_hash.to_string(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn holds(&self, path: &Path, checkpoint_hash: &str) -> bool {
+        self.checkpoint_hash == checkpoint_hash
+            && std::fs::metadata(path).is_ok_and(|metadata| {
+                metadata.len() == self.len && metadata.modified().ok() == self.modified
+            })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CookieSeed {
     name: String,
@@ -1022,13 +1050,18 @@ pub struct BrowserService {
     ca_cert_path: Option<PathBuf>,
     profiles_root: PathBuf,
     runtime: BrowserRuntimeInspection,
-    checkpoints: Mutex<HashMap<i64, Checkpoint>>,
+    /// Version of each session's latest checkpoint. Only the number is kept:
+    /// the checkpoint itself holds secrets and is never read back.
+    checkpoint_versions: Mutex<HashMap<i64, u64>>,
     runtime_sessions: Arc<Mutex<HashMap<i64, RuntimeSession>>>,
     cdp_reservations: Arc<std::sync::Mutex<HashMap<i64, u16>>>,
     profile_leases: Mutex<HashSet<(i64, String)>>,
     lifecycle: RwLock<()>,
     project_lifecycle: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
-    profile_io: Mutex<()>,
+    /// Serializes profile state file IO. It also remembers what this process
+    /// last wrote to each profile's `state.json`, so an unchanged checkpoint is
+    /// recognized without reading and parsing a file that can reach 25 MiB.
+    profile_io: Mutex<HashMap<(i64, String), PersistedProfileState>>,
     session_ops: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     workers: Mutex<HashMap<i64, Arc<Mutex<Option<WorkerProcess>>>>>,
     sandbox: std::sync::Mutex<HashMap<i64, SandboxState>>,
@@ -1175,13 +1208,13 @@ impl BrowserService {
             ca_cert_path: ca_cert_path.filter(|path| path.is_file()),
             profiles_root,
             runtime,
-            checkpoints: Mutex::new(HashMap::new()),
+            checkpoint_versions: Mutex::new(HashMap::new()),
             runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
             cdp_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             profile_leases: Mutex::new(HashSet::new()),
             lifecycle: RwLock::new(()),
             project_lifecycle: Mutex::new(HashMap::new()),
-            profile_io: Mutex::new(()),
+            profile_io: Mutex::new(HashMap::new()),
             session_ops: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             sandbox: std::sync::Mutex::new(HashMap::new()),
@@ -1829,7 +1862,10 @@ impl BrowserService {
         self.reap_worker(project_id).await;
         session.checkpoint_status = Some("start_failed".into());
         let _ = self.db.update_browser_session(session).await;
-        self.checkpoints.lock().await.remove(&session.id.get());
+        self.checkpoint_versions
+            .lock()
+            .await
+            .remove(&session.id.get());
         let _ = self
             .db
             .revoke_capture_session(project_id, capture_session_id)
@@ -2823,7 +2859,10 @@ impl BrowserService {
         }
         session.state = BrowserSessionState::Stopped;
         self.db.update_browser_session(&session).await?;
-        self.checkpoints.lock().await.remove(&session_id.get());
+        self.checkpoint_versions
+            .lock()
+            .await
+            .remove(&session_id.get());
         if let Some(runtime) = runtime {
             let _ = self
                 .db
@@ -3105,7 +3144,7 @@ impl BrowserService {
         };
         for (session_id, runtime) in runtimes {
             self.release_cdp_reservation(session_id);
-            self.checkpoints.lock().await.remove(&session_id);
+            self.checkpoint_versions.lock().await.remove(&session_id);
             self.session_ops.lock().await.remove(&session_id);
             if let Some(profile) = runtime.profile.as_ref().filter(|_| runtime.persistent) {
                 self.profile_leases
@@ -3227,7 +3266,9 @@ impl BrowserService {
         update: impl FnOnce(&mut PersistentBrowserProfile),
     ) -> DomainResult<()> {
         validate_browser_profile_name(profile_name)?;
-        let _guard = self.profile_io.lock().await;
+        let mut persisted = self.profile_io.lock().await;
+        // The update may change what the file holds; the next checkpoint reads it.
+        persisted.remove(&(project_id.get(), profile_name.to_string()));
         let path = self.profile_state_path(project_id, profile_name);
         let mut profile = match std::fs::read(&path) {
             Ok(encoded) if encoded.len() <= MAX_PERSISTENT_PROFILE_BYTES => {
@@ -3288,8 +3329,17 @@ impl BrowserService {
         checkpoint: &Checkpoint,
     ) -> DomainResult<()> {
         validate_browser_profile_name(profile_name)?;
-        let _guard = self.profile_io.lock().await;
+        let mut persisted = self.profile_io.lock().await;
+        let key = (project_id.get(), profile_name.to_string());
         let path = self.profile_state_path(project_id, profile_name);
+        // Most actions leave the checkpoint unchanged: skip reading the file.
+        if !checkpoint.hash.is_empty()
+            && persisted
+                .get(&key)
+                .is_some_and(|known| known.holds(&path, &checkpoint.hash))
+        {
+            return Ok(());
+        }
         let mut profile = match std::fs::read(&path) {
             Ok(encoded) if encoded.len() <= MAX_PERSISTENT_PROFILE_BYTES => {
                 serde_json::from_slice(&encoded).map_err(|_| {
@@ -3316,6 +3366,10 @@ impl BrowserService {
             }
         };
         if !checkpoint.hash.is_empty() && profile.checkpoint_hash == checkpoint.hash {
+            match PersistedProfileState::of(&path, &checkpoint.hash) {
+                Some(state) => persisted.insert(key, state),
+                None => persisted.remove(&key),
+            };
             return Ok(());
         }
         merge_persistent_profile(&mut profile, checkpoint);
@@ -3346,6 +3400,10 @@ impl BrowserService {
                 format!("commit browser profile state: {error}"),
             )
         })?;
+        match PersistedProfileState::of(&path, &checkpoint.hash) {
+            Some(state) => persisted.insert(key, state),
+            None => persisted.remove(&key),
+        };
         Ok(())
     }
 
@@ -3488,7 +3546,8 @@ impl BrowserService {
             }
         }
         let result = {
-            let _guard = self.profile_io.lock().await;
+            let mut persisted = self.profile_io.lock().await;
+            persisted.remove(&(project_id.get(), profile.to_string()));
             let removed_profile =
                 remove_browser_profile_path(&self.profile_directory(project_id, profile));
             let removed_chromium =
@@ -3546,7 +3605,8 @@ impl BrowserService {
         }
 
         let result = {
-            let _guard = self.profile_io.lock().await;
+            let mut persisted = self.profile_io.lock().await;
+            persisted.remove(&(project_id.get(), profile.to_string()));
             let state_target = if profile == DEFAULT_BROWSER_PROFILE {
                 self.profile_state_path(project_id, profile)
             } else {
@@ -3589,7 +3649,8 @@ impl BrowserService {
             .collect::<Vec<_>>();
         self.stop_sessions_inner(sessions).await?;
         {
-            let _profile_io = self.profile_io.lock().await;
+            let mut persisted = self.profile_io.lock().await;
+            persisted.retain(|(project, _), _| *project != project_id.get());
             remove_browser_profile_path(&self.project_profile_dir(project_id))?;
         }
         self.profile_leases
@@ -3608,13 +3669,13 @@ impl BrowserService {
         profile: Option<&str>,
     ) -> DomainResult<Checkpoint> {
         let mut checkpoint = decode_checkpoint(value)?;
-        let mut checkpoints = self.checkpoints.lock().await;
-        checkpoint.version = checkpoints
+        let mut versions = self.checkpoint_versions.lock().await;
+        checkpoint.version = versions
             .get(&session_id.get())
-            .map_or(1, |previous| previous.version.saturating_add(1));
+            .map_or(1, |previous| previous.saturating_add(1));
         checkpoint.hash = checkpoint_hash(&checkpoint)?;
-        checkpoints.insert(session_id.get(), checkpoint.clone());
-        drop(checkpoints);
+        versions.insert(session_id.get(), checkpoint.version);
+        drop(versions);
         if let Some(profile) = profile {
             self.persist_checkpoint(project_id, profile, &checkpoint)
                 .await?;
@@ -4935,6 +4996,147 @@ mod tests {
                     .mode()
                     & 0o777;
             assert_eq!(mode, 0o600);
+        }
+    }
+
+    fn hashed_checkpoint(value: &str) -> Checkpoint {
+        let mut checkpoint = Checkpoint {
+            url: Some("https://example.test/".into()),
+            cookies: vec![json!({"name":"sid","value":value,"domain":"example.test","path":"/"})],
+            ..Default::default()
+        };
+        checkpoint.hash = checkpoint_hash(&checkpoint).unwrap();
+        checkpoint
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_checkpoint_does_not_read_the_profile_file_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let project_id = ProjectId(42);
+        let checkpoint = hashed_checkpoint("one");
+        service
+            .persist_checkpoint(project_id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+
+        // Replace the file with garbage of the same size and modification time:
+        // reading it back would now fail, so success proves it was not read.
+        let path = service.profile_state_path(project_id, DEFAULT_BROWSER_PROFILE);
+        let written = std::fs::metadata(&path).unwrap();
+        let garbage = vec![b'x'; written.len() as usize];
+        std::fs::write(&path, &garbage).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written.modified().unwrap())
+            .unwrap();
+        service
+            .persist_checkpoint(project_id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), garbage);
+
+        // A different checkpoint is merged into what is on disk, which here is unreadable.
+        let error = service
+            .persist_checkpoint(
+                project_id,
+                DEFAULT_BROWSER_PROFILE,
+                &hashed_checkpoint("two"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::StorageError);
+    }
+
+    #[tokio::test]
+    async fn a_removed_or_replaced_profile_file_is_written_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "profile file".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let checkpoint = hashed_checkpoint("one");
+        let path = service.profile_state_path(project.id, DEFAULT_BROWSER_PROFILE);
+        service
+            .persist_checkpoint(project.id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        service
+            .persist_checkpoint(project.id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+        let loaded = service
+            .load_persistent_profile(project.id, DEFAULT_BROWSER_PROFILE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.checkpoint_hash, checkpoint.hash);
+
+        // Resetting the profile forgets what was written; the next checkpoint writes it all again.
+        assert!(service.reset_project_profile(project.id).await.unwrap());
+        assert!(service.profile_io.lock().await.is_empty());
+        assert!(!path.exists());
+        service
+            .persist_checkpoint(project.id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+        assert!(path.is_file());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_versions_advance_per_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "versions".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let service = BrowserService::new_with_proxy_and_ca(
+            db.clone(),
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let first = db.create_browser_session(project.id, None).await.unwrap();
+        let second = db.create_browser_session(project.id, None).await.unwrap();
+        let value = json!({"url":"https://example.test/","_private":{}});
+        for (session, expected) in [(&first, 1), (&first, 2), (&second, 1), (&first, 3)] {
+            let saved = service
+                .save_checkpoint(project.id, session.id, &value, "ok", None)
+                .await
+                .unwrap();
+            assert_eq!(saved.version, expected);
         }
     }
 
