@@ -8,7 +8,11 @@ Set `HUNTPROXY_CHROME_EXECUTABLE=/absolute/path/to/chrome` to select an installe
 
 Set environment variables before starting the daemon; existing sessions retain their process until restarted. `HuntProxy doctor` and browser status report the browser path, version, and mode.
 
+Each release keeps its browser worker in `browser-worker-<version>` in the data directory. Preparing a release removes the worker folders of releases older than the previous one; the previous release's folder stays so that rolling back keeps working. Other folders are never touched.
+
 If Chromium's sandbox cannot start, HuntProxy retries without it and reports the fallback in browser status and `HuntProxy doctor`.
+
+HuntProxy authenticates the browser to its own proxy and never offers those credentials to a site. A site's own HTTP authentication challenge is handled as in a plain browser, so a headless navigation to a protected page fails with `net::ERR_INVALID_AUTH_CREDENTIALS`. Put the site's credentials in the URL (`https://user:password@host/`) to sign in.
 
 The proxy verifies origin certificates using combined Chromium and Mozilla roots. Chromium root loading does not implement Chrome's additional root-policy or certificate-transparency checks.
 
