@@ -385,3 +385,37 @@ async fn private_catalog_route_is_read_only_and_returns_current_tools() {
     cancel.cancel();
     server.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn bridge_survives_malformed_input_and_answers_only_requests() {
+    let (mut bridge, _config) = Bridge::start(false).await;
+
+    // A non-UTF-8 line is a parse error, not the end of the bridge.
+    bridge
+        .input
+        .write_all(b"\xff\xfe not utf-8\n")
+        .await
+        .unwrap();
+    bridge.input.flush().await.unwrap();
+    let parse_error = bridge.next_message(Duration::from_secs(5)).await;
+    assert_eq!(parse_error["error"]["code"], -32700);
+
+    // Notifications never get a response, known or not.
+    bridge
+        .send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}))
+        .await;
+    bridge
+        .send(json!({"jsonrpc": "2.0", "method": "does/not/exist"}))
+        .await;
+    bridge
+        .send(json!({"jsonrpc": "2.0", "id": 77, "method": "does/not/exist"}))
+        .await;
+    // Responses are written in order, so the first message after the
+    // notifications must be the answer to the id-bearing request.
+    let unknown = bridge.next_message(Duration::from_secs(5)).await;
+    assert_eq!(unknown["id"], 77);
+    assert_eq!(unknown["error"]["code"], -32601);
+
+    let pong = bridge.rpc("ping", json!({})).await;
+    assert_eq!(pong["result"], json!({}));
+}
