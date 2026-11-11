@@ -2,9 +2,12 @@
 set -Eeuo pipefail
 
 REPOSITORY="BehiSecc/HuntProxy"
-PLUGIN_REPOSITORY="BehiSecc/HuntProxy-Plugins"
-NODE_VERSION="v22.23.2"
-LEGACY_PLUGIN_SHA="95ad5b29cb02e8b1aa1c0ec0b6d7cb1e485f0c32"
+# The oldest release this installer can install (the first with `install-release`).
+MINIMUM_VERSION="0.2.0"
+# HuntProxy provisions its own runtime; these pins only locate it when Chromium
+# needs system libraries. Keep them in step with src/installation.rs.
+NODE_VERSION="22.23.2"
+PLAYWRIGHT_VERSION="1.63.0"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; RESET='\033[0m'
@@ -24,7 +27,8 @@ Install HuntProxy and its local runtime from verified upstream downloads.
 Usage: install.sh [--version VERSION] [--install-dir DIR] [--data-dir DIR]
 
 Options:
-  --version VERSION   Install a release such as 0.2.0 or v0.2.0 (default: latest)
+  --version VERSION   Install a release such as 0.2.0 or v0.2.0 (default: latest;
+                      0.2.0 is the oldest release this installer can install)
   --install-dir DIR   Install the executable here (default: ~/.local/bin)
   --data-dir DIR      Store HuntProxy data here (default: ~/.huntproxy)
   -h, --help          Show this help
@@ -32,11 +36,12 @@ Options:
 Environment equivalents:
   HUNTPROXY_VERSION, HUNTPROXY_INSTALL_DIR, HUNTPROXY_DATA_DIR
 
-The installer downloads the HuntProxy release binary and a private Node.js
-runtime. HuntProxy 0.2 and newer provision their embedded, version-matched
-browser SDK and first-party plugins. Unmodified official plugins are upgraded;
-modified packages and custom plugin folders are preserved. Existing project
-data, CA files, and MCP client configuration are preserved.
+The installer downloads the HuntProxy release binary and verifies its
+checksum. The release then provisions its private Node.js runtime, its
+version-matched browser SDK and Chromium, and the first-party plugins.
+Unmodified official plugins are upgraded; modified packages and custom plugin
+folders are preserved. Existing project data, CA files, and MCP client
+configuration are preserved.
 EOF
 }
 
@@ -81,7 +86,7 @@ if [[ "$REQUESTED_VERSION" != latest ]] && [[ ! "$REQUESTED_VERSION" =~ ^v[0-9]+
   die 'version must be a stable semantic version such as v0.2.0'
 fi
 
-for command_name in awk cat chmod cp curl grep head id mkdir mktemp mv rm sed sleep sort tar tr uname; do
+for command_name in awk cat chmod curl grep id mkdir mktemp rm sed tar tr uname; do
   command -v "$command_name" >/dev/null 2>&1 \
     || die "$command_name is required; install it and rerun this script"
 done
@@ -95,60 +100,12 @@ else
 fi
 
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/huntproxy-install.XXXXXX")"
-NEW_BIN=''; LOCK_DIR=''; LOCK_HELD=0; VERIFY_PID=''; NODE_BACKUP=''; WORKER_BACKUP=''; PLUGIN_DIR=''
-NODE_INCOMING=''; PLUGIN_INCOMING=''; PLUGIN_SOURCE_TEMP=''
-NODE_INSTALLED=0; NODE_REUSED=0; WORKER_TOUCHED=0; STATE_BACKED_UP=0; INSTALL_COMPLETE=0
-CURRENT_RUNTIME=0
-NEW_PLUGIN_LIST="$TEMP_DIR/new-plugins"
-: >"$NEW_PLUGIN_LIST"
-STATE_BACKUP="$TEMP_DIR/state-backup"
-STATE_FILES=(config.toml huntproxy.db huntproxy.db-wal huntproxy.db-shm bb.db bb.db-wal bb.db-shm ca/ca.crt ca/ca.key placeholder.key .mcp-stop-guard licenses/LICENSE)
 
-remove_managed_tree() {
-  local target=$1 parent=$2
-  [[ -n "$target" && "$target" == "$parent/"* && "$target" != "$parent" ]] || return 1
-  rm -rf -- "$target"
-}
-
+# Everything this script changes outside TEMP_DIR is done by `HuntProxy
+# install-release`, which rolls itself back and reports the result when it fails.
 cleanup() {
   local status=$?
   set +e
-  if [[ -n "$VERIFY_PID" ]]; then
-    kill "$VERIFY_PID" >/dev/null 2>&1
-    wait "$VERIFY_PID" >/dev/null 2>&1
-  fi
-  if [[ "$status" -ne 0 && "$INSTALL_COMPLETE" -eq 0 ]]; then
-    if [[ "$WORKER_TOUCHED" -eq 1 && -n "${WORKER_DIR:-}" ]]; then
-      remove_managed_tree "$WORKER_DIR" "$DATA_DIR"
-      [[ -z "$WORKER_BACKUP" || ! -d "$WORKER_BACKUP" ]] || mv -- "$WORKER_BACKUP" "$WORKER_DIR"
-    fi
-    if [[ "$NODE_INSTALLED" -eq 1 && -n "${MANAGED_NODE_DIR:-}" ]]; then
-      remove_managed_tree "$MANAGED_NODE_DIR" "$DATA_DIR/runtime"
-      [[ -z "$NODE_BACKUP" || ! -d "$NODE_BACKUP" ]] || mv -- "$NODE_BACKUP" "$MANAGED_NODE_DIR"
-    fi
-    while IFS= read -r plugin_path; do
-      [[ -z "$plugin_path" ]] || remove_managed_tree "$plugin_path" "$PLUGIN_DIR"
-    done <"$NEW_PLUGIN_LIST"
-    if [[ "$STATE_BACKED_UP" -eq 1 ]]; then
-      for relative in "${STATE_FILES[@]}"; do
-        state_target="$DATA_DIR/$relative"
-        state_source="$STATE_BACKUP/$relative"
-        [[ ! -f "$state_target" && ! -L "$state_target" ]] || rm -f -- "$state_target"
-        if [[ -f "$state_source" ]]; then
-          mkdir -p "${state_target%/*}"
-          cp -p -- "$state_source" "$state_target"
-        fi
-      done
-    fi
-    warn 'Installation failed before the HuntProxy binary was replaced.'
-  fi
-  [[ -z "$NEW_BIN" || ! -e "$NEW_BIN" ]] || rm -f -- "$NEW_BIN"
-  [[ -z "$NODE_INCOMING" || ! -d "$NODE_INCOMING" ]] || remove_managed_tree "$NODE_INCOMING" "$DATA_DIR/runtime"
-  [[ -z "$PLUGIN_INCOMING" || ! -d "$PLUGIN_INCOMING" ]] || remove_managed_tree "$PLUGIN_INCOMING" "$PLUGIN_DIR"
-  [[ -z "$PLUGIN_SOURCE_TEMP" || ! -f "$PLUGIN_SOURCE_TEMP" ]] || rm -f -- "$PLUGIN_SOURCE_TEMP"
-  [[ -z "$NODE_BACKUP" || ! -d "$NODE_BACKUP" ]] || remove_managed_tree "$NODE_BACKUP" "$DATA_DIR/runtime"
-  [[ -z "$WORKER_BACKUP" || ! -d "$WORKER_BACKUP" ]] || remove_managed_tree "$WORKER_BACKUP" "$DATA_DIR"
-  [[ "$LOCK_HELD" -eq 0 || ! -d "$LOCK_DIR" ]] || rmdir "$LOCK_DIR" >/dev/null 2>&1
   rm -rf -- "$TEMP_DIR"
   exit "$status"
 }
@@ -170,13 +127,6 @@ version_at_least() {
   }'
 }
 
-node_runtime_ready() {
-  local runtime=$1
-  [[ -x "$runtime/bin/node" && -x "$runtime/bin/npm" ]] \
-    && [[ "$("$runtime/bin/node" --version 2>/dev/null)" == "$NODE_VERSION" ]] \
-    && PATH="$runtime/bin:$PATH" "$runtime/bin/npm" --version >/dev/null 2>&1
-}
-
 browser_node_supported() {
   local version
   [[ -x "$1" ]] || return 1
@@ -185,35 +135,8 @@ browser_node_supported() {
   ((10#${BASH_REMATCH[1]} >= 20))
 }
 
-browser_smoke() {
-  local worker=$1 output_name=$2
-  local worker_path="$worker/index.js"
-  local playwright_path="$worker/node_modules/playwright-core"
-  [[ -f "$worker_path" && -f "$playwright_path/cli.js" ]] || return 1
-  PLAYWRIGHT_BROWSERS_PATH=0 \
-  HUNTPROXY_PLAYWRIGHT_CORE_PATH="$playwright_path" \
-  "$MANAGED_NODE_DIR/bin/node" "$worker_path" \
-    <"$TEMP_DIR/browser-smoke.ndjson" \
-    >"$TEMP_DIR/$output_name.out" 2>"$TEMP_DIR/$output_name.err" || return 1
-  "$MANAGED_NODE_DIR/bin/node" -e '
-const fs = require("fs");
-const rows = fs.readFileSync(process.argv[1], "utf8").trim().split(/\n+/).map(JSON.parse);
-for (const id of [1, 2, 3]) {
-  const row = rows.find((entry) => entry.id === id);
-  if (!row || row.error) process.exit(1);
-}
-' "$TEMP_DIR/$output_name.out"
-}
-
-show_browser_smoke_error() {
-  local output_name=$1
-  [[ ! -f "$TEMP_DIR/$output_name.out" ]] || sed -n '1,120p' "$TEMP_DIR/$output_name.out" >&2
-  [[ ! -f "$TEMP_DIR/$output_name.err" ]] || sed -n '1,120p' "$TEMP_DIR/$output_name.err" >&2
-}
-
 install_chromium_runtime_libraries() {
-  local playwright_path=$1
-  local node_path=${2:-$MANAGED_NODE_DIR/bin/node}
+  local playwright_path=$1 node_path=$2
   [[ -x "$node_path" && -f "$playwright_path/cli.js" ]] || return 1
   command -v apt-get >/dev/null 2>&1 || return 1
   if [[ "$(id -u)" == 0 ]]; then
@@ -225,18 +148,10 @@ install_chromium_runtime_libraries() {
 
 os_name="$(uname -s)"; arch_name="$(uname -m)"
 case "$os_name/$arch_name" in
-  Linux/x86_64|Linux/amd64)
-    ASSET_NAME='huntproxy-linux-x86_64.tar.gz'; NODE_PLATFORM='linux-x64'
-    ;;
-  Linux/arm64|Linux/aarch64)
-    ASSET_NAME='huntproxy-linux-aarch64.tar.gz'; NODE_PLATFORM='linux-arm64'
-    ;;
-  Darwin/x86_64|Darwin/amd64)
-    ASSET_NAME='huntproxy-mac-intel-chip.tar.gz'; NODE_PLATFORM='darwin-x64'
-    ;;
-  Darwin/arm64|Darwin/aarch64)
-    ASSET_NAME='huntproxy-mac-apple-chip.tar.gz'; NODE_PLATFORM='darwin-arm64'
-    ;;
+  Linux/x86_64|Linux/amd64) ASSET_NAME='huntproxy-linux-x86_64.tar.gz' ;;
+  Linux/arm64|Linux/aarch64) ASSET_NAME='huntproxy-linux-aarch64.tar.gz' ;;
+  Darwin/x86_64|Darwin/amd64) ASSET_NAME='huntproxy-mac-intel-chip.tar.gz' ;;
+  Darwin/arm64|Darwin/aarch64) ASSET_NAME='huntproxy-mac-apple-chip.tar.gz' ;;
   Linux/*|Darwin/*) die "unsupported CPU architecture: $arch_name" ;;
   *) die "unsupported operating system: $os_name" ;;
 esac
@@ -253,6 +168,8 @@ else
 fi
 [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
   || die "release has an unsupported version tag: $RELEASE_TAG"
+version_at_least "$RELEASE_TAG" "$MINIMUM_VERSION" \
+  || die "HuntProxy $RELEASE_TAG is no longer supported; install v$MINIMUM_VERSION or newer"
 
 info "Downloading HuntProxy $RELEASE_TAG"
 RELEASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
@@ -282,9 +199,6 @@ tar -xOzf "$DOWNLOAD_DIR/$ASSET_NAME" HuntProxy >"$STAGED_BIN" || die 'cannot ex
 chmod 755 "$STAGED_BIN"
 binary_version="$("$STAGED_BIN" --version 2>/dev/null | awk '{print $NF}')" || die 'the downloaded binary cannot run'
 [[ "$binary_version" == "${RELEASE_TAG#v}" ]] || die "release $RELEASE_TAG contains HuntProxy $binary_version"
-if version_at_least "$binary_version" "0.2.0"; then
-  CURRENT_RUNTIME=1
-fi
 
 # Persist absolute paths in generated configuration and MCP registrations. A
 # relative installer path would otherwise be resolved against each client's
@@ -295,352 +209,58 @@ INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
 HOME_CANON="$(cd "$HOME" && pwd -P)"
 [[ "$DATA_DIR" != / && "$DATA_DIR" != "$HOME_CANON" ]] \
   || die 'data directory is too broad'
-MANAGED_NODE_DIR="$DATA_DIR/runtime/node"
-
-if [[ "$CURRENT_RUNTIME" -eq 0 ]]; then
-# Reuse the private managed runtime when it is already the pinned version.
-if node_runtime_ready "$MANAGED_NODE_DIR"; then
-  STAGED_NODE=$MANAGED_NODE_DIR
-  NODE_REUSED=1
-  ok "Existing Node.js $NODE_VERSION runtime verified and reused"
-else
-  NODE_ASSET="node-$NODE_VERSION-$NODE_PLATFORM.tar.gz"
-  NODE_DOWNLOAD="$TEMP_DIR/node-download"; mkdir -p "$NODE_DOWNLOAD"
-  info "Downloading Node.js $NODE_VERSION"
-  curl_download "https://nodejs.org/dist/$NODE_VERSION/$NODE_ASSET" "$NODE_DOWNLOAD/$NODE_ASSET" \
-    || die "could not download $NODE_ASSET"
-  curl_download "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt" "$NODE_DOWNLOAD/SHASUMS256.txt" \
-    || die 'could not download Node.js checksums'
-  node_checksum="$(awk -v name="$NODE_ASSET" '$2 == name { print $1 }' "$NODE_DOWNLOAD/SHASUMS256.txt")"
-  [[ "$node_checksum" =~ ^[0-9A-Fa-f]{64}$ ]] || die "Node.js checksums do not contain $NODE_ASSET"
-  [[ "$(sha256_file "$NODE_DOWNLOAD/$NODE_ASSET")" == "$node_checksum" ]] || die 'Node.js checksum verification failed'
-  NODE_ROOT="${NODE_ASSET%.tar.gz}"
-  node_members="$(tar -tzf "$NODE_DOWNLOAD/$NODE_ASSET")" || die 'the Node.js archive could not be read'
-  while IFS= read -r member; do
-    case "${member%/}" in
-      "$NODE_ROOT"|"$NODE_ROOT"/*) ;;
-      *) die "unsafe Node.js archive member: $member" ;;
-    esac
-    case "/${member%/}/" in */../*|*//*) die "unsafe Node.js archive path: $member" ;; esac
-  done <<<"$node_members"
-  mkdir -p "$TEMP_DIR/node"
-  tar -xzf "$NODE_DOWNLOAD/$NODE_ASSET" -C "$TEMP_DIR/node" || die 'could not extract Node.js'
-  STAGED_NODE="$TEMP_DIR/node/$NODE_ROOT"
-  node_runtime_ready "$STAGED_NODE" || die 'the staged Node.js runtime failed verification'
-  ok 'Node.js checksum and runtime verified'
-fi
-
-# Legacy hosts receive the exact plugin snapshot published alongside v0.1.1,
-# never a moving branch.
-PLUGIN_SHA=$LEGACY_PLUGIN_SHA
-PLUGIN_ARCHIVE="$TEMP_DIR/plugins.tar.gz"
-info "Downloading legacy first-party plugins at ${PLUGIN_SHA:0:12}"
-curl_download "https://github.com/$PLUGIN_REPOSITORY/archive/$PLUGIN_SHA.tar.gz" "$PLUGIN_ARCHIVE" \
-  || die 'could not download the legacy first-party plugins'
-  plugin_members="$(tar -tzf "$PLUGIN_ARCHIVE")" || die 'the plugin archive could not be read'
-  PLUGIN_ROOT=''
-  while IFS= read -r member; do
-    normalized="${member%/}"
-    case "$normalized" in ''|/*|..|../*|*/..|*/../*) die "unsafe plugin archive path: $member" ;; esac
-    root="${normalized%%/*}"
-    [[ -n "$PLUGIN_ROOT" ]] || PLUGIN_ROOT=$root
-    [[ "$root" == "$PLUGIN_ROOT" ]] || die 'the plugin archive contains multiple roots'
-  done <<<"$plugin_members"
-  plugin_details="$(tar -tvzf "$PLUGIN_ARCHIVE")" || die 'the plugin archive could not be inspected'
-  while IFS= read -r detail; do
-    case "${detail:0:1}" in -|d) ;; *) die 'the plugin archive contains a link or special file' ;; esac
-  done <<<"$plugin_details"
-  mkdir -p "$TEMP_DIR/plugins"
-  tar -xzf "$PLUGIN_ARCHIVE" -C "$TEMP_DIR/plugins" || die 'could not extract the plugins'
-  PLUGIN_SOURCE="$TEMP_DIR/plugins/$PLUGIN_ROOT"
-  [[ -d "$PLUGIN_SOURCE/plugins" ]] || die 'the plugin snapshot has no plugins directory'
-  plugin_count=0
-  for plugin_source in "$PLUGIN_SOURCE/plugins/"*; do
-    [[ -d "$plugin_source" ]] || continue
-    [[ -f "$plugin_source/plugin.json" && -f "$plugin_source/index.js" ]] \
-      || die "invalid plugin directory: ${plugin_source##*/}"
-    plugin_count=$((plugin_count + 1))
-  done
-  [[ "$plugin_count" -gt 0 ]] || die 'the plugin snapshot is empty'
-  if ! PATH="$STAGED_NODE/bin:$PATH" "$STAGED_NODE/bin/npm" test --prefix "$PLUGIN_SOURCE" >"$TEMP_DIR/plugin-tests.log" 2>&1; then
-    sed -n '1,160p' "$TEMP_DIR/plugin-tests.log" >&2
-    die 'the legacy first-party plugin validation suite failed'
-  fi
-ok "$plugin_count legacy first-party plugins validated"
-
-# From this point on, serialize target changes and keep rollback copies.
-mkdir -p "$DATA_DIR" "$INSTALL_DIR"
 chmod 700 "$DATA_DIR"
-DATA_DIR_CANON="$(cd "$DATA_DIR" && pwd -P)"
-INSTALL_DIR_CANON="$(cd "$INSTALL_DIR" && pwd -P)"
-LOCK_DIR="$DATA_DIR/.installer-lock"
-mkdir "$LOCK_DIR" 2>/dev/null || die "another installer is active; remove $LOCK_DIR only if no installer is running"
-LOCK_HELD=1
 
-PLUGIN_DIR="$DATA_DIR/plugins"
-if [[ -f "$DATA_DIR/config.toml" ]]; then
-  configured_plugin_dir="$(sed -n 's/^plugin_dir = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"
-  [[ -z "$configured_plugin_dir" ]] || PLUGIN_DIR=$configured_plugin_dir
-fi
-[[ ! -L "$PLUGIN_DIR" ]] || die "refusing symlinked plugin directory: $PLUGIN_DIR"
-[[ ! -e "$PLUGIN_DIR" || -d "$PLUGIN_DIR" ]] || die "plugin path is not a directory: $PLUGIN_DIR"
-mkdir -p "$PLUGIN_DIR"
-PLUGIN_DIR="$(cd "$PLUGIN_DIR" && pwd -P)"
-[[ -n "${PLUGIN_DIR%/*}" ]] || die 'configured plugin_dir is too broad for safe installation'
-case "$PLUGIN_DIR" in /|"$HOME"|"$DATA_DIR_CANON"|"$INSTALL_DIR_CANON") die 'configured plugin_dir is too broad for safe installation' ;; esac
-case "$DATA_DIR_CANON/" in "$PLUGIN_DIR/"*) die 'configured plugin_dir contains the HuntProxy data directory' ;; esac
-case "$INSTALL_DIR_CANON/" in "$PLUGIN_DIR/"*) die 'configured plugin_dir contains the install directory' ;; esac
-chmod 700 "$PLUGIN_DIR"
-
-ca_cert_exists=0; ca_key_exists=0
-[[ ! -e "$DATA_DIR/ca/ca.crt" ]] || ca_cert_exists=1
-[[ ! -e "$DATA_DIR/ca/ca.key" ]] || ca_key_exists=1
-case "$ca_cert_exists$ca_key_exists" in
-  00|11) ;;
-  *) die "incomplete CA in $DATA_DIR/ca; restore the missing certificate or key before installing" ;;
-esac
-if [[ -S "$DATA_DIR/daemon.sock" ]]; then
-  status_output="$("$STAGED_BIN" --data-dir "$DATA_DIR" status 2>&1 || true)"
-  case "$status_output" in *'daemon: running'*|*'daemon: unhealthy'*) die 'HuntProxy is running; run HuntProxy stop, restart/reconnect AI clients, then rerun the installer' ;; esac
-fi
-
-[[ ! -L "$DATA_DIR/licenses" ]] || die "refusing symlinked license directory: $DATA_DIR/licenses"
-mkdir -p "$STATE_BACKUP"
-for relative in "${STATE_FILES[@]}"; do
-  state_target="$DATA_DIR/$relative"
-  [[ ! -L "$state_target" ]] || die "refusing symlinked state file: $state_target"
-  if [[ -f "$state_target" ]]; then
-    state_source="$STATE_BACKUP/$relative"
-    mkdir -p "${state_source%/*}"
-    cp -p -- "$state_target" "$state_source"
-  fi
-done
-STATE_BACKED_UP=1
-STOP_GUARD_EXISTED=0
-[[ ! -f "$STATE_BACKUP/.mcp-stop-guard" ]] || STOP_GUARD_EXISTED=1
-
-mkdir -p "$DATA_DIR/runtime"
-if [[ "$NODE_REUSED" -eq 1 ]]; then
-  node_runtime_ready "$MANAGED_NODE_DIR" || die 'the managed Node.js runtime changed during installation'
-else
-  NODE_INCOMING="$(mktemp -d "$DATA_DIR/runtime/.node.new.XXXXXX")"
-  cp -R "$STAGED_NODE/." "$NODE_INCOMING/"
-  node_runtime_ready "$NODE_INCOMING" || die 'the copied Node.js runtime failed verification'
-  if [[ -e "$MANAGED_NODE_DIR" ]]; then
-    NODE_BACKUP="$(mktemp -d "$DATA_DIR/runtime/.node.old.XXXXXX")"
-    rmdir "$NODE_BACKUP"
-    mv -- "$MANAGED_NODE_DIR" "$NODE_BACKUP"
-  fi
-  mv -- "$NODE_INCOMING" "$MANAGED_NODE_DIR"
-  NODE_INCOMING=''
-  NODE_INSTALLED=1
-fi
-export PATH="$MANAGED_NODE_DIR/bin:$PATH"
-
-# Only initialize when there is no CA. This keeps old release binaries from
-# rotating an existing CA; the application also enforces this invariant.
-if [[ ! -e "$DATA_DIR/ca/ca.crt" && ! -e "$DATA_DIR/ca/ca.key" ]]; then
-  info "Initializing $DATA_DIR"
-  "$STAGED_BIN" --data-dir "$DATA_DIR" init >"$TEMP_DIR/init.log" \
-    || { sed -n '1,120p' "$TEMP_DIR/init.log" >&2; die 'HuntProxy initialization failed'; }
-fi
-[[ -f "$DATA_DIR/ca/ca.crt" && -f "$DATA_DIR/ca/ca.key" ]] \
-  || die 'HuntProxy initialization did not create a complete CA'
-CA_CERT_HASH="$(sha256_file "$DATA_DIR/ca/ca.crt")"
-CA_KEY_HASH="$(sha256_file "$DATA_DIR/ca/ca.key")"
-
-WORKER_DIR="$DATA_DIR/browser-worker-$binary_version"
-  cat >"$TEMP_DIR/browser-smoke.ndjson" <<'EOF'
-{"jsonrpc":"2.0","id":1,"method":"hello"}
-{"jsonrpc":"2.0","id":2,"method":"session.start","params":{"session_id":1,"engine":"chromium","url":"about:blank","persistent":false}}
-{"jsonrpc":"2.0","id":3,"method":"session.stop","params":{"session_id":1}}
-EOF
-# The embedded lock can change without the HuntProxy version changing. Refresh
-# it even when an older SDK/browser still launches, preserving rollback below.
-if [[ -d "$WORKER_DIR" ]]; then
-  WORKER_BACKUP="$(mktemp -d "$DATA_DIR/.browser-worker.old.XXXXXX")"
-  rmdir "$WORKER_BACKUP"
-  mv -- "$WORKER_DIR" "$WORKER_BACKUP"
-fi
-WORKER_TOUCHED=1
-info 'Installing the legacy Chromium runtime in the HuntProxy data directory'
-"$STAGED_BIN" --data-dir "$DATA_DIR" browser install >"$TEMP_DIR/browser-install.log" 2>&1 \
-  || { sed -n '1,160p' "$TEMP_DIR/browser-install.log" >&2; die 'browser runtime installation failed'; }
-
-if ! browser_smoke "$WORKER_DIR" browser-installed; then
+info 'Coordinating release preparation and activation'
+if ! "$STAGED_BIN" install-release \
+  --executable "$INSTALL_DIR/HuntProxy" \
+  --data-dir "$DATA_DIR" >"$TEMP_DIR/install-release.log" 2>&1; then
   linux_id=''
   if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
     linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
   fi
-  if [[ "$linux_id" != ubuntu && "$linux_id" != debian ]]; then
-    show_browser_smoke_error browser-installed
-    die 'Chromium could not launch; automatic system libraries are supported only on Debian/Ubuntu'
+  stable_playwright="$DATA_DIR/runtime/playwright-core-$PLAYWRIGHT_VERSION"
+  runtime_node=''
+  if [[ -f "$DATA_DIR/config.toml" ]]; then
+    runtime_node="$(sed -n 's/^node_path = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"
   fi
-  if [[ "$(id -u)" != 0 ]] && ! { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
-    show_browser_smoke_error browser-installed
-    die 'Chromium needs system libraries; rerun interactively with sudo available'
+  if ! browser_node_supported "$runtime_node"; then
+    runtime_node="$DATA_DIR/runtime/node-$NODE_VERSION/bin/node"
   fi
-  info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
-  install_chromium_runtime_libraries "$WORKER_DIR/node_modules/playwright-core" >"$TEMP_DIR/browser-deps.log" 2>&1 \
-    || {
-      sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
-      show_browser_smoke_error browser-installed
-      die 'Chromium system library installation failed'
-    }
-  if ! browser_smoke "$WORKER_DIR" browser-with-deps; then
-    show_browser_smoke_error browser-with-deps
-    die 'Chromium still could not launch after installing its system libraries'
+  if ! browser_node_supported "$runtime_node"; then
+    runtime_node="$(command -v node 2>/dev/null || true)"
   fi
-fi
-ok 'Chromium launched successfully'
-
-installed_plugins=0; preserved_plugins=0
-for plugin_source in "$PLUGIN_SOURCE/plugins/"*; do
-    [[ -d "$plugin_source" ]] || continue
-    plugin_name="${plugin_source##*/}"
-    plugin_target="$PLUGIN_DIR/$plugin_name"
-    if [[ -e "$plugin_target" ]]; then
-      preserved_plugins=$((preserved_plugins + 1))
-      continue
-    fi
-    plugin_incoming="$(mktemp -d "$PLUGIN_DIR/.plugin.new.XXXXXX")"
-    PLUGIN_INCOMING=$plugin_incoming
-    cp -R "$plugin_source/." "$plugin_incoming/"
-    mv -- "$plugin_incoming" "$plugin_target"
-    PLUGIN_INCOMING=''
-    printf '%s\n' "$plugin_target" >>"$NEW_PLUGIN_LIST"
-    installed_plugins=$((installed_plugins + 1))
-done
-ok "$installed_plugins legacy plugins installed; $preserved_plugins existing plugin folders preserved"
-
-# Doctor output stays private: only concise assertions are surfaced.
-DOCTOR_OUTPUT="$("$STAGED_BIN" --data-dir "$DATA_DIR" doctor 2>&1)" || die 'HuntProxy doctor failed'
-printf '%s\n' "$DOCTOR_OUTPUT" | grep -Eq '^[[:space:]]*db:.*exists=true$' || die 'database readiness check failed'
-printf '%s\n' "$DOCTOR_OUTPUT" | grep -Eq '^[[:space:]]*ca:.*exists=true$' || die 'CA readiness check failed'
-printf '%s\n' "$DOCTOR_OUTPUT" | grep -Eq '^[[:space:]]*node:[[:space:]]+.+$' || die 'Node.js readiness check failed'
-printf '%s\n' "$DOCTOR_OUTPUT" | grep -Eq '^[[:space:]]*node:[[:space:]]+not found$' && die 'Node.js readiness check failed'
-printf '%s\n' "$DOCTOR_OUTPUT" | grep -Eq '^[[:space:]]*worker:[[:space:]]+ready$' || die 'browser worker readiness check failed'
-printf '%s\n' "$DOCTOR_OUTPUT" | grep -Eq '^[[:space:]]*chromium:[[:space:]]+.+$' || die 'Chromium readiness check failed'
-printf '%s\n' "$DOCTOR_OUTPUT" | grep -Eq '^[[:space:]]*chromium:[[:space:]]+not found$' && die 'Chromium readiness check failed'
-[[ "$(sha256_file "$DATA_DIR/ca/ca.crt")" == "$CA_CERT_HASH" ]] || die 'CA certificate changed during installation'
-[[ "$(sha256_file "$DATA_DIR/ca/ca.key")" == "$CA_KEY_HASH" ]] || die 'CA key changed during installation'
-
-# Load the final plugin set through the real daemon, then shut down that
-# foreground verification process without creating an MCP stop guard.
-API_ADDR="$(printf '%s\n' "$DOCTOR_OUTPUT" | awk '$1 == "api:" { print $2; exit }')"
-[[ -n "$API_ADDR" ]] || die 'could not resolve the local API address'
-"$STAGED_BIN" --data-dir "$DATA_DIR" serve >"$TEMP_DIR/serve.log" 2>&1 &
-VERIFY_PID=$!
-health_ready=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if curl -fsS "http://$API_ADDR/api/v1/health" >"$TEMP_DIR/health.json" 2>/dev/null; then health_ready=1; break; fi
-  sleep 1
-done
-[[ "$health_ready" -eq 1 ]] || { sed -n '1,120p' "$TEMP_DIR/serve.log" >&2; die 'the HuntProxy daemon did not become healthy'; }
-curl -fsS "http://$API_ADDR/api/v1/extensions" -o "$TEMP_DIR/extensions.json" || die 'could not verify loaded plugins'
-set +e
-"$MANAGED_NODE_DIR/bin/node" -e '
-const fs = require("fs");
-const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-if (!Array.isArray(result.plugins) || !Array.isArray(result.load_issues)) process.exit(1);
-if (result.load_issues.length) process.exit(2);
-' "$TEMP_DIR/extensions.json"
-extension_status=$?
-set -e
-case "$extension_status" in
-  0) ;;
-  2) warn 'One or more preserved or custom plugins did not load; HuntProxy itself is ready.' ;;
-  *) die 'the extension status response was invalid' ;;
-esac
-kill "$VERIFY_PID" >/dev/null 2>&1 || true
-wait "$VERIFY_PID" >/dev/null 2>&1 || true
-VERIFY_PID=''
-if [[ "$STOP_GUARD_EXISTED" -eq 1 ]]; then
-  cp -p -- "$STATE_BACKUP/.mcp-stop-guard" "$DATA_DIR/.mcp-stop-guard"
-fi
-ok 'HuntProxy daemon and plugins verified'
-
-# Preserve the bundled project license and third-party attributions.
-license_count="$(awk '$0 == "LICENSE" { count++ } END { print count + 0 }' <<<"$archive_members")"
-[[ "$license_count" -le 1 ]] || die 'duplicate release LICENSE'
-if [[ "$license_count" -eq 1 ]]; then
-  license_details="$(tar -tvzf "$DOWNLOAD_DIR/$ASSET_NAME" LICENSE)" || die 'cannot inspect LICENSE'
-  [[ "${license_details:0:1}" == '-' ]] || die 'the LICENSE archive member must be a regular file'
-  mkdir -p "$DATA_DIR/licenses"
-  tar -xOzf "$DOWNLOAD_DIR/$ASSET_NAME" LICENSE >"$DATA_DIR/licenses/LICENSE" || die 'cannot extract LICENSE'
-fi
-
-# The executable is the last component replaced.
-NEW_BIN="$(mktemp "$INSTALL_DIR/.HuntProxy.new.XXXXXX")"
-cp -- "$STAGED_BIN" "$NEW_BIN"; chmod 755 "$NEW_BIN"
-"$NEW_BIN" --version >/dev/null || die 'the installed executable failed its final check'
-mv -f -- "$NEW_BIN" "$INSTALL_DIR/HuntProxy"
-NEW_BIN=''; INSTALL_COMPLETE=1
-if PLUGIN_SOURCE_TEMP="$(mktemp "$PLUGIN_DIR/.first-party-source.new.XXXXXX")" \
-  && printf '%s\n' "$PLUGIN_SHA" >"$PLUGIN_SOURCE_TEMP" \
-  && chmod 600 "$PLUGIN_SOURCE_TEMP" \
-  && mv -f -- "$PLUGIN_SOURCE_TEMP" "$PLUGIN_DIR/.huntproxy-first-party-source"; then
-  PLUGIN_SOURCE_TEMP=''
-else
-  [[ -z "$PLUGIN_SOURCE_TEMP" || ! -f "$PLUGIN_SOURCE_TEMP" ]] || rm -f -- "$PLUGIN_SOURCE_TEMP"
-  PLUGIN_SOURCE_TEMP=''
-  warn 'Could not record the legacy first-party plugin source commit.'
-fi
-else
-  mkdir -p "$DATA_DIR" "$INSTALL_DIR"
-  chmod 700 "$DATA_DIR"
-  info 'Coordinating release preparation and activation'
-  if ! "$STAGED_BIN" install-release \
-    --executable "$INSTALL_DIR/HuntProxy" \
-    --data-dir "$DATA_DIR" >"$TEMP_DIR/install-release.log" 2>&1; then
-    linux_id=''
-    if [[ "$os_name" == Linux && -r /etc/os-release ]]; then
-      linux_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | awk 'NR == 1 { print }')"
-    fi
-    stable_playwright="$DATA_DIR/runtime/playwright-core-1.63.0"
-    runtime_node=''
-    if [[ -f "$DATA_DIR/config.toml" ]]; then
-      runtime_node="$(sed -n 's/^node_path = "\(.*\)"$/\1/p' "$DATA_DIR/config.toml" | awk 'NR == 1 { print }')"
-    fi
-    if ! browser_node_supported "$runtime_node"; then
-      runtime_node="$DATA_DIR/runtime/node-22.23.2/bin/node"
-    fi
-    if ! browser_node_supported "$runtime_node"; then
-      runtime_node="$(command -v node 2>/dev/null || true)"
-    fi
-    can_request_packages=0
-    if [[ "$(id -u)" == 0 ]] || { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
-      can_request_packages=1
-    fi
-    if [[ "$linux_id" =~ ^(ubuntu|debian)$ ]] \
-      && [[ "$can_request_packages" -eq 1 ]] \
-      && browser_node_supported "$runtime_node" \
-      && [[ -f "$stable_playwright/cli.js" ]] \
-      && grep -Eqi 'chromium|browser validation|browser worker' "$TEMP_DIR/install-release.log"; then
-      info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
-      if install_chromium_runtime_libraries "$stable_playwright" "$runtime_node" >"$TEMP_DIR/browser-deps.log" 2>&1 \
-        && "$STAGED_BIN" install-release \
-          --executable "$INSTALL_DIR/HuntProxy" \
-          --data-dir "$DATA_DIR" >>"$TEMP_DIR/install-release.log" 2>&1; then
-        :
-      else
-        sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
-        sed -n '1,160p' "$TEMP_DIR/install-release.log" >&2
-        die 'coordinated release installation failed'
-      fi
+  can_request_packages=0
+  if [[ "$(id -u)" == 0 ]] || { command -v sudo >/dev/null 2>&1 && [[ -t 0 || -t 1 ]]; }; then
+    can_request_packages=1
+  fi
+  if [[ "$linux_id" =~ ^(ubuntu|debian)$ ]] \
+    && [[ "$can_request_packages" -eq 1 ]] \
+    && browser_node_supported "$runtime_node" \
+    && [[ -f "$stable_playwright/cli.js" ]] \
+    && grep -Eqi 'chromium|browser validation|browser worker' "$TEMP_DIR/install-release.log"; then
+    info 'Chromium needs Debian/Ubuntu runtime libraries; requesting system package access'
+    if install_chromium_runtime_libraries "$stable_playwright" "$runtime_node" >"$TEMP_DIR/browser-deps.log" 2>&1 \
+      && "$STAGED_BIN" install-release \
+        --executable "$INSTALL_DIR/HuntProxy" \
+        --data-dir "$DATA_DIR" >>"$TEMP_DIR/install-release.log" 2>&1; then
+      :
     else
+      sed -n '1,160p' "$TEMP_DIR/browser-deps.log" >&2
       sed -n '1,160p' "$TEMP_DIR/install-release.log" >&2
       die 'coordinated release installation failed'
     fi
+  else
+    sed -n '1,160p' "$TEMP_DIR/install-release.log" >&2
+    die 'coordinated release installation failed'
   fi
-  INSTALL_COMPLETE=1
-  [[ -x "$INSTALL_DIR/HuntProxy" ]] || die 'coordinated installation did not create the executable'
-  installed_version="$("$INSTALL_DIR/HuntProxy" --version 2>/dev/null | awk '{print $NF}')" \
-    || die 'the installed executable failed its final check'
-  [[ "$installed_version" == "$binary_version" ]] \
-    || die "coordinated installation activated HuntProxy $installed_version instead of $binary_version"
-  ok 'Release runtime, data, plugins, and executable installed'
 fi
+[[ -x "$INSTALL_DIR/HuntProxy" ]] || die 'coordinated installation did not create the executable'
+installed_version="$("$INSTALL_DIR/HuntProxy" --version 2>/dev/null | awk '{print $NF}')" \
+  || die 'the installed executable failed its final check'
+[[ "$installed_version" == "$binary_version" ]] \
+  || die "coordinated installation activated HuntProxy $installed_version instead of $binary_version"
+ok 'Release runtime, data, plugins, and executable installed'
 
 configure_mcp_clients() {
   local names=() commands=() choice selected index client command
@@ -653,7 +273,7 @@ configure_mcp_clients() {
     commands+=("$command")
   done
   ((${#names[@]})) || return 0
-  if ! printf '' >/dev/tty 2>/dev/null; then
+  if ! { printf '' >/dev/tty; } 2>/dev/null; then
     warn 'AI clients were found, but no interactive terminal is available; MCP setup was skipped.'
     return 0
   fi

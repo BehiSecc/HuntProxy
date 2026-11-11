@@ -15,7 +15,6 @@ pub const DAEMON_LOCK_NAME: &str = "daemon.lock";
 pub const BOOTSTRAP_LOCK_NAME: &str = "bootstrap.lock";
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const DB_FILE_NAME: &str = "huntproxy.db";
-const LEGACY_DB_FILE_NAME: &str = "bb.db";
 pub const CA_CERT_NAME: &str = "ca.crt";
 pub const CA_KEY_NAME: &str = "ca.key";
 pub const PLACEHOLDER_KEY_NAME: &str = "placeholder.key";
@@ -252,9 +251,7 @@ impl Config {
             })?;
             cfg.apply_file(file);
         }
-        if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH")
-            .or_else(|| std::env::var_os("BB_BROWSER_WORKER_PATH"))
-        {
+        if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH") {
             cfg.browser_worker_path = Some(PathBuf::from(path));
         }
         cfg.node_path = select_browser_node(cfg.node_path, which_path("node"), &cfg.runtime_dir);
@@ -340,13 +337,7 @@ impl Config {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        let current = self.data_dir.join(DB_FILE_NAME);
-        let legacy = self.data_dir.join(LEGACY_DB_FILE_NAME);
-        if !current.exists() && legacy.exists() {
-            legacy
-        } else {
-            current
-        }
+        self.data_dir.join(DB_FILE_NAME)
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -522,10 +513,7 @@ fn select_browser_node(
     configured
         .into_iter()
         .chain(system)
-        .chain([
-            crate::installation::managed_node_path(runtime_dir),
-            runtime_dir.join("node/bin/node"),
-        ])
+        .chain([crate::installation::managed_node_path(runtime_dir)])
         .find(|node| browser_node_supported(node))
 }
 
@@ -598,15 +586,16 @@ mod tests {
     }
 
     #[test]
-    fn new_databases_use_huntproxy_name_and_existing_legacy_databases_still_open() {
+    fn the_database_is_always_huntproxy_db() {
         let parent = tempfile::tempdir().unwrap();
         let data_dir = parent.path().join("data");
         let config = Config::load(Some(data_dir.clone())).unwrap();
 
         assert_eq!(config.db_path(), data_dir.join("huntproxy.db"));
 
-        std::fs::write(data_dir.join(LEGACY_DB_FILE_NAME), b"legacy").unwrap();
-        assert_eq!(config.db_path(), data_dir.join(LEGACY_DB_FILE_NAME));
+        // The database of pre-0.1.0 development builds is not adopted.
+        std::fs::write(data_dir.join("bb.db"), b"old").unwrap();
+        assert_eq!(config.db_path(), data_dir.join(DB_FILE_NAME));
 
         std::fs::write(data_dir.join(DB_FILE_NAME), b"current").unwrap();
         assert_eq!(config.db_path(), data_dir.join(DB_FILE_NAME));
@@ -618,7 +607,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let parent = tempfile::tempdir().unwrap();
         let data_dir = parent.path().join("data");
-        let node = data_dir.join("runtime/node/bin/node");
+        let node = crate::installation::managed_node_path(&data_dir.join("runtime"));
         std::fs::create_dir_all(node.parent().unwrap()).unwrap();
         std::fs::write(&node, b"#!/bin/sh\nprintf 'v22.23.2\\n'\n").unwrap();
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -637,34 +626,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn managed_node_selection_covers_versioned_and_legacy_runtimes() {
+    fn managed_node_selection_uses_only_the_versioned_runtime() {
         use std::os::unix::fs::PermissionsExt;
 
         let manifest: serde_json::Value =
             serde_json::from_str(include_str!("../../resources/release/node-runtimes.json"))
                 .unwrap();
         let version = manifest["version"].as_str().unwrap();
-        for (versioned_exists, legacy_exists) in
+        for (versioned_exists, unversioned_exists) in
             [(true, false), (false, true), (true, true), (false, false)]
         {
             let parent = tempfile::tempdir().unwrap();
             let runtime = parent.path().join("runtime");
             let versioned = runtime.join(format!("node-{version}/bin/node"));
-            let legacy = runtime.join("node/bin/node");
-            for (path, exists) in [(&versioned, versioned_exists), (&legacy, legacy_exists)] {
+            // The unversioned runtime of releases before 0.2.0 is never selected.
+            let unversioned = runtime.join("node/bin/node");
+            for (path, exists) in [
+                (&versioned, versioned_exists),
+                (&unversioned, unversioned_exists),
+            ] {
                 if exists {
                     fs::create_dir_all(path.parent().unwrap()).unwrap();
                     fs::write(path, b"#!/bin/sh\nprintf 'v22.23.2\\n'\n").unwrap();
                     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
                 }
             }
-            let expected = if versioned_exists {
-                Some(versioned)
-            } else if legacy_exists {
-                Some(legacy)
-            } else {
-                None
-            };
+            let expected = versioned_exists.then_some(versioned);
             assert_eq!(select_browser_node(None, None, &runtime), expected);
         }
     }
@@ -679,8 +666,7 @@ mod tests {
         let configured = parent.path().join("configured");
         let system = parent.path().join("system");
         let versioned = crate::installation::managed_node_path(&runtime);
-        let legacy = runtime.join("node/bin/node");
-        for path in [&configured, &system, &versioned, &legacy] {
+        for path in [&configured, &system, &versioned] {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"#!/bin/sh\nprintf 'v22.23.2\\n'\n").unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -695,7 +681,7 @@ mod tests {
             Some(system)
         );
         fs::write(&versioned, b"#!/bin/sh\nprintf 'v18.0.0\\n'\n").unwrap();
-        assert_eq!(select_browser_node(None, None, &runtime), Some(legacy));
+        assert_eq!(select_browser_node(None, None, &runtime), None);
     }
 
     #[test]
@@ -719,7 +705,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let parent = tempfile::tempdir().unwrap();
         let data = parent.path().join("data");
-        let managed = data.join("runtime/node/bin/node");
+        let managed = crate::installation::managed_node_path(&data.join("runtime"));
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
         let selected = parent.path().join("selected-node");
         let system = which_path("node").filter(|node| browser_node_supported(node));

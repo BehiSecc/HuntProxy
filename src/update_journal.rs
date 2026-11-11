@@ -137,6 +137,15 @@ pub(crate) fn finish(config: &Config) -> DomainResult<()> {
     }
 }
 
+/// Whether an update is in flight or waiting for recovery. Until it finishes
+/// the previous release can still be restored, so its files must be kept.
+pub(crate) fn is_pending(config: &Config) -> bool {
+    !matches!(
+        fs::symlink_metadata(journal_path(config)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Retain one validated restore point and remove only older, owned snapshots.
 pub(crate) fn prune_restore_points(config: &Config, keep_root: Option<&Path>) -> DomainResult<()> {
     let updates = updates_root(config);
@@ -676,9 +685,9 @@ mod tests {
     async fn prepared_interruption_restores_source_state_idempotently() {
         let directory = directory();
         let config = config(&directory);
-        let snapshot = snapshot(&config, "0.2.0");
-        let binary = binary(&directory, "0.1.1");
-        begin(&config, "0.1.1", "0.2.0", &binary, &snapshot.root).unwrap();
+        let snapshot = snapshot(&config, "0.3.0");
+        let binary = binary(&directory, "0.2.0");
+        begin(&config, "0.2.0", "0.3.0", &binary, &snapshot.root).unwrap();
         fs::write(config.db_path(), b"migrated database").unwrap();
         fs::write(config.data_dir.join("config.toml"), b"new config").unwrap();
         fs::write(config.plugin_dir.join("racer/index.js"), b"new plugin").unwrap();
@@ -686,6 +695,7 @@ mod tests {
         create_private_dir(&new_package).unwrap();
         write_private_file(&new_package.join("index.js"), b"new package").unwrap();
 
+        assert!(is_pending(&config));
         recover(&config).await.unwrap();
         assert_eq!(fs::read(config.db_path()).unwrap(), b"source database");
         assert_eq!(
@@ -698,6 +708,7 @@ mod tests {
         );
         assert!(!new_package.exists());
         assert!(!journal_path(&config).exists());
+        assert!(!is_pending(&config));
         recover(&config).await.unwrap();
     }
 
@@ -705,13 +716,13 @@ mod tests {
     async fn activated_interruption_commits_and_prunes_only_owned_points() {
         let directory = directory();
         let config = config(&directory);
-        let old = snapshot(&config, "0.1.9");
-        let latest = snapshot(&config, "0.2.0");
+        let old = snapshot(&config, "0.2.9");
+        let latest = snapshot(&config, "0.3.0");
         let arbitrary = updates_root(&config).join("user-notes");
         create_private_dir(&arbitrary).unwrap();
         write_private_file(&arbitrary.join("keep.txt"), b"mine").unwrap();
-        let binary = binary(&directory, "0.2.0");
-        begin(&config, "0.1.1", "0.2.0", &binary, &latest.root).unwrap();
+        let binary = binary(&directory, "0.3.0");
+        begin(&config, "0.2.0", "0.3.0", &binary, &latest.root).unwrap();
         fs::write(config.db_path(), b"target database").unwrap();
 
         recover(&config).await.unwrap();
@@ -726,9 +737,9 @@ mod tests {
     async fn malformed_or_future_metadata_never_restores_or_escapes() {
         let directory = directory();
         let config = config(&directory);
-        let snapshot = snapshot(&config, "0.2.0");
-        let binary = binary(&directory, "0.1.1");
-        begin(&config, "0.1.1", "0.2.0", &binary, &snapshot.root).unwrap();
+        let snapshot = snapshot(&config, "0.3.0");
+        let binary = binary(&directory, "0.2.0");
+        begin(&config, "0.2.0", "0.3.0", &binary, &snapshot.root).unwrap();
         fs::write(config.db_path(), b"do not restore").unwrap();
         let outside = directory.path().join("outside");
         fs::write(&outside, b"outside").unwrap();
@@ -777,9 +788,9 @@ mod tests {
     async fn unexpected_installed_version_keeps_recovery_metadata() {
         let directory = directory();
         let config = config(&directory);
-        let snapshot = snapshot(&config, "0.2.0");
-        let binary = binary(&directory, "0.3.0");
-        begin(&config, "0.1.1", "0.2.0", &binary, &snapshot.root).unwrap();
+        let snapshot = snapshot(&config, "0.3.0");
+        let binary = binary(&directory, "0.4.0");
+        begin(&config, "0.2.0", "0.3.0", &binary, &snapshot.root).unwrap();
         fs::write(config.db_path(), b"ambiguous").unwrap();
 
         assert!(recover(&config).await.is_err());

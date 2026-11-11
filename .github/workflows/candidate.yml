@@ -61,6 +61,15 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup override set "$RUST_VERSION"
 
+      # Restore the dependency cache written by CI on the default branch. This
+      # job keeps the full check because it provisions from target/release, and
+      # the packaged candidate binaries below are built uncached.
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: dev
+          save-if: false
+
       - name: Install browser-worker Node runtime
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -132,28 +141,39 @@ jobs:
               output.write(f"{node_dir}\n")
           PY
 
-      - name: Fetch verified HuntProxy 0.1.1 fixture
+      - name: Fetch verified previous release fixtures
         shell: bash
         run: |
           set -Eeuo pipefail
-          archive="${RUNNER_TEMP}/huntproxy-v0.1.1-linux-x86_64.tar.gz"
-          fixture_dir="${RUNNER_TEMP}/huntproxy-v0.1.1"
-          curl --fail --location --silent --show-error \
-            https://github.com/BehiSecc/HuntProxy/releases/download/v0.1.1/huntproxy-linux-x86_64.tar.gz \
-            --output "$archive"
-          echo "8d691a62337932db28d1203ca5d860b45b9cfd89c898ee049a627ce1f10d4ac1  $archive" \
-            | sha256sum -c -
-          mkdir -p "$fixture_dir"
-          tar -xzf "$archive" -C "$fixture_dir" HuntProxy
-          chmod 755 "$fixture_dir/HuntProxy"
-          [[ "$("$fixture_dir/HuntProxy" --version)" == "HuntProxy 0.1.1" ]]
-          echo "HUNTPROXY_LEGACY_BINARY=$fixture_dir/HuntProxy" >> "$GITHUB_ENV"
+          for fixture in \
+            "0.2.0 2016a21c7ee7a03cccf6f9406a4ecce6231ab3ecea41e1bd354d76881ef8b0a3" \
+            "0.3.0 7d5742db477a92ea935a1385eccbe8ea354a8568dcb04fb30f4652af46c6fe3f"; do
+            read -r version sha256 <<<"$fixture"
+            archive="${RUNNER_TEMP}/huntproxy-v${version}-linux-x86_64.tar.gz"
+            fixture_dir="${RUNNER_TEMP}/huntproxy-v${version}"
+            curl --fail --location --silent --show-error \
+              "https://github.com/BehiSecc/HuntProxy/releases/download/v${version}/huntproxy-linux-x86_64.tar.gz" \
+              --output "$archive"
+            echo "${sha256}  ${archive}" | sha256sum -c -
+            mkdir -p "$fixture_dir"
+            tar -xzf "$archive" -C "$fixture_dir" HuntProxy
+            chmod 755 "$fixture_dir/HuntProxy"
+            [[ "$("$fixture_dir/HuntProxy" --version)" == "HuntProxy ${version}" ]]
+          done
 
-      - name: Exercise a full 0.1.1 data and bundle upgrade
+      - name: Exercise full data and bundle upgrades from v0.2.0 and v0.3.0
+        shell: bash
         env:
           HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-upgrade-default
           TMPDIR: ${{ runner.temp }}
-        run: cargo test --locked --test upgrade_workflows -- --ignored --test-threads=1 --nocapture
+        run: |
+          set -Eeuo pipefail
+          for version in 0.2.0 0.3.0; do
+            echo "::group::Upgrade from v${version}"
+            HUNTPROXY_PREVIOUS_BINARY="${RUNNER_TEMP}/huntproxy-v${version}/HuntProxy" \
+              cargo test --locked --test upgrade_workflows -- --ignored --test-threads=1 --nocapture
+            echo "::endgroup::"
+          done
 
   build:
     name: Build and smoke-test ${{ matrix.asset }}

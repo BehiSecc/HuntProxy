@@ -4,6 +4,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -17,7 +18,9 @@ spec.loader.exec_module(notices)
 
 class SourceProvenanceChecks(unittest.TestCase):
     def setUp(self):
-        self.repo = Path("/tmp/artis/huntproxy-notices-test")
+        temporary = tempfile.TemporaryDirectory(prefix="huntproxy-notices-test-")
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name)
 
     def test_registry_checksum_is_recorded(self):
         source = "registry+https://github.com/rust-lang/crates.io-index"

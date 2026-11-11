@@ -62,6 +62,15 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup override set "$RUST_VERSION"
 
+      # Only pushes write the dependency cache; pull requests and the other
+      # workflows restore it. The release build is covered by the candidate and
+      # tag workflows, so this job skips it.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: dev
+          save-if: ${{ github.event_name != 'pull_request' }}
+
       - name: Install browser-worker Node runtime
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -76,7 +85,7 @@ jobs:
       - name: Run repository checks
         env:
           HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-ci-default
-        run: scripts/check.sh
+        run: scripts/check.sh --quick
 
   browser:
     name: Pinned Chromium integration tests
@@ -111,6 +120,12 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup override set "$RUST_VERSION"
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: dev
+          save-if: false
 
       - name: Build HuntProxy
         run: cargo build --locked --bin HuntProxy

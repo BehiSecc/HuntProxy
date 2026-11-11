@@ -9,10 +9,9 @@ use crate::reply::{ReplySendContext, ReplyService};
 use crate::storage::{Db, JavascriptProvenanceInput};
 use dashmap::DashSet;
 use futures::{stream, StreamExt};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{broadcast, Semaphore};
 use url::Url;
 
@@ -21,17 +20,17 @@ const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CONCURRENT_FETCHES: usize = 4;
 const MAX_SEEN_URLS: usize = 50_000;
 
-static CRAWL_TAG: Lazy<Regex> = Lazy::new(|| {
+static CRAWL_TAG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<\s*(a|script|img|link|source|video|audio|track)\b([^>]*)>"#)
         .expect("valid crawler tag regex")
 });
 
-static CRAWL_ATTRIBUTE: Lazy<Regex> = Lazy::new(|| {
+static CRAWL_ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)\b(href|src|srcset|poster|rel)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
         .expect("valid crawler attribute regex")
 });
 
-static SCRIPT_SRC_ATTRIBUTE: Lazy<Regex> = Lazy::new(|| {
+static SCRIPT_SRC_ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<script\b[^>]*\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
         .expect("valid crawler script source regex")
 });
