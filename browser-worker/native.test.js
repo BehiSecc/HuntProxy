@@ -14,12 +14,20 @@ function fixture(t, mode = "ready", startup = {}) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "huntproxy-native-"));
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
   const events = [];
+  const logs = [];
   const children = [];
   const attempts = [];
+  const credentials = [];
   const browser = {
     contexts: () => [{
-      async setHTTPCredentials(credentials) { events.push("auth"); assert.equal(credentials.username, "workspace"); if (mode === "auth-error" || mode === "auth-unkillable") throw Error("Authentication setup failed"); },
-      pages() { events.push("pages"); return [{ async bringToFront() { events.push("activate"); } }]; },
+      async setHTTPCredentials(supplied) { events.push("auth"); credentials.push(supplied); assert.equal(supplied.username, "workspace"); if (mode === "auth-error" || mode === "auth-unkillable") throw Error("Authentication setup failed"); },
+      pages() {
+        events.push("pages");
+        return [{
+          async bringToFront() { events.push("activate"); },
+          async goto(url) { events.push(`goto ${url}`); if (mode === "prime-error") throw Error("net::ERR_PROXY_CONNECTION_FAILED\nCall log: detail"); },
+        }];
+      },
     }],
     async close() { events.push("disconnect"); },
   };
@@ -34,7 +42,7 @@ function fixture(t, mode = "ready", startup = {}) {
     } }, URL, ownedChromeChildren: new Set(), shuttingDown: false,
     browserRuntime: { headless: false, chromium_path: "/selected/chrome" },
     chromiumProxy: (proxy) => proxy,
-    os,
+    os, logMeta: (event, fields) => logs.push({ event, ...fields }),
     inspectNativeIdentity: async () => ({ userAgent: "test" }),
     setTimeout: (fn, ms) => setTimeout(fn, Math.min(ms, 30)), clearTimeout,
     spawn(executable, supplied, options) {
@@ -77,14 +85,17 @@ function fixture(t, mode = "ready", startup = {}) {
       return browser;
     } },
   });
-  return { api, profile, events, get child() { return children[0]; }, children, attempts, args: () => args };
+  return { api, profile, events, logs, credentials, get child() { return children[0]; }, children, attempts, args: () => args };
 }
 
 test("native startup attaches only its emitted endpoint and retains auth and routing protections", async (t) => {
   const f = fixture(t);
   const runtime = await f.api.launchNativeChromium({ server: "http://127.0.0.1:17891", username: "workspace", password: "local-session" }, "/managed/ca.crt", f.profile, null);
   assert.equal(runtime.ownedChrome, f.child);
-  assert.deepEqual(f.events, ["connect", "auth", "pages", "activate"]);
+  // The proxy is authenticated once, on the launched tab, before it is handed over.
+  assert.deepEqual(f.events, ["connect", "auth", "pages", "goto http://huntproxy-auth-prime.invalid/", "goto about:blank", "activate"]);
+  // Proxy credentials must never answer a target's own authentication challenge.
+  assert.deepEqual(JSON.parse(JSON.stringify(f.credentials)), [{ username: "workspace", password: "local-session", origin: "http://huntproxy-auth-prime.invalid" }]);
   for (const argument of ["--remote-debugging-address=127.0.0.1", "--proxy-bypass-list=<-loopback>", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--ignore-certificate-errors", "--disable-quic"]) assert.equal(f.args().includes(argument), true);
   for (const flag of ["--disable-back-forward-cache", "--disable-background-networking", "--disable-component-update", "--disable-sync", "--disable-default-apps", "--no-service-autorun", "--disable-client-side-phishing-detection", "--disable-breakpad", "--disable-component-extensions-with-background-pages", "--disable-popup-blocking", "--disable-prompt-on-repost", "--password-store=basic", "--use-mock-keychain", "--disable-dev-shm-usage", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--disable-hang-monitor", "--metrics-recording-only", "--disable-search-engine-choice-screen", "--no-first-run", "--no-default-browser-check"]) assert.ok(f.args().includes(flag), flag);
   for (const flag of ["--enable-automation", "--disable-extensions", "--remote-debugging-pipe", "--disable-features", "--enable-features", "--disable-field-trial-config", "--force-color-profile", "--allow-pre-commit-input", "--no-sandbox"]) assert.equal(f.args().some((arg) => arg === flag || arg.startsWith(`${flag}=`)), false, flag);
@@ -94,6 +105,22 @@ test("native startup attaches only its emitted endpoint and retains auth and rou
   assert.equal(f.args().some((value) => /remote-debugging-pipe|AutomationControlled|local-session/.test(value)), false);
   await f.api.stopOwnedChrome(f.child);
   assert.equal(f.child.signalCode, "SIGTERM");
+});
+
+test("a failed proxy authentication prime is logged without the credentials and does not fail startup", async (t) => {
+  const f = fixture(t, "prime-error");
+  const runtime = await f.api.launchNativeChromium({ server: "http://127.0.0.1:17891", username: "workspace", password: "local-session" }, null, f.profile, null);
+  assert.equal(runtime.ownedChrome, f.child);
+  assert.deepEqual(f.logs, [{ event: "proxy_auth_prime_failed", error: "net::ERR_PROXY_CONNECTION_FAILED" }]);
+  assert.equal(JSON.stringify(f.logs).includes("local-session"), false);
+  assert.deepEqual(f.events, ["connect", "auth", "pages", "goto http://huntproxy-auth-prime.invalid/", "activate"]);
+});
+
+test("a proxy without credentials installs none and primes nothing", async (t) => {
+  const f = fixture(t);
+  await f.api.launchNativeChromium({ server: "http://127.0.0.1:17891" }, null, f.profile, null);
+  assert.deepEqual(f.events, ["connect", "pages", "activate"]);
+  assert.deepEqual(f.credentials, []);
 });
 
 test("identity probe uses the same behavior flags as a persistent launch", async (t) => {

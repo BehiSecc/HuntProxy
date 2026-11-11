@@ -10,6 +10,8 @@ Set environment variables before starting the daemon; existing sessions retain t
 
 If Chromium's sandbox cannot start, HuntProxy retries without it and reports the fallback in browser status and `HuntProxy doctor`.
 
+HuntProxy authenticates the browser to its own proxy and never offers those credentials to a site. A site's own HTTP authentication challenge is handled as in a plain browser, so a headless navigation to a protected page fails with `net::ERR_INVALID_AUTH_CREDENTIALS`. Put the site's credentials in the URL (`https://user:password@host/`) to sign in.
+
 The proxy verifies origin certificates using combined Chromium and Mozilla roots. Chromium root loading does not implement Chrome's additional root-policy or certificate-transparency checks.
 
 Chrome background requests to a small set of internal endpoints are forwarded but omitted from browser History.

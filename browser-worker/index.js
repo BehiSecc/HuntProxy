@@ -670,14 +670,11 @@ function browserHeadlessCompatibility() {
   return enabled;
 }
 
+// Credentials are deliberately absent: Playwright would answer every HTTP
+// authentication challenge with them (see proxyHttpCredentials).
 function chromiumProxy(proxy) {
   if (!proxy?.server) return undefined;
-  return {
-    server: proxy.server,
-    username: proxy.username || undefined,
-    password: proxy.password || undefined,
-    bypass: "<-loopback>",
-  };
+  return { server: proxy.server, bypass: "<-loopback>" };
 }
 
 function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null, executablePath = browserRuntime.chromium_path) {
@@ -700,10 +697,51 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null, executablePath
     executablePath,
     headless: browserRuntime.headless,
     proxy: chromiumProxy(proxy),
+    httpCredentials: proxyHttpCredentials(proxy),
     ignoreHTTPSErrors: Boolean(caCertPath),
     serviceWorkers: "allow",
     args,
   };
+}
+
+// The capture token belongs to the proxy alone. Playwright answers every
+// Fetch.authRequired whose request URL matches one of its HTTP credentials, and
+// a credential without an origin matches every URL: it would also answer a
+// target site's own `401 WWW-Authenticate: Basic` and hand the target the
+// token. So the credential is scoped to a reserved origin that is never a real
+// destination, and the proxy is authenticated once by requesting that origin
+// (primeProxyAuth). Chromium keeps the credentials the proxy accepted and sends
+// them with every later request, HTTP and CONNECT alike, so no other challenge
+// from the proxy reaches Playwright, and a target's own challenge is answered
+// as it would be without credentials. The same one-time authentication lets a
+// CDP client that routes requests (Playwright's page.route enables Fetch with
+// auth handling, so it receives a proxy challenge instead of this worker) make
+// its first navigation. The name is reserved (.invalid never resolves):
+// HuntProxy rejects it while resolving the destination, so no target is
+// contacted and nothing is captured.
+const PROXY_AUTH_PRIME_URL = "http://huntproxy-auth-prime.invalid/";
+
+function proxyHttpCredentials(proxy) {
+  if (!proxy?.username && !proxy?.password) return undefined;
+  return {
+    username: proxy.username || "",
+    password: proxy.password || "",
+    origin: new URL(PROXY_AUTH_PRIME_URL).origin,
+  };
+}
+
+// Uses the launched tab and leaves it on about:blank: closing a throwaway tab
+// stalled intermittently (Page.close never completed while the tab's proxy-auth
+// request was in flight), which hung a CDP handoff. A failure is logged rather
+// than raised: the first real navigation then reports the proxy problem itself.
+async function primeProxyAuth(page, proxy) {
+  if (!proxyHttpCredentials(proxy)) return;
+  try {
+    await page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10_000 });
+  } catch (error) {
+    logMeta("proxy_auth_prime_failed", { error: String(error?.message || error).split("\n")[0].slice(0, 200) });
+  }
 }
 
 async function nativeDebugPort(preferred) {
@@ -896,10 +934,10 @@ async function launchNativeChromium(proxy, caCertPath, profileDir, cdpPort) {
     }
     const context = browser.contexts()[0];
     if (!context) throw new Error("Chromium default context is missing");
-    if (proxy?.username || proxy?.password) {
-      await context.setHTTPCredentials({ username: proxy.username || "", password: proxy.password || "" });
-    }
+    const credentials = proxyHttpCredentials(proxy);
+    if (credentials) await context.setHTTPCredentials(credentials);
     const page = context.pages()[0] || await context.newPage();
+    await primeProxyAuth(page, proxy);
     await page.bringToFront();
     identityController?.assertHealthy();
     return { browser, context, page, persistent: true, profileDir, ownedChrome: child, identityController,
@@ -935,6 +973,7 @@ async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = nu
     if (!browserRuntime.headless || browserRuntime.headless_compatibility) return launchNativeChromium(proxy, caCertPath, profileDir, cdpPort);
     const context = await chromium.launchPersistentContext(profileDir, options);
     const page = context.pages()[0] || await context.newPage();
+    await primeProxyAuth(page, proxy);
     return {
       browser: null,
       context,
@@ -943,13 +982,15 @@ async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = nu
       profileDir,
     };
   }
-  const { ignoreHTTPSErrors, serviceWorkers, ...launchOptions } = options;
+  const { ignoreHTTPSErrors, serviceWorkers, httpCredentials, ...launchOptions } = options;
   const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
     serviceWorkers,
     ignoreHTTPSErrors,
+    httpCredentials,
   });
   const page = await context.newPage();
+  await primeProxyAuth(page, proxy);
   return { browser, context, page, persistent: false, profileDir: null };
 }
 
@@ -1147,26 +1188,6 @@ async function restoreRuntimePages(runtime, pageState) {
   await runtime.page.bringToFront();
 }
 
-// A proxy challenge is answered by the worker's own CDP credentials. Once a
-// client such as Playwright's page.route enables Fetch with auth handling, it
-// receives that challenge instead and, having no credentials, cancels the
-// request (net::ERR_INVALID_AUTH_CREDENTIALS). Chromium reuses proxy credentials
-// it has already accepted, so authenticate once here, before control is
-// returned. The name is reserved (.invalid never resolves): HuntProxy rejects it
-// while resolving the destination, so no target is contacted and nothing is
-// captured. Best effort. It uses the runtime's own tab and leaves it for
-// restoreRuntimePages to put back: closing a throwaway tab here stalled
-// intermittently (Page.close never completed while the tab's proxy-auth
-// request was in flight), which hung the whole handoff.
-const PROXY_AUTH_PRIME_URL = "http://huntproxy-auth-prime.invalid/";
-
-async function primeProxyAuth(runtime, proxy) {
-  if (!proxy?.username && !proxy?.password) return;
-  try {
-    await runtime.page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
-  } catch {}
-}
-
 // Closing a tab can stall in Chromium; a handoff must never wait on it.
 async function closePageWithin(page, milliseconds = 5_000) {
   let timer;
@@ -1189,7 +1210,6 @@ async function launchSessionRuntime(session, cdpPort, pageState, sessionCookies 
   );
   try {
     if (sessionCookies.length) await runtime.context.addCookies(sessionCookies);
-    if (cdpPort != null) await primeProxyAuth(runtime, session.proxy);
     await restoreRuntimePages(runtime, pageState);
     const cdp = cdpPort == null ? null : await discoverCdp(runtime.page, cdpPort);
     return { runtime, cdp };
