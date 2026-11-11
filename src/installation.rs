@@ -247,7 +247,83 @@ pub async fn prepare(config: &Config) -> DomainResult<PreparedInstallation> {
     };
     validate_browser_once(config, &prepared).await?;
     prepared.preserved_plugins = prepare_plugins(config)?;
+    remove_superseded_runtime(config, &prepared);
     Ok(prepared)
+}
+
+/// Remove the runtime folders of earlier releases once this release is fully
+/// prepared. Every release pins its own `node-<version>` and
+/// `playwright-core-<version>` (which holds its Chromium), so each update
+/// leaves the previous pair behind, and releases before 0.2.0 kept a single
+/// unversioned `node`. The installation already succeeded, so failures here are
+/// logged and never fail it.
+fn remove_superseded_runtime(config: &Config, prepared: &PreparedInstallation) {
+    // While an update is unfinished the previous release can still be restored
+    // and needs its runtime back.
+    if crate::update_journal::is_pending(config) {
+        return;
+    }
+    let entries = match fs::read_dir(&config.runtime_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, path = %config.runtime_dir.display(), "could not list the runtime directory");
+            return;
+        }
+    };
+    let in_use = [
+        &prepared.node_path,
+        &prepared.worker_path,
+        &prepared.playwright_core_path,
+        &prepared.chromium_path,
+    ];
+    for entry in entries.filter_map(Result::ok) {
+        // Real directories with a known name only; a symlink is never followed.
+        let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        let superseded = entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_superseded_runtime_name);
+        if !is_directory || !superseded {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if in_use.iter().any(|used| used.starts_with(&canonical)) {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "removed the runtime of an earlier release");
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "could not remove the runtime of an earlier release");
+            }
+        }
+    }
+}
+
+/// Names of runtime folders no current release uses: the unversioned `node` of
+/// releases before 0.2.0 and any `node-` or `playwright-core-` folder whose
+/// `major.minor.patch` is not the one pinned by this release.
+fn is_superseded_runtime_name(name: &str) -> bool {
+    let earlier_release = |prefix: &str, current: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|version| version != current && is_release_version(version))
+    };
+    name == "node"
+        || earlier_release("node-", NODE_VERSION)
+        || earlier_release("playwright-core-", PLAYWRIGHT_VERSION)
+}
+
+/// A `major.minor.patch` made of digits only, like the pinned runtime versions.
+fn is_release_version(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 async fn acquire_installation_lock(config: &Config) -> DomainResult<InstallationLock> {
@@ -1627,6 +1703,198 @@ done
             prepare_node(&without_selected_node).await.unwrap(),
             pinned_node.canonicalize().unwrap()
         );
+    }
+
+    fn write_file(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"x").unwrap();
+    }
+
+    fn runtime_config(base: &Path) -> Config {
+        Config {
+            data_dir: base.join("data"),
+            runtime_dir: base.join("data/runtime"),
+            ..Config::default()
+        }
+    }
+
+    /// The first path component below the runtime folder.
+    fn runtime_folder(runtime: &Path, path: &Path) -> PathBuf {
+        runtime.join(
+            path.strip_prefix(runtime)
+                .unwrap()
+                .components()
+                .next()
+                .unwrap(),
+        )
+    }
+
+    fn current_installation(runtime: &Path, worker: &Path) -> PreparedInstallation {
+        let playwright = runtime.join(format!("playwright-core-{PLAYWRIGHT_VERSION}"));
+        PreparedInstallation {
+            node_path: managed_node_path(runtime),
+            worker_path: worker.to_path_buf(),
+            chromium_path: playwright.join(format!(
+                ".local-browsers/chromium-{CHROMIUM_REVISION}/chrome"
+            )),
+            playwright_core_path: playwright,
+            preserved_plugins: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn earlier_release_runtimes_are_removed_and_everything_else_is_kept() {
+        let temporary = temporary_directory();
+        let base = temporary.path().canonicalize().unwrap();
+        let config = runtime_config(&base);
+        let runtime = &config.runtime_dir;
+        let worker = base.join("worker/index.js");
+        let prepared = current_installation(runtime, &worker);
+
+        let removed = [
+            // The single unversioned runtime of releases before 0.2.0.
+            runtime.join("node/bin/node"),
+            runtime.join("node-22.20.0/bin/node"),
+            runtime.join("playwright-core-1.64.0/.local-browsers/chromium-1250/chrome"),
+            runtime.join("playwright-core-1.62.1/cli.js"),
+        ];
+        let kept = [
+            prepared.node_path.clone(),
+            prepared.chromium_path.clone(),
+            worker.clone(),
+            runtime.join("browser-validation.json"),
+            runtime.join("installation.lock"),
+            runtime.join("updates/v0.3.0-1/restore.json"),
+            // Names that only look like a runtime folder.
+            runtime.join("node-22.20/bin/node"),
+            runtime.join("node-v22.20.0/bin/node"),
+            runtime.join("node-22.20.0-rc1/bin/node"),
+            runtime.join("playwright-core-latest/cli.js"),
+            runtime.join("node_modules/package/index.js"),
+            runtime.join(".huntproxy-node-22.20.0.backup/bin/node"),
+            // A file is not a runtime folder.
+            runtime.join("playwright-core-1.60.0"),
+        ];
+        for path in removed.iter().chain(&kept) {
+            write_file(path);
+        }
+        // A symlink named like an earlier runtime is neither followed nor removed.
+        let outside = base.join("outside-node");
+        write_file(&outside.join("bin/node"));
+        std::os::unix::fs::symlink(&outside, runtime.join("node-21.0.0")).unwrap();
+
+        remove_superseded_runtime(&config, &prepared);
+
+        for path in &removed {
+            let folder = runtime_folder(runtime, path);
+            assert!(!folder.exists(), "{} should be removed", folder.display());
+        }
+        for path in &kept {
+            assert!(path.exists(), "{} should be kept", path.display());
+        }
+        assert!(runtime.join("node-21.0.0").is_symlink());
+        assert!(outside.join("bin/node").is_file());
+    }
+
+    #[test]
+    fn runtime_of_the_previous_release_is_kept_while_an_update_is_pending() {
+        let temporary = temporary_directory();
+        let base = temporary.path().canonicalize().unwrap();
+        let config = runtime_config(&base);
+        let runtime = &config.runtime_dir;
+        let prepared = current_installation(runtime, &base.join("worker/index.js"));
+        let earlier = [
+            runtime.join("node-22.20.0/bin/node"),
+            runtime.join("playwright-core-1.64.0/cli.js"),
+        ];
+        for path in &earlier {
+            write_file(path);
+        }
+        let journal = runtime.join("update-journal.json");
+        write_file(&journal);
+
+        remove_superseded_runtime(&config, &prepared);
+        assert!(earlier.iter().all(|path| path.exists()));
+
+        fs::remove_file(journal).unwrap();
+        remove_superseded_runtime(&config, &prepared);
+        assert!(earlier.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn runtime_folders_in_use_are_never_removed() {
+        let temporary = temporary_directory();
+        let base = temporary.path().canonicalize().unwrap();
+        let config = runtime_config(&base);
+        let runtime = &config.runtime_dir;
+        // The user pinned Node.js and the browser SDK inside folders of earlier releases.
+        let playwright = runtime.join("playwright-core-1.64.0");
+        let prepared = PreparedInstallation {
+            node_path: runtime.join("node-22.20.0/bin/node"),
+            worker_path: base.join("worker/index.js"),
+            chromium_path: playwright.join(".local-browsers/chromium-1250/chrome"),
+            playwright_core_path: playwright,
+            preserved_plugins: Vec::new(),
+        };
+        let in_use = [
+            prepared.node_path.clone(),
+            prepared.chromium_path.clone(),
+            prepared.playwright_core_path.join("cli.js"),
+        ];
+        let unused = [
+            runtime.join("node-21.1.1/bin/node"),
+            runtime.join("playwright-core-1.60.0/cli.js"),
+        ];
+        for path in in_use.iter().chain(&unused) {
+            write_file(path);
+        }
+
+        remove_superseded_runtime(&config, &prepared);
+
+        assert!(in_use.iter().all(|path| path.exists()));
+        assert!(unused.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn superseded_runtime_names_are_matched_strictly() {
+        let current_node = format!("node-{NODE_VERSION}");
+        let current_playwright = format!("playwright-core-{PLAYWRIGHT_VERSION}");
+        for name in [
+            "node",
+            "node-22.20.0",
+            "node-18.0.1",
+            "playwright-core-1.64.0",
+            "playwright-core-0.1.0",
+        ] {
+            assert!(is_superseded_runtime_name(name), "{name}");
+        }
+        for name in [
+            current_node.as_str(),
+            current_playwright.as_str(),
+            "node-22",
+            "node-22.20",
+            "node-22.20.0.1",
+            "node-v22.20.0",
+            "node-22.20.0-rc1",
+            "node-",
+            "node-..",
+            "node-1.2.x",
+            "playwright-core",
+            "playwright-core-latest",
+            "playwright-core-1.64",
+            "playwright-1.64.0",
+            "nodejs",
+            "node_modules",
+            "Node",
+            ".node",
+            ".huntproxy-node-22.20.0.backup",
+            "browser-validation.json",
+            "installation.lock",
+            "updates",
+        ] {
+            assert!(!is_superseded_runtime_name(name), "{name}");
+        }
     }
 
     #[test]

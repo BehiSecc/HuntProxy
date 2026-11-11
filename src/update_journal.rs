@@ -137,6 +137,15 @@ pub(crate) fn finish(config: &Config) -> DomainResult<()> {
     }
 }
 
+/// Whether an update is in flight or waiting for recovery. Until it finishes
+/// the previous release can still be restored, so its files must be kept.
+pub(crate) fn is_pending(config: &Config) -> bool {
+    !matches!(
+        fs::symlink_metadata(journal_path(config)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Retain one validated restore point and remove only older, owned snapshots.
 pub(crate) fn prune_restore_points(config: &Config, keep_root: Option<&Path>) -> DomainResult<()> {
     let updates = updates_root(config);
@@ -686,6 +695,7 @@ mod tests {
         create_private_dir(&new_package).unwrap();
         write_private_file(&new_package.join("index.js"), b"new package").unwrap();
 
+        assert!(is_pending(&config));
         recover(&config).await.unwrap();
         assert_eq!(fs::read(config.db_path()).unwrap(), b"source database");
         assert_eq!(
@@ -698,6 +708,7 @@ mod tests {
         );
         assert!(!new_package.exists());
         assert!(!journal_path(&config).exists());
+        assert!(!is_pending(&config));
         recover(&config).await.unwrap();
     }
 

@@ -280,6 +280,7 @@ fn previous_release_data_and_full_bundle_upgrade_to_current_release() {
     assert_eq!(prepared_json["ok"], true);
     assert_eq!(prepared_json["version"], env!("CARGO_PKG_VERSION"));
     assert_latest_plugins_and_custom_plugin(&data_dir);
+    assert_earlier_runtimes_removed(&data_dir);
 
     let mut daemon = start_daemon(&installed, &data_dir);
     wait_for_health(&api_base, &mut daemon);
@@ -345,6 +346,30 @@ fn required_previous_binary() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Every release pins its own Node.js and browser SDK folder. Once the upgrade
+/// has finished and the current release prepared its runtime, the folders of the
+/// previous release must be gone and only one of each kind may remain.
+fn assert_earlier_runtimes_removed(data_dir: &Path) {
+    let names = fs::read_dir(data_dir.join("runtime"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        !names.iter().any(|name| name == "node"),
+        "unversioned runtime folder was not removed: {names:?}"
+    );
+    for prefix in ["node-", "playwright-core-"] {
+        let versions = names
+            .iter()
+            .filter(|name| name.starts_with(prefix))
+            .collect::<Vec<_>>();
+        assert!(
+            versions.len() <= 1,
+            "runtime folders of an earlier release were not removed: {versions:?}"
+        );
+    }
 }
 
 /// The `HuntProxy x.y.z` line a release prints for `--version`.
