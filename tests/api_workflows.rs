@@ -1808,6 +1808,29 @@ async fn response_body_api_decodes_gzip_and_preserves_raw_access() {
 }
 
 #[tokio::test]
+async fn bootstrap_fails_instead_of_using_an_unpersisted_placeholder_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        data_dir: directory.path().to_path_buf(),
+        spool_dir: directory.path().join("spool"),
+        export_dir: directory.path().join("exports"),
+        runtime_dir: directory.path().join("runtime"),
+        plugin_dir: directory.path().join("plugins"),
+        ..Config::default()
+    };
+    // A directory where the key file belongs can be neither read nor replaced.
+    std::fs::create_dir_all(config.placeholder_key_path()).unwrap();
+    let error = bootstrap_state(config)
+        .await
+        .err()
+        .expect("bootstrap must fail");
+    assert!(
+        error.to_string().contains("placeholder key"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn sitemap_and_findings_work_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let mut first = exchange(project_id, "GET", "/z-route");

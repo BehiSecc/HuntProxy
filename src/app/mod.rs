@@ -352,29 +352,20 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
     let transport: Arc<dyn SemanticTransport> = Arc::new(WreqTransport::with_chrome_major(
         transport_status.chrome_major,
     )?);
-    let key_bytes = std::fs::read(config.placeholder_key_path()).unwrap_or_else(|_| {
-        let key = PlaceholderKey::load_or_create(&config.placeholder_key_path())
-            .map(|_| ())
-            .ok();
-        let _ = key;
-        std::fs::read(config.placeholder_key_path()).unwrap_or_else(|_| {
-            let mut b = vec![0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
-            let _ = crate::config::write_private_file(&config.placeholder_key_path(), &b);
-            b
-        })
-    });
+    // A key that cannot be loaded or persisted must fail startup: a throwaway
+    // key would make everything minted this session unreadable after restart.
+    let placeholder_key = PlaceholderKey::load_or_create(&config.placeholder_key_path())?;
 
     let reply = Arc::new(ReplyService {
         db: db.clone(),
         transport: transport.clone(),
-        placeholder_key: PlaceholderKey::from_bytes(key_bytes.clone()),
+        placeholder_key: placeholder_key.clone(),
         upstream_proxies: config.upstream_proxies.clone(),
     });
     let fuzzer = Arc::new(FuzzerService::new(
         db.clone(),
         reply.clone(),
-        PlaceholderKey::from_bytes(key_bytes),
+        placeholder_key,
     ));
     let plugins = Arc::new(crate::plugins::PluginService::load_with_browser(
         config.plugin_dir.clone(),
