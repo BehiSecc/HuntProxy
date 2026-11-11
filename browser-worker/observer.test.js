@@ -21,7 +21,7 @@ function tracking() {
     ${source.slice(source.indexOf("function requireRuntimeGeneration"), source.indexOf("async function performPages"))}
     ${source.slice(source.indexOf("async function performEvents"), source.indexOf("async function performScroll"))}
     ({ initializeSessionTracking, drainWindowMessages, disposeSessionTracking, performEvents, recordSessionEvent,
-      javascriptFilesSince });`, {
+      waitForEvents, javascriptFilesSince });`, {
     Buffer, URL, setTimeout, rpcError: (code, message) => ({ code, message }),
   });
 }
@@ -196,6 +196,40 @@ function quietSession() {
   };
   return { page, session: { context, page } };
 }
+
+test("waiting for events ends at the first match or at its deadline, without a checkpoint", async () => {
+  const tracker = tracking();
+  const { page, session } = quietSession();
+  await tracker.initializeSessionTracking(session);
+  const query = { kinds: ["page_error"] };
+  const wait = async (action, milliseconds) => ({ ...await tracker.waitForEvents(session, action, milliseconds) });
+  // Nothing matches: the wait lasts as long as asked.
+  let started = Date.now();
+  assert.deepEqual(await wait(query, 150), { ready: false });
+  let elapsed = Date.now() - started;
+  assert.ok(elapsed >= 150 && elapsed < 3_000, `${elapsed} ms`);
+  // A match that arrives meanwhile ends it early, well before the cap below.
+  setTimeout(() => page.emit("pageerror", new Error("late")), 60);
+  started = Date.now();
+  assert.deepEqual(await wait(query, 5_000), { ready: true });
+  elapsed = Date.now() - started;
+  assert.ok(elapsed < 900, `${elapsed} ms`);
+  // A match that is already there is reported at once, a seen one is not.
+  started = Date.now();
+  assert.deepEqual(await wait(query, 5_000), { ready: true });
+  assert.ok(Date.now() - started < 900);
+  const seen = { ...query, runtime_generation: 1, after_sequence: session.eventSequence };
+  assert.deepEqual(await wait(seen, 100), { ready: false });
+  // The cursor is checked as when reading events.
+  await assert.rejects(tracker.waitForEvents(session, { runtime_generation: 9 }, 100),
+    (error) => error.code === -32001);
+  // The worker handles one request at a time: a long wait is cut short.
+  started = Date.now();
+  assert.deepEqual(await wait(seen, 60_000), { ready: false });
+  elapsed = Date.now() - started;
+  assert.ok(elapsed >= 1_000 && elapsed < 10_000, `${elapsed} ms`);
+  await tracker.disposeSessionTracking(session);
+});
 
 function scriptResponse(url, { status = 200, type = "application/javascript" } = {}) {
   return {

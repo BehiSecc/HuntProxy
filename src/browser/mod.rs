@@ -20,6 +20,10 @@ use tokio::sync::{Mutex, RwLock};
 
 const WORKER_PROTOCOL_VERSION: u64 = 1;
 const WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(90);
+/// The longest a single worker request waits for browser events. The worker
+/// answers one request at a time, so a longer wait would hold up every other
+/// session of the project.
+const EVENT_WAIT_SLICE: Duration = Duration::from_millis(100);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
 const BROWSER_CDP_PORT: u16 = 9222;
 const BROWSER_CDP_PORT_END: u16 = 9321;
@@ -2602,41 +2606,24 @@ impl BrowserService {
             BrowserAction::Events { wait_ms, .. } => *wait_ms,
             _ => 0,
         };
-        let mut worker_action = serde_json::to_value(&action)
+        let worker_action = serde_json::to_value(&action)
             .map_err(|error| DomainError::new(ErrorCode::InvalidArgument, error.to_string()))?;
-        // A worker RPC is serialized behind one shared stdin/stdout stream. Keep
-        // long-poll timing here so an empty event wait does not monopolize that
-        // stream and block independent browser sessions.
-        if event_wait_ms > 0 {
-            worker_action["wait_ms"] = json!(0);
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(event_wait_ms);
-        let worker_result = loop {
-            let result = self
-                .call_worker(
-                    project_id,
-                    "session.action",
-                    json!({
-                        "session_id": session_id.get(),
-                        "action": worker_action.clone(),
-                    }),
-                )
-                .await;
-            let should_wait = event_wait_ms > 0
-                && result.as_ref().is_ok_and(|value| {
-                    value
-                        .get("data")
-                        .and_then(|data| data.get("events"))
-                        .and_then(Value::as_array)
-                        .is_some_and(Vec::is_empty)
-                })
-                && tokio::time::Instant::now() < deadline;
-            if !should_wait {
-                break result;
+        let worker_result = async {
+            if event_wait_ms > 0 {
+                self.wait_for_browser_events(project_id, session_id, &worker_action, event_wait_ms)
+                    .await?;
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
-        };
+            self.call_worker(
+                project_id,
+                "session.action",
+                json!({
+                    "session_id": session_id.get(),
+                    "action": worker_action,
+                }),
+            )
+            .await
+        }
+        .await;
         let result = match worker_result {
             Ok(result) => result,
             Err(error) => {
@@ -2736,6 +2723,47 @@ impl BrowserService {
                     )
                 })?,
         })
+    }
+
+    /// Returns once the worker holds an event the `events` action would return,
+    /// or `wait_ms` has passed. The worker does the waiting, in slices of at
+    /// most `EVENT_WAIT_SLICE`, and the other sessions of the project are
+    /// served between slices.
+    async fn wait_for_browser_events(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        action: &Value,
+        wait_ms: u64,
+    ) -> DomainResult<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let slice = remaining.min(EVENT_WAIT_SLICE);
+            let result = self
+                .call_worker(
+                    project_id,
+                    "session.events_wait",
+                    json!({
+                        "session_id": session_id.get(),
+                        "action": action,
+                        "wait_ms": slice.as_millis().max(1) as u64,
+                    }),
+                )
+                .await?;
+            let ready = result
+                .get("ready")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    DomainError::new(ErrorCode::ProtocolError, "worker omitted event wait result")
+                })?;
+            if ready {
+                return Ok(());
+            }
+        }
     }
 
     pub async fn javascript_files(
@@ -6785,6 +6813,101 @@ done
             fixture.recorded_javascript_urls().await,
             ["https://app.test/a.js"]
         );
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    const SCRIPTED_EVENT_WAIT: &str = r#"
+    *'"method":"session.events_wait"'*)
+      printf 'x\n' >> '@DIR@/waits'
+      sleep 0.05
+      if [ "$(wc -l < '@DIR@/waits')" -ge @READY_AFTER@ ]; then ready=true; else ready=false; fi
+      printf '{"id":%s,"result":{"ready":%s}}\n' "$n" "$ready" ;;
+    *'"method":"session.action"'*) printf '{"id":%s,"result":{"ok":true,"message":"browser events read","data":{"events":[]},"checkpoint":{"url":"about:blank","_private":{}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*) printf '{"id":%s,"result":{"files":[],"cursor":0}}\n' "$n" ;;"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn event_waits_are_short_worker_requests_followed_by_one_action() {
+        let fixture =
+            ScriptedSession::start(&SCRIPTED_EVENT_WAIT.replace("@READY_AFTER@", "3")).await;
+        let started = std::time::Instant::now();
+        let result = fixture
+            .run(json!({"type": "events", "wait_ms": 20_000, "kinds": ["page_error"]}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait ends with the first event, not at its deadline"
+        );
+        let waits = fixture.requests("session.events_wait");
+        assert_eq!(waits.len(), 3);
+        for wait in &waits {
+            let params = &wait["params"];
+            assert!(params["wait_ms"].as_u64().unwrap() <= 100);
+            assert_eq!(params["session_id"], fixture.session_id.get());
+            assert_eq!(params["action"]["type"], "events");
+            assert_eq!(params["action"]["kinds"], json!(["page_error"]));
+        }
+        // However long the wait took, the action and its checkpoint happen once.
+        assert_eq!(fixture.requests("session.action").len(), 1);
+
+        fixture.run(json!({"type": "events"})).await.unwrap();
+        assert_eq!(fixture.requests("session.events_wait").len(), 3);
+        assert_eq!(fixture.requests("session.action").len(), 2);
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_event_wait_without_events_ends_at_its_deadline() {
+        let fixture =
+            ScriptedSession::start(&SCRIPTED_EVENT_WAIT.replace("@READY_AFTER@", "1000")).await;
+        let started = std::time::Instant::now();
+        fixture
+            .run(json!({"type": "events", "wait_ms": 350}))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        let waits = fixture.requests("session.events_wait").len();
+        assert!((2..=8).contains(&waits), "{waits} waits");
+        assert_eq!(fixture.requests("session.action").len(), 1);
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn other_requests_are_served_between_event_wait_slices() {
+        let fixture =
+            ScriptedSession::start(&SCRIPTED_EVENT_WAIT.replace("@READY_AFTER@", "1000")).await;
+        let waiting = {
+            let service = fixture.service.clone();
+            let (project_id, session_id) = (fixture.project_id, fixture.session_id);
+            tokio::spawn(async move {
+                let action = serde_json::from_value(json!({"type": "events", "wait_ms": 3_000}));
+                service
+                    .action(project_id, session_id, action.unwrap())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        fixture
+            .service
+            .call_worker(
+                fixture.project_id,
+                "session.status",
+                json!({"session_id": fixture.session_id.get()}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "a request made during a 3 s event wait waited {:?}",
+            started.elapsed()
+        );
+        waiting.await.unwrap().unwrap();
         fixture.service.force_stop_all().await;
     }
 

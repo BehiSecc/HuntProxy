@@ -22,6 +22,8 @@ const ownedChromeChildren = new Set();
 let shuttingDown = false;
 const MAX_SESSION_EVENTS = 256;
 const MAX_SESSION_EVENT_BYTES = 256 * 1024;
+const MAX_EVENT_WAIT_MS = 1_000;
+const EVENT_POLL_MS = 50;
 const MAX_SCREENSHOT_PIXELS = 16 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
 
@@ -1731,25 +1733,9 @@ async function performPages(session, action) {
 }
 
 async function performEvents(session, action) {
-  const generation = action.runtime_generation == null
-    ? session.runtimeGeneration : Number(action.runtime_generation);
-  requireRuntimeGeneration(session, generation);
-  const after = Number(action.after_sequence || 0);
-  const limit = Number(action.limit || 50);
-  const waitMs = Number(action.wait_ms || 0);
-  const kinds = new Set(Array.isArray(action.kinds) ? action.kinds : []);
-  const matching = () => session.events
-    .map((entry) => entry.event)
-    .filter((event) => event.sequence > after && (!kinds.size || kinds.has(event.kind)))
-    .slice(0, limit);
-  const deadline = Date.now() + waitMs;
-  let events;
-  do {
-    await drainWindowMessages(session);
-    events = matching();
-    if (events.length || Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now())));
-  } while (Date.now() < deadline);
+  const { after, matching } = eventQuery(session, action);
+  await drainWindowMessages(session);
+  const events = matching();
   const oldestSequence = session.events[0]?.event.sequence ?? session.eventSequence + 1;
   return { message: "browser events read", data: {
     runtime_generation: session.runtimeGeneration,
@@ -1765,6 +1751,35 @@ async function performEvents(session, action) {
         page_id: pageIdFor(session, page), observer: "window_message", operation: state.error,
       })),
   } };
+}
+
+function eventQuery(session, action) {
+  const generation = action.runtime_generation == null
+    ? session.runtimeGeneration : Number(action.runtime_generation);
+  requireRuntimeGeneration(session, generation);
+  const after = Number(action.after_sequence || 0);
+  const limit = Number(action.limit || 50);
+  const kinds = new Set(Array.isArray(action.kinds) ? action.kinds : []);
+  const matching = () => session.events
+    .map((entry) => entry.event)
+    .filter((event) => event.sequence > after && (!kinds.size || kinds.has(event.kind)))
+    .slice(0, limit);
+  return { after, matching };
+}
+
+// Waits up to `waitMs` for an event the query would return, without extracting
+// a checkpoint. The worker serves one request at a time, so callers chain short
+// waits and the other sessions of the project are served in between.
+async function waitForEvents(session, action, waitMs) {
+  const { matching } = eventQuery(session, action);
+  const deadline = Date.now() + Math.min(Math.max(Number(waitMs) || 0, 0), MAX_EVENT_WAIT_MS);
+  for (;;) {
+    await drainWindowMessages(session);
+    if (matching().length) return { ready: true };
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { ready: false };
+    await new Promise((resolve) => setTimeout(resolve, Math.min(EVENT_POLL_MS, remaining)));
+  }
 }
 
 async function performScroll(session, action) {
@@ -2246,6 +2261,12 @@ async function handle(req) {
           checkpoint,
           engine: session.engine,
         });
+      }
+      case "session.events_wait": {
+        const session = sessions.get(Number(params.session_id));
+        if (!session) throw rpcError(-32001, "session not found");
+        session.identityController?.assertHealthy();
+        return respond(id, await waitForEvents(session, params.action || {}, params.wait_ms));
       }
       case "session.csrf_probe": {
         const sessionId = Number(params.session_id);
