@@ -1541,7 +1541,8 @@ async fn copy_as(
     {
         Ok(result) => {
             if query.include_secrets {
-                let _ = state
+                // An unaudited secret reveal must not succeed.
+                if let Err(error) = state
                     .db
                     .audit(
                         Some(project_id),
@@ -1551,7 +1552,10 @@ async fn copy_as(
                         Some(&eid.to_string()),
                         serde_json::json!({ "format": query.format }),
                     )
-                    .await;
+                    .await
+                {
+                    return error_response(error);
+                }
             }
             Json(result).into_response()
         }

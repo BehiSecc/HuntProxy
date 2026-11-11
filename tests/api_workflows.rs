@@ -2209,6 +2209,46 @@ async fn copy_as_includes_secrets_by_default_and_can_explicitly_redact_them() {
 }
 
 #[tokio::test]
+async fn copy_as_with_secrets_fails_when_the_reveal_cannot_be_audited() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut captured = exchange(project_id, "GET", "/private");
+    captured.request_headers = vec![HeaderEntry {
+        name: "Authorization".into(),
+        value: b"Bearer top-secret".to_vec(),
+        ordinal: 0,
+    }];
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+    state
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER audit_down BEFORE INSERT ON audit_events \
+                 BEGIN SELECT RAISE(ABORT, 'audit log unavailable'); END;",
+            )
+            .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))
+        })
+        .await
+        .unwrap();
+    let app = huntproxy::api::router(state);
+
+    let response = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/copy-as?format=curl",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&body).contains("top-secret"));
+}
+
+#[tokio::test]
 async fn raw_reply_preserves_framing_and_collects_response_sequences() {
     let (_directory, state, project_id) = test_state().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
