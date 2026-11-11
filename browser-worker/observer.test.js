@@ -20,7 +20,8 @@ function tracking() {
   return vm.runInNewContext(`${source.slice(source.indexOf("const MAX_SESSION_EVENTS"), source.indexOf("async function activePage"))}
     ${source.slice(source.indexOf("function requireRuntimeGeneration"), source.indexOf("async function performPages"))}
     ${source.slice(source.indexOf("async function performEvents"), source.indexOf("async function performScroll"))}
-    ({ initializeSessionTracking, drainWindowMessages, disposeSessionTracking, performEvents, recordSessionEvent });`, {
+    ({ initializeSessionTracking, drainWindowMessages, disposeSessionTracking, performEvents, recordSessionEvent,
+      javascriptFilesSince });`, {
     Buffer, URL, setTimeout, rpcError: (code, message) => ({ code, message }),
   });
 }
@@ -182,4 +183,71 @@ test("observer read failure preserves buffered events and reports one persistent
   });
   assert.equal(later.data.events.length, 0);
   assert.equal(later.data.observer_errors.length, 1);
+});
+
+// A page whose message observer cannot start; its other events still flow.
+function quietSession() {
+  const page = new EventEmitter();
+  page.isClosed = () => false;
+  page.url = () => "https://app.test/";
+  const context = {
+    on() {}, off() {}, pages: () => [page],
+    newCDPSession: async () => { throw new Error("unavailable"); },
+  };
+  return { page, session: { context, page } };
+}
+
+function scriptResponse(url, { status = 200, type = "application/javascript" } = {}) {
+  return {
+    url: () => url, status: () => status, headers: () => ({ "content-type": type }),
+    request: () => ({
+      frame: () => ({ url: () => "https://app.test/" }),
+      resourceType: () => "script", isNavigationRequest: () => false,
+    }),
+  };
+}
+
+test("each JavaScript file is reported once, also across a CDP handoff or resume", async () => {
+  const tracker = tracking();
+  const { page, session } = quietSession();
+  await tracker.initializeSessionTracking(session);
+  // Objects made inside the vm have another realm's prototypes.
+  const since = (cursor) => JSON.parse(JSON.stringify(tracker.javascriptFilesSince(session, cursor)));
+  const urls = (reply) => reply.files.map((file) => file.url);
+  page.emit("response", scriptResponse("https://app.test/a.js"));
+  page.emit("response", scriptResponse("https://app.test/b.mjs", { type: "text/plain" }));
+  page.emit("response", scriptResponse("https://app.test/page", { type: "text/html" }));
+  const first = since();
+  assert.deepEqual(urls(first), ["https://app.test/a.js", "https://app.test/b.mjs"]);
+  assert.deepEqual(Object.keys(first.files[0]).sort(),
+    ["host", "mime", "path", "source_page_url", "status_code", "url"]);
+  assert.equal(first.cursor, 2);
+  assert.deepEqual(since(first.cursor), { files: [], cursor: 2 });
+
+  // The same response again is not news; a changed one is, alone.
+  page.emit("response", scriptResponse("https://app.test/a.js"));
+  assert.deepEqual(since(2), { files: [], cursor: 2 });
+  page.emit("response", scriptResponse("https://app.test/a.js", { status: 304 }));
+  const changed = since(2);
+  assert.deepEqual(changed.files.map((file) => [file.url, file.status_code]), [["https://app.test/a.js", 304]]);
+  assert.equal(changed.cursor, 3);
+
+  // A handoff or resume replaces the browser runtime but not the session: what
+  // was reported stays reported, and new files still count on from the cursor.
+  const known = new Map(session.javascriptFiles);
+  await tracker.disposeSessionTracking(session);
+  const relaunched = quietSession();
+  Object.assign(session, relaunched.session);
+  await tracker.initializeSessionTracking(session, known, 2);
+  assert.deepEqual(since(3), { files: [], cursor: 3 });
+  relaunched.page.emit("response", scriptResponse("https://app.test/c.js"));
+  const resumed = since(3);
+  assert.deepEqual(urls(resumed), ["https://app.test/c.js"]);
+  assert.equal(resumed.cursor, 4);
+
+  // No cursor, or one this session never issued, means everything.
+  for (const cursor of [undefined, null, -1, 99, "2", 1.5]) {
+    assert.equal(since(cursor).files.length, 3, String(cursor));
+  }
+  await tracker.disposeSessionTracking(session);
 });

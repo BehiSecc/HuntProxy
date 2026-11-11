@@ -770,6 +770,9 @@ struct RuntimeSession {
     persistent: bool,
     profile: Option<String>,
     cdp: Option<BrowserCdpInfo>,
+    /// Position in the worker's list of JavaScript files up to which they have
+    /// been recorded; the next record asks only for what came after it.
+    javascript_cursor: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1686,6 +1689,7 @@ impl BrowserService {
                 persistent,
                 profile: profile.clone(),
                 cdp: None,
+                javascript_cursor: 0,
             },
         );
         let result = match self
@@ -1752,7 +1756,12 @@ impl BrowserService {
             return Err(error);
         }
         if let Err(error) = self
-            .persist_javascript_files(project_id, session.id, session.current_url.as_deref())
+            .persist_javascript_files(
+                project_id,
+                session.id,
+                session.current_url.as_deref(),
+                false,
+            )
             .await
         {
             tracing::warn!(%error, session_id = session.id.get(), "could not persist JavaScript provenance");
@@ -2678,7 +2687,12 @@ impl BrowserService {
         self.db.update_browser_session(&session).await?;
         drop(runtimes);
         if let Err(error) = self
-            .persist_javascript_files(project_id, session_id, session.current_url.as_deref())
+            .persist_javascript_files(
+                project_id,
+                session_id,
+                session.current_url.as_deref(),
+                false,
+            )
             .await
         {
             tracing::warn!(%error, session_id = session_id.get(), "could not persist JavaScript provenance");
@@ -2740,23 +2754,40 @@ impl BrowserService {
         }
         let operation_lock = self.session_operation_lock(session_id).await;
         let _operation_guard = operation_lock.lock().await;
-        self.persist_javascript_files(project_id, session_id, None)
+        self.persist_javascript_files(project_id, session_id, None, true)
             .await
     }
 
+    /// Records the session's JavaScript files and returns the ones the worker
+    /// reported: only those not recorded before, or every file with `all`.
     async fn persist_javascript_files(
         &self,
         project_id: ProjectId,
         session_id: BrowserSessionId,
         default_source_page_url: Option<&str>,
+        all: bool,
     ) -> DomainResult<Vec<BrowserJavascriptFile>> {
+        let mut params = json!({ "session_id": session_id.get() });
+        if !all {
+            if let Some(runtime) = self
+                .runtime_sessions
+                .lock()
+                .await
+                .get(&session_id.get())
+                .filter(|runtime| runtime.project_id == project_id)
+            {
+                params["after"] = json!(runtime.javascript_cursor);
+            }
+        }
         let result = self
-            .call_worker(
-                project_id,
-                "session.javascript_files",
-                json!({ "session_id": session_id.get() }),
-            )
+            .call_worker(project_id, "session.javascript_files", params)
             .await?;
+        let cursor = result
+            .get("cursor")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                DomainError::new(ErrorCode::ProtocolError, "worker omitted JavaScript cursor")
+            })?;
         let files: Vec<BrowserJavascriptFile> =
             serde_json::from_value(result.get("files").cloned().unwrap_or_else(|| json!([])))
                 .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
@@ -2767,7 +2798,12 @@ impl BrowserService {
                     .iter()
                     .find_map(|file| file.source_page_url.as_deref())
             });
-        if let Some(fallback) = fallback {
+        if !files.is_empty() {
+            // Without a page to attribute them to, the files stay unrecorded
+            // and the cursor stays put, so the next call offers them again.
+            let Some(fallback) = fallback else {
+                return Ok(files);
+            };
             self.db
                 .record_javascript_files(
                     project_id,
@@ -2783,6 +2819,15 @@ impl BrowserService {
                     "browser",
                 )
                 .await?;
+        }
+        if let Some(runtime) = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get_mut(&session_id.get())
+            .filter(|runtime| runtime.project_id == project_id)
+        {
+            runtime.javascript_cursor = cursor;
         }
         Ok(files)
     }
@@ -4623,6 +4668,7 @@ mod tests {
                     persistent: true,
                     profile: Some("account1".into()),
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             ),
             (
@@ -4633,6 +4679,7 @@ mod tests {
                     persistent: false,
                     profile: None,
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             ),
             (
@@ -4643,6 +4690,7 @@ mod tests {
                     persistent: true,
                     profile: Some("foreign-account".into()),
                     cdp: Some(cdp.clone()),
+                    javascript_cursor: 0,
                 },
             ),
         ]);
@@ -4730,6 +4778,7 @@ mod tests {
                 persistent: true,
                 profile: Some("default".into()),
                 cdp: None,
+                javascript_cursor: 0,
             },
         );
         let operation = service.session_operation_lock(own.id).await;
@@ -4797,6 +4846,7 @@ mod tests {
                     devtools_url: String::new(),
                     hosted_devtools_url: String::new(),
                 }),
+                javascript_cursor: 0,
             },
         );
         service
@@ -5451,6 +5501,7 @@ done
                     persistent: true,
                     profile: Some("account1".into()),
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             );
             let lease = (project.id.get(), "account1".to_string());
@@ -6205,7 +6256,7 @@ while IFS= read -r request; do
       session=$(printf '%s\n' "$request" | sed -n 's/.*"session_id":\([0-9][0-9]*\).*/\1/p')
       printf '{{"id":%s,"result":{{"session_id":%s,"requested_profile":null,"active_profile":null,"profile_dir":null,"persistent":false,"checkpoint":{{"url":"about:blank","_private":{{}}}}}}}}\n' "$n" "$session" ;;
     *'"method":"session.action"'*) printf '{{"id":%s,"result":{{"ok":true,"checkpoint":{{"url":"about:blank","_private":{{}}}}}}}}\n' "$n" ;;
-    *'"method":"session.javascript_files"'*) printf '{{"id":%s,"result":{{"files":[]}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*) printf '{{"id":%s,"result":{{"files":[],"cursor":0}}}}\n' "$n" ;;
     *) printf '{{"id":%s,"result":{{"stopped":true}}}}\n' "$n" ;;
   esac
 done
@@ -6259,6 +6310,7 @@ done
                 persistent: false,
                 profile: None,
                 cdp: None,
+                javascript_cursor: 0,
             },
         );
         let mut worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
@@ -6467,6 +6519,7 @@ done
                     persistent: false,
                     profile: None,
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             );
             ids.push(session.id);
@@ -6522,6 +6575,217 @@ done
             Some(&9223)
         );
         service.force_stop_all().await;
+    }
+
+    /// A service with one ready browser session whose worker is a shell
+    /// script. The script appends every request to `requests.log` and answers
+    /// with the given `case` arms, where `@DIR@` is the fixture directory.
+    #[cfg(unix)]
+    struct ScriptedSession {
+        service: Arc<BrowserService>,
+        db: Arc<Db>,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl ScriptedSession {
+        async fn start(arms: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("worker.sh");
+            let body = r#"
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  printf '%s\n' "$request" >> '@DIR@/requests.log'
+  case "$request" in
+    *'"method":"hello"'*) printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}' ;;
+@ARMS@
+    *) printf '{"id":%s,"result":{}}\n' "$n" ;;
+  esac
+done
+"#;
+            std::fs::write(
+                &script,
+                body.replace("@ARMS@", arms)
+                    .replace("@DIR@", &directory.path().display().to_string()),
+            )
+            .unwrap();
+            let db = Arc::new(Db::open_in_memory().await.unwrap());
+            let project = db
+                .create_project(CreateProjectRequest {
+                    name: "Scripted worker".into(),
+                    target_url: "https://app.test".into(),
+                    advanced: None,
+                })
+                .await
+                .unwrap();
+            let mut service = BrowserService::new_with_proxy_and_ca(
+                db.clone(),
+                None,
+                None,
+                "http://127.0.0.1:17891".into(),
+                None,
+                directory.path().join("profiles"),
+            );
+            service.node_path = Some(PathBuf::from("/bin/sh"));
+            service.worker_path = Some(script.clone());
+            let mut session = db.create_browser_session(project.id, None).await.unwrap();
+            session.state = BrowserSessionState::Ready;
+            db.update_browser_session(&session).await.unwrap();
+            let capture = db
+                .create_capture_session(CreateCaptureSession {
+                    project_id: project.id,
+                    browser_session_id: Some(session.id),
+                    browser_action_id: None,
+                    is_browser_bound: true,
+                    ttl: None,
+                })
+                .await
+                .unwrap();
+            service.runtime_sessions.lock().await.insert(
+                session.id.get(),
+                RuntimeSession {
+                    project_id: project.id,
+                    capture_session_id: capture.id,
+                    persistent: false,
+                    profile: None,
+                    cdp: None,
+                    javascript_cursor: 0,
+                },
+            );
+            let worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
+                .await
+                .unwrap_or_else(|_| panic!("start scripted worker"));
+            *service.worker_entry(project.id).await.lock().await = Some(worker);
+            Self {
+                service: Arc::new(service),
+                db,
+                project_id: project.id,
+                session_id: session.id,
+                directory,
+            }
+        }
+
+        async fn run(&self, action: Value) -> DomainResult<ActionResult> {
+            let action = serde_json::from_value(action).unwrap();
+            self.service
+                .action(self.project_id, self.session_id, action)
+                .await
+        }
+
+        /// The requests the worker received for one method, in order.
+        fn requests(&self, method: &str) -> Vec<Value> {
+            std::fs::read_to_string(self.directory.path().join("requests.log"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|request| request["method"] == method)
+                .collect()
+        }
+
+        /// The `after` cursor of every JavaScript file request so far.
+        fn javascript_cursors_asked(&self) -> Vec<Option<u64>> {
+            self.requests("session.javascript_files")
+                .iter()
+                .map(|request| request["params"]["after"].as_u64())
+                .collect()
+        }
+
+        async fn recorded_javascript_urls(&self) -> Vec<String> {
+            let (records, _) = self
+                .db
+                .list_javascript_files(self.project_id, None, Some("app.test".into()), 20)
+                .await
+                .unwrap();
+            let mut urls: Vec<_> = records.into_iter().map(|record| record.url).collect();
+            urls.sort();
+            urls
+        }
+    }
+
+    #[cfg(unix)]
+    fn scripted_javascript_file(name: &str) -> String {
+        format!(
+            r#"{{"url":"https://app.test/{name}.js","path":"/{name}.js","host":"app.test","mime":"application/javascript","status_code":200,"source_page_url":"https://app.test/"}}"#
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn javascript_files_are_recorded_once_and_asked_for_from_the_last_cursor() {
+        let arms = r#"
+    *'"method":"session.action"'*) printf '{"id":%s,"result":{"ok":true,"checkpoint":{"url":"https://app.test/","_private":{}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*)
+      after=$(printf '%s\n' "$request" | sed -n 's/.*"after":\([0-9][0-9]*\).*/\1/p')
+      case "${after:-none}" in
+        0) printf '{"id":%s,"result":{"files":[@A@,@B@],"cursor":2}}\n' "$n" ;;
+        2) printf '{"id":%s,"result":{"files":[@C@],"cursor":3}}\n' "$n" ;;
+        3) printf '{"id":%s,"result":{"files":[],"cursor":3}}\n' "$n" ;;
+        *) printf '{"id":%s,"result":{"files":[@A@,@B@,@C@],"cursor":3}}\n' "$n" ;;
+      esac ;;"#
+            .replace("@A@", &scripted_javascript_file("a"))
+            .replace("@B@", &scripted_javascript_file("b"))
+            .replace("@C@", &scripted_javascript_file("c"));
+        let fixture = ScriptedSession::start(&arms).await;
+        for _ in 0..3 {
+            fixture.run(json!({"type": "snapshot"})).await.unwrap();
+        }
+        // Asking for the session's files returns all of them, whatever was recorded.
+        let all = fixture
+            .service
+            .javascript_files(fixture.project_id, fixture.session_id)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            fixture.javascript_cursors_asked(),
+            [Some(0), Some(2), Some(3), None]
+        );
+        assert_eq!(
+            fixture.recorded_javascript_urls().await,
+            ["a", "b", "c"].map(|name| format!("https://app.test/{name}.js"))
+        );
+        let runtimes = fixture.service.runtime_sessions.lock().await;
+        assert_eq!(runtimes[&fixture.session_id.get()].javascript_cursor, 3);
+        drop(runtimes);
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn javascript_files_without_a_page_are_offered_again_until_recorded() {
+        let arms = r#"
+    *'"method":"session.action"'*)
+      if [ -e '@DIR@/online' ]; then url='https://app.test/'; else url='about:blank'; fi
+      printf '{"id":%s,"result":{"ok":true,"checkpoint":{"url":"%s","_private":{}}}}\n' "$n" "$url" ;;
+    *'"method":"session.javascript_files"'*)
+      after=$(printf '%s\n' "$request" | sed -n 's/.*"after":\([0-9][0-9]*\).*/\1/p')
+      if [ "${after:-0}" -lt 1 ]; then
+        printf '{"id":%s,"result":{"files":[{"url":"https://app.test/a.js","path":"/a.js","host":"app.test","mime":null,"status_code":200,"source_page_url":null}],"cursor":1}}\n' "$n"
+      else
+        printf '{"id":%s,"result":{"files":[],"cursor":1}}\n' "$n"
+      fi ;;"#;
+        let fixture = ScriptedSession::start(arms).await;
+        // On about:blank the file has no page to be attributed to.
+        for _ in 0..2 {
+            fixture.run(json!({"type": "snapshot"})).await.unwrap();
+        }
+        assert!(fixture.recorded_javascript_urls().await.is_empty());
+        std::fs::write(fixture.directory.path().join("online"), "").unwrap();
+        for _ in 0..2 {
+            fixture.run(json!({"type": "snapshot"})).await.unwrap();
+        }
+        assert_eq!(
+            fixture.javascript_cursors_asked(),
+            [Some(0), Some(0), Some(0), Some(1)]
+        );
+        assert_eq!(
+            fixture.recorded_javascript_urls().await,
+            ["https://app.test/a.js"]
+        );
+        fixture.service.force_stop_all().await;
     }
 
     #[test]

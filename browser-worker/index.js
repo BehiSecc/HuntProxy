@@ -59,8 +59,30 @@ function javascriptFile(response, fallbackPageUrl) {
 function trackJavascriptFiles(session, page) {
   page.on("response", (response) => {
     const file = javascriptFile(response, page.url());
-    if (file) session.javascriptFiles.set(file.url, file);
+    if (file) recordJavascriptFile(session, file);
   });
+}
+
+// Every new or changed entry takes the next sequence number. The counter lives
+// on the session, so it keeps counting across CDP handoffs and resumes, which
+// replace the browser runtime but not the session.
+function recordJavascriptFile(session, file) {
+  const known = session.javascriptFiles.get(file.url);
+  if (known && known.mime === file.mime && known.status_code === file.status_code
+      && known.source_page_url === file.source_page_url) return;
+  session.javascriptFiles.set(file.url, { ...file, sequence: ++session.javascriptSequence });
+}
+
+// The files recorded after `after`, plus the cursor to ask from next time. A
+// caller without a cursor, or with one this session never issued, gets all.
+function javascriptFilesSince(session, after) {
+  const cursor = session.javascriptSequence ?? 0;
+  const from = Number.isSafeInteger(after) && after >= 0 && after <= cursor ? after : 0;
+  const files = [];
+  for (const { sequence, ...file } of session.javascriptFiles?.values() ?? []) {
+    if (sequence > from) files.push(file);
+  }
+  return { files, cursor };
 }
 
 function publicLocation(value) {
@@ -338,6 +360,7 @@ async function drainWindowMessages(session) {
 
 async function initializeSessionTracking(session, existingJavascriptFiles = new Map(), generation = 1) {
   session.javascriptFiles = existingJavascriptFiles;
+  session.javascriptSequence ??= 0;
   session.runtimeErrors = [];
   session.runtimeErrorCount = 0;
   session.runtimeGeneration = generation;
@@ -2352,7 +2375,7 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        return respond(id, { files: [...(session.javascriptFiles?.values() || [])] });
+        return respond(id, javascriptFilesSince(session, params.after));
       }
       case "session.cdp_enable": {
         const sessionId = Number(params.session_id);
