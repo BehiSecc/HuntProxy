@@ -1,7 +1,8 @@
-//! Black-box compatibility coverage for upgrading an actual v0.1.1 data directory.
+//! Black-box compatibility coverage for upgrading an actual data directory created
+//! by a previous official release.
 //!
 //! This is deliberately ignored in ordinary test runs. CI or a release engineer must
-//! provide a verified official v0.1.1 executable in `HUNTPROXY_LEGACY_BINARY`.
+//! provide a verified official v0.2.0 or newer executable in `HUNTPROXY_PREVIOUS_BINARY`.
 
 #![cfg(unix)]
 
@@ -54,7 +55,7 @@ impl Fixture {
                             .next()
                             .and_then(|line| line.split_whitespace().nth(1))
                             .unwrap_or("/");
-                        let body = format!(r#"{{"fixture":"legacy-upgrade","path":"{path}"}}"#);
+                        let body = format!(r#"{{"fixture":"upgrade","path":"{path}"}}"#);
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
@@ -90,24 +91,28 @@ impl Drop for Fixture {
 }
 
 #[test]
-#[ignore = "requires HUNTPROXY_LEGACY_BINARY pointing to a verified official v0.1.1 binary"]
-fn v011_data_and_full_bundle_upgrade_to_current_release() {
-    let legacy = required_legacy_binary();
+#[ignore = "requires HUNTPROXY_PREVIOUS_BINARY pointing to a verified official previous release binary"]
+fn previous_release_data_and_full_bundle_upgrade_to_current_release() {
+    let previous = required_previous_binary();
     let current = PathBuf::from(env!("CARGO_BIN_EXE_HuntProxy"));
     let workspace = tempfile::Builder::new()
-        .prefix("legacy-upgrade-")
+        .prefix("previous-upgrade-")
         .tempdir()
         .unwrap();
     let data_dir = workspace.path().join("data");
-    let bundle = workspace.path().join("v0.1.1-full.huntproxy");
+    let bundle = workspace.path().join("previous-full.huntproxy");
     let fixture = Fixture::start();
     let api_port = available_port();
     let proxy_port = available_port();
     let api_base = format!("http://127.0.0.1:{api_port}");
 
-    assert_success(&run(&legacy, &data_dir, &["init"]), "legacy init");
+    let previous_version = version_line(&previous, &data_dir);
+    assert_success(
+        &run(&previous, &data_dir, &["init"]),
+        "previous release init",
+    );
     configure_ports(&data_dir, api_port, proxy_port);
-    let mut daemon = start_daemon(&legacy, &data_dir);
+    let mut daemon = start_daemon(&previous, &data_dir);
     wait_for_health(&api_base, &mut daemon);
     let client = http_client();
 
@@ -116,7 +121,7 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
         "POST",
         &format!("{api_base}/api/v1/projects"),
         Some(json!({
-            "name": "Legacy upgrade fixture",
+            "name": "Upgrade fixture",
             "target_url": fixture.url("/account")
         })),
     );
@@ -131,7 +136,7 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     let token = capture["token_once"]
         .as_str()
         .expect("one-time proxy token");
-    send_captured_request(proxy_port, &fixture.url("/captured?source=v011"), token);
+    send_captured_request(proxy_port, &fixture.url("/captured?source=previous"), token);
     wait_until(Duration::from_secs(10), || {
         request_json(
             &client,
@@ -150,7 +155,7 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
         Some(json!({
             "target_url": fixture.url("/account"),
             "profile_name": "member",
-            "cookie": "session=legacy-member; Path=/"
+            "cookie": "session=previous-member; Path=/"
         })),
     );
     request_json(
@@ -158,28 +163,28 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
         "POST",
         &format!("{api_base}/api/v1/projects/{project_id}/reply-tabs"),
         Some(json!({
-            "name": "Legacy saved request",
+            "name": "Saved request",
             "protocol": "h1",
             "draft": {
                 "method": "POST",
                 "url": fixture.url("/draft"),
-                "body_text": "legacy-draft-body"
+                "body_text": "previous-draft-body"
             }
         })),
     );
 
-    let legacy_browser_state = data_dir
+    let browser_state = data_dir
         .join("browser-profiles/projects")
         .join(project_id.to_string())
         .join("state.json");
-    fs::create_dir_all(legacy_browser_state.parent().unwrap()).unwrap();
+    fs::create_dir_all(browser_state.parent().unwrap()).unwrap();
     fs::write(
-        &legacy_browser_state,
+        &browser_state,
         serde_json::to_vec(&json!({
             "version": 7,
             "last_url": fixture.url("/remembered"),
             "local_storage": {
-                format!("http://{}", fixture.address): {"upgrade-marker": "v0.1.1"}
+                format!("http://{}", fixture.address): {"upgrade-marker": &previous_version}
             }
         }))
         .unwrap(),
@@ -188,7 +193,7 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
 
     assert_success(
         &run(
-            &legacy,
+            &previous,
             &data_dir,
             &[
                 "project",
@@ -198,21 +203,22 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
                 "--include-secrets",
             ],
         ),
-        "legacy full bundle export",
+        "previous release full bundle export",
     );
-    assert!(bundle.is_file(), "legacy bundle was not created");
+    assert!(bundle.is_file(), "previous release bundle was not created");
 
     write_custom_plugin(&data_dir);
 
     // Exercise the same coordinated installation transaction used by the
     // upstream installer. Seed a realistic installation with the verified
-    // legacy executable while its daemon is still serving this data directory.
+    // previous release executable while its daemon is still serving this data
+    // directory.
     let install_dir = workspace.path().join("install");
     fs::create_dir_all(&install_dir).unwrap();
     let installed = install_dir.join("HuntProxy");
-    fs::copy(&legacy, &installed).unwrap();
-    fs::set_permissions(&installed, fs::metadata(&legacy).unwrap().permissions()).unwrap();
-    let legacy_hash = sha256_file(&legacy);
+    fs::copy(&previous, &installed).unwrap();
+    fs::set_permissions(&installed, fs::metadata(&previous).unwrap().permissions()).unwrap();
+    let previous_hash = sha256_file(&previous);
 
     let installation = run(
         &current,
@@ -231,14 +237,14 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     );
     assert!(
         installation_stdout.contains("daemon restarted"),
-        "running legacy daemon was not restarted: {installation_stdout}"
+        "running previous daemon was not restarted: {installation_stdout}"
     );
 
-    let legacy_status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(10))
-        .expect("legacy daemon did not exit during coordinated installation");
+    let previous_status = wait_for_child_exit(&mut daemon.child, Duration::from_secs(10))
+        .expect("previous daemon did not exit during coordinated installation");
     assert!(
-        legacy_status.success(),
-        "legacy daemon exited with {legacy_status}"
+        previous_status.success(),
+        "previous daemon exited with {previous_status}"
     );
     let installed_version = run(&installed, &data_dir, &["--version"]);
     assert_success(&installed_version, "installed release version");
@@ -248,8 +254,8 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
     );
     assert_eq!(
         sha256_file(&install_dir.join("HuntProxy.previous")),
-        legacy_hash,
-        "rollback binary must match the verified legacy executable"
+        previous_hash,
+        "rollback binary must match the verified previous release executable"
     );
     let restore_points = fs::read_dir(data_dir.join("runtime/updates"))
         .unwrap()
@@ -293,9 +299,9 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
         .expect("default browser profile");
     assert_eq!(default["has_state"], true);
     assert_eq!(
-        serde_json::from_slice::<Value>(&fs::read(&legacy_browser_state).unwrap()).unwrap()
+        serde_json::from_slice::<Value>(&fs::read(&browser_state).unwrap()).unwrap()
             ["local_storage"][format!("http://{}", fixture.address)]["upgrade-marker"],
-        "v0.1.1"
+        previous_version
     );
     assert_browser_roundtrip(&client, &api_base, project_id, &fixture);
 
@@ -305,7 +311,7 @@ fn v011_data_and_full_bundle_upgrade_to_current_release() {
         &data_dir,
         &["project", "import", bundle.to_str().unwrap()],
     );
-    assert_success(&imported, "current import of legacy full bundle");
+    assert_success(&imported, "current import of previous release full bundle");
     let imported_id = imported_project_id(&String::from_utf8_lossy(&imported.stdout));
 
     // A repeated preparation/startup is the normal path after a restart and must
@@ -329,16 +335,23 @@ fn sha256_file(path: &Path) -> String {
     hex::encode(Sha256::digest(fs::read(path).unwrap()))
 }
 
-fn required_legacy_binary() -> PathBuf {
-    let path = std::env::var_os("HUNTPROXY_LEGACY_BINARY")
+fn required_previous_binary() -> PathBuf {
+    let path = std::env::var_os("HUNTPROXY_PREVIOUS_BINARY")
         .map(PathBuf::from)
-        .expect("HUNTPROXY_LEGACY_BINARY is required for this ignored integration test");
+        .expect("HUNTPROXY_PREVIOUS_BINARY is required for this ignored integration test");
     assert!(
         path.is_file(),
-        "legacy binary does not exist: {}",
+        "previous release binary does not exist: {}",
         path.display()
     );
     path
+}
+
+/// The `HuntProxy x.y.z` line a release prints for `--version`.
+fn version_line(binary: &Path, data_dir: &Path) -> String {
+    let output = run(binary, data_dir, &["--version"]);
+    assert_success(&output, "version");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 fn command(binary: &Path, data_dir: &Path) -> Command {
@@ -615,9 +628,9 @@ fn assert_project_state(
         .as_array()
         .unwrap()
         .iter()
-        .find(|tab| tab["name"] == "Legacy saved request")
+        .find(|tab| tab["name"] == "Saved request")
         .expect("saved request draft");
-    assert_eq!(tab["draft"]["body_text"], "legacy-draft-body");
+    assert_eq!(tab["draft"]["body_text"], "previous-draft-body");
     assert_eq!(tab["draft"]["url"], fixture.url("/draft"));
 
     let cookies = request_json(

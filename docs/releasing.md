@@ -34,13 +34,14 @@ Run `scripts/check.sh --quick` for day-to-day formatting, notices, asset validat
 cargo test --locked --test browser_profile_isolation -- --ignored --test-threads=1
 ```
 
-Run the ignored upgrade fixture with `HUNTPROXY_LEGACY_BINARY` set to a verified official v0.1.1 executable. The Linux x86_64 release archive SHA-256 is `8d691a62337932db28d1203ca5d860b45b9cfd89c898ee049a627ce1f10d4ac1`.
+Run the ignored upgrade fixture once for each supported previous release, v0.2.0 and v0.3.0, with `HUNTPROXY_PREVIOUS_BINARY` set to that verified official executable. The Linux x86_64 release archive SHA-256 values are `2016a21c7ee7a03cccf6f9406a4ecce6231ab3ecea41e1bd354d76881ef8b0a3` (v0.2.0) and `7d5742db477a92ea935a1385eccbe8ea354a8568dcb04fb30f4652af46c6fe3f` (v0.3.0).
 
 ```bash
-cargo test --locked --test upgrade_workflows -- --ignored --test-threads=1
+HUNTPROXY_PREVIOUS_BINARY=/path/to/HuntProxy \
+  cargo test --locked --test upgrade_workflows -- --ignored --test-threads=1
 ```
 
-The fixture creates real v0.1.1 project data and a full bundle, upgrades a running installation, checks rollback assets, opens saved projects, starts Chromium, imports the old bundle, and repeats preparation. Also verify the real dashboard on desktop and mobile, including a named identity, profile restart, and an invalid-input state. Build and smoke-test Docker against an isolated volume.
+The fixture creates real project data and a full bundle with the previous release, upgrades a running installation, checks rollback assets, opens saved projects, starts Chromium, imports the old bundle, and repeats preparation. Also verify the real dashboard on desktop and mobile, including a named identity, profile restart, and an invalid-input state. Build and smoke-test Docker against an isolated volume.
 
 The normal test gate includes `mcp_catalog_refresh`: a continuously connected bridge observes a synthetic daemon upgrade, advertises its new schemas, dispatches a call once, and retains the latest catalog while stopped. The real private metadata route must leave the daemon's idle timer unchanged.
 
@@ -52,10 +53,10 @@ Candidate CI checks the immutable catalog, provisions and launches Chromium, ver
 
 ## Publication checkpoint
 
-Confirm the approved candidate is on the intended default branch, the Cargo version matches the tag, `docs/releases/vX.Y.Z.md` exists and still describes the one-time v0.1.1 stop/reconnect requirement, and no unrelated local changes are included.
+Confirm the approved candidate is on the intended default branch, the Cargo version matches the tag, `docs/releases/vX.Y.Z.md` exists, and no unrelated local changes are included.
 
 After explicit approval, create and push the `vX.Y.Z` tag at that validated commit. The tag workflow validates its version, rebuilds four binaries, verifies the two-member archive contract, and creates a **draft** GitHub release. Compare its assets with the validated candidate, verify `SHA256SUMS`, add the reviewed release notes, then publish the draft only within the approved scope.
 
-Never add a third member to an archive: v0.1.1 rejects it. The packaged `LICENSE` concatenates the project license, embedded-asset notices, and `RUST_THIRD_PARTY_NOTICES.txt`. Regenerate the Rust notices with `python3 scripts/prepare-rust-notices.py` after any `Cargo.lock` change; `scripts/check.sh` rejects stale or incomplete notices. Keep the combined file below 1 MiB so v0.1.1 can still extract it. Keep the existing v0.1.1 release and assets available.
+Never add a third member to an archive: the updater rejects it. The packaged `LICENSE` concatenates the project license, embedded-asset notices, and `RUST_THIRD_PARTY_NOTICES.txt`. Regenerate the Rust notices with `python3 scripts/prepare-rust-notices.py` after any `Cargo.lock` change; `scripts/check.sh` rejects stale or incomplete notices. Keep the combined file below 1 MiB, the size the updater accepts for that member. Keep the v0.2.0 and v0.3.0 releases and assets available: candidate CI downloads them as upgrade fixtures.
 
 For rollback after migration, restore the matching database/configuration/plugin snapshot together with the previous executable while the daemon is stopped. The CA and browser profiles are preserved in place and are not included in that snapshot. A newer Chromium may upgrade a profile in place, so a rollback that must reopen it in an older browser requires a complete independent backup of the data directory and any configured external paths.
