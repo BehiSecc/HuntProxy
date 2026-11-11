@@ -299,6 +299,8 @@ impl PluginJobRecord {
 }
 
 struct PluginJob {
+    /// Monotonic creation order, used to prune the oldest finished jobs first.
+    sequence: u64,
     view: parking_lot::RwLock<PluginJobRecord>,
     cancel: CancellationToken,
     analysis_checkpoint: parking_lot::Mutex<Option<AnalysisCheckpoint>>,
@@ -306,8 +308,6 @@ struct PluginJob {
 
 #[derive(Debug, Clone)]
 struct AnalysisCheckpoint {
-    plugin_version: String,
-    entrypoint_sha256: String,
     input: Value,
     observations_zstd: Arc<Vec<u8>>,
     observations_bytes: usize,
@@ -538,6 +538,54 @@ pub struct PluginService {
     preview_slots: Arc<tokio::sync::Semaphore>,
     analysis_retry_slots: Arc<tokio::sync::Semaphore>,
     analysis_checkpoint_bytes: Arc<AtomicUsize>,
+}
+
+type StopFuture = futures::future::BoxFuture<'static, DomainResult<()>>;
+
+/// Runs an async cleanup exactly once: explicitly through [`StopOnDrop::stop`],
+/// or on a background task when dropped first (early return, cancelled or
+/// timed-out future).
+struct StopOnDrop {
+    stop: Option<Box<dyn FnOnce() -> StopFuture + Send>>,
+}
+
+impl StopOnDrop {
+    fn new<F, Fut>(stop: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = DomainResult<()>> + Send + 'static,
+    {
+        Self {
+            stop: Some(Box::new(move || Box::pin(stop()))),
+        }
+    }
+
+    async fn stop(&mut self) -> DomainResult<()> {
+        match self.stop.take() {
+            Some(stop) => stop().await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let Some(stop) = self.stop.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = stop().await {
+                        tracing::warn!(%error, "failed to clean up isolated browser after an interrupted probe");
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::warn!("isolated browser cleanup skipped: no async runtime available");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1389,6 +1437,7 @@ impl PluginService {
 
         let id = Uuid::new_v4();
         let job = Arc::new(PluginJob {
+            sequence: next_job_sequence(),
             view: parking_lot::RwLock::new(PluginJobRecord {
                 id,
                 project_id,
@@ -1446,34 +1495,21 @@ impl PluginService {
             .get(&id)
             .map(|entry| entry.clone())
             .ok_or_else(|| DomainError::not_found("plugin job"))?;
+        // The plugin set is immutable after load, so the job's plugin (and its
+        // version/hash) cannot have changed since the checkpoint was taken.
         let plugin = self
             .plugins
             .get(&job.view.read().plugin_id)
             .cloned()
-            .ok_or_else(|| DomainError::not_found("plugin used by job is no longer installed"))?;
+            .ok_or_else(|| {
+                DomainError::new(ErrorCode::Internal, "plugin used by job is not loaded")
+            })?;
         let checkpoint = job.analysis_checkpoint.lock().clone().ok_or_else(|| {
             DomainError::new(
                 ErrorCode::Conflict,
                 "plugin job has no resumable analysis checkpoint",
             )
         })?;
-        if plugin.manifest.version != checkpoint.plugin_version
-            || plugin.manifest.entrypoint_sha256 != checkpoint.entrypoint_sha256
-        {
-            let mut view = job.view.write();
-            view.state = PluginJobState::Failed;
-            view.phase = PluginJobPhase::Finished;
-            view.error = Some("plugin changed since execution; analysis retry refused".into());
-            view.analysis_resume_available = false;
-            view.analysis_checkpoint_status = "unavailable".into();
-            view.analysis_resume_reason =
-                Some("Plugin changed since the saved observations were collected.".into());
-            *job.analysis_checkpoint.lock() = None;
-            return Err(DomainError::new(
-                ErrorCode::Conflict,
-                "plugin changed since execution; analysis retry refused",
-            ));
-        }
         let retry_permit = self
             .analysis_retry_slots
             .clone()
@@ -2102,8 +2138,6 @@ impl PluginService {
             .as_ref()
             .map(|(bytes, _)| bytes.clone());
         let checkpoint = AnalysisCheckpoint {
-            plugin_version: plugin.manifest.version.clone(),
-            entrypoint_sha256: plugin.manifest.entrypoint_sha256.clone(),
             input: input.clone(),
             observations_zstd: compressed.clone().unwrap_or_else(|| Arc::new(Vec::new())),
             observations_bytes: observations_json.len(),
@@ -3285,20 +3319,11 @@ impl PluginService {
                         format!("raw_http1_group requires {} concurrent connections; project limit is {project_limit}", group.members.len()),
                     ));
                 }
-                let aggregate_response_cap = project
-                    .limits
-                    .max_body_bytes
-                    .saturating_add(64 * 1024)
-                    .saturating_mul(group.members.len() as u64);
-                if aggregate_response_cap > MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES {
-                    return Err(DomainError::new(
-                        ErrorCode::BodyTooLarge,
-                        format!(
-                            "raw_http1_group aggregate response allowance exceeds {} MiB; reduce members or the project body limit",
-                            MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES / (1024 * 1024)
-                        ),
-                    ));
-                }
+                // Split one bounded budget across the members instead of
+                // rejecting large groups; a member that reaches its share is
+                // reported as truncated.
+                let member_response_cap =
+                    group_member_response_cap(project.limits.max_body_bytes, group.members.len());
                 let mut ids = BTreeSet::new();
                 let mut prepared = Vec::with_capacity(group.members.len());
                 for (index, member) in group.members.into_iter().enumerate() {
@@ -3351,6 +3376,7 @@ impl PluginService {
                     let operation_id = format!("{group_id}:{member_id}");
                     async move {
                         options.start_barrier = Some(barrier);
+                        options.response_cap_bytes = Some(member_response_cap);
                         let result = tokio::select! {
                             _ = cancel.cancelled() => Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
                             response = service.reply.send_raw_http1_with_context(
@@ -3505,13 +3531,10 @@ impl PluginService {
                     .timeout_ms
                     .unwrap_or(60_000)
                     .clamp(1_000, 120_000);
-                let project_limit = self
-                    .db
-                    .get_project(project_id)
-                    .await?
-                    .limits
-                    .max_concurrent_requests
-                    .max(1) as usize;
+                let project = self.db.get_project(project_id).await?;
+                let project_limit = project.limits.max_concurrent_requests.max(1) as usize;
+                let member_response_cap =
+                    group_member_response_cap(project.limits.max_body_bytes, group.requests.len());
                 if matches!(group.technique, RaceTechnique::LastByteSync)
                     && group.requests.len() > project_limit
                 {
@@ -3605,6 +3628,7 @@ impl PluginService {
                                         &cancel,
                                         barrier,
                                         hold_timeout_ms,
+                                        member_response_cap,
                                     )
                                     .await
                             }
@@ -3781,6 +3805,11 @@ impl PluginService {
             Err(error) => return Err(error),
         };
         let session_id = session.id;
+        // Early returns and a dropped future (job timeout) still stop the browser.
+        let mut guard = StopOnDrop::new({
+            let browser = browser.clone();
+            move || async move { browser.stop(project_id, session_id).await }
+        });
         let result = tokio::select! {
             _ = cancel.cancelled() => Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
             result = browser.csrf_probe(project_id, session_id, target.as_str(), method, &fields, probe.timeout_ms) => result,
@@ -3875,7 +3904,7 @@ impl PluginService {
             // cookie decision; redirects may set or refresh cookies later.
             break;
         }
-        let stop_result = browser.stop(project_id, session_id).await;
+        let stop_result = guard.stop().await;
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -4056,12 +4085,7 @@ impl PluginService {
                 target_url = Some(materialized.url.clone());
             }
             let body = materialized.body.unwrap_or_default();
-            let authority = match (parsed.host_str(), parsed.port()) {
-                (Some(host), Some(port)) if host.contains(':') => format!("[{host}]:{port}"),
-                (Some(host), Some(port)) => format!("{host}:{port}"),
-                (Some(host), None) => host.to_string(),
-                _ => return Err(DomainError::invalid("race request URL requires a host")),
-            };
+            let authority = h2_authority(&parsed)?;
             let mut path = parsed.path().to_string();
             if let Some(query) = parsed.query() {
                 path.push('?');
@@ -4229,6 +4253,7 @@ impl PluginService {
         cancel: &CancellationToken,
         barrier: Arc<tokio::sync::Barrier>,
         hold_timeout_ms: u64,
+        response_cap_bytes: u64,
     ) -> Value {
         let result = async {
             if matches!(request.protocol, ProtocolPreference::H2) {
@@ -4250,7 +4275,7 @@ impl PluginService {
             enforce_plugin_scope(&target_url, scope, target_host)?;
             let bytes = materialized_http1_bytes(&materialized)?;
             if bytes.len() < 2 { return Err(DomainError::invalid("saved request is too short for last_byte_sync")); }
-            let options = crate::reply::RawHttp1Options { pause_at_byte: Some(bytes.len() - 1), pause_ms: Some(hold_timeout_ms), release_barrier: Some(barrier), ..Default::default() };
+            let options = crate::reply::RawHttp1Options { pause_at_byte: Some(bytes.len() - 1), pause_ms: Some(hold_timeout_ms), release_barrier: Some(barrier), response_cap_bytes: Some(response_cap_bytes), ..Default::default() };
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
                 response = self.reply.send_raw_http1_with_context(
@@ -5213,6 +5238,24 @@ fn race_request_draft(request: &RaceRequest) -> DomainResult<ReplyDraft> {
     })
 }
 
+/// Per-member response cap for grouped raw sends: the project's per-response
+/// allowance, lowered so the whole group stays within the aggregate bound.
+fn group_member_response_cap(max_body_bytes: u64, members: usize) -> u64 {
+    max_body_bytes
+        .saturating_add(64 * 1024)
+        .min(MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES / members.max(1) as u64)
+}
+
+/// `:authority` value for a parsed URL. `Url::host_str` already brackets IPv6
+/// literals, so they must not be wrapped a second time.
+fn h2_authority(url: &url::Url) -> DomainResult<String> {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => Ok(format!("{host}:{port}")),
+        (Some(host), None) => Ok(host.to_string()),
+        _ => Err(DomainError::invalid("race request URL requires a host")),
+    }
+}
+
 fn materialized_http1_bytes(request: &crate::reply::MaterializedRequest) -> DomainResult<Vec<u8>> {
     let url = url::Url::parse(&request.url)
         .map_err(|error| DomainError::invalid(format!("invalid race request url: {error}")))?;
@@ -5421,20 +5464,26 @@ fn prune_finished_jobs(jobs: &DashMap<Uuid, Arc<PluginJob>>) {
     if excess == 0 {
         return;
     }
-    let removable = jobs
+    let mut finished = jobs
         .iter()
         .filter_map(|job| {
             (!matches!(
                 job.view.read().state,
                 PluginJobState::Queued | PluginJobState::Running
             ))
-            .then_some(*job.key())
+            .then_some((job.sequence, *job.key()))
         })
-        .take(excess)
         .collect::<Vec<_>>();
-    for id in removable {
+    // DashMap iteration order is arbitrary; drop the oldest finished jobs first.
+    finished.sort_unstable();
+    for (_, id) in finished.into_iter().take(excess) {
         jobs.remove(&id);
     }
+}
+
+fn next_job_sequence() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn normalize_operation_label(operation_id: &str) -> String {
@@ -6750,6 +6799,7 @@ mod tests {
 
     fn test_job(state: PluginJobState) -> Arc<PluginJob> {
         Arc::new(PluginJob {
+            sequence: next_job_sequence(),
             view: parking_lot::RwLock::new(PluginJobRecord {
                 id: Uuid::new_v4(),
                 project_id: ProjectId(1),
@@ -8942,9 +8992,12 @@ mod tests {
     #[test]
     fn completed_job_retention_is_bounded_without_removing_active_jobs() {
         let jobs = DashMap::new();
+        let mut finished_ids = Vec::new();
         for _ in 0..MAX_RETAINED_JOBS {
             let job = test_job(PluginJobState::Completed);
-            jobs.insert(job.view.read().id, job.clone());
+            let id = job.view.read().id;
+            finished_ids.push(id);
+            jobs.insert(id, job);
         }
         let active = test_job(PluginJobState::Running);
         let active_id = active.view.read().id;
@@ -8954,6 +9007,94 @@ mod tests {
 
         assert_eq!(jobs.len(), MAX_RETAINED_JOBS - 1);
         assert!(jobs.contains_key(&active_id));
+        // Only the oldest finished jobs are dropped, whatever the map order is.
+        let pruned = MAX_RETAINED_JOBS + 1 - (MAX_RETAINED_JOBS - 1);
+        for id in &finished_ids[..pruned] {
+            assert!(!jobs.contains_key(id), "oldest finished job must be pruned");
+        }
+        for id in &finished_ids[pruned..] {
+            assert!(jobs.contains_key(id), "newer finished job must be kept");
+        }
+    }
+
+    #[test]
+    fn group_response_budget_is_split_instead_of_rejecting_large_groups() {
+        let default_limit = 25 * 1024 * 1024;
+        let per_response = default_limit + 64 * 1024;
+        // Small groups keep the full per-response allowance.
+        assert_eq!(group_member_response_cap(default_limit, 2), per_response);
+        // Larger groups, up to the advertised maximum, share the 64 MiB bound.
+        for members in 3..=MAX_RAW_HTTP1_GROUP_MEMBERS {
+            let cap = group_member_response_cap(default_limit, members);
+            assert!(cap > 0 && cap <= per_response);
+            assert!(cap * members as u64 <= MAX_RAW_HTTP1_GROUP_AGGREGATE_BYTES);
+        }
+        assert_eq!(
+            group_member_response_cap(default_limit, MAX_RAW_HTTP1_GROUP_MEMBERS),
+            2 * 1024 * 1024
+        );
+        // A small project limit is never raised by the split.
+        assert_eq!(group_member_response_cap(1024, 8), 1024 + 64 * 1024);
+    }
+
+    #[test]
+    fn h2_authority_brackets_ipv6_literals_once() {
+        let authority = |url: &str| h2_authority(&url::Url::parse(url).unwrap()).unwrap();
+        assert_eq!(authority("https://[::1]:8443/x"), "[::1]:8443");
+        assert_eq!(authority("https://[2001:db8::7]/x"), "[2001:db8::7]");
+        assert_eq!(
+            authority("https://example.test:8443/x"),
+            "example.test:8443"
+        );
+        assert_eq!(authority("https://example.test/x"), "example.test");
+    }
+
+    #[tokio::test]
+    async fn stop_on_drop_cleans_up_exactly_once() {
+        let stops = Arc::new(AtomicUsize::new(0));
+        let counter = |stops: &Arc<AtomicUsize>| {
+            let stops = stops.clone();
+            move || async move {
+                stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+
+        // Dropped without an explicit stop (early return or cancelled future).
+        drop(StopOnDrop::new(counter(&stops)));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stops.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop must run the cleanup");
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+
+        // An explicit stop disarms the drop cleanup.
+        let mut guard = StopOnDrop::new(counter(&stops));
+        guard.stop().await.unwrap();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(stops.load(Ordering::SeqCst), 2);
+
+        // A future dropped mid-await (job timeout) still runs the cleanup.
+        let slow = tokio::time::timeout(Duration::from_millis(20), {
+            let guard = StopOnDrop::new(counter(&stops));
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            }
+        })
+        .await;
+        assert!(slow.is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stops.load(Ordering::SeqCst) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out future must run the cleanup");
     }
 
     #[test]
