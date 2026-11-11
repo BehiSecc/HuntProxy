@@ -619,8 +619,16 @@ test
       historyTotalExact: true,
       ipRotationBusy: false,
       historyRequestId: 0,
+      historyRefreshSeq: 0,
+      historyQuery: '',
       sitemapRequestId: 0,
+      selectToken: 0,
       bodies: { request: null, response: null },
+      bodySeq: { request: 0, response: 0 },
+      bodyErrors: { request: null, response: null },
+      websocketMessages: [],
+      websocketLastId: 0,
+      websocketSeq: 0,
     };
 
     async function api(path, options = {}, onResponse = null) {
@@ -641,6 +649,31 @@ test
       if (onResponse) onResponse(response);
       return data;
     }
+
+    // --- pure helpers, covered by tests/ui_project_selection.test.cjs ---
+    function fuzzPayloadSummary(payloads) {
+      if (!Array.isArray(payloads) || !payloads.length) return '—';
+      return payloads.map(p => {
+        const value = p.encoding === 'text' ? p.value : `[${p.encoding}] ${p.value}`;
+        return `${p.insertion_point}=${value}`;
+      }).join(', ');
+    }
+    // Merge a freshly fetched first history page into the pages already loaded.
+    // Keeps loaded older pages; if the fresh page does not overlap them, items
+    // may have been missed in between, so the fresh page replaces everything.
+    function mergeHistoryPage(existing, fetched) {
+      const ids = new Set(fetched.map(item => item.exchange_id));
+      const overlaps = existing.some(item => ids.has(item.exchange_id));
+      if (!existing.length || !overlaps) return { items: fetched, replaced: true };
+      return { items: fetched.concat(existing.filter(item => !ids.has(item.exchange_id))), replaced: false };
+    }
+    // Append messages newer than the last one held, keeping only the newest `cap`.
+    function mergeWebSocketMessages(existing, incoming, cap) {
+      const lastId = existing.length ? existing[existing.length - 1].id : 0;
+      const merged = existing.concat(incoming.filter(message => message.id > lastId));
+      return merged.length > cap ? merged.slice(merged.length - cap) : merged;
+    }
+    // --- end pure helpers ---
 
     function status(id, message = '', kind = '') {
       const el = $(id);
@@ -775,7 +808,14 @@ test
       state.historyCursor = null;
       state.historyTotal = 0;
       state.historyTotalExact = true;
+      state.selectToken++;
       state.bodies = { request: null, response: null };
+      state.bodyErrors = { request: null, response: null };
+      state.historyQuery = '';
+      state.historyRefreshSeq++;
+      clearTimeout(historyRefreshTimer);
+      resetFuzzState();
+      resetWebSocketState();
       $('saveAnnotation').disabled = true;
       $('sendToReply').disabled = true;
       $('markFinding').disabled = true;
@@ -1094,14 +1134,19 @@ test
       source.addEventListener('ready', () => { $('liveDot').classList.add('on'); $('liveText').textContent = 'live'; });
       for (const event of ['exchange', 'annotation', 'finding', 'fuzz', 'browser', 'websocket', 'capture']) {
         source.addEventListener(event, () => {
-          if (event === 'exchange' || event === 'annotation') loadHistory();
+          if (event === 'exchange' || event === 'annotation') scheduleHistoryRefresh();
           if (event === 'finding') loadFindings();
           if (event === 'fuzz') loadFuzzJobs();
           if (event === 'browser') loadBrowserStatus();
           if (event === 'websocket') loadWebSockets();
         });
       }
-      source.addEventListener('lagged', () => projectChanged());
+      // Events were dropped: re-sync what is live without resetting the
+      // selection, loaded history pages or half-edited forms.
+      source.addEventListener('lagged', () => {
+        scheduleHistoryRefresh();
+        for (const load of [loadFindings, loadFuzzJobs, loadWebSockets, loadBrowserStatus, loadProjectUsage, loadSitemap]) load();
+      });
       source.onerror = () => { $('liveDot').classList.remove('on'); $('liveText').textContent = 'reconnecting'; };
     }
 
@@ -1120,14 +1165,44 @@ test
       status('historyStatus', summary);
     }
 
+    let historyRefreshTimer = null;
+    // Live events arrive in bursts; coalesce them into one incremental refresh.
+    function scheduleHistoryRefresh() {
+      clearTimeout(historyRefreshTimer);
+      historyRefreshTimer = setTimeout(refreshHistory, 300);
+    }
+    // Fetch the newest page and merge it into the loaded pages, so a live event
+    // does not collapse "Load more" pages back to page 1.
+    async function refreshHistory() {
+      if (!state.projectId) return;
+      const projectId = state.projectId;
+      const baseRequest = state.historyRequestId;
+      const seq = ++state.historyRefreshSeq;
+      const current = () => projectId === state.projectId && baseRequest === state.historyRequestId && seq === state.historyRefreshSeq;
+      try {
+        const q = new URLSearchParams({ limit: '100' });
+        if (state.historyQuery) q.set('q', state.historyQuery);
+        const result = await api(`/api/v1/projects/${projectId}/history?${q}`);
+        if (!current()) return;
+        const merged = mergeHistoryPage(state.historyItems, result.items || []);
+        state.historyItems = merged.items;
+        if (merged.replaced) state.historyCursor = result.next_cursor || null;
+        state.historyTotal = Number(result.total ?? state.historyItems.length);
+        state.historyTotalExact = result.total_exact !== false;
+        renderHistory();
+      } catch (e) { if (current()) status('historyStatus', e.message, 'err'); }
+    }
+
     async function loadHistory(append = false) {
       if (!state.projectId) return;
       const projectId = state.projectId;
       const requestId = ++state.historyRequestId;
       try {
         const q = new URLSearchParams({ limit: '100' });
-        if ($('historyFilter').value.trim()) q.set('q', $('historyFilter').value.trim());
+        if (!append) state.historyQuery = $('historyFilter').value.trim();
+        if (state.historyQuery) q.set('q', state.historyQuery);
         if (append && state.historyCursor) q.set('cursor', state.historyCursor);
+        if (!state.historyItems.length) status('historyStatus', 'Loading…');
         const result = await api(`/api/v1/projects/${projectId}/history?${q}`);
         if (projectId !== state.projectId || requestId !== state.historyRequestId) return;
         const items = result.items || [];
@@ -1189,43 +1264,77 @@ test
         output.textContent = lines.join('\n');
       } else output.textContent = decoder.decode(body.bytes);
       if (body && body.loaded < body.total) output.textContent += `\n\n[${body.loaded} of ${body.total} bytes loaded]`;
+      const error = state.bodyErrors[side];
+      if (error) output.textContent = body?.bytes.length ? `${output.textContent}\n\n[Could not load body: ${error}]` : `Could not load body: ${error}`;
       $(`${side}BodyMore`).disabled = !body || body.loaded >= body.total;
       $(`${side}BodyDownload`).disabled = !body || body.total === 0;
     }
+    // Loads (or appends) one page of a body. Failures are shown in the body's
+    // own pane so they never hide the headers or the other body.
     async function loadExchangeBody(exchangeId, side, append = false) {
+      const token = state.selectToken;
+      const seq = ++state.bodySeq[side];
+      const current = () => token === state.selectToken && seq === state.bodySeq[side];
       const existing = append ? state.bodies[side] : null;
       const raw = bodyIsRaw(side);
       const offset = existing?.loaded || 0;
-      const query = new URLSearchParams({ side, offset: String(offset), max_bytes: '131072', raw: String(raw) });
-      const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}/body?${query}`);
-      const chunk = decodeBase64Bytes(result.data);
-      const combined = new Uint8Array(offset + chunk.length);
-      if (existing) combined.set(existing.bytes);
-      combined.set(chunk, offset);
-      state.bodies[side] = { bytes: combined, loaded: offset + chunk.length, total: result.total_length || 0, raw };
-      renderBody(side);
+      try {
+        const query = new URLSearchParams({ side, offset: String(offset), max_bytes: '131072', raw: String(raw) });
+        const result = await api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}/body?${query}`);
+        if (!current()) return;
+        const chunk = decodeBase64Bytes(result.data);
+        const combined = new Uint8Array(offset + chunk.length);
+        if (existing) combined.set(existing.bytes);
+        combined.set(chunk, offset);
+        state.bodies[side] = { bytes: combined, loaded: offset + chunk.length, total: result.total_length || 0, raw };
+        state.bodyErrors[side] = null;
+        renderBody(side);
+      } catch (error) {
+        if (current()) { state.bodyErrors[side] = error.message; renderBody(side); }
+        throw error;
+      }
     }
     async function selectExchange(exchangeId) {
-      try {
-        $('pageAnalysis').classList.add('hidden');
-        const noisy = $('showNoisy').checked;
-        state.bodies = { request: null, response: null };
-        const [detail] = await Promise.all([
-          api(`/api/v1/projects/${state.projectId}/exchanges/${exchangeId}?include_noisy_headers=${noisy}`),
-          loadExchangeBody(exchangeId, 'request'), loadExchangeBody(exchangeId, 'response'),
-        ]);
-        state.selectedExchange = exchangeId; state.selectedDetail = detail;
-        $('requestHeaders').textContent = formatHeaders(detail.request_headers);
-        $('responseHeaders').textContent = formatHeaders(detail.response_headers);
-        $('annotationTitle').value = detail.annotation?.display_title || detail.summary.display_title || '';
-        $('annotationLabels').value = (detail.annotation?.labels || detail.summary.labels || []).join(', ');
-        $('annotationNote').value = detail.annotation?.note || '';
-        $('saveAnnotation').disabled = false; $('sendToReply').disabled = false; $('markFinding').disabled = false;
-        $('copyCurl').disabled = false; $('copyPython').disabled = false; $('analyzePage').disabled = false;
-        $('pageAnalysis').classList.add('hidden');
-        status('inspectorStatus', `${detail.summary.method} ${detail.summary.scheme}://${detail.summary.authority}${detail.summary.path} · ${detail.protocol}`);
-        document.querySelectorAll('#historyRows tr').forEach(r => r.classList.toggle('selected', Number(r.dataset.id) === exchangeId));
-      } catch (e) { status('inspectorStatus', e.message, 'err'); }
+      const projectId = state.projectId;
+      const token = ++state.selectToken;
+      const current = () => token === state.selectToken && projectId === state.projectId;
+      const noisy = $('showNoisy').checked;
+      $('pageAnalysis').classList.add('hidden');
+      state.selectedExchange = exchangeId; state.selectedDetail = null;
+      state.bodies = { request: null, response: null };
+      state.bodyErrors = { request: null, response: null };
+      for (const id of ['saveAnnotation', 'sendToReply', 'markFinding', 'copyCurl', 'copyPython', 'analyzePage']) $(id).disabled = true;
+      for (const side of ['request', 'response']) {
+        $(`${side}Headers`).textContent = 'Loading…';
+        $(`${side}Body`).textContent = 'Loading…';
+        $(`${side}BodyMore`).disabled = true; $(`${side}BodyDownload`).disabled = true;
+      }
+      status('inspectorStatus', `Loading exchange ${exchangeId}…`);
+      document.querySelectorAll('#historyRows tr').forEach(r => r.classList.toggle('selected', Number(r.dataset.id) === exchangeId));
+      const [detailResult] = await Promise.allSettled([
+        api(`/api/v1/projects/${projectId}/exchanges/${exchangeId}?include_noisy_headers=${noisy}`),
+        loadExchangeBody(exchangeId, 'request'), loadExchangeBody(exchangeId, 'response'),
+      ]);
+      if (!current()) return;
+      if (detailResult.status === 'rejected') {
+        const message = `Could not load exchange ${exchangeId}: ${detailResult.reason.message}`;
+        $('requestHeaders').textContent = message; $('responseHeaders').textContent = message;
+        status('inspectorStatus', message, 'err');
+        return;
+      }
+      const detail = detailResult.value;
+      state.selectedDetail = detail;
+      $('requestHeaders').textContent = formatHeaders(detail.request_headers);
+      $('responseHeaders').textContent = formatHeaders(detail.response_headers);
+      $('annotationTitle').value = detail.annotation?.display_title || detail.summary.display_title || '';
+      $('annotationLabels').value = (detail.annotation?.labels || detail.summary.labels || []).join(', ');
+      $('annotationNote').value = detail.annotation?.note || '';
+      for (const id of ['saveAnnotation', 'sendToReply', 'markFinding', 'copyCurl', 'copyPython', 'analyzePage']) $(id).disabled = false;
+      const bodyErrors = ['request', 'response'].filter(side => state.bodyErrors[side]);
+      status('inspectorStatus', bodyErrors.length
+        ? `${detail.summary.method} ${detail.summary.scheme}://${detail.summary.authority}${detail.summary.path} · could not load ${bodyErrors.join(' and ')} body`
+        : `${detail.summary.method} ${detail.summary.scheme}://${detail.summary.authority}${detail.summary.path} · ${detail.protocol}`,
+      bodyErrors.length ? 'err' : '');
     }
 
     for (const side of ['request', 'response']) {
@@ -1233,9 +1342,15 @@ test
       $(`${side}BodyMore`).onclick = () => state.selectedExchange && loadExchangeBody(state.selectedExchange, side, true).catch(error => status('inspectorStatus', error.message, 'err'));
       $(`${side}BodyDownload`).onclick = async () => {
         if (!state.selectedExchange) return;
+        const exchangeId = state.selectedExchange;
         try {
-          while (state.bodies[side] && state.bodies[side].loaded < state.bodies[side].total) await loadExchangeBody(state.selectedExchange, side, true);
+          while (state.bodies[side] && state.bodies[side].loaded < state.bodies[side].total) {
+            const before = state.bodies[side].loaded;
+            await loadExchangeBody(exchangeId, side, true);
+            if (state.selectedExchange !== exchangeId || !state.bodies[side] || state.bodies[side].loaded <= before) throw new Error('Download interrupted');
+          }
           const body = state.bodies[side];
+          if (!body) return;
           const link = document.createElement('a');
           const url = URL.createObjectURL(new Blob([body.bytes], { type: 'application/octet-stream' }));
           link.href = url;
@@ -1703,10 +1818,21 @@ test
         state.selectedFuzzJob = job.id; status('fuzzStatus', `Job ${job.id} started`, 'ok'); await loadFuzzJobs();
       } catch (e) { status('fuzzStatus', e.message, 'err'); }
     };
+    function resetFuzzState() {
+      clearTimeout(state.fuzzTimer);
+      Object.assign(state, { selectedFuzzJob: null, selectedFuzzGroup: null, fuzzResultsMode: 'groups', fuzzCases: [], fuzzCasesCursor: null, fuzzGroups: [] });
+      $('fuzzJobs').innerHTML = ''; $('fuzzGroups').innerHTML = ''; $('fuzzCases').innerHTML = '';
+      $('fuzzDiff').classList.add('hidden'); $('fuzzDiff').textContent = '';
+      $('loadMoreFuzzCases').classList.add('hidden');
+      showFuzzResultsPanel('groups');
+      status('fuzzStatus');
+    }
     async function loadFuzzJobs() {
       if (!state.projectId) return;
+      const projectId = state.projectId;
       try {
-        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`);
+        const result = await api(`/api/v1/projects/${projectId}/fuzz-jobs`);
+        if (projectId !== state.projectId) return;
         const jobs = result.jobs || [];
         $('fuzzJobs').innerHTML = jobs.map(j => `<tr data-id="${j.id}"><td>${j.id}</td><td>${escapeHtml(j.state)}</td><td>${j.completed_cases}/${j.estimated_cases}</td><td>${j.failed_cases}</td><td><button class="btn" data-view-cases="${j.id}">Cases</button> <button class="btn danger" data-cancel="${j.id}" ${['completed','failed','interrupted'].includes(j.state) ? 'disabled' : ''}>Cancel</button></td></tr>`).join('');
         if (state.selectedFuzzJob) loadFuzzResults(state.selectedFuzzJob);
@@ -1725,10 +1851,12 @@ test
       return loadFuzzCases(jobId, state.selectedFuzzGroup);
     }
     async function loadFuzzGroups(jobId) {
+      const projectId = state.projectId;
       state.selectedFuzzJob = Number(jobId);
       state.selectedFuzzGroup = null;
       try {
-        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/groups`);
+        const result = await api(`/api/v1/projects/${projectId}/fuzz-jobs/${jobId}/groups`);
+        if (projectId !== state.projectId) return;
         state.fuzzGroups = result.groups || [];
         renderFuzzGroups();
         showFuzzResultsPanel('groups');
@@ -1753,16 +1881,18 @@ test
     $('fuzzOnlyDifferent').onchange = renderFuzzGroups;
     $('fuzzGroupSort').onchange = renderFuzzGroups;
     async function loadFuzzCases(jobId, groupId = null, append = false) {
+      const projectId = state.projectId;
       state.selectedFuzzJob = Number(jobId);
       state.selectedFuzzGroup = groupId;
       try {
         const groupQuery = groupId ? `&group_id=${encodeURIComponent(groupId)}` : '';
         const cursorQuery = append && state.fuzzCasesCursor != null ? `&before_case_index=${state.fuzzCasesCursor}` : '';
-        const result = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs/${jobId}/cases?limit=250${groupQuery}${cursorQuery}`);
+        const result = await api(`/api/v1/projects/${projectId}/fuzz-jobs/${jobId}/cases?limit=250${groupQuery}${cursorQuery}`);
+        if (projectId !== state.projectId) return;
         state.fuzzCases = append ? state.fuzzCases.concat(result.cases || []) : (result.cases || []);
         state.fuzzCasesCursor = result.next_before_case_index ?? null;
         $('fuzzCases').innerHTML = state.fuzzCases.map(c => {
-          const payload = c.payload_summary || JSON.stringify(c.payloads || []);
+          const payload = fuzzPayloadSummary(c.payloads);
           const actions = c.exchange_id ? `<button class="btn fit" data-fuzz-open="${c.exchange_id}">Open response</button> <button class="btn fit" data-fuzz-compare="${c.id}">Compare</button>` : escapeHtml(c.error || '—');
           return `<tr><td>${c.case_index}</td><td title="${escapeHtml(payload)}">${escapeHtml(payload.slice(0, 60))}</td><td>${c.status_code ?? c.state ?? '—'}</td><td>${c.response_length ?? '—'}</td><td>${c.exchange_id ?? '—'}</td><td>${actions}</td></tr>`;
         }).join('');
@@ -1809,17 +1939,61 @@ test
         if (state.websocketConnection && connections.some(connection => connection.id === state.websocketConnection)) await loadWebSocketMessages();
       } catch (error) { status('websocketStatus', error.message, 'err'); }
     }
-    async function loadWebSocketMessages() {
+    const WEBSOCKET_PAGE = 500;
+    const WEBSOCKET_KEEP = 1000;
+    function resetWebSocketState() {
+      state.websocketSeq++;
+      state.websocketMessages = []; state.websocketLastId = 0;
+      $('websocketConnections').innerHTML = ''; $('websocketMessages').innerHTML = '';
+      $('sendWebSocket').disabled = true;
+      status('websocketStatus');
+    }
+    function renderWebSocketMessages(placeholder = null) {
+      const messages = state.websocketMessages;
+      const wrap = $('websocketMessages').closest('.table-wrap');
+      const atEnd = !wrap || wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 8;
+      $('websocketMessages').innerHTML = placeholder || !messages.length
+        ? `<tr><td colspan="4" class="muted">${escapeHtml(placeholder || 'No messages yet.')}</td></tr>`
+        : messages.map(message => `<tr><td>${message.id}</td><td>${escapeHtml(message.direction)}</td><td>${escapeHtml(message.opcode)}</td><td class="mono" title="${escapeHtml(message.payload)}">${escapeHtml(message.payload.slice(0, 100))}${message.truncated ? ' …' : ''}</td></tr>`).join('');
+      if (wrap && atEnd) wrap.scrollTop = wrap.scrollHeight;
+    }
+    // Messages are listed oldest first, so page forward with after_id: a reset
+    // reads the whole connection (keeping the newest), later calls only read
+    // what arrived since the last message held.
+    async function loadWebSocketMessages(reset = false) {
       if (!state.projectId || !state.websocketConnection) return;
-      const result = await api(`/api/v1/projects/${state.projectId}/websockets/${state.websocketConnection}/messages?limit=500`);
-      $('websocketMessages').innerHTML = (result.messages || []).map(message => `<tr><td>${message.id}</td><td>${escapeHtml(message.direction)}</td><td>${escapeHtml(message.opcode)}</td><td class="mono" title="${escapeHtml(message.payload)}">${escapeHtml(message.payload.slice(0, 100))}${message.truncated ? ' …' : ''}</td></tr>`).join('');
+      const projectId = state.projectId;
+      const connection = state.websocketConnection;
+      const seq = ++state.websocketSeq;
+      const current = () => projectId === state.projectId && connection === state.websocketConnection && seq === state.websocketSeq;
+      if (reset) {
+        state.websocketMessages = []; state.websocketLastId = 0;
+        renderWebSocketMessages('Loading…');
+      }
+      let afterId = state.websocketLastId;
+      let messages = state.websocketMessages;
+      try {
+        for (;;) {
+          const result = await api(`/api/v1/projects/${projectId}/websockets/${connection}/messages?limit=${WEBSOCKET_PAGE}&after_id=${afterId}`);
+          if (!current()) return;
+          const page = result.messages || [];
+          messages = mergeWebSocketMessages(messages, page, WEBSOCKET_KEEP);
+          if (page.length) afterId = page[page.length - 1].id;
+          if (page.length < WEBSOCKET_PAGE) break;
+        }
+      } catch (error) {
+        if (reset && current()) renderWebSocketMessages('Could not load messages.');
+        throw error;
+      }
+      state.websocketMessages = messages; state.websocketLastId = afterId;
+      renderWebSocketMessages();
       $('sendWebSocket').disabled = false;
     }
     $('websocketConnections').onclick = async event => {
       const row = event.target.closest('tr[data-websocket-id]'); if (!row) return;
       state.websocketConnection = Number(row.dataset.websocketId);
       document.querySelectorAll('#websocketConnections tr').forEach(item => item.classList.toggle('selected', item === row));
-      await loadWebSocketMessages().catch(error => status('websocketStatus', error.message, 'err'));
+      await loadWebSocketMessages(true).catch(error => status('websocketStatus', error.message, 'err'));
     };
     $('refreshWebSockets').onclick = loadWebSockets;
     $('sendWebSocket').onclick = async () => {
