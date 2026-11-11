@@ -20,6 +20,10 @@ use tokio::sync::{Mutex, RwLock};
 
 const WORKER_PROTOCOL_VERSION: u64 = 1;
 const WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(90);
+/// The longest a single worker request waits for browser events. The worker
+/// answers one request at a time, so a longer wait would hold up every other
+/// session of the project.
+const EVENT_WAIT_SLICE: Duration = Duration::from_millis(100);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
 const BROWSER_CDP_PORT: u16 = 9222;
 const BROWSER_CDP_PORT_END: u16 = 9321;
@@ -203,6 +207,34 @@ struct PersistentBrowserProfile {
     local_storage: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     session_storage: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// What this process last wrote to a profile's `state.json`: the checkpoint it
+/// holds and the file's size and modification time, so a file that was removed
+/// or replaced behind our back is read again instead of being trusted.
+struct PersistedProfileState {
+    checkpoint_hash: String,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl PersistedProfileState {
+    /// `None` when the file cannot be inspected.
+    fn of(path: &Path, checkpoint_hash: &str) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            checkpoint_hash: checkpoint_hash.to_string(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn holds(&self, path: &Path, checkpoint_hash: &str) -> bool {
+        self.checkpoint_hash == checkpoint_hash
+            && std::fs::metadata(path).is_ok_and(|metadata| {
+                metadata.len() == self.len && metadata.modified().ok() == self.modified
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,8 +756,6 @@ pub struct ActionResult {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserActionContext>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
 }
 
 /// Result of a bounded, host-owned cross-site navigation template. Secret
@@ -744,6 +774,9 @@ struct RuntimeSession {
     persistent: bool,
     profile: Option<String>,
     cdp: Option<BrowserCdpInfo>,
+    /// Position in the worker's list of JavaScript files up to which they have
+    /// been recorded; the next record asks only for what came after it.
+    javascript_cursor: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1024,13 +1057,18 @@ pub struct BrowserService {
     ca_cert_path: Option<PathBuf>,
     profiles_root: PathBuf,
     runtime: BrowserRuntimeInspection,
-    checkpoints: Mutex<HashMap<i64, Checkpoint>>,
+    /// Version of each session's latest checkpoint. Only the number is kept:
+    /// the checkpoint itself holds secrets and is never read back.
+    checkpoint_versions: Mutex<HashMap<i64, u64>>,
     runtime_sessions: Arc<Mutex<HashMap<i64, RuntimeSession>>>,
     cdp_reservations: Arc<std::sync::Mutex<HashMap<i64, u16>>>,
     profile_leases: Mutex<HashSet<(i64, String)>>,
     lifecycle: RwLock<()>,
     project_lifecycle: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
-    profile_io: Mutex<()>,
+    /// Serializes profile state file IO. It also remembers what this process
+    /// last wrote to each profile's `state.json`, so an unchanged checkpoint is
+    /// recognized without reading and parsing a file that can reach 25 MiB.
+    profile_io: Mutex<HashMap<(i64, String), PersistedProfileState>>,
     session_ops: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     workers: Mutex<HashMap<i64, Arc<Mutex<Option<WorkerProcess>>>>>,
     sandbox: std::sync::Mutex<HashMap<i64, SandboxState>>,
@@ -1126,11 +1164,8 @@ impl BrowserService {
     pub fn new(db: Arc<Db>, node_path: Option<PathBuf>, worker_path: Option<PathBuf>) -> Self {
         let profiles_root = default_profiles_root(&db);
         let proxy_server = std::env::var("HUNTPROXY_BROWSER_PROXY_SERVER")
-            .or_else(|_| std::env::var("BB_BROWSER_PROXY_SERVER"))
             .unwrap_or_else(|_| DEFAULT_BROWSER_PROXY.to_string());
-        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT")
-            .or_else(|| std::env::var_os("BB_BROWSER_CA_CERT"))
-            .map(PathBuf::from);
+        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT").map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
             node_path,
@@ -1149,9 +1184,7 @@ impl BrowserService {
         proxy_server: String,
     ) -> Self {
         let profiles_root = default_profiles_root(&db);
-        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT")
-            .or_else(|| std::env::var_os("BB_BROWSER_CA_CERT"))
-            .map(PathBuf::from);
+        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT").map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
             node_path,
@@ -1182,13 +1215,13 @@ impl BrowserService {
             ca_cert_path: ca_cert_path.filter(|path| path.is_file()),
             profiles_root,
             runtime,
-            checkpoints: Mutex::new(HashMap::new()),
+            checkpoint_versions: Mutex::new(HashMap::new()),
             runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
             cdp_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             profile_leases: Mutex::new(HashSet::new()),
             lifecycle: RwLock::new(()),
             project_lifecycle: Mutex::new(HashMap::new()),
-            profile_io: Mutex::new(()),
+            profile_io: Mutex::new(HashMap::new()),
             session_ops: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             sandbox: std::sync::Mutex::new(HashMap::new()),
@@ -1625,7 +1658,6 @@ impl BrowserService {
             "url": url,
             "proxy": {
                 "server": self.proxy_server.clone(),
-                "bearer_token": token.clone(),
                 "username": PROXY_BASIC_USER,
                 "password": token,
             },
@@ -1661,6 +1693,7 @@ impl BrowserService {
                 persistent,
                 profile: profile.clone(),
                 cdp: None,
+                javascript_cursor: 0,
             },
         );
         let result = match self
@@ -1727,7 +1760,12 @@ impl BrowserService {
             return Err(error);
         }
         if let Err(error) = self
-            .persist_javascript_files(project_id, session.id, session.current_url.as_deref())
+            .persist_javascript_files(
+                project_id,
+                session.id,
+                session.current_url.as_deref(),
+                false,
+            )
             .await
         {
             tracing::warn!(%error, session_id = session.id.get(), "could not persist JavaScript provenance");
@@ -1837,7 +1875,10 @@ impl BrowserService {
         self.reap_worker(project_id).await;
         session.checkpoint_status = Some("start_failed".into());
         let _ = self.db.update_browser_session(session).await;
-        self.checkpoints.lock().await.remove(&session.id.get());
+        self.checkpoint_versions
+            .lock()
+            .await
+            .remove(&session.id.get());
         let _ = self
             .db
             .revoke_capture_session(project_id, capture_session_id)
@@ -2525,7 +2566,6 @@ impl BrowserService {
                 message: "session closed".into(),
                 data: None,
                 browser: None,
-                error_code: None,
             });
         }
         let operation_lock = self.session_operation_lock(session_id).await;
@@ -2566,41 +2606,24 @@ impl BrowserService {
             BrowserAction::Events { wait_ms, .. } => *wait_ms,
             _ => 0,
         };
-        let mut worker_action = serde_json::to_value(&action)
+        let worker_action = serde_json::to_value(&action)
             .map_err(|error| DomainError::new(ErrorCode::InvalidArgument, error.to_string()))?;
-        // A worker RPC is serialized behind one shared stdin/stdout stream. Keep
-        // long-poll timing here so an empty event wait does not monopolize that
-        // stream and block independent browser sessions.
-        if event_wait_ms > 0 {
-            worker_action["wait_ms"] = json!(0);
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(event_wait_ms);
-        let worker_result = loop {
-            let result = self
-                .call_worker(
-                    project_id,
-                    "session.action",
-                    json!({
-                        "session_id": session_id.get(),
-                        "action": worker_action.clone(),
-                    }),
-                )
-                .await;
-            let should_wait = event_wait_ms > 0
-                && result.as_ref().is_ok_and(|value| {
-                    value
-                        .get("data")
-                        .and_then(|data| data.get("events"))
-                        .and_then(Value::as_array)
-                        .is_some_and(Vec::is_empty)
-                })
-                && tokio::time::Instant::now() < deadline;
-            if !should_wait {
-                break result;
+        let worker_result = async {
+            if event_wait_ms > 0 {
+                self.wait_for_browser_events(project_id, session_id, &worker_action, event_wait_ms)
+                    .await?;
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
-        };
+            self.call_worker(
+                project_id,
+                "session.action",
+                json!({
+                    "session_id": session_id.get(),
+                    "action": worker_action,
+                }),
+            )
+            .await
+        }
+        .await;
         let result = match worker_result {
             Ok(result) => result,
             Err(error) => {
@@ -2651,7 +2674,12 @@ impl BrowserService {
         self.db.update_browser_session(&session).await?;
         drop(runtimes);
         if let Err(error) = self
-            .persist_javascript_files(project_id, session_id, session.current_url.as_deref())
+            .persist_javascript_files(
+                project_id,
+                session_id,
+                session.current_url.as_deref(),
+                false,
+            )
             .await
         {
             tracing::warn!(%error, session_id = session_id.get(), "could not persist JavaScript provenance");
@@ -2694,11 +2722,48 @@ impl BrowserService {
                         format!("invalid browser action context: {error}"),
                     )
                 })?,
-            error_code: result
-                .get("error_code")
-                .and_then(Value::as_str)
-                .map(str::to_string),
         })
+    }
+
+    /// Returns once the worker holds an event the `events` action would return,
+    /// or `wait_ms` has passed. The worker does the waiting, in slices of at
+    /// most `EVENT_WAIT_SLICE`, and the other sessions of the project are
+    /// served between slices.
+    async fn wait_for_browser_events(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        action: &Value,
+        wait_ms: u64,
+    ) -> DomainResult<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let slice = remaining.min(EVENT_WAIT_SLICE);
+            let result = self
+                .call_worker(
+                    project_id,
+                    "session.events_wait",
+                    json!({
+                        "session_id": session_id.get(),
+                        "action": action,
+                        "wait_ms": slice.as_millis().max(1) as u64,
+                    }),
+                )
+                .await?;
+            let ready = result
+                .get("ready")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    DomainError::new(ErrorCode::ProtocolError, "worker omitted event wait result")
+                })?;
+            if ready {
+                return Ok(());
+            }
+        }
     }
 
     pub async fn javascript_files(
@@ -2717,23 +2782,40 @@ impl BrowserService {
         }
         let operation_lock = self.session_operation_lock(session_id).await;
         let _operation_guard = operation_lock.lock().await;
-        self.persist_javascript_files(project_id, session_id, None)
+        self.persist_javascript_files(project_id, session_id, None, true)
             .await
     }
 
+    /// Records the session's JavaScript files and returns the ones the worker
+    /// reported: only those not recorded before, or every file with `all`.
     async fn persist_javascript_files(
         &self,
         project_id: ProjectId,
         session_id: BrowserSessionId,
         default_source_page_url: Option<&str>,
+        all: bool,
     ) -> DomainResult<Vec<BrowserJavascriptFile>> {
+        let mut params = json!({ "session_id": session_id.get() });
+        if !all {
+            if let Some(runtime) = self
+                .runtime_sessions
+                .lock()
+                .await
+                .get(&session_id.get())
+                .filter(|runtime| runtime.project_id == project_id)
+            {
+                params["after"] = json!(runtime.javascript_cursor);
+            }
+        }
         let result = self
-            .call_worker(
-                project_id,
-                "session.javascript_files",
-                json!({ "session_id": session_id.get() }),
-            )
+            .call_worker(project_id, "session.javascript_files", params)
             .await?;
+        let cursor = result
+            .get("cursor")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                DomainError::new(ErrorCode::ProtocolError, "worker omitted JavaScript cursor")
+            })?;
         let files: Vec<BrowserJavascriptFile> =
             serde_json::from_value(result.get("files").cloned().unwrap_or_else(|| json!([])))
                 .map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
@@ -2744,7 +2826,12 @@ impl BrowserService {
                     .iter()
                     .find_map(|file| file.source_page_url.as_deref())
             });
-        if let Some(fallback) = fallback {
+        if !files.is_empty() {
+            // Without a page to attribute them to, the files stay unrecorded
+            // and the cursor stays put, so the next call offers them again.
+            let Some(fallback) = fallback else {
+                return Ok(files);
+            };
             self.db
                 .record_javascript_files(
                     project_id,
@@ -2760,6 +2847,15 @@ impl BrowserService {
                     "browser",
                 )
                 .await?;
+        }
+        if let Some(runtime) = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get_mut(&session_id.get())
+            .filter(|runtime| runtime.project_id == project_id)
+        {
+            runtime.javascript_cursor = cursor;
         }
         Ok(files)
     }
@@ -2836,7 +2932,10 @@ impl BrowserService {
         }
         session.state = BrowserSessionState::Stopped;
         self.db.update_browser_session(&session).await?;
-        self.checkpoints.lock().await.remove(&session_id.get());
+        self.checkpoint_versions
+            .lock()
+            .await
+            .remove(&session_id.get());
         if let Some(runtime) = runtime {
             let _ = self
                 .db
@@ -3118,7 +3217,7 @@ impl BrowserService {
         };
         for (session_id, runtime) in runtimes {
             self.release_cdp_reservation(session_id);
-            self.checkpoints.lock().await.remove(&session_id);
+            self.checkpoint_versions.lock().await.remove(&session_id);
             self.session_ops.lock().await.remove(&session_id);
             if let Some(profile) = runtime.profile.as_ref().filter(|_| runtime.persistent) {
                 self.profile_leases
@@ -3240,7 +3339,9 @@ impl BrowserService {
         update: impl FnOnce(&mut PersistentBrowserProfile),
     ) -> DomainResult<()> {
         validate_browser_profile_name(profile_name)?;
-        let _guard = self.profile_io.lock().await;
+        let mut persisted = self.profile_io.lock().await;
+        // The update may change what the file holds; the next checkpoint reads it.
+        persisted.remove(&(project_id.get(), profile_name.to_string()));
         let path = self.profile_state_path(project_id, profile_name);
         let mut profile = match std::fs::read(&path) {
             Ok(encoded) if encoded.len() <= MAX_PERSISTENT_PROFILE_BYTES => {
@@ -3301,8 +3402,17 @@ impl BrowserService {
         checkpoint: &Checkpoint,
     ) -> DomainResult<()> {
         validate_browser_profile_name(profile_name)?;
-        let _guard = self.profile_io.lock().await;
+        let mut persisted = self.profile_io.lock().await;
+        let key = (project_id.get(), profile_name.to_string());
         let path = self.profile_state_path(project_id, profile_name);
+        // Most actions leave the checkpoint unchanged: skip reading the file.
+        if !checkpoint.hash.is_empty()
+            && persisted
+                .get(&key)
+                .is_some_and(|known| known.holds(&path, &checkpoint.hash))
+        {
+            return Ok(());
+        }
         let mut profile = match std::fs::read(&path) {
             Ok(encoded) if encoded.len() <= MAX_PERSISTENT_PROFILE_BYTES => {
                 serde_json::from_slice(&encoded).map_err(|_| {
@@ -3329,6 +3439,10 @@ impl BrowserService {
             }
         };
         if !checkpoint.hash.is_empty() && profile.checkpoint_hash == checkpoint.hash {
+            match PersistedProfileState::of(&path, &checkpoint.hash) {
+                Some(state) => persisted.insert(key, state),
+                None => persisted.remove(&key),
+            };
             return Ok(());
         }
         merge_persistent_profile(&mut profile, checkpoint);
@@ -3359,6 +3473,10 @@ impl BrowserService {
                 format!("commit browser profile state: {error}"),
             )
         })?;
+        match PersistedProfileState::of(&path, &checkpoint.hash) {
+            Some(state) => persisted.insert(key, state),
+            None => persisted.remove(&key),
+        };
         Ok(())
     }
 
@@ -3501,7 +3619,8 @@ impl BrowserService {
             }
         }
         let result = {
-            let _guard = self.profile_io.lock().await;
+            let mut persisted = self.profile_io.lock().await;
+            persisted.remove(&(project_id.get(), profile.to_string()));
             let removed_profile =
                 remove_browser_profile_path(&self.profile_directory(project_id, profile));
             let removed_chromium =
@@ -3559,7 +3678,8 @@ impl BrowserService {
         }
 
         let result = {
-            let _guard = self.profile_io.lock().await;
+            let mut persisted = self.profile_io.lock().await;
+            persisted.remove(&(project_id.get(), profile.to_string()));
             let state_target = if profile == DEFAULT_BROWSER_PROFILE {
                 self.profile_state_path(project_id, profile)
             } else {
@@ -3602,7 +3722,8 @@ impl BrowserService {
             .collect::<Vec<_>>();
         self.stop_sessions_inner(sessions).await?;
         {
-            let _profile_io = self.profile_io.lock().await;
+            let mut persisted = self.profile_io.lock().await;
+            persisted.retain(|(project, _), _| *project != project_id.get());
             remove_browser_profile_path(&self.project_profile_dir(project_id))?;
         }
         self.profile_leases
@@ -3621,13 +3742,13 @@ impl BrowserService {
         profile: Option<&str>,
     ) -> DomainResult<Checkpoint> {
         let mut checkpoint = decode_checkpoint(value)?;
-        let mut checkpoints = self.checkpoints.lock().await;
-        checkpoint.version = checkpoints
+        let mut versions = self.checkpoint_versions.lock().await;
+        checkpoint.version = versions
             .get(&session_id.get())
-            .map_or(1, |previous| previous.version.saturating_add(1));
+            .map_or(1, |previous| previous.saturating_add(1));
         checkpoint.hash = checkpoint_hash(&checkpoint)?;
-        checkpoints.insert(session_id.get(), checkpoint.clone());
-        drop(checkpoints);
+        versions.insert(session_id.get(), checkpoint.version);
+        drop(versions);
         if let Some(profile) = profile {
             self.persist_checkpoint(project_id, profile, &checkpoint)
                 .await?;
@@ -4297,9 +4418,7 @@ fn worker_path_candidates(explicit: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(path) = explicit {
         candidates.push(path);
     }
-    if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH")
-        .or_else(|| std::env::var_os("BB_BROWSER_WORKER_PATH"))
-    {
+    if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH") {
         candidates.push(PathBuf::from(path));
     }
     if let Ok(executable) = std::env::current_exe() {
@@ -4307,7 +4426,6 @@ fn worker_path_candidates(explicit: Option<PathBuf>) -> Vec<PathBuf> {
             candidates.push(bin_dir.join("browser-worker/index.js"));
             candidates.push(bin_dir.join("../libexec/huntproxy/browser-worker/index.js"));
             candidates.push(bin_dir.join("../share/huntproxy/browser-worker/index.js"));
-            candidates.push(bin_dir.join("../share/bb/browser-worker/index.js"));
         }
     }
     candidates
@@ -4326,9 +4444,14 @@ fn first_existing_worker(candidates: Vec<PathBuf>) -> Option<PathBuf> {
         .map(|path| path.canonicalize().unwrap_or(path))
 }
 
+const WORKER_DIRECTORY_PREFIX: &str = "browser-worker-";
+
 fn browser_worker_path(data_dir: &Path) -> PathBuf {
     data_dir
-        .join(format!("browser-worker-{}", env!("CARGO_PKG_VERSION")))
+        .join(format!(
+            "{WORKER_DIRECTORY_PREFIX}{}",
+            env!("CARGO_PKG_VERSION")
+        ))
         .join("index.js")
 }
 
@@ -4362,7 +4485,88 @@ fn materialize_embedded_worker(data_dir: &Path) -> std::io::Result<PathBuf> {
     )?;
     write_if_changed(&package_path, EMBEDDED_WORKER_PACKAGE.as_bytes())?;
     write_if_changed(&lock_path, EMBEDDED_WORKER_LOCK.as_bytes())?;
+    prune_old_worker_directories(data_dir, env!("CARGO_PKG_VERSION"));
     Ok(worker_path)
+}
+
+/// A plain `MAJOR.MINOR.PATCH` release: decimal numbers without signs or
+/// leading zeros.
+fn parse_release(version: &str) -> Option<[u64; 3]> {
+    let mut parts = version.split('.');
+    let mut release = [0; 3];
+    for number in &mut release {
+        let part = parts.next()?;
+        let plain = !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && (part == "0" || !part.starts_with('0'));
+        if !plain {
+            return None;
+        }
+        *number = part.parse().ok()?;
+    }
+    parts.next().is_none().then_some(release)
+}
+
+/// Removes the worker directories of releases older than the previous one.
+///
+/// Only real directories named exactly `browser-worker-MAJOR.MINOR.PATCH` are
+/// considered. The current release, newer ones and anything else stay. So does
+/// the previous release: an installer can run the new binary before it commits
+/// to it, and rolling back then needs the old worker. Failing to remove a
+/// directory only costs disk space, so it is logged and never propagated.
+fn prune_old_worker_directories(data_dir: &Path, current_version: &str) {
+    let Some(current) = current_version
+        .split(['-', '+'])
+        .next()
+        .and_then(parse_release)
+    else {
+        return;
+    };
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, directory = %data_dir.display(), "could not list old browser worker directories");
+            return;
+        }
+    };
+    let mut older = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, directory = %data_dir.display(), "could not read a data directory entry");
+                continue;
+            }
+        };
+        let Some(release) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix(WORKER_DIRECTORY_PREFIX))
+            .and_then(parse_release)
+            .filter(|release| *release < current)
+        else {
+            continue;
+        };
+        // A symlink is not a directory here, so a link is never followed.
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => older.push((release, entry.path())),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %entry.path().display(), "could not inspect an old browser worker directory");
+            }
+        }
+    }
+    older.sort();
+    older.pop();
+    for (_, path) in older {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "could not remove an old browser worker directory");
+            }
+        }
+    }
 }
 
 fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
@@ -4578,6 +4782,7 @@ mod tests {
                     persistent: true,
                     profile: Some("account1".into()),
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             ),
             (
@@ -4588,6 +4793,7 @@ mod tests {
                     persistent: false,
                     profile: None,
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             ),
             (
@@ -4598,6 +4804,7 @@ mod tests {
                     persistent: true,
                     profile: Some("foreign-account".into()),
                     cdp: Some(cdp.clone()),
+                    javascript_cursor: 0,
                 },
             ),
         ]);
@@ -4685,6 +4892,7 @@ mod tests {
                 persistent: true,
                 profile: Some("default".into()),
                 cdp: None,
+                javascript_cursor: 0,
             },
         );
         let operation = service.session_operation_lock(own.id).await;
@@ -4752,6 +4960,7 @@ mod tests {
                     devtools_url: String::new(),
                     hosted_devtools_url: String::new(),
                 }),
+                javascript_cursor: 0,
             },
         );
         service
@@ -4951,6 +5160,147 @@ mod tests {
                     .mode()
                     & 0o777;
             assert_eq!(mode, 0o600);
+        }
+    }
+
+    fn hashed_checkpoint(value: &str) -> Checkpoint {
+        let mut checkpoint = Checkpoint {
+            url: Some("https://example.test/".into()),
+            cookies: vec![json!({"name":"sid","value":value,"domain":"example.test","path":"/"})],
+            ..Default::default()
+        };
+        checkpoint.hash = checkpoint_hash(&checkpoint).unwrap();
+        checkpoint
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_checkpoint_does_not_read_the_profile_file_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let project_id = ProjectId(42);
+        let checkpoint = hashed_checkpoint("one");
+        service
+            .persist_checkpoint(project_id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+
+        // Replace the file with garbage of the same size and modification time:
+        // reading it back would now fail, so success proves it was not read.
+        let path = service.profile_state_path(project_id, DEFAULT_BROWSER_PROFILE);
+        let written = std::fs::metadata(&path).unwrap();
+        let garbage = vec![b'x'; written.len() as usize];
+        std::fs::write(&path, &garbage).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written.modified().unwrap())
+            .unwrap();
+        service
+            .persist_checkpoint(project_id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), garbage);
+
+        // A different checkpoint is merged into what is on disk, which here is unreadable.
+        let error = service
+            .persist_checkpoint(
+                project_id,
+                DEFAULT_BROWSER_PROFILE,
+                &hashed_checkpoint("two"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::StorageError);
+    }
+
+    #[tokio::test]
+    async fn a_removed_or_replaced_profile_file_is_written_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "profile file".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let service = BrowserService::new_with_proxy_and_ca(
+            db,
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let checkpoint = hashed_checkpoint("one");
+        let path = service.profile_state_path(project.id, DEFAULT_BROWSER_PROFILE);
+        service
+            .persist_checkpoint(project.id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        service
+            .persist_checkpoint(project.id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+        let loaded = service
+            .load_persistent_profile(project.id, DEFAULT_BROWSER_PROFILE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.checkpoint_hash, checkpoint.hash);
+
+        // Resetting the profile forgets what was written; the next checkpoint writes it all again.
+        assert!(service.reset_project_profile(project.id).await.unwrap());
+        assert!(service.profile_io.lock().await.is_empty());
+        assert!(!path.exists());
+        service
+            .persist_checkpoint(project.id, DEFAULT_BROWSER_PROFILE, &checkpoint)
+            .await
+            .unwrap();
+        assert!(path.is_file());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_versions_advance_per_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "versions".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let service = BrowserService::new_with_proxy_and_ca(
+            db.clone(),
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        let first = db.create_browser_session(project.id, None).await.unwrap();
+        let second = db.create_browser_session(project.id, None).await.unwrap();
+        let value = json!({"url":"https://example.test/","_private":{}});
+        for (session, expected) in [(&first, 1), (&first, 2), (&second, 1), (&first, 3)] {
+            let saved = service
+                .save_checkpoint(project.id, session.id, &value, "ok", None)
+                .await
+                .unwrap();
+            assert_eq!(saved.version, expected);
         }
     }
 
@@ -5265,6 +5615,7 @@ done
                     persistent: true,
                     profile: Some("account1".into()),
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             );
             let lease = (project.id.get(), "account1".to_string());
@@ -6019,7 +6370,7 @@ while IFS= read -r request; do
       session=$(printf '%s\n' "$request" | sed -n 's/.*"session_id":\([0-9][0-9]*\).*/\1/p')
       printf '{{"id":%s,"result":{{"session_id":%s,"requested_profile":null,"active_profile":null,"profile_dir":null,"persistent":false,"checkpoint":{{"url":"about:blank","_private":{{}}}}}}}}\n' "$n" "$session" ;;
     *'"method":"session.action"'*) printf '{{"id":%s,"result":{{"ok":true,"checkpoint":{{"url":"about:blank","_private":{{}}}}}}}}\n' "$n" ;;
-    *'"method":"session.javascript_files"'*) printf '{{"id":%s,"result":{{"files":[]}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*) printf '{{"id":%s,"result":{{"files":[],"cursor":0}}}}\n' "$n" ;;
     *) printf '{{"id":%s,"result":{{"stopped":true}}}}\n' "$n" ;;
   esac
 done
@@ -6073,6 +6424,7 @@ done
                 persistent: false,
                 profile: None,
                 cdp: None,
+                javascript_cursor: 0,
             },
         );
         let mut worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
@@ -6226,7 +6578,7 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn worker_timeout_interrupts_only_its_project() {
-        let directory = tempfile::tempdir_in("/tmp/artis").unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("worker.sh");
         std::fs::write(&script, r#"
 while IFS= read -r request; do
@@ -6281,6 +6633,7 @@ done
                     persistent: false,
                     profile: None,
                     cdp: None,
+                    javascript_cursor: 0,
                 },
             );
             ids.push(session.id);
@@ -6338,6 +6691,312 @@ done
         service.force_stop_all().await;
     }
 
+    /// A service with one ready browser session whose worker is a shell
+    /// script. The script appends every request to `requests.log` and answers
+    /// with the given `case` arms, where `@DIR@` is the fixture directory.
+    #[cfg(unix)]
+    struct ScriptedSession {
+        service: Arc<BrowserService>,
+        db: Arc<Db>,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl ScriptedSession {
+        async fn start(arms: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("worker.sh");
+            let body = r#"
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  printf '%s\n' "$request" >> '@DIR@/requests.log'
+  case "$request" in
+    *'"method":"hello"'*) printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}' ;;
+@ARMS@
+    *) printf '{"id":%s,"result":{}}\n' "$n" ;;
+  esac
+done
+"#;
+            std::fs::write(
+                &script,
+                body.replace("@ARMS@", arms)
+                    .replace("@DIR@", &directory.path().display().to_string()),
+            )
+            .unwrap();
+            let db = Arc::new(Db::open_in_memory().await.unwrap());
+            let project = db
+                .create_project(CreateProjectRequest {
+                    name: "Scripted worker".into(),
+                    target_url: "https://app.test".into(),
+                    advanced: None,
+                })
+                .await
+                .unwrap();
+            let mut service = BrowserService::new_with_proxy_and_ca(
+                db.clone(),
+                None,
+                None,
+                "http://127.0.0.1:17891".into(),
+                None,
+                directory.path().join("profiles"),
+            );
+            service.node_path = Some(PathBuf::from("/bin/sh"));
+            service.worker_path = Some(script.clone());
+            let mut session = db.create_browser_session(project.id, None).await.unwrap();
+            session.state = BrowserSessionState::Ready;
+            db.update_browser_session(&session).await.unwrap();
+            let capture = db
+                .create_capture_session(CreateCaptureSession {
+                    project_id: project.id,
+                    browser_session_id: Some(session.id),
+                    browser_action_id: None,
+                    is_browser_bound: true,
+                    ttl: None,
+                })
+                .await
+                .unwrap();
+            service.runtime_sessions.lock().await.insert(
+                session.id.get(),
+                RuntimeSession {
+                    project_id: project.id,
+                    capture_session_id: capture.id,
+                    persistent: false,
+                    profile: None,
+                    cdp: None,
+                    javascript_cursor: 0,
+                },
+            );
+            let worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
+                .await
+                .unwrap_or_else(|_| panic!("start scripted worker"));
+            *service.worker_entry(project.id).await.lock().await = Some(worker);
+            Self {
+                service: Arc::new(service),
+                db,
+                project_id: project.id,
+                session_id: session.id,
+                directory,
+            }
+        }
+
+        async fn run(&self, action: Value) -> DomainResult<ActionResult> {
+            let action = serde_json::from_value(action).unwrap();
+            self.service
+                .action(self.project_id, self.session_id, action)
+                .await
+        }
+
+        /// The requests the worker received for one method, in order.
+        fn requests(&self, method: &str) -> Vec<Value> {
+            std::fs::read_to_string(self.directory.path().join("requests.log"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|request| request["method"] == method)
+                .collect()
+        }
+
+        /// The `after` cursor of every JavaScript file request so far.
+        fn javascript_cursors_asked(&self) -> Vec<Option<u64>> {
+            self.requests("session.javascript_files")
+                .iter()
+                .map(|request| request["params"]["after"].as_u64())
+                .collect()
+        }
+
+        async fn recorded_javascript_urls(&self) -> Vec<String> {
+            let (records, _) = self
+                .db
+                .list_javascript_files(self.project_id, None, Some("app.test".into()), 20)
+                .await
+                .unwrap();
+            let mut urls: Vec<_> = records.into_iter().map(|record| record.url).collect();
+            urls.sort();
+            urls
+        }
+    }
+
+    #[cfg(unix)]
+    fn scripted_javascript_file(name: &str) -> String {
+        format!(
+            r#"{{"url":"https://app.test/{name}.js","path":"/{name}.js","host":"app.test","mime":"application/javascript","status_code":200,"source_page_url":"https://app.test/"}}"#
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn javascript_files_are_recorded_once_and_asked_for_from_the_last_cursor() {
+        let arms = r#"
+    *'"method":"session.action"'*) printf '{"id":%s,"result":{"ok":true,"checkpoint":{"url":"https://app.test/","_private":{}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*)
+      after=$(printf '%s\n' "$request" | sed -n 's/.*"after":\([0-9][0-9]*\).*/\1/p')
+      case "${after:-none}" in
+        0) printf '{"id":%s,"result":{"files":[@A@,@B@],"cursor":2}}\n' "$n" ;;
+        2) printf '{"id":%s,"result":{"files":[@C@],"cursor":3}}\n' "$n" ;;
+        3) printf '{"id":%s,"result":{"files":[],"cursor":3}}\n' "$n" ;;
+        *) printf '{"id":%s,"result":{"files":[@A@,@B@,@C@],"cursor":3}}\n' "$n" ;;
+      esac ;;"#
+            .replace("@A@", &scripted_javascript_file("a"))
+            .replace("@B@", &scripted_javascript_file("b"))
+            .replace("@C@", &scripted_javascript_file("c"));
+        let fixture = ScriptedSession::start(&arms).await;
+        for _ in 0..3 {
+            fixture.run(json!({"type": "snapshot"})).await.unwrap();
+        }
+        // Asking for the session's files returns all of them, whatever was recorded.
+        let all = fixture
+            .service
+            .javascript_files(fixture.project_id, fixture.session_id)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            fixture.javascript_cursors_asked(),
+            [Some(0), Some(2), Some(3), None]
+        );
+        assert_eq!(
+            fixture.recorded_javascript_urls().await,
+            ["a", "b", "c"].map(|name| format!("https://app.test/{name}.js"))
+        );
+        let runtimes = fixture.service.runtime_sessions.lock().await;
+        assert_eq!(runtimes[&fixture.session_id.get()].javascript_cursor, 3);
+        drop(runtimes);
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn javascript_files_without_a_page_are_offered_again_until_recorded() {
+        let arms = r#"
+    *'"method":"session.action"'*)
+      if [ -e '@DIR@/online' ]; then url='https://app.test/'; else url='about:blank'; fi
+      printf '{"id":%s,"result":{"ok":true,"checkpoint":{"url":"%s","_private":{}}}}\n' "$n" "$url" ;;
+    *'"method":"session.javascript_files"'*)
+      after=$(printf '%s\n' "$request" | sed -n 's/.*"after":\([0-9][0-9]*\).*/\1/p')
+      if [ "${after:-0}" -lt 1 ]; then
+        printf '{"id":%s,"result":{"files":[{"url":"https://app.test/a.js","path":"/a.js","host":"app.test","mime":null,"status_code":200,"source_page_url":null}],"cursor":1}}\n' "$n"
+      else
+        printf '{"id":%s,"result":{"files":[],"cursor":1}}\n' "$n"
+      fi ;;"#;
+        let fixture = ScriptedSession::start(arms).await;
+        // On about:blank the file has no page to be attributed to.
+        for _ in 0..2 {
+            fixture.run(json!({"type": "snapshot"})).await.unwrap();
+        }
+        assert!(fixture.recorded_javascript_urls().await.is_empty());
+        std::fs::write(fixture.directory.path().join("online"), "").unwrap();
+        for _ in 0..2 {
+            fixture.run(json!({"type": "snapshot"})).await.unwrap();
+        }
+        assert_eq!(
+            fixture.javascript_cursors_asked(),
+            [Some(0), Some(0), Some(0), Some(1)]
+        );
+        assert_eq!(
+            fixture.recorded_javascript_urls().await,
+            ["https://app.test/a.js"]
+        );
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    const SCRIPTED_EVENT_WAIT: &str = r#"
+    *'"method":"session.events_wait"'*)
+      printf 'x\n' >> '@DIR@/waits'
+      sleep 0.05
+      if [ "$(wc -l < '@DIR@/waits')" -ge @READY_AFTER@ ]; then ready=true; else ready=false; fi
+      printf '{"id":%s,"result":{"ready":%s}}\n' "$n" "$ready" ;;
+    *'"method":"session.action"'*) printf '{"id":%s,"result":{"ok":true,"message":"browser events read","data":{"events":[]},"checkpoint":{"url":"about:blank","_private":{}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*) printf '{"id":%s,"result":{"files":[],"cursor":0}}\n' "$n" ;;"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn event_waits_are_short_worker_requests_followed_by_one_action() {
+        let fixture =
+            ScriptedSession::start(&SCRIPTED_EVENT_WAIT.replace("@READY_AFTER@", "3")).await;
+        let started = std::time::Instant::now();
+        let result = fixture
+            .run(json!({"type": "events", "wait_ms": 20_000, "kinds": ["page_error"]}))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait ends with the first event, not at its deadline"
+        );
+        let waits = fixture.requests("session.events_wait");
+        assert_eq!(waits.len(), 3);
+        for wait in &waits {
+            let params = &wait["params"];
+            assert!(params["wait_ms"].as_u64().unwrap() <= 100);
+            assert_eq!(params["session_id"], fixture.session_id.get());
+            assert_eq!(params["action"]["type"], "events");
+            assert_eq!(params["action"]["kinds"], json!(["page_error"]));
+        }
+        // However long the wait took, the action and its checkpoint happen once.
+        assert_eq!(fixture.requests("session.action").len(), 1);
+
+        fixture.run(json!({"type": "events"})).await.unwrap();
+        assert_eq!(fixture.requests("session.events_wait").len(), 3);
+        assert_eq!(fixture.requests("session.action").len(), 2);
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_event_wait_without_events_ends_at_its_deadline() {
+        let fixture =
+            ScriptedSession::start(&SCRIPTED_EVENT_WAIT.replace("@READY_AFTER@", "1000")).await;
+        let started = std::time::Instant::now();
+        fixture
+            .run(json!({"type": "events", "wait_ms": 350}))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        let waits = fixture.requests("session.events_wait").len();
+        assert!((2..=8).contains(&waits), "{waits} waits");
+        assert_eq!(fixture.requests("session.action").len(), 1);
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn other_requests_are_served_between_event_wait_slices() {
+        let fixture =
+            ScriptedSession::start(&SCRIPTED_EVENT_WAIT.replace("@READY_AFTER@", "1000")).await;
+        let waiting = {
+            let service = fixture.service.clone();
+            let (project_id, session_id) = (fixture.project_id, fixture.session_id);
+            tokio::spawn(async move {
+                let action = serde_json::from_value(json!({"type": "events", "wait_ms": 3_000}));
+                service
+                    .action(project_id, session_id, action.unwrap())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        fixture
+            .service
+            .call_worker(
+                fixture.project_id,
+                "session.status",
+                json!({"session_id": fixture.session_id.get()}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "a request made during a 3 s event wait waited {:?}",
+            started.elapsed()
+        );
+        waiting.await.unwrap().unwrap();
+        fixture.service.force_stop_all().await;
+    }
+
     #[test]
     fn browser_worker_installation_uses_selected_data_directory() {
         let directory = tempfile::tempdir().unwrap();
@@ -6350,6 +7009,180 @@ done
             std::fs::read_to_string(worker_dir.join("headless.js")).unwrap(),
             EMBEDDED_WORKER_HEADLESS
         );
+    }
+
+    #[test]
+    fn worker_releases_are_plain_numeric_triples() {
+        assert_eq!(parse_release("0.3.0"), Some([0, 3, 0]));
+        assert_eq!(parse_release("12.0.104"), Some([12, 0, 104]));
+        for rejected in [
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.x",
+            "1..3",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "+1.2.3",
+            "-1.2.3",
+            "1.2.3-rc.1",
+            "1.2.3+build",
+            " 1.2.3",
+            "1.2.3 ",
+            "99999999999999999999.0.0",
+        ] {
+            assert_eq!(parse_release(rejected), None, "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn only_worker_directories_older_than_the_previous_release_are_pruned() {
+        let data = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let directory = |name: &str| {
+            let path = data.path().join(name);
+            std::fs::create_dir_all(path.join("node_modules")).unwrap();
+            std::fs::write(path.join("index.js"), "worker").unwrap();
+            path
+        };
+        let stale = [
+            directory("browser-worker-0.1.0"),
+            directory("browser-worker-0.1.5"),
+            directory("browser-worker-0.0.9"),
+        ];
+        let kept = [
+            // The previous release, the current one and newer ones.
+            directory("browser-worker-0.2.0"),
+            directory("browser-worker-0.3.0"),
+            directory("browser-worker-0.4.0"),
+            // 10 is newer than 3, which a text comparison would get wrong.
+            directory("browser-worker-0.10.0"),
+            // Not exactly browser-worker-MAJOR.MINOR.PATCH, whatever they hold.
+            directory("browser-worker-0.1.0.bak"),
+            directory("browser-worker-0.1.0-rc.1"),
+            directory("browser-worker-01.0.0"),
+            directory("browser-worker-1.0"),
+            directory("browser-worker-old"),
+            directory("browser-worker-"),
+            directory("browser-workers-0.1.0"),
+            directory(".browser-worker.old.k3j2h1"),
+            directory("worker-0.1.0"),
+            directory("runtime"),
+        ];
+        // Neither a file nor a link to a directory is a worker directory.
+        let file = data.path().join("browser-worker-0.0.1");
+        std::fs::write(&file, "not a directory").unwrap();
+        std::fs::write(outside.path().join("keep"), "precious").unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = data.path().join("browser-worker-0.0.2");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            link
+        };
+
+        prune_old_worker_directories(data.path(), "0.3.0");
+
+        for path in &stale {
+            assert!(!path.exists(), "{} should be pruned", path.display());
+        }
+        for path in &kept {
+            assert!(
+                path.join("index.js").is_file(),
+                "{} should stay",
+                path.display()
+            );
+        }
+        assert!(file.is_file());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+            "precious"
+        );
+        #[cfg(unix)]
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+
+        // Pruning again, or pruning from the oldest release, removes nothing more.
+        prune_old_worker_directories(data.path(), "0.3.0");
+        prune_old_worker_directories(data.path(), "0.0.1");
+        for path in &kept {
+            assert!(path.join("index.js").is_file(), "{}", path.display());
+        }
+        // An unusable current version prunes nothing.
+        let before = std::fs::read_dir(data.path()).unwrap().count();
+        for current in ["", "dev", "0.3", "0.3.0.1"] {
+            prune_old_worker_directories(data.path(), current);
+        }
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), before);
+    }
+
+    #[test]
+    fn a_pre_release_build_prunes_by_its_release_number() {
+        let data = tempfile::tempdir().unwrap();
+        for name in ["0.1.0", "0.2.0", "0.3.0"] {
+            std::fs::create_dir(data.path().join(format!("browser-worker-{name}"))).unwrap();
+        }
+        prune_old_worker_directories(data.path(), "0.3.0-rc.1");
+        assert!(!data.path().join("browser-worker-0.1.0").exists());
+        assert!(data.path().join("browser-worker-0.2.0").exists());
+        assert!(data.path().join("browser-worker-0.3.0").exists());
+    }
+
+    #[test]
+    fn materializing_the_worker_prunes_the_old_ones_after_writing_it() {
+        let data = tempfile::tempdir().unwrap();
+        let old = |version: &str| {
+            let path = data.path().join(format!("browser-worker-{version}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let (oldest, previous) = (old("0.0.1"), old("0.0.2"));
+        let worker = materialize_embedded_worker(data.path()).unwrap();
+        assert!(worker.is_file());
+        assert!(!oldest.exists());
+        assert!(previous.is_dir());
+
+        // Nothing is pruned when the current worker could not be written.
+        let data = tempfile::tempdir().unwrap();
+        let blocked = browser_worker_path(data.path());
+        std::fs::write(blocked.parent().unwrap(), "in the way").unwrap();
+        let stale = data.path().join("browser-worker-0.0.0");
+        std::fs::create_dir(&stale).unwrap();
+        assert!(materialize_embedded_worker(data.path()).is_err());
+        assert!(stale.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_removed_does_not_stop_the_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        let old = |version: &str| {
+            let path = data.path().join(format!("browser-worker-{version}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        // The directory that cannot be removed comes first, so pruning must
+        // carry on after the failure to reach the removable one.
+        let (stuck, removable, previous) = (old("0.0.0"), old("0.0.1"), old("0.0.2"));
+        // Entries of a read-only directory cannot be unlinked (except by root).
+        let locked = stuck.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("file"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = materialize_embedded_worker(data.path());
+
+        if locked.exists() {
+            // Removable again, so the temporary directory can be cleaned up.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        } else {
+            eprintln!("permissions do not block removal here (root); failure path not exercised");
+        }
+        let worker = result.expect("a failed cleanup must not fail the worker");
+        assert!(worker.is_file());
+        assert!(previous.is_dir());
+        assert!(!removable.exists(), "pruning carries on after a failure");
     }
 
     #[cfg(unix)]

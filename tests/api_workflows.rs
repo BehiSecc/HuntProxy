@@ -874,6 +874,75 @@ async fn fuzzer_number_generator_runs_through_http_api() {
 }
 
 #[tokio::test]
+async fn sniper_fuzzing_never_sends_literal_markers_for_untouched_points() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let (_directory, state, project_id) = test_state().await;
+    let response = huntproxy::api::router(state.clone())
+        .oneshot(
+            Request::post(format!("/api/v1/projects/{}/fuzz-jobs", project_id.get()))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "template": {
+                            "draft": {
+                                "url": format!("{}/item?a=§a§&b=§b§", server.uri()),
+                                "header_overrides": [{"name": "X-Probe", "value": "v-§h§"}]
+                            },
+                            "insertion_points": [
+                                {"name": "a", "location": "url"},
+                                {"name": "b", "location": "url"},
+                                {"name": "h", "location": "header:X-Probe"}
+                            ],
+                            "wordlists": [["P"]]
+                        },
+                        "confirm": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let job = json_response(response).await;
+    for _ in 0..100 {
+        let current = state
+            .db
+            .get_fuzz_job(project_id, FuzzJobId(job["id"].as_i64().unwrap()))
+            .await
+            .unwrap();
+        if current.state == FuzzJobState::Completed {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut seen = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let probe = request
+                .headers
+                .get("x-probe")
+                .map(|value| value.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            assert!(!probe.contains('§'), "literal marker in header: {probe}");
+            format!("{}|{probe}", request.url.query().unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    seen.sort();
+    assert_eq!(seen, ["a=&b=P|v-", "a=&b=|v-P", "a=P&b=|v-"]);
+}
+
+#[tokio::test]
 async fn page_analyzer_extracts_saved_response_findings_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let mut captured = exchange(project_id, "GET", "/app.js");
@@ -1739,6 +1808,107 @@ async fn response_body_api_decodes_gzip_and_preserves_raw_access() {
 }
 
 #[tokio::test]
+async fn bootstrap_fails_instead_of_using_an_unpersisted_placeholder_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        data_dir: directory.path().to_path_buf(),
+        spool_dir: directory.path().join("spool"),
+        export_dir: directory.path().join("exports"),
+        runtime_dir: directory.path().join("runtime"),
+        plugin_dir: directory.path().join("plugins"),
+        ..Config::default()
+    };
+    // A directory where the key file belongs can be neither read nor replaced.
+    std::fs::create_dir_all(config.placeholder_key_path()).unwrap();
+    let error = bootstrap_state(config)
+        .await
+        .err()
+        .expect("bootstrap must fail");
+    assert!(
+        error.to_string().contains("placeholder key"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn body_paging_reuses_one_prepared_body_and_survives_extreme_offsets() {
+    use base64::Engine;
+
+    let (_directory, state, project_id) = test_state().await;
+    let payload = (0..10_000u32)
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<u8>>();
+    let mut captured = exchange(project_id, "GET", "/large");
+    captured.response_body = Some(payload.clone());
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+    let app = huntproxy::api::router(state.clone());
+
+    let mut reassembled = Vec::new();
+    let mut sha = None;
+    while reassembled.len() < payload.len() {
+        let page = json_response(
+            app.clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/projects/{}/exchanges/{}/body?side=response&offset={}&max_bytes=16384",
+                        project_id.get(),
+                        exchange_id.get(),
+                        reassembled.len()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(page["total_length"], payload.len());
+        let sha = sha.get_or_insert_with(|| page["sha256"].clone());
+        assert_eq!(&page["sha256"], sha);
+        reassembled.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(page["data"].as_str().unwrap())
+                .unwrap(),
+        );
+    }
+    assert_eq!(reassembled, payload);
+
+    let first = state
+        .prepared_body(project_id, exchange_id, MessageSide::Response, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = state
+        .prepared_body(project_id, exchange_id, MessageSide::Response, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "pages must share one prepared body"
+    );
+
+    // offset + max_bytes would overflow usize.
+    let past_end = json_response(
+        app.oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/body?side=response&offset={}&max_bytes=65536",
+                project_id.get(),
+                exchange_id.get(),
+                usize::MAX
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(past_end["length"], 0);
+    assert_eq!(past_end["truncated"], false);
+}
+
+#[tokio::test]
 async fn sitemap_and_findings_work_through_http_api() {
     let (_directory, state, project_id) = test_state().await;
     let mut first = exchange(project_id, "GET", "/z-route");
@@ -2036,6 +2206,46 @@ async fn copy_as_includes_secrets_by_default_and_can_explicitly_redact_them() {
     assert!(!content.contains("Bearer top-secret"));
     assert!(content.contains("\"X-Repeat\": \"one, two\""));
     assert!(content.contains("https://example.com/submit?from=history"));
+}
+
+#[tokio::test]
+async fn copy_as_with_secrets_fails_when_the_reveal_cannot_be_audited() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut captured = exchange(project_id, "GET", "/private");
+    captured.request_headers = vec![HeaderEntry {
+        name: "Authorization".into(),
+        value: b"Bearer top-secret".to_vec(),
+        ordinal: 0,
+    }];
+    let exchange_id = state.db.insert_exchange(captured).await.unwrap();
+    state
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER audit_down BEFORE INSERT ON audit_events \
+                 BEGIN SELECT RAISE(ABORT, 'audit log unavailable'); END;",
+            )
+            .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))
+        })
+        .await
+        .unwrap();
+    let app = huntproxy::api::router(state);
+
+    let response = app
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/projects/{}/exchanges/{}/copy-as?format=curl",
+                project_id.get(),
+                exchange_id.get()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&body).contains("top-secret"));
 }
 
 #[tokio::test]

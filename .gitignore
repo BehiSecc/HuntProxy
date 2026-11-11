@@ -1,7 +1,5 @@
 /target/
 **/target/
-/web/node_modules
-/web/dist
 /browser-worker/node_modules
 **/*.rs.bk
 .DS_Store
@@ -15,7 +13,5 @@
 /test-output
 /screenshots
 /exports
-.bb/
 *.log
-Cargo.lock.bak
 **/.git/

@@ -202,8 +202,7 @@ impl Db {
             for r in rows {
                 let (id, name, target_url, ca, ua, sj, lj, prof, noise) =
                     r.map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                let scope: ScopePolicy = serde_json::from_str(&sj).unwrap_or_default();
-                let limits: ProjectLimits = serde_json::from_str(&lj).unwrap_or_default();
+                let (scope, limits) = decode_project_settings(id, &sj, &lj)?;
                 out.push(Project {
                     id: ProjectId(id),
                     name,
@@ -247,10 +246,9 @@ impl Db {
                 }
                 other => DomainError::new(ErrorCode::StorageError, other.to_string()),
             })
-            .map(|(id, name, target_url, ca, ua, sj, lj, prof, noise)| {
-                let scope: ScopePolicy = serde_json::from_str(&sj).unwrap_or_default();
-                let limits: ProjectLimits = serde_json::from_str(&lj).unwrap_or_default();
-                Project {
+            .and_then(|(id, name, target_url, ca, ua, sj, lj, prof, noise)| {
+                let (scope, limits) = decode_project_settings(id, &sj, &lj)?;
+                Ok(Project {
                     id: ProjectId(id),
                     name,
                     target_url,
@@ -260,7 +258,7 @@ impl Db {
                     limits,
                     default_browser_profile: prof,
                     noise_policy: noise,
-                }
+                })
             })
         })
         .await
@@ -356,6 +354,93 @@ impl Db {
     }
 }
 
+/// Decode a project's stored scope and limits. Corrupt JSON is reported rather
+/// than replaced by defaults, which would silently widen scope or limits.
+pub(crate) fn decode_project_settings(
+    project_id: i64,
+    scope_json: &str,
+    limits_json: &str,
+) -> DomainResult<(ScopePolicy, ProjectLimits)> {
+    let scope = serde_json::from_str(scope_json).map_err(|error| {
+        DomainError::new(
+            ErrorCode::StorageError,
+            format!("project {project_id} has invalid stored scope: {error}"),
+        )
+    })?;
+    let limits = serde_json::from_str(limits_json).map_err(|error| {
+        DomainError::new(
+            ErrorCode::StorageError,
+            format!("project {project_id} has invalid stored limits: {error}"),
+        )
+    })?;
+    Ok((scope, limits))
+}
+
 fn storage_error(error: rusqlite::Error) -> DomainError {
     DomainError::new(ErrorCode::StorageError, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn project_with_settings(
+        scope_json: &'static str,
+        limits_json: &'static str,
+    ) -> (Db, ProjectId) {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "settings".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let id = project.id;
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE projects SET scope_json=?1, limits_json=?2 WHERE id=?3",
+                params![scope_json, limits_json, id.get()],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        (db, id)
+    }
+
+    #[tokio::test]
+    async fn corrupt_stored_settings_are_reported_not_defaulted() {
+        for (scope, limits, expected) in [
+            ("not json", "{}", "invalid stored scope"),
+            ("{}", "[1,2", "invalid stored limits"),
+            (
+                "{}",
+                r#"{"requests_per_second":"fast"}"#,
+                "invalid stored limits",
+            ),
+        ] {
+            let (db, id) = project_with_settings(scope, limits).await;
+            let error = db.get_project(id).await.unwrap_err();
+            assert_eq!(error.code(), ErrorCode::StorageError);
+            assert!(error.to_string().contains(expected), "{error}");
+            let error = db.list_projects().await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_stored_limits_fill_missing_fields_with_defaults() {
+        let (db, id) =
+            project_with_settings("{}", r#"{"requests_per_second":5.0,"max_fuzz_cases":7}"#).await;
+        let project = db.get_project(id).await.unwrap();
+        assert_eq!(project.limits.requests_per_second, 5.0);
+        assert_eq!(project.limits.max_fuzz_cases, 7);
+        assert_eq!(
+            project.limits.max_disk_bytes,
+            ProjectLimits::default().max_disk_bytes
+        );
+    }
 }

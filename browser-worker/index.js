@@ -22,6 +22,8 @@ const ownedChromeChildren = new Set();
 let shuttingDown = false;
 const MAX_SESSION_EVENTS = 256;
 const MAX_SESSION_EVENT_BYTES = 256 * 1024;
+const MAX_EVENT_WAIT_MS = 1_000;
+const EVENT_POLL_MS = 50;
 const MAX_SCREENSHOT_PIXELS = 16 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024;
 
@@ -59,8 +61,30 @@ function javascriptFile(response, fallbackPageUrl) {
 function trackJavascriptFiles(session, page) {
   page.on("response", (response) => {
     const file = javascriptFile(response, page.url());
-    if (file) session.javascriptFiles.set(file.url, file);
+    if (file) recordJavascriptFile(session, file);
   });
+}
+
+// Every new or changed entry takes the next sequence number. The counter lives
+// on the session, so it keeps counting across CDP handoffs and resumes, which
+// replace the browser runtime but not the session.
+function recordJavascriptFile(session, file) {
+  const known = session.javascriptFiles.get(file.url);
+  if (known && known.mime === file.mime && known.status_code === file.status_code
+      && known.source_page_url === file.source_page_url) return;
+  session.javascriptFiles.set(file.url, { ...file, sequence: ++session.javascriptSequence });
+}
+
+// The files recorded after `after`, plus the cursor to ask from next time. A
+// caller without a cursor, or with one this session never issued, gets all.
+function javascriptFilesSince(session, after) {
+  const cursor = session.javascriptSequence ?? 0;
+  const from = Number.isSafeInteger(after) && after >= 0 && after <= cursor ? after : 0;
+  const files = [];
+  for (const { sequence, ...file } of session.javascriptFiles?.values() ?? []) {
+    if (sequence > from) files.push(file);
+  }
+  return { files, cursor };
 }
 
 function publicLocation(value) {
@@ -338,6 +362,7 @@ async function drainWindowMessages(session) {
 
 async function initializeSessionTracking(session, existingJavascriptFiles = new Map(), generation = 1) {
   session.javascriptFiles = existingJavascriptFiles;
+  session.javascriptSequence ??= 0;
   session.runtimeErrors = [];
   session.runtimeErrorCount = 0;
   session.runtimeGeneration = generation;
@@ -506,10 +531,7 @@ async function inspectRuntime(session, action) {
 }
 
 function loadPlaywright() {
-  const candidates = [
-    process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH,
-    process.env.BB_PLAYWRIGHT_CORE_PATH,
-  ].filter(Boolean);
+  const candidates = [process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH].filter(Boolean);
   const workerDir = path.dirname(fileURLToPath(import.meta.url));
   candidates.push(
     path.join(workerDir, "node_modules", "playwright-core"),
@@ -519,8 +541,7 @@ function loadPlaywright() {
 
   const requireFromWorker = createRequire(path.join(workerDir, "package.json"));
   const requireFromCwd = createRequire(path.join(process.cwd(), "package.json"));
-  const explicit = candidates[0] === process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH
-    || candidates[0] === process.env.BB_PLAYWRIGHT_CORE_PATH;
+  const explicit = candidates[0] === process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH;
   const pinnedVersion = explicit ? null
     : JSON.parse(fs.readFileSync(path.join(workerDir, "package.json"), "utf8"))
       .dependencies?.["playwright-core"];
@@ -610,7 +631,6 @@ function rpcError(code, message) {
 function existingChromiumExecutable() {
   const candidates = [
     process.env.HUNTPROXY_CHROME_EXECUTABLE,
-    process.env.BB_CHROME_EXECUTABLE,
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
   ].filter(Boolean);
   try {
@@ -675,14 +695,11 @@ function browserHeadlessCompatibility() {
   return enabled;
 }
 
+// Credentials are deliberately absent: Playwright would answer every HTTP
+// authentication challenge with them (see proxyHttpCredentials).
 function chromiumProxy(proxy) {
   if (!proxy?.server) return undefined;
-  return {
-    server: proxy.server,
-    username: proxy.username || undefined,
-    password: proxy.password || undefined,
-    bypass: "<-loopback>",
-  };
+  return { server: proxy.server, bypass: "<-loopback>" };
 }
 
 function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null, executablePath = browserRuntime.chromium_path) {
@@ -705,10 +722,51 @@ function chromiumLaunchOptions(proxy, caCertPath, cdpPort = null, executablePath
     executablePath,
     headless: browserRuntime.headless,
     proxy: chromiumProxy(proxy),
+    httpCredentials: proxyHttpCredentials(proxy),
     ignoreHTTPSErrors: Boolean(caCertPath),
     serviceWorkers: "allow",
     args,
   };
+}
+
+// The capture token belongs to the proxy alone. Playwright answers every
+// Fetch.authRequired whose request URL matches one of its HTTP credentials, and
+// a credential without an origin matches every URL: it would also answer a
+// target site's own `401 WWW-Authenticate: Basic` and hand the target the
+// token. So the credential is scoped to a reserved origin that is never a real
+// destination, and the proxy is authenticated once by requesting that origin
+// (primeProxyAuth). Chromium keeps the credentials the proxy accepted and sends
+// them with every later request, HTTP and CONNECT alike, so no other challenge
+// from the proxy reaches Playwright, and a target's own challenge is answered
+// as it would be without credentials. The same one-time authentication lets a
+// CDP client that routes requests (Playwright's page.route enables Fetch with
+// auth handling, so it receives a proxy challenge instead of this worker) make
+// its first navigation. The name is reserved (.invalid never resolves):
+// HuntProxy rejects it while resolving the destination, so no target is
+// contacted and nothing is captured.
+const PROXY_AUTH_PRIME_URL = "http://huntproxy-auth-prime.invalid/";
+
+function proxyHttpCredentials(proxy) {
+  if (!proxy?.username && !proxy?.password) return undefined;
+  return {
+    username: proxy.username || "",
+    password: proxy.password || "",
+    origin: new URL(PROXY_AUTH_PRIME_URL).origin,
+  };
+}
+
+// Uses the launched tab and leaves it on about:blank: closing a throwaway tab
+// stalled intermittently (Page.close never completed while the tab's proxy-auth
+// request was in flight), which hung a CDP handoff. A failure is logged rather
+// than raised: the first real navigation then reports the proxy problem itself.
+async function primeProxyAuth(page, proxy) {
+  if (!proxyHttpCredentials(proxy)) return;
+  try {
+    await page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10_000 });
+  } catch (error) {
+    logMeta("proxy_auth_prime_failed", { error: String(error?.message || error).split("\n")[0].slice(0, 200) });
+  }
 }
 
 async function nativeDebugPort(preferred) {
@@ -901,10 +959,10 @@ async function launchNativeChromium(proxy, caCertPath, profileDir, cdpPort) {
     }
     const context = browser.contexts()[0];
     if (!context) throw new Error("Chromium default context is missing");
-    if (proxy?.username || proxy?.password) {
-      await context.setHTTPCredentials({ username: proxy.username || "", password: proxy.password || "" });
-    }
+    const credentials = proxyHttpCredentials(proxy);
+    if (credentials) await context.setHTTPCredentials(credentials);
     const page = context.pages()[0] || await context.newPage();
+    await primeProxyAuth(page, proxy);
     await page.bringToFront();
     identityController?.assertHealthy();
     return { browser, context, page, persistent: true, profileDir, ownedChrome: child, identityController,
@@ -940,6 +998,7 @@ async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = nu
     if (!browserRuntime.headless || browserRuntime.headless_compatibility) return launchNativeChromium(proxy, caCertPath, profileDir, cdpPort);
     const context = await chromium.launchPersistentContext(profileDir, options);
     const page = context.pages()[0] || await context.newPage();
+    await primeProxyAuth(page, proxy);
     return {
       browser: null,
       context,
@@ -948,13 +1007,15 @@ async function launchChromium(proxy, caCertPath, profileDir = null, cdpPort = nu
       profileDir,
     };
   }
-  const { ignoreHTTPSErrors, serviceWorkers, ...launchOptions } = options;
+  const { ignoreHTTPSErrors, serviceWorkers, httpCredentials, ...launchOptions } = options;
   const browser = await chromium.launch(launchOptions);
   const context = await browser.newContext({
     serviceWorkers,
     ignoreHTTPSErrors,
+    httpCredentials,
   });
   const page = await context.newPage();
+  await primeProxyAuth(page, proxy);
   return { browser, context, page, persistent: false, profileDir: null };
 }
 
@@ -1152,26 +1213,6 @@ async function restoreRuntimePages(runtime, pageState) {
   await runtime.page.bringToFront();
 }
 
-// A proxy challenge is answered by the worker's own CDP credentials. Once a
-// client such as Playwright's page.route enables Fetch with auth handling, it
-// receives that challenge instead and, having no credentials, cancels the
-// request (net::ERR_INVALID_AUTH_CREDENTIALS). Chromium reuses proxy credentials
-// it has already accepted, so authenticate once here, before control is
-// returned. The name is reserved (.invalid never resolves): HuntProxy rejects it
-// while resolving the destination, so no target is contacted and nothing is
-// captured. Best effort. It uses the runtime's own tab and leaves it for
-// restoreRuntimePages to put back: closing a throwaway tab here stalled
-// intermittently (Page.close never completed while the tab's proxy-auth
-// request was in flight), which hung the whole handoff.
-const PROXY_AUTH_PRIME_URL = "http://huntproxy-auth-prime.invalid/";
-
-async function primeProxyAuth(runtime, proxy) {
-  if (!proxy?.username && !proxy?.password) return;
-  try {
-    await runtime.page.goto(PROXY_AUTH_PRIME_URL, { waitUntil: "commit", timeout: 10_000 });
-  } catch {}
-}
-
 // Closing a tab can stall in Chromium; a handoff must never wait on it.
 async function closePageWithin(page, milliseconds = 5_000) {
   let timer;
@@ -1194,7 +1235,6 @@ async function launchSessionRuntime(session, cdpPort, pageState, sessionCookies 
   );
   try {
     if (sessionCookies.length) await runtime.context.addCookies(sessionCookies);
-    if (cdpPort != null) await primeProxyAuth(runtime, session.proxy);
     await restoreRuntimePages(runtime, pageState);
     const cdp = cdpPort == null ? null : await discoverCdp(runtime.page, cdpPort);
     return { runtime, cdp };
@@ -1693,25 +1733,9 @@ async function performPages(session, action) {
 }
 
 async function performEvents(session, action) {
-  const generation = action.runtime_generation == null
-    ? session.runtimeGeneration : Number(action.runtime_generation);
-  requireRuntimeGeneration(session, generation);
-  const after = Number(action.after_sequence || 0);
-  const limit = Number(action.limit || 50);
-  const waitMs = Number(action.wait_ms || 0);
-  const kinds = new Set(Array.isArray(action.kinds) ? action.kinds : []);
-  const matching = () => session.events
-    .map((entry) => entry.event)
-    .filter((event) => event.sequence > after && (!kinds.size || kinds.has(event.kind)))
-    .slice(0, limit);
-  const deadline = Date.now() + waitMs;
-  let events;
-  do {
-    await drainWindowMessages(session);
-    events = matching();
-    if (events.length || Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now())));
-  } while (Date.now() < deadline);
+  const { after, matching } = eventQuery(session, action);
+  await drainWindowMessages(session);
+  const events = matching();
   const oldestSequence = session.events[0]?.event.sequence ?? session.eventSequence + 1;
   return { message: "browser events read", data: {
     runtime_generation: session.runtimeGeneration,
@@ -1727,6 +1751,35 @@ async function performEvents(session, action) {
         page_id: pageIdFor(session, page), observer: "window_message", operation: state.error,
       })),
   } };
+}
+
+function eventQuery(session, action) {
+  const generation = action.runtime_generation == null
+    ? session.runtimeGeneration : Number(action.runtime_generation);
+  requireRuntimeGeneration(session, generation);
+  const after = Number(action.after_sequence || 0);
+  const limit = Number(action.limit || 50);
+  const kinds = new Set(Array.isArray(action.kinds) ? action.kinds : []);
+  const matching = () => session.events
+    .map((entry) => entry.event)
+    .filter((event) => event.sequence > after && (!kinds.size || kinds.has(event.kind)))
+    .slice(0, limit);
+  return { after, matching };
+}
+
+// Waits up to `waitMs` for an event the query would return, without extracting
+// a checkpoint. The worker serves one request at a time, so callers chain short
+// waits and the other sessions of the project are served in between.
+async function waitForEvents(session, action, waitMs) {
+  const { matching } = eventQuery(session, action);
+  const deadline = Date.now() + Math.min(Math.max(Number(waitMs) || 0, 0), MAX_EVENT_WAIT_MS);
+  for (;;) {
+    await drainWindowMessages(session);
+    if (matching().length) return { ready: true };
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { ready: false };
+    await new Promise((resolve) => setTimeout(resolve, Math.min(EVENT_POLL_MS, remaining)));
+  }
 }
 
 async function performScroll(session, action) {
@@ -1994,26 +2047,21 @@ async function executeAction(session, action = {}) {
     case "navigate": {
       const response = await navigateWithProxyCheck(page, () => page.goto(action.url, {
         waitUntil: "domcontentloaded",
-        timeout: action.timeout_ms || 30_000,
+        timeout: 30_000,
       }));
       await reconcileCurrentOriginStorage(session);
       return { message: "navigation completed", data: { url: page.url(), status: response?.status() ?? null } };
     }
     case "snapshot": {
-      let content;
-      if (action.format === "dom") {
-        content = await page.content();
-      } else if (typeof page.locator("body").ariaSnapshot === "function") {
-        content = await page.locator("body").ariaSnapshot();
-      } else {
-        content = await page.content();
-      }
+      // Anything but "dom" is the accessibility tree; report the format produced.
+      const format = action.format === "dom" ? "dom" : "accessibility";
+      const content = format === "dom" ? await page.content() : await page.locator("body").ariaSnapshot();
       const maxBytes = Math.max(0, Math.min(Number(action.max_bytes || 200_000), 2_000_000));
       const bytes = Buffer.from(String(content), "utf8");
       return {
         message: "snapshot captured",
         data: {
-          format: action.format || "accessibility",
+          format,
           content: bytes.subarray(0, maxBytes).toString("utf8"),
           truncated: bytes.length > maxBytes,
           total_bytes: bytes.length,
@@ -2175,7 +2223,7 @@ async function handle(req) {
           if (params.url && params.url !== "about:blank") {
             await navigateWithProxyCheck(session.page, () => session.page.goto(params.url, {
               waitUntil: "domcontentloaded",
-              timeout: params.timeout_ms || 30_000,
+              timeout: 30_000,
             }));
             await reconcileCurrentOriginStorage(session);
           }
@@ -2213,6 +2261,12 @@ async function handle(req) {
           checkpoint,
           engine: session.engine,
         });
+      }
+      case "session.events_wait": {
+        const session = sessions.get(Number(params.session_id));
+        if (!session) throw rpcError(-32001, "session not found");
+        session.identityController?.assertHealthy();
+        return respond(id, await waitForEvents(session, params.action || {}, params.wait_ms));
       }
       case "session.csrf_probe": {
         const sessionId = Number(params.session_id);
@@ -2342,7 +2396,7 @@ async function handle(req) {
         const sessionId = Number(params.session_id);
         const session = sessions.get(sessionId);
         if (!session) throw rpcError(-32001, "session not found");
-        return respond(id, { files: [...(session.javascriptFiles?.values() || [])] });
+        return respond(id, javascriptFilesSince(session, params.after));
       }
       case "session.cdp_enable": {
         const sessionId = Number(params.session_id);

@@ -66,6 +66,14 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup override set "$RUST_VERSION"
 
+      # Restore the dependency cache written by CI on the default branch. Tag
+      # runs never write it, and the release binaries below are built uncached.
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: dev
+          save-if: false
+
       - name: Install browser-worker Node runtime
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -80,7 +88,7 @@ jobs:
       - name: Run repository checks
         env:
           HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-release-default
-        run: scripts/check.sh
+        run: scripts/check.sh --quick
 
   build:
     name: Build ${{ matrix.asset }}

@@ -2,7 +2,9 @@
 
 use crate::config::{create_private_dir, write_private_file, Config};
 use crate::domain::*;
-use crate::storage::{migrate, reconcile_project_usage_conn, schema_version, Db};
+use crate::storage::{
+    decode_project_settings, migrate, reconcile_project_usage_conn, schema_version, Db,
+};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -437,19 +439,22 @@ fn import_snapshot(
         tx.execute_batch(&sql).map_err(storage_error)?;
         materialize_reply_placeholders(&tx, old_project, new_project)?;
         reconcile_project_usage_conn(&tx, ProjectId(new_project))?;
-        tx.commit().map_err(storage_error)?;
-        let (name,target_url,created,updated,scope,limits,profile,noise): (String,String,String,String,String,String,String,String) = conn.query_row(
+        // Read the project back before committing so a bundle with corrupt
+        // scope or limits is rejected instead of imported half-usable.
+        let (name,target_url,created,updated,scope,limits,profile,noise): (String,String,String,String,String,String,String,String) = tx.query_row(
             "SELECT name,target_url,created_at,updated_at,scope_json,limits_json,default_browser_profile,noise_policy FROM projects WHERE id=?1",
             params![new_project], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))
         ).map_err(storage_error)?;
+        let (scope, limits) = decode_project_settings(new_project, &scope, &limits)?;
+        tx.commit().map_err(storage_error)?;
         Ok(Project {
             id: ProjectId(new_project),
             name,
             target_url,
             created_at: crate::storage::parse_time(&created),
             updated_at: crate::storage::parse_time(&updated),
-            scope: serde_json::from_str(&scope).unwrap_or_default(),
-            limits: serde_json::from_str(&limits).unwrap_or_default(),
+            scope,
+            limits,
             default_browser_profile: profile,
             noise_policy: noise,
         })
@@ -660,7 +665,7 @@ INSERT INTO bodies SELECT id+{body},sha256,original_length,stored_length,codec,m
 INSERT INTO browser_sessions (id,project_id,engine,engine_policy,current_url,state,fallback_used,checkpoint_status,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title,profile_name)
  SELECT id+{browser},{new},'chromium','chromium',current_url,'interrupted',0,CASE WHEN checkpoint_status='fallback_chromium' THEN 'ok' ELSE checkpoint_status END,checkpoint_hash,checkpoint_version,created_at,updated_at,current_title,profile_name FROM hp_archive.browser_sessions WHERE project_id={old};
 INSERT INTO browser_actions SELECT id+{action},session_id+{browser},{new},action_type,CASE WHEN status IN ('running','queued') THEN 'failed' ELSE status END,error_code,created_at,finished_at FROM hp_archive.browser_actions WHERE project_id={old};
-INSERT INTO capture_sessions SELECT id+{capture},{new},CASE WHEN browser_session_id IS NULL THEN NULL ELSE browser_session_id+{browser} END,CASE WHEN browser_action_id IS NULL THEN NULL ELSE browser_action_id+{action} END,created_at,expires_at,COALESCE(revoked_at,created_at),'revoked',is_browser_bound,randomblob(32),randomblob(16) FROM hp_archive.capture_sessions WHERE project_id={old};
+INSERT INTO capture_sessions SELECT id+{capture},{new},CASE WHEN browser_session_id IS NULL THEN NULL ELSE browser_session_id+{browser} END,CASE WHEN browser_action_id IS NULL THEN NULL ELSE browser_action_id+{action} END,created_at,expires_at,COALESCE(revoked_at,created_at),'revoked',is_browser_bound,randomblob(32),randomblob(16),NULL FROM hp_archive.capture_sessions WHERE project_id={old};
 INSERT INTO labels SELECT id+{label},{new},name FROM hp_archive.labels WHERE project_id={old};
 INSERT INTO reply_workspaces SELECT id+{workspace},{new},name,created_at FROM hp_archive.reply_workspaces WHERE project_id={old};
 INSERT INTO reply_tabs SELECT id+{tab},{new},CASE WHEN workspace_id IS NULL THEN NULL ELSE workspace_id+{workspace} END,name,base_exchange_id,revision,protocol,draft_json,created_at,updated_at FROM hp_archive.reply_tabs WHERE project_id={old};
@@ -681,8 +686,16 @@ INSERT INTO websocket_connections SELECT id+{websocket_connection},{new},handsha
 INSERT INTO websocket_messages SELECT id+{websocket_message},{new},connection_id+{websocket_connection},direction,opcode,payload,payload_length,truncated,created_at FROM hp_archive.websocket_messages WHERE project_id={old};
 INSERT INTO request_rules SELECT id+{request_rule},{new},name,enabled,position,host_pattern,target,operation,header_name,match_kind,pattern,replacement,replace_all,revision,created_at,updated_at FROM hp_archive.request_rules WHERE project_id={old};
 INSERT INTO exchange_request_rules SELECT {new},exchange_id,CASE WHEN rule_id IS NULL THEN NULL ELSE rule_id+{request_rule} END,rule_name FROM hp_archive.exchange_request_rules WHERE project_id={old};
-INSERT INTO ip_rotation_profiles SELECT id+{ip_rotation_profile},{new},target_origin,stage_name,enabled,created_at,updated_at FROM hp_archive.ip_rotation_profiles WHERE project_id={old};
-INSERT INTO ip_rotation_gateways SELECT id+{ip_rotation_gateway},profile_id+{ip_rotation_profile},region,rest_api_id,endpoint FROM hp_archive.ip_rotation_gateways WHERE profile_id IN (SELECT id FROM hp_archive.ip_rotation_profiles WHERE project_id={old});
+-- A cloud gateway may be owned by one profile only: disabling a profile deletes its
+-- gateways remotely, so a copy shared with another project would be deleted under it.
+-- Gateways already owned locally are not copied, and profiles left without any are dropped.
+INSERT INTO ip_rotation_profiles SELECT p.id+{ip_rotation_profile},{new},p.target_origin,p.stage_name,p.enabled,p.created_at,p.updated_at FROM hp_archive.ip_rotation_profiles p WHERE p.project_id={old}
+ AND (NOT EXISTS (SELECT 1 FROM hp_archive.ip_rotation_gateways g WHERE g.profile_id=p.id)
+      OR EXISTS (SELECT 1 FROM hp_archive.ip_rotation_gateways g WHERE g.profile_id=p.id
+                 AND NOT EXISTS (SELECT 1 FROM main.ip_rotation_gateways m WHERE m.region=g.region AND m.rest_api_id=g.rest_api_id)));
+INSERT INTO ip_rotation_gateways SELECT g.id+{ip_rotation_gateway},g.profile_id+{ip_rotation_profile},g.region,g.rest_api_id,g.endpoint FROM hp_archive.ip_rotation_gateways g
+ WHERE g.profile_id IN (SELECT id FROM hp_archive.ip_rotation_profiles WHERE project_id={old})
+ AND NOT EXISTS (SELECT 1 FROM main.ip_rotation_gateways m WHERE m.region=g.region AND m.rest_api_id=g.rest_api_id);
 INSERT INTO project_seq (project_id,next_exchange_id) SELECT {new},COALESCE(MAX(exchange_id),0)+1 FROM hp_archive.exchanges WHERE project_id={old};
 INSERT INTO project_usage (project_id,updated_at) VALUES ({new},strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 INSERT INTO search_fts (project_id,exchange_id,title,preview,labels) SELECT {new},exchange_id,title,preview,labels FROM hp_archive.search_fts WHERE project_id={old};
@@ -1136,6 +1149,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reimporting_a_bundle_never_shares_cloud_gateways_between_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path());
+        let db = Db::open(&config).await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "rotation".into(),
+                target_url: "https://example.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let second = crate::storage::IpRotationGateway {
+            region: "eu-west-1".into(),
+            rest_api_id: "def456".into(),
+            endpoint: "https://def456.execute-api.eu-west-1.amazonaws.com/transfer".into(),
+        };
+        db.activate_ip_rotation(
+            project.id,
+            "https://example.test".into(),
+            "transfer".into(),
+            vec![rotation_gateway(), second.clone()],
+        )
+        .await
+        .unwrap();
+        let bundle = directory.path().join("rotation.huntproxy");
+        db.export_bundle(
+            &config,
+            project.id,
+            bundle.clone(),
+            BundleExportOptions {
+                secrets: SecretMode::Full,
+                include_chromium_profile: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Every gateway is already owned by the source project: the import
+        // succeeds but the copy owns none, so disabling one cannot delete the
+        // other's gateways.
+        let copy = db
+            .import_bundle(&config, bundle.clone(), Some("copy".into()))
+            .await
+            .unwrap();
+        assert!(db
+            .list_ip_rotation_profiles(copy.project.id)
+            .await
+            .unwrap()
+            .is_empty());
+        let original = db.list_ip_rotation_profiles(project.id).await.unwrap();
+        assert_eq!(
+            original[0].gateways,
+            vec![rotation_gateway(), second.clone()]
+        );
+
+        // A destination that shares only one gateway imports the other.
+        let other_config = test_config(&directory.path().join("other"));
+        let other_db = Db::open(&other_config).await.unwrap();
+        let other = other_db
+            .create_project(CreateProjectRequest {
+                name: "other".into(),
+                target_url: "https://other.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        other_db
+            .activate_ip_rotation(
+                other.id,
+                "https://other.test".into(),
+                "transfer".into(),
+                vec![rotation_gateway()],
+            )
+            .await
+            .unwrap();
+        let partial = other_db
+            .import_bundle(&other_config, bundle, None)
+            .await
+            .unwrap();
+        let profiles = other_db
+            .list_ip_rotation_profiles(partial.project.id)
+            .await
+            .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].gateways, vec![second]);
+        assert_eq!(
+            other_db.list_ip_rotation_profiles(other.id).await.unwrap()[0].gateways,
+            vec![rotation_gateway()]
+        );
+    }
+
+    #[tokio::test]
     async fn every_project_scoped_table_is_exported() {
         let directory = tempfile::tempdir().unwrap();
         let config = test_config(directory.path());
@@ -1295,7 +1401,7 @@ mod tests {
         let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
         archive
             .execute_batch(
-                "DROP TABLE project_upstream_proxies; ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14;",
+                "DROP TABLE project_upstream_proxies; DROP INDEX idx_capture_sessions_token_lookup; DROP INDEX idx_capture_sessions_legacy_active; ALTER TABLE capture_sessions DROP COLUMN token_lookup; ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14;",
             )
             .unwrap();
         drop(archive);

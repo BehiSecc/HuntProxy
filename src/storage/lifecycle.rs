@@ -439,20 +439,60 @@ impl Db {
         .await
     }
 
-    pub async fn import_project(&self, mut archive: ProjectArchive) -> DomainResult<Project> {
+    /// Import an archive as a new project. The import is all-or-nothing: the
+    /// work runs in a task that finishes even if the caller goes away, and any
+    /// failure deletes the partially built project before the error returns.
+    pub async fn import_project(&self, archive: ProjectArchive) -> DomainResult<Project> {
         if archive.format != ARCHIVE_FORMAT || archive.version != ARCHIVE_VERSION {
             return Err(DomainError::invalid(
                 "unsupported HuntProxy project archive",
             ));
         }
         crate::policy::TargetRef::from_url(&archive.project.target_url)?;
-        let project = self
-            .create_project(CreateProjectRequest {
-                name: archive.project.name.clone(),
-                target_url: archive.project.target_url.clone(),
-                advanced: Some(archive.project.scope.clone()),
-            })
-            .await?;
+        let db = self.clone();
+        tokio::spawn(async move {
+            let project = db
+                .create_project(CreateProjectRequest {
+                    name: archive.project.name.clone(),
+                    target_url: archive.project.target_url.clone(),
+                    advanced: Some(archive.project.scope.clone()),
+                })
+                .await?;
+            match db.populate_imported_project(&project, archive).await {
+                Ok(project) => Ok(project),
+                Err(error) => Err(db.discard_failed_import(project.id, error).await),
+            }
+        })
+        .await
+        .map_err(|error| storage_error(format!("project import task failed: {error}")))?
+    }
+
+    async fn discard_failed_import(
+        &self,
+        project_id: ProjectId,
+        error: DomainError,
+    ) -> DomainError {
+        match self.delete_project(project_id).await {
+            Ok(()) => error,
+            Err(cleanup) => {
+                tracing::error!(project_id = project_id.get(), %cleanup, "failed to remove partially imported project");
+                DomainError::new(
+                    error.code(),
+                    format!(
+                        "{error}; the partially imported project {} could not be removed: {cleanup}",
+                        project_id.get()
+                    ),
+                )
+            }
+        }
+    }
+
+    async fn populate_imported_project(
+        &self,
+        project: &Project,
+        mut archive: ProjectArchive,
+    ) -> DomainResult<Project> {
+        let project = project.clone();
         self.update_project_scope(
             project.id,
             archive.project.scope.clone(),
@@ -886,6 +926,46 @@ mod tests {
         assert_eq!(cleared.deleted_exchanges, 1);
         db.delete_project(project.id).await.unwrap();
         assert!(db.get_project(project.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_project_import_leaves_nothing_behind() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db.create_project(project_request("Source")).await.unwrap();
+        db.insert_exchange(exchange(project.id)).await.unwrap();
+        db.insert_exchange(exchange(project.id)).await.unwrap();
+        let mut archive = db.export_project(project.id).await.unwrap();
+        archive.project.name = "Half imported".into();
+        // The first exchange imports fine; the second fails validation.
+        archive.exchanges[1].findings.push(ArchivedFinding {
+            title: String::new(),
+            description: "invalid".into(),
+        });
+
+        let counts = |db: Db| async move {
+            db.with_conn(|conn| {
+                let count = |sql: &str| -> DomainResult<i64> {
+                    conn.query_row(sql, [], |row| row.get(0))
+                        .map_err(|error| storage_error(error.to_string()))
+                };
+                Ok((
+                    count("SELECT COUNT(*) FROM projects")?,
+                    count("SELECT COUNT(*) FROM exchanges")?,
+                    count("SELECT COUNT(*) FROM bodies")?,
+                    count("SELECT COUNT(*) FROM search_fts")?,
+                    count("SELECT COUNT(*) FROM project_seq")?,
+                ))
+            })
+            .await
+            .unwrap()
+        };
+        let before = counts(db.clone()).await;
+        let error = db.import_project(archive).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(counts(db.clone()).await, before);
+        let projects = db.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Source");
     }
 
     #[tokio::test]

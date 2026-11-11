@@ -1,5 +1,6 @@
 //! History filtering, pagination, summaries, diffs.
 
+use crate::compare::bounded_line_diff;
 use crate::domain::{DomainError, DomainResult};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,24 +764,6 @@ pub fn diff_exchanges(
         header_changed,
         text_diff,
     }
-}
-
-fn bounded_line_diff(a: &str, b: &str, max_lines: usize) -> String {
-    let al: Vec<&str> = a.lines().collect();
-    let bl: Vec<&str> = b.lines().collect();
-    let mut out = String::new();
-    let max = al.len().max(bl.len()).min(max_lines);
-    for i in 0..max {
-        let left = al.get(i).copied().unwrap_or("");
-        let right = bl.get(i).copied().unwrap_or("");
-        if left != right {
-            out.push_str(&format!("- {left}\n+ {right}\n"));
-        }
-    }
-    if al.len().max(bl.len()) > max_lines {
-        out.push_str(&format!("... truncated after {max_lines} lines\n"));
-    }
-    out
 }
 
 #[cfg(test)]

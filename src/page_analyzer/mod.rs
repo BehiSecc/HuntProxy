@@ -2,11 +2,11 @@
 //! captured JavaScript and HTML responses.
 
 use base64::Engine as _;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
+use std::sync::LazyLock;
 
 use crate::domain::{DomainError, DomainResult, ErrorCode, ExchangeId, MessageSide, ProjectId};
 use crate::storage::Db;
@@ -19,73 +19,75 @@ const MAX_SCRIPT_BUNDLES: usize = 64;
 const MAX_SCRIPT_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SCRIPT_ANALYSIS_BYTES: usize = 32 * 1024 * 1024;
 
-static ABSOLUTE_URL: Lazy<Regex> = Lazy::new(|| {
+static ABSOLUTE_URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:https?|wss?)://[^\s"'<>\\]{4,2048}"#).expect("absolute-url regex")
 });
 
-static PROTOCOL_RELATIVE_URL: Lazy<Regex> = Lazy::new(|| {
+static PROTOCOL_RELATIVE_URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)//[a-z0-9](?:[a-z0-9.-]*\.)[a-z]{2,24}(?::\d{1,5})?(?:/[^\s"'<>\\]{0,2000})?"#,
     )
     .expect("protocol-relative-url regex")
 });
 
-static DIRECT_PATH: Lazy<Regex> = Lazy::new(|| {
+static DIRECT_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)["']((?:/|\./|\.\./)[^"'<>\\\s]{2,2048})["']"#).expect("direct-path regex")
 });
 
-static EMAIL: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.-]+\.[a-z]{2,24}").expect("email regex"));
+static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.-]+\.[a-z]{2,24}").expect("email regex")
+});
 
-static SCRIPT_SRC: Lazy<Regex> = Lazy::new(|| {
+static SCRIPT_SRC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<script\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'=<>`]+))"#)
         .expect("script-src regex")
 });
-static LINK_HREF: Lazy<Regex> = Lazy::new(|| {
+static LINK_HREF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<link\b[^>]*?\bhref\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'=<>`]+))"#)
         .expect("link-href regex")
 });
-static BASE_HREF: Lazy<Regex> = Lazy::new(|| {
+static BASE_HREF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<base\b[^>]*?\bhref\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s\"'=<>`]+))"#)
         .expect("base-href regex")
 });
-static MODERNJS_MANIFEST_ASSIGNMENT: Lazy<Regex> = Lazy::new(|| {
+static MODERNJS_MANIFEST_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)window\s*\.\s*_MODERNJS_ROUTE_MANIFEST\s*=")
         .expect("modernjs route manifest assignment regex")
 });
-static PASSIVE_EXTENSION: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\.(?:js|mjs|css|json)$").expect("passive extension regex"));
+static PASSIVE_EXTENSION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\.(?:js|mjs|css|json)$").expect("passive extension regex"));
 
-static QUERY_PARAMETER: Lazy<Regex> = Lazy::new(|| {
+static QUERY_PARAMETER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:[?&]|&amp;)([A-Za-z_][A-Za-z0-9_.\-]{0,127})=").expect("query parameter regex")
 });
-static PARAMETER_METHOD: Lazy<Regex> = Lazy::new(|| {
+static PARAMETER_METHOD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)\b(?:URLSearchParams|FormData)?\s*\.?\s*(?:append|set|get|has|delete)\s*\(\s*["']([A-Za-z_][A-Za-z0-9_.\-]{0,127})["']"#)
         .expect("parameter method regex")
 });
-static REQUEST_BODY: Lazy<Regex> = Lazy::new(|| {
+static REQUEST_BODY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)(?:JSON\.stringify\s*\(|axios\.(?:post|put|patch)\s*\([^,]+,\s*)\{([^{}]{1,1000}[^{}]{0,1000}[^{}]{0,1000}[^{}]{0,1000}[^{}]{0,96})\}")
         .expect("request body regex")
 });
-static OBJECT_KEY: Lazy<Regex> = Lazy::new(|| {
+static OBJECT_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:^|,)\s*(?:["']([A-Za-z_][A-Za-z0-9_.\-]{0,127})["']|([A-Za-z_][A-Za-z0-9_.\-]{0,127}))\s*:"#)
         .expect("object key regex")
 });
-static GRAPHQL_VARIABLE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\$([_A-Za-z][_0-9A-Za-z]*)\s*:").expect("graphql variable regex"));
-static HTML_NAME: Lazy<Regex> = Lazy::new(|| {
+static GRAPHQL_VARIABLE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$([_A-Za-z][_0-9A-Za-z]*)\s*:").expect("graphql variable regex")
+});
+static HTML_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<(?:input|select|textarea|button)\b[^>]*?\bname\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'=<>`]+))"#)
         .expect("html field name regex")
 });
 
-static STATIC_ASSET: Lazy<Regex> = Lazy::new(|| {
+static STATIC_ASSET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\.(?:css|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webm|mp3|wav|webp)(?:[?#].*)?$",
     )
     .expect("static-asset regex")
 });
 
-static ROUTE_SEGMENT: Lazy<Regex> = Lazy::new(|| {
+static ROUTE_SEGMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^(?::?[A-Za-z0-9_.@%\-]+|\{[A-Za-z0-9_.\-]+\}|[A-Za-z0-9_.@%\-]+:[A-Za-z0-9_.\-]+)$",
     )
@@ -1223,7 +1225,10 @@ fn valid_email(content: &str, start: usize, value: &str) -> bool {
     if start > 0 && content.as_bytes()[start - 1] == b':' {
         return false;
     }
-    let context_start = start.saturating_sub(12);
+    let mut context_start = start.saturating_sub(12);
+    while !content.is_char_boundary(context_start) {
+        context_start += 1;
+    }
     let prefix = content[context_start..start].to_ascii_lowercase();
     !prefix.contains("://")
         && !prefix.contains("mongodb")
@@ -1282,6 +1287,15 @@ mod tests {
         );
         assert!(result.endpoints.is_empty());
         assert!(result.emails.is_empty());
+    }
+
+    #[test]
+    fn email_context_before_non_ascii_text_does_not_panic() {
+        // The 12-byte look-behind would land inside a multi-byte character.
+        let result = analyze_page("été été été été ça va contact@target.test".as_bytes());
+        assert_eq!(result.emails, ["contact@target.test"]);
+        let result = analyze_page("日本語日本語 mail@target.test".as_bytes());
+        assert_eq!(result.emails, ["mail@target.test"]);
     }
 
     #[test]

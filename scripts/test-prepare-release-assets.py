@@ -24,11 +24,7 @@ spec.loader.exec_module(assets)
 
 class ReleaseAssetChecks(unittest.TestCase):
     def setUp(self):
-        root = Path("/tmp/artis")
-        root.mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(
-            prefix="huntproxy-release-assets-test-", dir=root
-        )
+        self.temporary = tempfile.TemporaryDirectory(prefix="huntproxy-release-assets-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.existing = self.root / "existing" / "plugins-catalog.tar.zst"

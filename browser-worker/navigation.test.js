@@ -115,3 +115,27 @@ test("empty synthetic response diagnostics produce a useful fallback", async () 
   await assert.rejects(execute({ page }, { type: "navigate", url: "http://localhost/" }),
     (error) => error.code === -32000 && error.message === "HuntProxy proxy error (HTTP 504)");
 });
+
+test("a snapshot reports the format it produced and never substitutes another", async () => {
+  const execute = actions().executeAction;
+  const calls = [];
+  const page = {
+    bringToFront: async () => {},
+    content: async () => { calls.push("content"); return "<html>dom</html>"; },
+    locator: (selector) => ({ ariaSnapshot: async () => { calls.push(`aria ${selector}`); return "- document"; } }),
+  };
+  const snapshot = async (format) => (await execute({ page }, { type: "snapshot", format })).data;
+  for (const [requested, format, content] of [
+    [undefined, "accessibility", "- document"],
+    ["accessibility", "accessibility", "- document"],
+    ["dom", "dom", "<html>dom</html>"],
+    ["unknown", "accessibility", "- document"],
+  ]) {
+    const data = await snapshot(requested);
+    assert.deepEqual({ format: data.format, content: data.content }, { format, content }, String(requested));
+  }
+  assert.deepEqual(Array.from(calls), ["aria body", "aria body", "content", "aria body"]);
+  // A Playwright without ariaSnapshot fails loudly instead of answering with HTML.
+  const old = { bringToFront: async () => {}, content: async () => "<html>dom</html>", locator: () => ({}) };
+  await assert.rejects(execute({ page: old }, { type: "snapshot" }), (error) => /ariaSnapshot is not a function/.test(error.message));
+});

@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import vm from "node:vm";
 
 const source = fs.readFileSync(new URL("./index.js", import.meta.url), "utf8");
-const overrides = ["HUNTPROXY_CHROME_EXECUTABLE", "BB_CHROME_EXECUTABLE", "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"];
+const overrides = ["HUNTPROXY_CHROME_EXECUTABLE", "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"];
 
 function fixture(t) {
-  fs.mkdirSync("/tmp/artis", { recursive: true });
-  const root = fs.mkdtempSync("/tmp/artis/huntproxy-runtime-");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "huntproxy-runtime-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const worker = path.join(root, "worker.mjs");
   fs.writeFileSync(worker, source);
@@ -33,7 +33,7 @@ function fixture(t) {
       : ${JSON.stringify(bundle)} }
   };`);
   const env = { ...process.env, PATH: bin, HUNTPROXY_PLAYWRIGHT_CORE_PATH: packageDir };
-  for (const key of [...overrides, "BB_PLAYWRIGHT_CORE_PATH", "PLAYWRIGHT_BROWSERS_PATH", "HUNTPROXY_BROWSER_HEADLESS", "HUNTPROXY_BROWSER_HEADLESS_COMPAT"]) delete env[key];
+  for (const key of [...overrides, "PLAYWRIGHT_BROWSERS_PATH", "HUNTPROXY_BROWSER_HEADLESS", "HUNTPROXY_BROWSER_HEADLESS_COMPAT"]) delete env[key];
   function executable(filename, version = "149.0.7827.55") {
     fs.writeFileSync(filename, `#!/bin/sh\nprintf 'Chromium ${version}\\n'\n`, { mode: 0o700 });
     return filename;
@@ -56,7 +56,7 @@ test("explicit executable overrides precede the paired browser and preserve vers
   const f = fixture(t);
   const explicit = f.executable(path.join(f.root, "chosen-chrome"), "153.0.8010.36");
   const other = f.executable(path.join(f.root, "other-chrome"), "152.0.0.1");
-  const result = f.run({ HUNTPROXY_CHROME_EXECUTABLE: explicit, BB_CHROME_EXECUTABLE: other });
+  const result = f.run({ HUNTPROXY_CHROME_EXECUTABLE: explicit, PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: other });
   assert.equal(result.chromium_path, explicit);
   assert.equal(result.chromium_version, "153.0.8010.36");
   assert.equal(result.playwright_core_path, f.packageDir);
@@ -97,14 +97,14 @@ test("launch options retain mode and routing protections for existing probe path
   }
 });
 
-test("all override aliases work, with missing paths, directories, and non-executable files skipped", (t) => {
+test("every executable override works, with missing paths, directories, and non-executable files skipped", (t) => {
   const f = fixture(t);
   const explicit = f.executable(path.join(f.root, "chosen-chrome"));
   const unusable = path.join(f.root, "not-executable");
   fs.writeFileSync(unusable, "Chromium");
   for (const alias of overrides) assert.equal(f.run({ [alias]: explicit }).chromium_path, explicit);
-  assert.equal(f.run({ HUNTPROXY_CHROME_EXECUTABLE: path.join(f.root, "missing"), BB_CHROME_EXECUTABLE: explicit }).chromium_path, explicit);
-  assert.equal(f.run({ HUNTPROXY_CHROME_EXECUTABLE: f.root, BB_CHROME_EXECUTABLE: unusable }).chromium_path, f.bundle);
+  assert.equal(f.run({ HUNTPROXY_CHROME_EXECUTABLE: path.join(f.root, "missing"), PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: explicit }).chromium_path, explicit);
+  assert.equal(f.run({ HUNTPROXY_CHROME_EXECUTABLE: f.root, PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: unusable }).chromium_path, f.bundle);
 });
 
 test("the version-paired Chromium precedes system Chrome; missing paired Chromium falls back to PATH", (t) => {
@@ -126,7 +126,7 @@ test("package-local installs and explicit Playwright overrides use the same reso
   assert.equal(result.chromium_path, localBrowser);
   assert.deepEqual(f.run({}, false), result);
   assert.equal(f.run({ PLAYWRIGHT_BROWSERS_PATH: path.join(f.root, "custom-cache") }).chromium_path, f.bundle);
-  assert.match(f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: path.join(f.root, "missing"), BB_PLAYWRIGHT_CORE_PATH: f.packageDir }).compatibility_error, /missing/);
+  assert.match(f.run({ HUNTPROXY_PLAYWRIGHT_CORE_PATH: path.join(f.root, "missing") }).compatibility_error, /missing/);
 });
 
 test("inspection reports missing Playwright without creating profiles or launching Chromium", (t) => {

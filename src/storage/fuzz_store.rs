@@ -114,11 +114,6 @@ impl Db {
             .await
     }
 
-    pub async fn get_fuzz_job_by_id(&self, job_id: FuzzJobId) -> DomainResult<FuzzJob> {
-        self.with_conn(move |conn| load_fuzz_job(conn, None, job_id))
-            .await
-    }
-
     pub async fn list_fuzz_jobs(&self, project_id: ProjectId) -> DomainResult<Vec<FuzzJob>> {
         self.with_conn(move |conn| {
             let mut stmt = conn
@@ -290,6 +285,16 @@ impl Db {
                     return Err(DomainError::not_found("fuzz exchange"));
                 }
             }
+            let previous_state: String = tx
+                .query_row(
+                    "SELECT state FROM fuzz_cases WHERE id=?1 AND job_id=?2",
+                    params![case_id, job_id.get()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => DomainError::not_found("fuzz case"),
+                    other => storage_error(other),
+                })?;
             let changed = tx
                 .execute(
                     "UPDATE fuzz_cases
@@ -315,7 +320,7 @@ impl Db {
             if changed == 0 {
                 return Err(DomainError::not_found("fuzz case"));
             }
-            refresh_fuzz_counts(&tx, project_id, job_id, &ts)?;
+            update_fuzz_counts(&tx, project_id, job_id, &previous_state, state_s, &ts)?;
             tx.commit().map_err(storage_error)?;
             Ok(())
         })
@@ -805,19 +810,34 @@ fn map_fuzz_case(row: &rusqlite::Row<'_>) -> rusqlite::Result<FuzzCaseResult> {
     })
 }
 
-fn refresh_fuzz_counts(
+/// Apply one case's state transition to the job's completed/failed counters
+/// instead of recounting every case of the job.
+fn update_fuzz_counts(
     conn: &rusqlite::Connection,
     project_id: ProjectId,
     job_id: FuzzJobId,
+    previous_state: &str,
+    new_state: &str,
     timestamp: &str,
 ) -> DomainResult<()> {
+    let delta = |state: &str| {
+        let was = i64::from(previous_state == state);
+        let now = i64::from(new_state == state);
+        now - was
+    };
     conn.execute(
         "UPDATE fuzz_jobs
-         SET completed_cases=(SELECT COUNT(*) FROM fuzz_cases WHERE job_id=?1 AND state='completed'),
-             failed_cases=(SELECT COUNT(*) FROM fuzz_cases WHERE job_id=?1 AND state='failed'),
-             updated_at=?2
-         WHERE id=?1 AND project_id=?3",
-        params![job_id.get(), timestamp, project_id.get()],
+         SET completed_cases=completed_cases+?1,
+             failed_cases=failed_cases+?2,
+             updated_at=?3
+         WHERE id=?4 AND project_id=?5",
+        params![
+            delta("completed"),
+            delta("failed"),
+            timestamp,
+            job_id.get(),
+            project_id.get()
+        ],
     )
     .map_err(storage_error)?;
     Ok(())
@@ -845,7 +865,6 @@ fn fuzz_state_str(state: FuzzJobState) -> &'static str {
     match state {
         FuzzJobState::Queued => "queued",
         FuzzJobState::Running => "running",
-        FuzzJobState::Paused => "paused",
         FuzzJobState::Cancelling => "cancelling",
         FuzzJobState::Completed => "completed",
         FuzzJobState::Failed => "failed",
@@ -856,7 +875,6 @@ fn fuzz_state_str(state: FuzzJobState) -> &'static str {
 fn parse_fuzz_state(state: &str) -> FuzzJobState {
     match state {
         "running" => FuzzJobState::Running,
-        "paused" => FuzzJobState::Paused,
         "cancelling" => FuzzJobState::Cancelling,
         "completed" => FuzzJobState::Completed,
         "failed" => FuzzJobState::Failed,
@@ -894,6 +912,85 @@ fn not_found_fuzz_job(error: rusqlite::Error) -> DomainError {
 
 fn storage_error(error: rusqlite::Error) -> DomainError {
     DomainError::new(ErrorCode::StorageError, error.to_string())
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    async fn finish(db: &Db, project: ProjectId, job: FuzzJobId, case: i64, state: FuzzCaseState) {
+        db.finish_fuzz_case(
+            project, job, case, state, None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_counters_follow_case_state_transitions() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap()
+            .id;
+        let job = db
+            .create_fuzz_job(
+                project,
+                None,
+                FuzzStrategy::Sniper,
+                "{}".into(),
+                4,
+                "{}".into(),
+            )
+            .await
+            .unwrap()
+            .id;
+        let mut cases = Vec::new();
+        for index in 0..4 {
+            cases.push(
+                db.create_fuzz_case(project, job, index, vec![])
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+
+        finish(&db, project, job, cases[0], FuzzCaseState::Completed).await;
+        finish(&db, project, job, cases[1], FuzzCaseState::Completed).await;
+        finish(&db, project, job, cases[2], FuzzCaseState::Failed).await;
+        finish(&db, project, job, cases[3], FuzzCaseState::Cancelled).await;
+        let counts = |job: FuzzJob| (job.completed_cases, job.failed_cases);
+        assert_eq!(counts(db.get_fuzz_job(project, job).await.unwrap()), (2, 1));
+
+        // Re-finishing a case moves it between buckets instead of double counting.
+        finish(&db, project, job, cases[0], FuzzCaseState::Failed).await;
+        assert_eq!(counts(db.get_fuzz_job(project, job).await.unwrap()), (1, 2));
+        finish(&db, project, job, cases[0], FuzzCaseState::Failed).await;
+        finish(&db, project, job, cases[2], FuzzCaseState::Cancelled).await;
+        assert_eq!(counts(db.get_fuzz_job(project, job).await.unwrap()), (1, 1));
+
+        let missing = db
+            .finish_fuzz_case(
+                project,
+                job,
+                9999,
+                FuzzCaseState::Completed,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), ErrorCode::NotFound);
+    }
 }
 
 #[cfg(test)]

@@ -1541,7 +1541,8 @@ async fn copy_as(
     {
         Ok(result) => {
             if query.include_secrets {
-                let _ = state
+                // An unaudited secret reveal must not succeed.
+                if let Err(error) = state
                     .db
                     .audit(
                         Some(project_id),
@@ -1551,7 +1552,10 @@ async fn copy_as(
                         Some(&eid.to_string()),
                         serde_json::json!({ "format": query.format }),
                     )
-                    .await;
+                    .await
+                {
+                    return error_response(error);
+                }
             }
             Json(result).into_response()
         }
@@ -1615,74 +1619,13 @@ async fn get_body(
     let offset = q.offset.unwrap_or(0);
     let max_bytes = q.max_bytes.unwrap_or(64 * 1024).min(1024 * 1024);
     match state
-        .db
-        .load_raw_body(ProjectId(id), ExchangeId(eid), side)
+        .prepared_body(ProjectId(id), ExchangeId(eid), side, q.raw.unwrap_or(false))
         .await
     {
-        Ok(Some(mut body)) => {
-            let raw_total = body.len();
-            let mut content_encoding = None;
-            let mut decoded = false;
-            if side == MessageSide::Request {
-                if let Ok(detail) = state
-                    .db
-                    .get_exchange_detail(
-                        ProjectId(id),
-                        ExchangeId(eid),
-                        PresentationOptions::default(),
-                    )
-                    .await
-                {
-                    if detail.protocol == "HTTP/1.1 raw" {
-                        body = crate::reply::redact_raw_request_headers(&body);
-                    }
-                }
-            } else if !q.raw.unwrap_or(false) {
-                if let Ok(detail) = state
-                    .db
-                    .get_exchange_detail(
-                        ProjectId(id),
-                        ExchangeId(eid),
-                        PresentationOptions::default(),
-                    )
-                    .await
-                {
-                    if detail.protocol == "HTTP/1.1 raw" {
-                        body = crate::reply::presented_raw_response_body(&body);
-                    }
-                }
-                let headers = match state
-                    .db
-                    .load_raw_headers(ProjectId(id), ExchangeId(eid), MessageSide::Response)
-                    .await
-                {
-                    Ok(headers) => headers,
-                    Err(error) => return error_response(error),
-                };
-                let encodings = headers
-                    .iter()
-                    .filter(|header| header.name.eq_ignore_ascii_case("content-encoding"))
-                    .map(|header| String::from_utf8_lossy(&header.value).trim().to_string())
-                    .filter(|encoding| {
-                        !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
-                    })
-                    .collect::<Vec<_>>();
-                if !encodings.is_empty() {
-                    let encoding = encodings.join(", ");
-                    body = match crate::codec::decode_content_encodings(
-                        &body,
-                        &encoding,
-                        crate::codec::MAX_DECODED_BODY_OUTPUT,
-                    ) {
-                        Ok(body) => body,
-                        Err(error) => return error_response(error),
-                    };
-                    content_encoding = Some(encoding);
-                    decoded = true;
-                }
-            }
+        Ok(Some(prepared)) => {
+            let body = &prepared.data;
             let total = body.len();
-            let end = (offset + max_bytes).min(total);
+            let end = offset.saturating_add(max_bytes).min(total);
             let slice = if offset >= total {
                 &body[..0]
             } else {
@@ -1694,13 +1637,13 @@ async fn get_body(
                 "offset": offset,
                 "length": slice.len(),
                 "truncated": end < total,
-                "sha256": crate::storage::sha256_hex(&body),
+                "sha256": prepared.sha256,
                 "encoding": "base64",
                 "data": b64,
                 "untrusted": true,
-                "decoded": decoded,
-                "content_encoding": content_encoding,
-                "raw_total_length": raw_total,
+                "decoded": prepared.decoded,
+                "content_encoding": prepared.content_encoding,
+                "raw_total_length": prepared.raw_total,
             }))
             .into_response()
         }
@@ -1726,6 +1669,7 @@ struct UpsertTab {
     name: String,
     base_exchange_id: Option<i64>,
     protocol: Option<String>,
+    #[serde(deserialize_with = "deserialize_reply_draft_request")]
     draft: ReplyDraft,
     revision: Option<i64>,
 }
@@ -1763,6 +1707,7 @@ async fn upsert_reply_tab(
 struct ReplySendBody {
     tab_id: Option<i64>,
     base_exchange_id: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_reply_draft_request")]
     draft: Option<ReplyDraft>,
     protocol: Option<String>,
     upstream_proxy: Option<String>,
@@ -1900,8 +1845,21 @@ async fn list_fuzz_jobs(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartFuzzBody {
+    #[serde(deserialize_with = "deserialize_fuzz_template_request")]
     template: FuzzTemplate,
     confirm: Option<bool>,
+}
+
+/// Rejects unknown keys inside `template.draft` before they are silently dropped.
+fn deserialize_fuzz_template_request<'de, D>(deserializer: D) -> Result<FuzzTemplate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(draft) = value.get("draft") {
+        validate_reply_draft_request(draft).map_err(serde::de::Error::custom)?;
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 async fn start_fuzz(
@@ -2469,6 +2427,44 @@ mod tests {
     fn request_supplied_config_values_are_bad_requests() {
         let error = DomainError::new(ErrorCode::ConfigInvalid, "invalid upstream proxy URL");
         assert_eq!(status_for_error(&error), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn request_drafts_with_unknown_fields_are_rejected() {
+        let tab = |draft: serde_json::Value| {
+            serde_json::from_value::<UpsertTab>(serde_json::json!({"name": "t", "draft": draft}))
+        };
+        assert!(tab(serde_json::json!({"headers": []}))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("header_overrides"));
+        assert!(tab(serde_json::json!({"url": "https://example.test/"})).is_ok());
+
+        let send = |draft: serde_json::Value| {
+            serde_json::from_value::<ReplySendBody>(serde_json::json!({"draft": draft}))
+        };
+        assert!(send(serde_json::json!({"body": "x"}))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("body_text"));
+        assert!(send(serde_json::json!({"body_text": "x"})).is_ok());
+        assert!(serde_json::from_value::<ReplySendBody>(serde_json::json!({"tab_id": 1})).is_ok());
+
+        let fuzz = |draft: serde_json::Value| {
+            serde_json::from_value::<StartFuzzBody>(serde_json::json!({"template": {
+                "draft": draft,
+                "insertion_points": [{"name": "a", "location": "url"}],
+                "wordlists": [["x"]],
+            }}))
+        };
+        assert!(fuzz(serde_json::json!({"headers": []}))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("header_overrides"));
+        assert!(fuzz(serde_json::json!({"url": "https://example.test/§a§"})).is_ok());
     }
 
     #[test]

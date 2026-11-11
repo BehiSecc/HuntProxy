@@ -426,7 +426,9 @@ fn compare_bodies(
         &mut warnings,
     );
     let text_diff = match (left_text, right_text) {
-        (Some(left), Some(right)) if left != right => Some(bounded_line_diff(&left, &right)),
+        (Some(left), Some(right)) if left != right => {
+            Some(bounded_line_diff(&left, &right, MAX_DIFF_LINES))
+        }
         (Some(_), Some(_)) => Some(String::new()),
         _ => None,
     };
@@ -535,11 +537,13 @@ fn is_textual_mime(mime: Option<&str>) -> bool {
         || mime == "application/graphql"
 }
 
-fn bounded_line_diff(left: &str, right: &str) -> String {
+/// Line-by-line diff limited to `max_lines` lines and `MAX_COMPARE_TEXT_BYTES`
+/// of output. Shared by exchange comparison and history response diffs.
+pub(crate) fn bounded_line_diff(left: &str, right: &str, max_lines: usize) -> String {
     let left = left.lines().collect::<Vec<_>>();
     let right = right.lines().collect::<Vec<_>>();
     let mut output = String::new();
-    for index in 0..left.len().max(right.len()).min(MAX_DIFF_LINES) {
+    for index in 0..left.len().max(right.len()).min(max_lines) {
         let left_line = left.get(index).copied().unwrap_or("");
         let right_line = right.get(index).copied().unwrap_or("");
         if left_line == right_line {
@@ -550,10 +554,10 @@ fn bounded_line_diff(left: &str, right: &str) -> String {
             break;
         }
     }
-    if left.len().max(right.len()) > MAX_DIFF_LINES && output.len() < MAX_COMPARE_TEXT_BYTES {
+    if left.len().max(right.len()) > max_lines && output.len() < MAX_COMPARE_TEXT_BYTES {
         push_bounded(
             &mut output,
-            &format!("... diff truncated after {MAX_DIFF_LINES} lines\n"),
+            &format!("... diff truncated after {max_lines} lines\n"),
         );
     }
     output
@@ -814,6 +818,16 @@ mod tests {
 
         let comparison = compare_exchange_data(&left, &right, &CompareOptions::default());
         assert!(comparison.response.body.text_diff.unwrap().len() <= MAX_COMPARE_TEXT_BYTES);
+    }
+
+    #[test]
+    fn bounded_line_diff_marks_changes_and_truncation() {
+        assert_eq!(bounded_line_diff("a\nb\nc", "a\nx\nc", 50), "- b\n+ x\n");
+        assert_eq!(
+            bounded_line_diff("a\nb\nc\nd", "a\nB\nc\nD", 2),
+            "- b\n+ B\n... diff truncated after 2 lines\n"
+        );
+        assert_eq!(bounded_line_diff("same", "same", 50), "");
     }
 
     fn gzip(body: &[u8]) -> Vec<u8> {

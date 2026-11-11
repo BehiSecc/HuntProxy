@@ -1,10 +1,10 @@
 //! Target-specific wordlist extraction from saved HTTP traffic.
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::sync::LazyLock;
 
 use crate::domain::{DomainError, DomainResult, MessageSide, ProjectId};
 use crate::storage::{Db, WordSourceExchange};
@@ -17,29 +17,29 @@ const MAX_TOTAL_SCAN: usize = 32 * 1024 * 1024;
 pub const DEFAULT_WORD_LIMIT: usize = 5_000;
 pub const MAX_WORD_LIMIT: usize = 10_000;
 
-static WORD: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?u)[A-Za-z][A-Za-z_'-]{2,63}").expect("word regex"));
-static JSON_KEY: Lazy<Regex> = Lazy::new(|| {
+static WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?u)[A-Za-z][A-Za-z_'-]{2,63}").expect("word regex"));
+static JSON_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"[\"']([A-Za-z][A-Za-z0-9_.:-]{2,63})[\"']\s*:"#).expect("JSON key regex")
 });
-static XML_NAME: Lazy<Regex> = Lazy::new(|| {
+static XML_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)</?([a-z][a-z0-9_.:-]{2,63})|\s([a-z][a-z0-9_.:-]{2,63})\s*=")
         .expect("XML name regex")
 });
-static FORM_NAME: Lazy<Regex> = Lazy::new(|| {
+static FORM_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(?:^|[&;])([a-z][a-z0-9_.-]{2,63})=|\bname=[\"']([^\"']{3,64})[\"']"#)
         .expect("form name regex")
 });
-static SCRIPT_STYLE: Lazy<Regex> = Lazy::new(|| {
+static SCRIPT_STYLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>")
         .expect("script/style regex")
 });
-static HTML_TAG: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?s)<[^>]{0,4096}>").expect("HTML tag regex"));
-static CAMEL_BOUNDARY: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"([a-z])([A-Z])").expect("camel-case regex"));
+static HTML_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<[^>]{0,4096}>").expect("HTML tag regex"));
+static CAMEL_BOUNDARY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([a-z])([A-Z])").expect("camel-case regex"));
 
-static STOP_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "about",
         "after",
