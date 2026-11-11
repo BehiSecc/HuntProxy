@@ -116,10 +116,6 @@ fn default_fuzz_strategy() -> FuzzStrategy {
     FuzzStrategy::Sniper
 }
 
-pub fn estimate_cases(strategy: FuzzStrategy, points: usize, list_lens: &[usize]) -> u64 {
-    estimate_combinations(strategy, points, list_lens)
-}
-
 pub fn estimate_combinations(
     strategy: FuzzStrategy,
     point_count: usize,
@@ -478,12 +474,6 @@ impl FuzzerService {
                 .await?;
         }
         Ok(())
-    }
-
-    /// Compatibility wrapper for callers that do not yet pass the route project id.
-    pub async fn cancel(&self, job_id: FuzzJobId) -> DomainResult<()> {
-        let job = self.db.get_fuzz_job_by_id(job_id).await?;
-        self.cancel_for_project(job.project_id, job_id).await
     }
 
     pub async fn list(&self, project_id: ProjectId) -> DomainResult<Vec<FuzzJob>> {
@@ -1242,9 +1232,6 @@ struct PreparedCase {
 struct PrepareError {
     message: String,
     payloads: Vec<FuzzCasePayload>,
-            // An insertion point this case leaves untouched (Sniper) must not
-            // reach the target as a literal `§name§` marker.
-            clear_marker(&mut draft, point);
 }
 
 fn prepare_case(
@@ -1255,6 +1242,9 @@ fn prepare_case(
     let mut payloads = Vec::new();
     for (index, point) in template.insertion_points.iter().enumerate() {
         let Some(raw_value) = case.values.get(index).and_then(Option::as_ref) else {
+            // An insertion point this case leaves untouched (Sniper) must not
+            // reach the target as a literal `§name§` marker.
+            clear_marker(&mut draft, point);
             continue;
         };
         let transformed = match apply_pipeline(&template.transforms, raw_value.as_bytes()) {
@@ -1268,6 +1258,16 @@ fn prepare_case(
             }
         };
         payloads.push(display_payload(point, &transformed));
+        if let Err(error) = apply_insertion(&mut draft, point, &transformed) {
+            return Err(PrepareError {
+                message: error.to_string(),
+                payloads,
+            });
+        }
+    }
+    Ok(PreparedCase { draft, payloads })
+}
+
 /// Replaces the point's marker with an empty string wherever the point's
 /// location holds it. Insertion points carry no default value, so empty is the
 /// neutral fill for a point a case does not mutate.
@@ -1302,16 +1302,6 @@ fn clear_marker(draft: &mut ReplyDraft, point: &InsertionPoint) {
         }
         _ => {}
     }
-}
-
-        if let Err(error) = apply_insertion(&mut draft, point, &transformed) {
-            return Err(PrepareError {
-                message: error.to_string(),
-                payloads,
-            });
-        }
-    }
-    Ok(PreparedCase { draft, payloads })
 }
 
 fn apply_insertion(
@@ -1594,6 +1584,16 @@ mod tests {
             estimate_combinations(FuzzStrategy::BatteringRam, 2, &[3]),
             3
         );
+        assert_eq!(
+            estimate_combinations(FuzzStrategy::Pitchfork, 2, &[5, 3]),
+            3
+        );
+        assert_eq!(
+            estimate_combinations(FuzzStrategy::ClusterBomb, 2, &[2, 3]),
+            6
+        );
+    }
+
     #[test]
     fn sniper_clears_markers_of_untouched_points_in_built_request() {
         let template = FuzzTemplate {
@@ -1653,16 +1653,6 @@ mod tests {
             );
             assert!(!all.contains('§'), "literal marker left in {all}");
         }
-    }
-
-        assert_eq!(
-            estimate_combinations(FuzzStrategy::Pitchfork, 2, &[5, 3]),
-            3
-        );
-        assert_eq!(
-            estimate_combinations(FuzzStrategy::ClusterBomb, 2, &[2, 3]),
-            6
-        );
     }
 
     #[test]

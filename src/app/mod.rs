@@ -841,40 +841,6 @@ fn process_is_huntproxy(pid: i32) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("HuntProxy"))
 }
 
-pub fn daemon_status(config: &Config) -> DomainResult<serde_json::Value> {
-    let lock = config.daemon_lock_path();
-    if !lock.exists() {
-        return Ok(serde_json::json!({
-            "running": false,
-            "data_dir": config.data_dir,
-        }));
-    }
-    let pid = std::fs::read_to_string(&lock)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
-    let alive = pid
-        .map(|p| {
-            #[cfg(unix)]
-            {
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok()
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = p;
-                true
-            }
-        })
-        .unwrap_or(false);
-    Ok(serde_json::json!({
-        "running": alive,
-        "pid": pid,
-        "socket": config.socket_path().exists(),
-        "data_dir": config.data_dir,
-        "api_listen": config.api_listen.to_string(),
-        "proxy_listen": config.proxy_listen.to_string(),
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
