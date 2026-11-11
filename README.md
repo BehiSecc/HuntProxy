@@ -509,9 +509,7 @@ Update HuntProxy to the latest release:
 HuntProxy update
 ```
 
-The updater keeps your projects and data and restores the previous installation if the update fails.
-
-**Upgrading from v0.1.1:** Run `HuntProxy stop` before `HuntProxy update`, then reconnect your MCP client.
+The updater keeps your projects and data and restores the previous installation if the update fails. It installs v0.2.0 and newer releases only; older releases are no longer supported.
 
 `HuntProxy backup` copies only the SQLite database; for a full backup, stop HuntProxy and copy `~/.huntproxy` and any configured external paths.
 

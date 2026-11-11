@@ -88,6 +88,14 @@ impl fmt::Display for StableVersion {
     }
 }
 
+/// The oldest release the updater installs: the first with the coordinated
+/// preparation, data snapshot and rollback transaction.
+const OLDEST_SUPPORTED: StableVersion = StableVersion {
+    major: 0,
+    minor: 2,
+    patch: 0,
+};
+
 fn parse_version_part(value: Option<&str>) -> DomainResult<u64> {
     let value =
         value.filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
@@ -236,31 +244,12 @@ async fn run_with_context(
         });
     }
 
-    let coordinated = target
-        >= StableVersion {
-            major: 0,
-            minor: 2,
-            patch: 0,
-        };
-    let daemon_config = if coordinated {
-        Config::load(request.data_dir.clone())?
-    } else {
-        daemon_config(request.data_dir)
-    };
-    if !coordinated {
-        ensure_daemon_stopped(&daemon_config)?;
-        if daemon_config.db_path().exists() {
-            let database = rusqlite::Connection::open_with_flags(
-                daemon_config.db_path(),
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .map_err(|error| update_error(format!("inspect database compatibility: {error}")))?;
-            let schema = crate::storage::schema_version(&database)?;
-            if schema > 14 {
-                return Err(update_error("this data directory requires HuntProxy 0.2 or newer; downgrading would make saved projects unavailable"));
-            }
-        }
+    if target < OLDEST_SUPPORTED {
+        return Err(DomainError::invalid(format!(
+            "HuntProxy {target} is no longer supported; the updater installs {OLDEST_SUPPORTED} and newer"
+        )));
     }
+    let config = Config::load(request.data_dir)?;
     let executable = &context.executable;
     let metadata = fs::metadata(executable)
         .map_err(|error| update_error(format!("inspect current executable: {error}")))?;
@@ -311,19 +300,14 @@ async fn run_with_context(
     }
     archive_guard.remove_now()?;
 
-    let plugin_names = if coordinated {
-        inspect_release_plugins(staged.path(), target).await?
-    } else {
-        Vec::new()
-    };
+    let plugin_names = inspect_release_plugins(staged.path(), target).await?;
     activate_release(
-        &daemon_config,
+        &config,
         ReleaseInstallation {
             executable: executable.to_owned(),
             staged,
             target,
             current: Some(context.current_version),
-            coordinated,
             initial_hash: Some(initial_hash),
             plugin_names,
         },
@@ -376,7 +360,6 @@ pub async fn install_local(
             staged,
             target,
             current,
-            coordinated: true,
             initial_hash,
             plugin_names,
         },
@@ -389,7 +372,6 @@ struct ReleaseInstallation {
     staged: TempPath,
     target: StableVersion,
     current: Option<StableVersion>,
-    coordinated: bool,
     initial_hash: Option<[u8; 32]>,
     plugin_names: Vec<String>,
 }
@@ -403,63 +385,52 @@ async fn activate_release(
         mut staged,
         target,
         current,
-        coordinated,
         initial_hash,
         plugin_names,
     } = release;
     let parent = executable
         .parent()
         .ok_or_else(|| update_error("installation path has no parent directory"))?;
-    let _maintenance = if coordinated {
-        Some(app::acquire_bootstrap_lock(config).await?)
-    } else {
-        None
-    };
-    if coordinated {
-        app::recover_installation(config, true).await?;
-    }
+    let _maintenance = app::acquire_bootstrap_lock(config).await?;
+    app::recover_installation(config, true).await?;
     let was_running = app::daemon_is_active(config)?;
     if was_running && initial_hash.is_none() {
         return Err(update_error(
             "cannot replace a running installation without its original executable",
         ));
     }
-    if was_running && coordinated {
+    if was_running {
         app::stop_daemon(config).await?;
     } else {
         ensure_daemon_stopped(config)?;
     }
-    let snapshot = if coordinated {
-        let snapshot_config = config.clone();
-        let tag = target.tag();
-        match tokio::task::spawn_blocking(move || {
-            DataSnapshot::capture(&snapshot_config, &tag, &plugin_names)
-        })
-        .await
-        {
-            Ok(Ok(snapshot)) => Some(snapshot),
-            result => {
-                if was_running {
-                    if let Err(restart) = app::start_daemon_binary(config, &executable).await {
-                        return Err(update_error(format!("could not preserve update state and could not restart the previous daemon: {restart}")));
-                    }
+    let snapshot_config = config.clone();
+    let tag = target.tag();
+    let snapshot = match tokio::task::spawn_blocking(move || {
+        DataSnapshot::capture(&snapshot_config, &tag, &plugin_names)
+    })
+    .await
+    {
+        Ok(Ok(snapshot)) => snapshot,
+        result => {
+            if was_running {
+                if let Err(restart) = app::start_daemon_binary(config, &executable).await {
+                    return Err(update_error(format!("could not preserve update state and could not restart the previous daemon: {restart}")));
                 }
-                return Err(match result {
-                    Ok(Err(error)) => error,
-                    Err(error) => update_error(format!("update backup task: {error}")),
-                    _ => unreachable!(),
-                });
             }
+            return Err(match result {
+                Ok(Err(error)) => error,
+                Err(error) => update_error(format!("update backup task: {error}")),
+                _ => unreachable!(),
+            });
         }
-    } else {
-        None
     };
     let backup_path = backup_path(&executable)?;
     let mut replaced = false;
     let mut journal_started = false;
     let mut binary_conflict = false;
     let installation = async {
-        if let (Some(snapshot), Some(source)) = (&snapshot, current) {
+        if let Some(source) = current {
             if source != target {
                 journal_started = true;
                 crate::update_journal::begin(
@@ -471,9 +442,7 @@ async fn activate_release(
                 )?;
             }
         }
-        if coordinated {
-            prepare_downloaded_release(staged.path(), config, target).await?;
-        }
+        prepare_downloaded_release(staged.path(), config, target).await?;
         ensure_daemon_stopped(config)?;
         let actual_hash = executable
             .exists()
@@ -514,11 +483,8 @@ async fn activate_release(
     }
     .await;
     if let Err(error) = installation {
+        let recovery = snapshot.root.display().to_string();
         if binary_conflict {
-            let recovery = snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.root.display().to_string())
-                .unwrap_or_else(|| backup_path.display().to_string());
             return Err(DomainError::new(
                 ErrorCode::Conflict,
                 format!(
@@ -552,10 +518,8 @@ async fn activate_release(
             }
         }
         if failures.is_empty() {
-            if let Some(snapshot) = &snapshot {
-                if let Err(error) = snapshot.restore(config) {
-                    failures.push(error.to_string());
-                }
+            if let Err(error) = snapshot.restore(config) {
+                failures.push(error.to_string());
             }
         }
         if failures.is_empty() && journal_started {
@@ -564,12 +528,10 @@ async fn activate_release(
             }
         }
         if failures.is_empty() {
-            if let Some(snapshot) = &snapshot {
-                if let Err(error) =
-                    crate::update_journal::prune_restore_points(config, Some(&snapshot.root))
-                {
-                    tracing::warn!(%error, "rollback completed; older restore point cleanup failed");
-                }
+            if let Err(error) =
+                crate::update_journal::prune_restore_points(config, Some(&snapshot.root))
+            {
+                tracing::warn!(%error, "rollback completed; older restore point cleanup failed");
             }
         }
         // Once old data has been restored, retire the rollback journal before
@@ -580,10 +542,6 @@ async fn activate_release(
                 failures.push(format!("restart previous daemon: {error}"));
             }
         }
-        let recovery = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.root.display().to_string())
-            .unwrap_or_else(|| backup_path.display().to_string());
         return Err(update_error(if failures.is_empty() {
             format!("{error}; the previous installation was restored")
         } else {
@@ -593,17 +551,13 @@ async fn activate_release(
             )
         }));
     }
-    if let Some(snapshot) = &snapshot {
-        // Cleanup failures cannot turn a healthy, activated release into a
-        // rollback. The durable journal lets the next startup retry cleanup.
-        if let Err(error) =
-            crate::update_journal::prune_restore_points(config, Some(&snapshot.root))
-        {
-            tracing::warn!(%error, "release installed; restore point cleanup will be retried");
-        } else if journal_started {
-            if let Err(error) = crate::update_journal::finish(config) {
-                tracing::warn!(%error, "release installed; recovery journal cleanup will be retried");
-            }
+    // Cleanup failures cannot turn a healthy, activated release into a
+    // rollback. The durable journal lets the next startup retry cleanup.
+    if let Err(error) = crate::update_journal::prune_restore_points(config, Some(&snapshot.root)) {
+        tracing::warn!(%error, "release installed; restore point cleanup will be retried");
+    } else if journal_started {
+        if let Err(error) = crate::update_journal::finish(config) {
+            tracing::warn!(%error, "release installed; recovery journal cleanup will be retried");
         }
     }
     Ok(UpdateOutcome::Installed {
@@ -612,7 +566,7 @@ async fn activate_release(
             .unwrap_or_else(|| "none".into()),
         installed: target.to_string(),
         backup_path,
-        data_backup_path: snapshot.map(|snapshot| snapshot.root),
+        data_backup_path: Some(snapshot.root),
         daemon_restarted: was_running,
     })
 }
@@ -905,14 +859,6 @@ fn copy_backup_tree(source: &Path, destination: &Path) -> DomainResult<()> {
         ));
     }
     Ok(())
-}
-
-fn daemon_config(data_dir: Option<PathBuf>) -> Config {
-    let mut config = Config::default();
-    if let Some(data_dir) = data_dir {
-        config.data_dir = data_dir;
-    }
-    config
 }
 
 fn ensure_daemon_stopped(config: &Config) -> DomainResult<()> {
@@ -1438,7 +1384,7 @@ mod tests {
     fn request(data_dir: PathBuf, check: bool) -> UpdateRequest {
         UpdateRequest {
             check,
-            version: Some("v0.1.1".into()),
+            version: Some("v0.3.0".into()),
             data_dir: Some(data_dir),
         }
     }
@@ -1512,28 +1458,28 @@ mod tests {
     async fn check_is_read_only_and_does_not_download_assets() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(format!("/repos/{REPOSITORY}/releases/tags/v0.1.1")))
+            .and(path(format!("/repos/{REPOSITORY}/releases/tags/v0.3.0")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "tag_name": "v0.1.1"
+                "tag_name": "v0.3.0"
             })))
             .mount(&server)
             .await;
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("HuntProxy");
-        write_script(&executable, "0.1.0");
+        write_script(&executable, "0.2.0");
         let original = fs::read(&executable).unwrap();
         let data_dir = directory.path().join("missing-data");
         let outcome = run_with_context(
             request(data_dir.clone(), true),
-            context(&server, executable.clone(), "0.1.0"),
+            context(&server, executable.clone(), "0.2.0"),
         )
         .await
         .unwrap();
         assert_eq!(
             outcome,
             UpdateOutcome::Available {
-                current: "0.1.0".into(),
-                target: "0.1.1".into()
+                current: "0.2.0".into(),
+                target: "0.3.0".into()
             }
         );
         assert_eq!(fs::read(executable).unwrap(), original);
@@ -1545,18 +1491,18 @@ mod tests {
     async fn same_version_and_older_latest_are_no_ops() {
         for (current, requested, expected) in [
             (
-                "0.1.0",
-                Some("v0.1.0"),
+                "0.2.0",
+                Some("v0.2.0"),
                 UpdateOutcome::UpToDate {
-                    current: "0.1.0".into(),
+                    current: "0.2.0".into(),
                 },
             ),
             (
-                "0.1.1",
+                "0.3.0",
                 None,
                 UpdateOutcome::CurrentNewer {
-                    current: "0.1.1".into(),
-                    target: "0.1.0".into(),
+                    current: "0.3.0".into(),
+                    target: "0.2.0".into(),
                 },
             ),
         ] {
@@ -1568,7 +1514,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(api_path))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "tag_name": "v0.1.0"
+                    "tag_name": "v0.2.0"
                 })))
                 .mount(&server)
                 .await;
@@ -1608,65 +1554,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_release_replaces_binary_and_preserves_state_and_rollback() {
-        let server = MockServer::start().await;
-        let release = archive(&[
-            ("HuntProxy", script("0.1.1")),
-            // Preserve the archive format accepted by installed older updaters.
-            (
-                "LICENSE",
-                format!(
-                    "{}\n{}",
-                    include_str!("../LICENSE"),
-                    include_str!("../THIRD_PARTY_NOTICES")
-                )
-                .into_bytes(),
-            ),
-        ]);
-        mock_release(&server, "v0.1.1", &release, None).await;
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("HuntProxy");
-        write_script(&executable, "0.1.0");
-        let old_binary = fs::read(&executable).unwrap();
-        let data_dir = directory.path().join("data");
-        fs::create_dir(&data_dir).unwrap();
-        let sentinel = data_dir.join("state-sentinel");
-        fs::write(&sentinel, b"unchanged").unwrap();
-
-        let outcome = run_with_context(
-            request(data_dir, false),
-            context(&server, executable.clone(), "0.1.0"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            outcome,
-            UpdateOutcome::Installed {
-                previous: "0.1.0".into(),
-                installed: "0.1.1".into(),
-                backup_path: directory.path().join("HuntProxy.previous"),
-                data_backup_path: None,
-                daemon_restarted: false,
-            }
-        );
-        assert_eq!(fs::read(&executable).unwrap(), script("0.1.1"));
-        assert_eq!(
-            fs::read(directory.path().join("HuntProxy.previous")).unwrap(),
-            old_binary
-        );
-        assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
-        assert_eq!(
-            fs::metadata(executable).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-        assert!(staging_files(directory.path()).is_empty());
-    }
-
-    #[tokio::test]
     async fn checksum_and_version_failures_leave_binary_untouched() {
         for (release_version, checksum) in [
             (
-                "0.1.1",
+                "0.3.0",
                 Some(format!(
                     "{}  huntproxy-linux-x86_64.tar.gz\n",
                     "0".repeat(64)
@@ -1676,14 +1567,14 @@ mod tests {
         ] {
             let server = MockServer::start().await;
             let release = archive(&[("HuntProxy", script(release_version))]);
-            mock_release(&server, "v0.1.1", &release, checksum).await;
+            mock_release(&server, "v0.3.0", &release, checksum).await;
             let directory = tempfile::tempdir().unwrap();
             let executable = directory.path().join("HuntProxy");
-            write_script(&executable, "0.1.0");
+            write_script(&executable, "0.2.0");
             let original = fs::read(&executable).unwrap();
             let result = run_with_context(
                 request(directory.path().join("data"), false),
-                context(&server, executable.clone(), "0.1.0"),
+                context(&server, executable.clone(), "0.2.0"),
             )
             .await;
             assert!(result.is_err());
@@ -1694,45 +1585,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_daemon_is_rejected_before_any_update_files_are_created() {
+    async fn releases_older_than_the_oldest_supported_are_rejected_before_downloading_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("HuntProxy");
+        write_script(&executable, "0.3.0");
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(format!("/repos/{REPOSITORY}/releases/tags/v0.1.1")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "tag_name": "v0.1.1"
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tag_name":"v0.1.1"})),
+            )
+            .expect(1)
             .mount(&server)
             .await;
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("HuntProxy");
-        write_script(&executable, "0.1.0");
-        let original = fs::read(&executable).unwrap();
         let data_dir = directory.path().join("data");
-        fs::create_dir(&data_dir).unwrap();
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(data_dir.join(crate::config::DAEMON_LOCK_NAME))
-            .unwrap();
-        let _daemon_lock =
-            nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-                .unwrap();
-
         let error = run_with_context(
-            request(data_dir, false),
-            context(&server, executable.clone(), "0.1.0"),
+            UpdateRequest {
+                check: false,
+                version: Some("v0.1.1".into()),
+                data_dir: Some(data_dir.clone()),
+            },
+            context(&server, executable.clone(), "0.3.0"),
         )
         .await
         .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::Conflict);
-        assert!(error.to_string().contains("HuntProxy is running"));
-        assert_eq!(fs::read(executable).unwrap(), original);
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("0.1.1 is no longer supported"));
+        assert_eq!(fs::read(executable).unwrap(), script("0.3.0"));
+        assert!(!data_dir.exists());
         assert!(staging_files(directory.path()).is_empty());
     }
 
-    fn coordinated_script(fail_prepare: bool, bad_activation: bool) -> Vec<u8> {
+    fn coordinated_script(version: &str, fail_prepare: bool, bad_activation: bool) -> Vec<u8> {
         // Only the installed filename reports the intentionally bad version;
         // the verified staged binary passes both preflight inspections.
         format!(
@@ -1741,8 +1625,8 @@ case "$1" in
   --version)
     if [ "{bad_activation}" = true ] && [ "$(basename "$0")" = HuntProxy ]; then
       printf 'HuntProxy 9.9.9\n'
-    else printf 'HuntProxy 0.2.0\n'; fi ;;
-  release-info) printf '%s\n' '{{"version":"0.2.0","schema":15,"plugins":["racer","new-target"]}}' ;;
+    else printf 'HuntProxy {version}\n'; fi ;;
+  release-info) printf '%s\n' '{{"version":"{version}","schema":15,"plugins":["racer","new-target"]}}' ;;
   prepare-update)
     directory=$3
     mkdir -p "$directory/plugins/racer" "$directory/plugins/new-target"
@@ -1753,7 +1637,7 @@ case "$1" in
       printf 'fixture preparation failed\n' >&2
       exit 1
     fi
-    printf '%s\n' '{{"ok":true,"version":"0.2.0","schema":15}}' ;;
+    printf '%s\n' '{{"ok":true,"version":"{version}","schema":15}}' ;;
   *) exit 1 ;;
 esac
 "#
@@ -1786,33 +1670,50 @@ esac
         let directory = tempfile::tempdir().unwrap();
         let config = seed_update_state(directory.path());
         let executable = directory.path().join("HuntProxy");
-        write_script(&executable, "0.1.1");
-        let older = DataSnapshot::capture(&config, "v0.1.1", &[]).unwrap();
+        write_script(&executable, "0.2.0");
+        let older = DataSnapshot::capture(&config, "v0.2.0", &[]).unwrap();
         let release = archive(&[
-            ("HuntProxy", coordinated_script(false, false)),
-            ("LICENSE", b"fixture license".to_vec()),
+            ("HuntProxy", coordinated_script("0.3.0", false, false)),
+            // Preserve the archive format accepted by installed updaters.
+            (
+                "LICENSE",
+                format!(
+                    "{}\n{}",
+                    include_str!("../LICENSE"),
+                    include_str!("../THIRD_PARTY_NOTICES")
+                )
+                .into_bytes(),
+            ),
         ]);
         let server = MockServer::start().await;
-        mock_release(&server, "v0.2.0", &release, None).await;
+        mock_release(&server, "v0.3.0", &release, None).await;
         let outcome = run_with_context(
-            UpdateRequest {
-                check: false,
-                version: Some("v0.2.0".into()),
-                data_dir: Some(config.data_dir.clone()),
-            },
-            context(&server, executable.clone(), "0.1.1"),
+            request(config.data_dir.clone(), false),
+            context(&server, executable.clone(), "0.2.0"),
         )
         .await
         .unwrap();
         let UpdateOutcome::Installed {
+            previous,
+            installed,
+            backup_path,
             data_backup_path: Some(root),
             daemon_restarted,
-            ..
         } = outcome
         else {
             panic!("expected installed release")
         };
+        assert_eq!((previous.as_str(), installed.as_str()), ("0.2.0", "0.3.0"));
+        assert_eq!(backup_path, directory.path().join("HuntProxy.previous"));
         assert!(!daemon_restarted);
+        assert_eq!(
+            fs::read(&executable).unwrap(),
+            coordinated_script("0.3.0", false, false)
+        );
+        assert_eq!(
+            fs::metadata(&executable).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         assert!(root.join("restore.json").exists());
         assert!(!older.root.exists());
         assert!(!config.runtime_dir.join("update-journal.json").exists());
@@ -1844,10 +1745,7 @@ esac
                 .unwrap(),
             "Existing project"
         );
-        assert_eq!(
-            fs::read(directory.path().join("HuntProxy.previous")).unwrap(),
-            script("0.1.1")
-        );
+        assert_eq!(fs::read(backup_path).unwrap(), script("0.2.0"));
         assert!(staging_files(directory.path()).is_empty());
     }
 
@@ -1857,20 +1755,16 @@ esac
             let directory = tempfile::tempdir().unwrap();
             let config = seed_update_state(directory.path());
             let executable = directory.path().join("HuntProxy");
-            write_script(&executable, "0.1.1");
+            write_script(&executable, "0.2.0");
             let release = archive(&[(
                 "HuntProxy",
-                coordinated_script(fail_prepare, bad_activation),
+                coordinated_script("0.3.0", fail_prepare, bad_activation),
             )]);
             let server = MockServer::start().await;
-            mock_release(&server, "v0.2.0", &release, None).await;
+            mock_release(&server, "v0.3.0", &release, None).await;
             let error = run_with_context(
-                UpdateRequest {
-                    check: false,
-                    version: Some("v0.2.0".into()),
-                    data_dir: Some(config.data_dir.clone()),
-                },
-                context(&server, executable.clone(), "0.1.1"),
+                request(config.data_dir.clone(), false),
+                context(&server, executable.clone(), "0.2.0"),
             )
             .await
             .unwrap_err();
@@ -1880,7 +1774,7 @@ esac
                     .contains("previous installation was restored"),
                 "{error}"
             );
-            assert_eq!(fs::read(&executable).unwrap(), script("0.1.1"));
+            assert_eq!(fs::read(&executable).unwrap(), script("0.2.0"));
             assert!(!config.runtime_dir.join("update-journal.json").exists());
             assert_eq!(
                 fs::read(config.plugin_dir.join("racer/fixture.txt")).unwrap(),
@@ -1910,58 +1804,24 @@ esac
     }
 
     #[tokio::test]
-    async fn legacy_downgrade_rejects_current_schema_before_downloading_assets() {
-        let directory = tempfile::tempdir().unwrap();
-        let config = seed_update_state(directory.path());
-        let database = rusqlite::Connection::open(config.db_path()).unwrap();
-        database.pragma_update(None, "user_version", 15).unwrap();
-        let executable = directory.path().join("HuntProxy");
-        write_script(&executable, "0.2.0");
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/repos/{REPOSITORY}/releases/tags/v0.1.1")))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"tag_name":"v0.1.1"})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let error = run_with_context(
-            request(config.data_dir, false),
-            context(&server, executable.clone(), "0.2.0"),
-        )
-        .await
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("requires HuntProxy 0.2 or newer"));
-        assert_eq!(fs::read(executable).unwrap(), script("0.2.0"));
-        assert!(staging_files(directory.path()).is_empty());
-    }
-
-    #[tokio::test]
     async fn external_binary_replacement_preserves_recovery_and_does_not_claim_rollback() {
         let directory = tempfile::tempdir().unwrap();
         let config = seed_update_state(directory.path());
         let executable = directory.path().join("HuntProxy");
-        write_script(&executable, "0.1.1");
-        let release_script = String::from_utf8(coordinated_script(false, false))
+        write_script(&executable, "0.2.0");
+        let release_script = String::from_utf8(coordinated_script("0.3.0", false, false))
             .unwrap()
             .replace(
                 "directory=$3",
                 r#"directory=$3
-    printf '%s\n' '#!/bin/sh' 'printf "HuntProxy 0.3.0\n"' > "$directory/../HuntProxy""#,
+    printf '%s\n' '#!/bin/sh' 'printf "HuntProxy 0.4.0\n"' > "$directory/../HuntProxy""#,
             );
         let release = archive(&[("HuntProxy", release_script.into_bytes())]);
         let server = MockServer::start().await;
-        mock_release(&server, "v0.2.0", &release, None).await;
+        mock_release(&server, "v0.3.0", &release, None).await;
         let error = run_with_context(
-            UpdateRequest {
-                check: false,
-                version: Some("v0.2.0".into()),
-                data_dir: Some(config.data_dir.clone()),
-            },
-            context(&server, executable.clone(), "0.1.1"),
+            request(config.data_dir.clone(), false),
+            context(&server, executable.clone(), "0.2.0"),
         )
         .await
         .unwrap_err();
@@ -1975,7 +1835,7 @@ esac
             .contains("previous installation was restored"));
         assert_eq!(
             inspect_binary_version(&executable).await.unwrap(),
-            StableVersion::parse("0.3.0").unwrap()
+            StableVersion::parse("0.4.0").unwrap()
         );
         assert!(config.runtime_dir.join("update-journal.json").exists());
         assert_eq!(
@@ -2028,7 +1888,7 @@ esac
         fs::write(
             &archive_path,
             archive(&[
-                ("HuntProxy", script("0.1.1")),
+                ("HuntProxy", script("0.3.0")),
                 ("unexpected", b"nope".to_vec()),
             ]),
         )

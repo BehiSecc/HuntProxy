@@ -1,8 +1,8 @@
 # Updating
 
-Run `HuntProxy update` to update a native installation. The updater prepares the browser runtime and official plugins, preserves project data, and restarts a running daemon. Customized and third-party plugin folders are preserved; an incompatible preserved Racer package returns a compatibility error.
+Run `HuntProxy update` to update a native installation. The updater prepares the browser runtime and official plugins, preserves project data, and restarts a running daemon. Customized and third-party plugin folders are preserved; an incompatible preserved Racer package returns a compatibility error. It installs v0.2.0 and newer releases only; older releases are no longer supported.
 
-The MCP bridge refreshes its tool catalog after updates and sends `tools/list_changed` so supported clients can discover changes. It retains the last validated catalog while the daemon is idle or stopped. For an update from v0.1.1, run `HuntProxy stop` before updating and reconnect the MCP client afterward.
+The MCP bridge refreshes its tool catalog after updates and sends `tools/list_changed` so supported clients can discover changes. It retains the last validated catalog while the daemon is idle or stopped.
 
 Updates keep a private database, configuration, and plugin restore point and the previous executable. Failed preparation or activation triggers restoration; recovery errors are reported if restoration cannot complete. Interrupted v0.2 updates recover before opening project data. Schema migrations also keep a private copy of the earlier database. Browser profiles and the CA are preserved in place rather than included in update restore points.
 
