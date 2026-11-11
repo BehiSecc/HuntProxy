@@ -54,6 +54,7 @@ impl Default for ScopePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProjectLimits {
     pub requests_per_second: f64,
     pub max_concurrent_requests: u32,
@@ -381,7 +382,6 @@ pub enum FuzzStrategy {
 pub enum FuzzJobState {
     Queued,
     Running,
-    Paused,
     Cancelling,
     Completed,
     Failed,

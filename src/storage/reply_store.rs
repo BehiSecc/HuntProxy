@@ -112,29 +112,44 @@ impl Db {
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             let rows = stmt
                 .query_map(params![project_id.get()], |row| {
-                    let protocol = match row.get::<_, String>(4)?.as_str() {
-                        "h1" => ProtocolPreference::H1,
-                        "h2" => ProtocolPreference::H2,
-                        _ => ProtocolPreference::Auto,
-                    };
-                    let draft_json: String = row.get(5)?;
-                    let draft: ReplyDraft = serde_json::from_str(&draft_json).unwrap_or_default();
-                    Ok(ReplyTab {
-                        id: ReplyTabId(row.get(0)?),
-                        project_id,
-                        name: row.get(1)?,
-                        base_exchange_id: row.get::<_, Option<i64>>(2)?.map(ExchangeId),
-                        revision: row.get(3)?,
-                        protocol,
-                        draft,
-                        created_at: parse_time(&row.get::<_, String>(6)?),
-                        updated_at: parse_time(&row.get::<_, String>(7)?),
-                    })
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
                 })
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
             let mut out = Vec::new();
             for r in rows {
-                out.push(r.map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?);
+                let (id, name, base_exchange_id, revision, protocol, draft_json, created, updated) =
+                    r.map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+                let protocol = match protocol.as_str() {
+                    "h1" => ProtocolPreference::H1,
+                    "h2" => ProtocolPreference::H2,
+                    _ => ProtocolPreference::Auto,
+                };
+                let draft: ReplyDraft = serde_json::from_str(&draft_json).map_err(|error| {
+                    DomainError::new(
+                        ErrorCode::StorageError,
+                        format!("reply tab {id} has an invalid stored draft: {error}"),
+                    )
+                })?;
+                out.push(ReplyTab {
+                    id: ReplyTabId(id),
+                    project_id,
+                    name,
+                    base_exchange_id: base_exchange_id.map(ExchangeId),
+                    revision,
+                    protocol,
+                    draft,
+                    created_at: parse_time(&created),
+                    updated_at: parse_time(&updated),
+                });
             }
             Ok(out)
         })
@@ -155,4 +170,51 @@ impl Db {
 
 fn storage_error(error: rusqlite::Error) -> DomainError {
     DomainError::new(ErrorCode::StorageError, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn corrupt_stored_reply_draft_is_reported_not_defaulted() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "reply".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let tab = db
+            .upsert_reply_tab(
+                project.id,
+                None,
+                "tab".into(),
+                None,
+                ProtocolPreference::Auto,
+                ReplyDraft::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.list_reply_tabs(project.id).await.unwrap().len(), 1);
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE reply_tabs SET draft_json='not json' WHERE id=?1",
+                params![tab.id.0],
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db.list_reply_tabs(project.id).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::StorageError);
+        assert!(
+            error.to_string().contains("invalid stored draft"),
+            "{error}"
+        );
+    }
 }
