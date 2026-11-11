@@ -1126,11 +1126,8 @@ impl BrowserService {
     pub fn new(db: Arc<Db>, node_path: Option<PathBuf>, worker_path: Option<PathBuf>) -> Self {
         let profiles_root = default_profiles_root(&db);
         let proxy_server = std::env::var("HUNTPROXY_BROWSER_PROXY_SERVER")
-            .or_else(|_| std::env::var("BB_BROWSER_PROXY_SERVER"))
             .unwrap_or_else(|_| DEFAULT_BROWSER_PROXY.to_string());
-        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT")
-            .or_else(|| std::env::var_os("BB_BROWSER_CA_CERT"))
-            .map(PathBuf::from);
+        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT").map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
             node_path,
@@ -1149,9 +1146,7 @@ impl BrowserService {
         proxy_server: String,
     ) -> Self {
         let profiles_root = default_profiles_root(&db);
-        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT")
-            .or_else(|| std::env::var_os("BB_BROWSER_CA_CERT"))
-            .map(PathBuf::from);
+        let ca_cert_path = std::env::var_os("HUNTPROXY_BROWSER_CA_CERT").map(PathBuf::from);
         Self::new_with_proxy_and_ca(
             db,
             node_path,
@@ -4297,9 +4292,7 @@ fn worker_path_candidates(explicit: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(path) = explicit {
         candidates.push(path);
     }
-    if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH")
-        .or_else(|| std::env::var_os("BB_BROWSER_WORKER_PATH"))
-    {
+    if let Some(path) = std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH") {
         candidates.push(PathBuf::from(path));
     }
     if let Ok(executable) = std::env::current_exe() {
@@ -4307,7 +4300,6 @@ fn worker_path_candidates(explicit: Option<PathBuf>) -> Vec<PathBuf> {
             candidates.push(bin_dir.join("browser-worker/index.js"));
             candidates.push(bin_dir.join("../libexec/huntproxy/browser-worker/index.js"));
             candidates.push(bin_dir.join("../share/huntproxy/browser-worker/index.js"));
-            candidates.push(bin_dir.join("../share/bb/browser-worker/index.js"));
         }
     }
     candidates
@@ -6226,7 +6218,7 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn worker_timeout_interrupts_only_its_project() {
-        let directory = tempfile::tempdir_in("/tmp/artis").unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("worker.sh");
         std::fs::write(&script, r#"
 while IFS= read -r request; do

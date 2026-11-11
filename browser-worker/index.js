@@ -506,10 +506,7 @@ async function inspectRuntime(session, action) {
 }
 
 function loadPlaywright() {
-  const candidates = [
-    process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH,
-    process.env.BB_PLAYWRIGHT_CORE_PATH,
-  ].filter(Boolean);
+  const candidates = [process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH].filter(Boolean);
   const workerDir = path.dirname(fileURLToPath(import.meta.url));
   candidates.push(
     path.join(workerDir, "node_modules", "playwright-core"),
@@ -519,8 +516,7 @@ function loadPlaywright() {
 
   const requireFromWorker = createRequire(path.join(workerDir, "package.json"));
   const requireFromCwd = createRequire(path.join(process.cwd(), "package.json"));
-  const explicit = candidates[0] === process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH
-    || candidates[0] === process.env.BB_PLAYWRIGHT_CORE_PATH;
+  const explicit = candidates[0] === process.env.HUNTPROXY_PLAYWRIGHT_CORE_PATH;
   const pinnedVersion = explicit ? null
     : JSON.parse(fs.readFileSync(path.join(workerDir, "package.json"), "utf8"))
       .dependencies?.["playwright-core"];
@@ -610,7 +606,6 @@ function rpcError(code, message) {
 function existingChromiumExecutable() {
   const candidates = [
     process.env.HUNTPROXY_CHROME_EXECUTABLE,
-    process.env.BB_CHROME_EXECUTABLE,
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
   ].filter(Boolean);
   try {

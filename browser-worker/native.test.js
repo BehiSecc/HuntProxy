@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import vm from "node:vm";
@@ -10,8 +11,7 @@ import { test } from "node:test";
 const source = fs.readFileSync(new URL("./index.js", import.meta.url), "utf8");
 const launch = source.slice(source.indexOf("function chromiumLaunchOptions"), source.indexOf("async function launchChromium"));
 function fixture(t, mode = "ready", startup = {}) {
-  fs.mkdirSync("/tmp/artis", { recursive: true });
-  const profile = fs.mkdtempSync("/tmp/artis/huntproxy-native-");
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "huntproxy-native-"));
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
   const events = [];
   const children = [];
@@ -34,7 +34,7 @@ function fixture(t, mode = "ready", startup = {}) {
     } }, URL, ownedChromeChildren: new Set(), shuttingDown: false,
     browserRuntime: { headless: false, chromium_path: "/selected/chrome" },
     chromiumProxy: (proxy) => proxy,
-    os: { tmpdir: () => "/tmp/artis" },
+    os,
     inspectNativeIdentity: async () => ({ userAgent: "test" }),
     setTimeout: (fn, ms) => setTimeout(fn, Math.min(ms, 30)), clearTimeout,
     spawn(executable, supplied, options) {
