@@ -1223,7 +1223,10 @@ fn valid_email(content: &str, start: usize, value: &str) -> bool {
     if start > 0 && content.as_bytes()[start - 1] == b':' {
         return false;
     }
-    let context_start = start.saturating_sub(12);
+    let mut context_start = start.saturating_sub(12);
+    while !content.is_char_boundary(context_start) {
+        context_start += 1;
+    }
     let prefix = content[context_start..start].to_ascii_lowercase();
     !prefix.contains("://")
         && !prefix.contains("mongodb")
@@ -1282,6 +1285,15 @@ mod tests {
         );
         assert!(result.endpoints.is_empty());
         assert!(result.emails.is_empty());
+    }
+
+    #[test]
+    fn email_context_before_non_ascii_text_does_not_panic() {
+        // The 12-byte look-behind would land inside a multi-byte character.
+        let result = analyze_page("été été été été ça va contact@target.test".as_bytes());
+        assert_eq!(result.emails, ["contact@target.test"]);
+        let result = analyze_page("日本語日本語 mail@target.test".as_bytes());
+        assert_eq!(result.emails, ["mail@target.test"]);
     }
 
     #[test]

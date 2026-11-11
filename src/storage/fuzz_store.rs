@@ -114,11 +114,6 @@ impl Db {
             .await
     }
 
-    pub async fn get_fuzz_job_by_id(&self, job_id: FuzzJobId) -> DomainResult<FuzzJob> {
-        self.with_conn(move |conn| load_fuzz_job(conn, None, job_id))
-            .await
-    }
-
     pub async fn list_fuzz_jobs(&self, project_id: ProjectId) -> DomainResult<Vec<FuzzJob>> {
         self.with_conn(move |conn| {
             let mut stmt = conn

@@ -1,5 +1,8 @@
 //! Application service wiring, daemon lifecycle, graceful shutdown.
 
+mod body_cache;
+pub use body_cache::{BodyCache, PreparedBody};
+
 use crate::browser::BrowserService;
 use crate::config::Config;
 use crate::crawler::CrawlerService;
@@ -37,6 +40,7 @@ pub struct AppState {
     pub events: broadcast::Sender<AppEvent>,
     pub shutdown: CancellationToken,
     pub activity: ActivityTracker,
+    pub body_cache: BodyCache,
 }
 
 impl AppState {
@@ -352,29 +356,20 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
     let transport: Arc<dyn SemanticTransport> = Arc::new(WreqTransport::with_chrome_major(
         transport_status.chrome_major,
     )?);
-    let key_bytes = std::fs::read(config.placeholder_key_path()).unwrap_or_else(|_| {
-        let key = PlaceholderKey::load_or_create(&config.placeholder_key_path())
-            .map(|_| ())
-            .ok();
-        let _ = key;
-        std::fs::read(config.placeholder_key_path()).unwrap_or_else(|_| {
-            let mut b = vec![0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
-            let _ = crate::config::write_private_file(&config.placeholder_key_path(), &b);
-            b
-        })
-    });
+    // A key that cannot be loaded or persisted must fail startup: a throwaway
+    // key would make everything minted this session unreadable after restart.
+    let placeholder_key = PlaceholderKey::load_or_create(&config.placeholder_key_path())?;
 
     let reply = Arc::new(ReplyService {
         db: db.clone(),
         transport: transport.clone(),
-        placeholder_key: PlaceholderKey::from_bytes(key_bytes.clone()),
+        placeholder_key: placeholder_key.clone(),
         upstream_proxies: config.upstream_proxies.clone(),
     });
     let fuzzer = Arc::new(FuzzerService::new(
         db.clone(),
         reply.clone(),
-        PlaceholderKey::from_bytes(key_bytes),
+        placeholder_key,
     ));
     let plugins = Arc::new(crate::plugins::PluginService::load_with_browser(
         config.plugin_dir.clone(),
@@ -404,6 +399,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         events,
         shutdown: CancellationToken::new(),
         activity: ActivityTracker::new(),
+        body_cache: BodyCache::default(),
     }))
 }
 
@@ -843,40 +839,6 @@ fn process_is_huntproxy(pid: i32) -> bool {
                 .map(str::to_owned)
         })
         .is_some_and(|name| name.eq_ignore_ascii_case("HuntProxy"))
-}
-
-pub fn daemon_status(config: &Config) -> DomainResult<serde_json::Value> {
-    let lock = config.daemon_lock_path();
-    if !lock.exists() {
-        return Ok(serde_json::json!({
-            "running": false,
-            "data_dir": config.data_dir,
-        }));
-    }
-    let pid = std::fs::read_to_string(&lock)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok());
-    let alive = pid
-        .map(|p| {
-            #[cfg(unix)]
-            {
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok()
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = p;
-                true
-            }
-        })
-        .unwrap_or(false);
-    Ok(serde_json::json!({
-        "running": alive,
-        "pid": pid,
-        "socket": config.socket_path().exists(),
-        "data_dir": config.data_dir,
-        "api_listen": config.api_listen.to_string(),
-        "proxy_listen": config.proxy_listen.to_string(),
-    }))
 }
 
 #[cfg(test)]

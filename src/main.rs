@@ -32,11 +32,7 @@ enum Commands {
     /// Create data directory, config, database, and CA.
     Init,
     /// Run the daemon (API, proxy, private socket).
-    Serve {
-        /// Run the daemon in the foreground.
-        #[arg(long, default_value_t = true)]
-        foreground: bool,
-    },
+    Serve,
     /// Stdio MCP bridge (auto-starts daemon if needed).
     Mcp,
     /// Diagnostics.
@@ -209,7 +205,7 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!("  proxy:         {}", cfg.proxy_listen);
             Ok(())
         }
-        Commands::Serve { foreground: _ } => {
+        Commands::Serve => {
             let mut cfg = Config::load(cli.data_dir)?;
             huntproxy::mcp::clear_stop_guard(&cfg);
             let auto_started = std::env::var_os("HUNTPROXY_DAEMONIZED").is_some();

@@ -76,3 +76,42 @@ test('refresh preserves the current or explicitly requested selection', async ()
   await app.loadProjects(3);
   assert.equal(app.state.projectId, 3);
 });
+
+const helpers = vm.runInContext(
+  `${html.slice(html.indexOf('    // --- pure helpers'), html.indexOf('    // --- end pure helpers ---'))}
+   ({ fuzzPayloadSummary, mergeHistoryPage, mergeWebSocketMessages })`,
+  vm.createContext({}),
+);
+
+test('fuzz payloads render as a readable summary', () => {
+  assert.equal(helpers.fuzzPayloadSummary([]), '—');
+  assert.equal(helpers.fuzzPayloadSummary(undefined), '—');
+  assert.equal(
+    helpers.fuzzPayloadSummary([
+      { insertion_point: 'id', location: 'url', encoding: 'text', value: "1' OR 1=1" },
+      { insertion_point: 'blob', location: 'body', encoding: 'base64', value: '/w==' },
+    ]),
+    "id=1' OR 1=1, blob=[base64] /w==",
+  );
+});
+
+test('history refresh keeps loaded pages and replaces on a gap', () => {
+  const item = id => ({ exchange_id: id });
+  const ids = items => items.map(i => i.exchange_id);
+  const loaded = [5, 4, 3, 2, 1].map(item);
+  const grown = helpers.mergeHistoryPage(loaded, [7, 6, 5, 4].map(item));
+  assert.deepEqual(ids(grown.items), [7, 6, 5, 4, 3, 2, 1]);
+  assert.equal(grown.replaced, false);
+  const gap = helpers.mergeHistoryPage(loaded, [20, 19, 18].map(item));
+  assert.deepEqual(ids(gap.items), [20, 19, 18]);
+  assert.equal(gap.replaced, true);
+  assert.equal(helpers.mergeHistoryPage([], [2, 1].map(item)).replaced, true);
+});
+
+test('websocket messages append newer ones and keep only the newest', () => {
+  const message = id => ({ id });
+  const ids = items => items.map(m => m.id);
+  const held = [1, 2, 3].map(message);
+  assert.deepEqual(ids(helpers.mergeWebSocketMessages(held, [3, 4, 5].map(message), 10)), [1, 2, 3, 4, 5]);
+  assert.deepEqual(ids(helpers.mergeWebSocketMessages(held, [4, 5, 6].map(message), 4)), [3, 4, 5, 6]);
+});

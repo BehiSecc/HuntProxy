@@ -53,4 +53,4 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
   CMD curl --fail --silent http://127.0.0.1:17890/api/v1/health >/dev/null || exit 1
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "HuntProxy"]
-CMD ["serve", "--foreground"]
+CMD ["serve"]
