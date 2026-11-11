@@ -12,6 +12,7 @@ use rusqlite::types::Value;
 use rusqlite::{Transaction, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use time::{Duration, OffsetDateTime};
 
 pub(crate) const EXCHANGE_ACCOUNTING_OVERHEAD: u64 = 512;
 pub(crate) const HEADER_ACCOUNTING_OVERHEAD: u64 = 64;
@@ -885,6 +886,16 @@ pub fn insert_exchange_conn(
     insert_exchange_record_conn(conn, ex, request_body, response_body)
 }
 
+/// Exchanges are saved when capture finishes, so the real start is the save
+/// time minus the measured duration (the save time when the duration is unknown).
+fn exchange_started_at(duration_ms: Option<i64>) -> String {
+    let started =
+        OffsetDateTime::now_utc() - Duration::milliseconds(duration_ms.unwrap_or(0).max(0));
+    started
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now_rfc3339())
+}
+
 fn insert_exchange_record_conn(
     conn: &rusqlite::Connection,
     ex: NewExchange,
@@ -898,7 +909,7 @@ fn insert_exchange_record_conn(
         response_body.as_ref().map(|body| body.original_length),
     )?;
     let exchange_id = alloc_exchange_id(conn, ex.project_id)?;
-    let started = now_rfc3339();
+    let started = exchange_started_at(ex.duration_ms);
     let (req_body_id, req_hash, req_len) = match request_body {
         Some(stored) => (
             Some(stored.id.get()),
@@ -1415,6 +1426,41 @@ mod tests {
             page_title: None,
             error_message: None,
         }
+    }
+
+    #[tokio::test]
+    async fn started_at_is_save_time_minus_duration() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "started".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let mut slow = spool_exchange(project.id);
+        slow.duration_ms = Some(90_000);
+        let mut unknown = spool_exchange(project.id);
+        unknown.duration_ms = None;
+        let before = OffsetDateTime::now_utc();
+        db.insert_exchange(slow).await.unwrap();
+        db.insert_exchange(unknown).await.unwrap();
+        let after = OffsetDateTime::now_utc();
+
+        let (items, _) = db.list_history(project.id, 10, None, None).await.unwrap();
+        let started = |id: i64| {
+            items
+                .iter()
+                .find(|item| item.exchange_id.get() == id)
+                .unwrap()
+                .started_at
+        };
+        assert!(started(1) <= after - Duration::seconds(89));
+        assert!(started(1) >= before - Duration::seconds(91));
+        assert!(started(2) >= before - Duration::seconds(1) && started(2) <= after);
+        // History is ordered by real start, so the long request sorts first-seen last.
+        assert_eq!(items[0].exchange_id.get(), 2);
     }
 
     #[tokio::test]

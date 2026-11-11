@@ -65,6 +65,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "016_project_upstream_proxies",
         include_str!("../../migrations/016_project_upstream_proxies.sql"),
     ),
+    (
+        "017_capture_token_lookup",
+        include_str!("../../migrations/017_capture_token_lookup.sql"),
+    ),
 ];
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {
