@@ -724,8 +724,6 @@ pub struct ActionResult {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserActionContext>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
 }
 
 /// Result of a bounded, host-owned cross-site navigation template. Secret
@@ -1620,7 +1618,6 @@ impl BrowserService {
             "url": url,
             "proxy": {
                 "server": self.proxy_server.clone(),
-                "bearer_token": token.clone(),
                 "username": PROXY_BASIC_USER,
                 "password": token,
             },
@@ -2520,7 +2517,6 @@ impl BrowserService {
                 message: "session closed".into(),
                 data: None,
                 browser: None,
-                error_code: None,
             });
         }
         let operation_lock = self.session_operation_lock(session_id).await;
@@ -2689,10 +2685,6 @@ impl BrowserService {
                         format!("invalid browser action context: {error}"),
                     )
                 })?,
-            error_code: result
-                .get("error_code")
-                .and_then(Value::as_str)
-                .map(str::to_string),
         })
     }
 

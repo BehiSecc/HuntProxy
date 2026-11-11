@@ -2009,26 +2009,21 @@ async function executeAction(session, action = {}) {
     case "navigate": {
       const response = await navigateWithProxyCheck(page, () => page.goto(action.url, {
         waitUntil: "domcontentloaded",
-        timeout: action.timeout_ms || 30_000,
+        timeout: 30_000,
       }));
       await reconcileCurrentOriginStorage(session);
       return { message: "navigation completed", data: { url: page.url(), status: response?.status() ?? null } };
     }
     case "snapshot": {
-      let content;
-      if (action.format === "dom") {
-        content = await page.content();
-      } else if (typeof page.locator("body").ariaSnapshot === "function") {
-        content = await page.locator("body").ariaSnapshot();
-      } else {
-        content = await page.content();
-      }
+      // Anything but "dom" is the accessibility tree; report the format produced.
+      const format = action.format === "dom" ? "dom" : "accessibility";
+      const content = format === "dom" ? await page.content() : await page.locator("body").ariaSnapshot();
       const maxBytes = Math.max(0, Math.min(Number(action.max_bytes || 200_000), 2_000_000));
       const bytes = Buffer.from(String(content), "utf8");
       return {
         message: "snapshot captured",
         data: {
-          format: action.format || "accessibility",
+          format,
           content: bytes.subarray(0, maxBytes).toString("utf8"),
           truncated: bytes.length > maxBytes,
           total_bytes: bytes.length,
@@ -2190,7 +2185,7 @@ async function handle(req) {
           if (params.url && params.url !== "about:blank") {
             await navigateWithProxyCheck(session.page, () => session.page.goto(params.url, {
               waitUntil: "domcontentloaded",
-              timeout: params.timeout_ms || 30_000,
+              timeout: 30_000,
             }));
             await reconcileCurrentOriginStorage(session);
           }
