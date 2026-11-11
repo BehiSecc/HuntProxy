@@ -84,17 +84,12 @@ pub fn inspect(config: &Config) -> Option<PreparedInstallation> {
     let worker_path = config
         .browser_worker_path
         .clone()
-        .or_else(|| {
-            std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH")
-                .or_else(|| std::env::var_os("BB_BROWSER_WORKER_PATH"))
-                .map(PathBuf::from)
-        })
+        .or_else(|| std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH").map(PathBuf::from))
         .or_else(|| marker_path("worker"))
         .filter(|path| path.is_file())?
         .canonicalize()
         .ok()?;
     let explicit_playwright = std::env::var_os("HUNTPROXY_PLAYWRIGHT_CORE_PATH")
-        .or_else(|| std::env::var_os("BB_PLAYWRIGHT_CORE_PATH"))
         .map(PathBuf::from)
         .or_else(|| config.browser_playwright_core_path.clone());
     let playwright_core_path = explicit_playwright.clone().unwrap_or_else(|| {
@@ -108,7 +103,6 @@ pub fn inspect(config: &Config) -> Option<PreparedInstallation> {
     let playwright_core_path = playwright_core_path.canonicalize().ok()?;
     let explicit_chromium = [
         "HUNTPROXY_CHROME_EXECUTABLE",
-        "BB_CHROME_EXECUTABLE",
         "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
     ]
     .into_iter()
@@ -280,11 +274,10 @@ async fn acquire_installation_lock(config: &Config) -> DomainResult<Installation
 }
 
 fn prepare_worker(config: &Config) -> DomainResult<PathBuf> {
-    let explicit = config.browser_worker_path.clone().or_else(|| {
-        std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH")
-            .or_else(|| std::env::var_os("BB_BROWSER_WORKER_PATH"))
-            .map(PathBuf::from)
-    });
+    let explicit = config
+        .browser_worker_path
+        .clone()
+        .or_else(|| std::env::var_os("HUNTPROXY_BROWSER_WORKER_PATH").map(PathBuf::from));
     if let Some(path) = explicit {
         return canonical_regular_file(&path, "configured browser worker");
     }
@@ -329,7 +322,6 @@ fn prepare_websocket_dependency(worker_directory: &Path) -> DomainResult<()> {
 
 fn prepare_playwright(config: &Config) -> DomainResult<PathBuf> {
     if let Some(path) = std::env::var_os("HUNTPROXY_PLAYWRIGHT_CORE_PATH")
-        .or_else(|| std::env::var_os("BB_PLAYWRIGHT_CORE_PATH"))
         .map(PathBuf::from)
         .or_else(|| config.browser_playwright_core_path.clone())
     {
@@ -681,7 +673,6 @@ async fn prepare_chromium(
 ) -> DomainResult<PathBuf> {
     for name in [
         "HUNTPROXY_CHROME_EXECUTABLE",
-        "BB_CHROME_EXECUTABLE",
         "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
     ] {
         if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
