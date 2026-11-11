@@ -51,6 +51,10 @@ pub struct RawHttp1Options {
     /// established but before any request byte is written.
     #[serde(skip)]
     pub start_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+    /// Internal per-request response cap used by grouped sends to share one
+    /// aggregate budget. It can only lower the project limit.
+    #[serde(skip)]
+    pub response_cap_bytes: Option<u64>,
 }
 
 impl Default for RawHttp1Options {
@@ -66,6 +70,7 @@ impl Default for RawHttp1Options {
             idle_timeout_ms: 1_000,
             release_barrier: None,
             start_barrier: None,
+            response_cap_bytes: None,
         }
     }
 }
@@ -241,7 +246,10 @@ impl ReplyService {
             stream = connect_tls(stream, &target.host).await?;
         }
         wait_for_start_barrier(options.start_barrier.as_ref()).await?;
-        let response_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
+        let project_response_cap = project.limits.max_body_bytes.saturating_add(64 * 1024);
+        let response_cap = options
+            .response_cap_bytes
+            .map_or(project_response_cap, |cap| cap.min(project_response_cap));
         let response_to_head = parse_request_method(&request_bytes)
             .is_some_and(|method| method.eq_ignore_ascii_case("HEAD"));
         let read = write_and_read_raw_request(

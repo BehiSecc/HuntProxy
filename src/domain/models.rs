@@ -277,6 +277,72 @@ pub struct ReplyDraft {
     pub credential_mode: ReplyCredentialMode,
 }
 
+/// Keys a request-supplied `draft` may carry. Stored drafts (reply revisions,
+/// bundles) are deliberately not held to this list so old data keeps loading.
+const REPLY_DRAFT_REQUEST_FIELDS: &[&str] = &[
+    "method",
+    "url",
+    "identity",
+    "header_overrides",
+    "header_tombstones",
+    "inheritance",
+    "body_override",
+    "body_text",
+    "body_json",
+    "body_format",
+    "body_params",
+    "body_cleared",
+];
+
+/// Rejects unknown keys in a request-supplied reply draft instead of letting
+/// serde drop them and send a request without the caller's intent.
+pub fn validate_reply_draft_request(value: &serde_json::Value) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for key in object.keys() {
+        if REPLY_DRAFT_REQUEST_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        let hint = match key.as_str() {
+            "headers" | "header" => " (use `header_overrides`: [{\"name\", \"value\"}])",
+            "body" => " (use `body_text`, `body_json`, or `body_params`)",
+            _ => "",
+        };
+        return Err(format!(
+            "unknown field `{key}` in draft{hint}; allowed fields: {}",
+            REPLY_DRAFT_REQUEST_FIELDS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Deserializes a request-supplied draft and rejects unknown keys.
+pub fn deserialize_reply_draft_request<'de, D>(deserializer: D) -> Result<ReplyDraft, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    validate_reply_draft_request(&value).map_err(serde::de::Error::custom)?;
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+/// Optional variant of [`deserialize_reply_draft_request`].
+pub fn deserialize_optional_reply_draft_request<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReplyDraft>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    validate_reply_draft_request(&value).map_err(serde::de::Error::custom)?;
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReplyIdentity {
@@ -494,4 +560,50 @@ pub struct CreateProjectRequest {
     pub target_url: String,
     #[serde(default)]
     pub advanced: Option<ScopePolicy>,
+}
+
+#[cfg(test)]
+mod reply_draft_request_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_validation_rejects_unknown_keys_with_hints() {
+        let error = validate_reply_draft_request(&json!({"headers": []})).unwrap_err();
+        assert!(error.contains("header_overrides"), "{error}");
+        let error = validate_reply_draft_request(&json!({"body": "x"})).unwrap_err();
+        assert!(error.contains("body_text"), "{error}");
+        let error = validate_reply_draft_request(&json!({"credential_mode": "x"})).unwrap_err();
+        assert!(error.contains("credential_mode"), "{error}");
+        validate_reply_draft_request(&json!({"url": "https://example.test/", "body_json": {}}))
+            .unwrap();
+    }
+
+    #[test]
+    fn deserializer_helpers_reject_unknown_keys_but_stored_drafts_still_load() {
+        #[derive(Deserialize)]
+        struct Request {
+            #[serde(deserialize_with = "deserialize_reply_draft_request")]
+            draft: ReplyDraft,
+            #[serde(default, deserialize_with = "deserialize_optional_reply_draft_request")]
+            maybe: Option<ReplyDraft>,
+        }
+        let error = serde_json::from_value::<Request>(json!({"draft": {"headers": []}}))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("header_overrides"));
+        let error = serde_json::from_value::<Request>(json!({"draft": {}, "maybe": {"body": 1}}))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("body_text"));
+        let ok = serde_json::from_value::<Request>(json!({"draft": {"method": "GET"}})).unwrap();
+        assert_eq!(ok.draft.method.as_deref(), Some("GET"));
+        assert!(ok.maybe.is_none());
+
+        // Stored data written by older versions may carry keys this version does
+        // not know; it must keep loading.
+        let stored: ReplyDraft =
+            serde_json::from_value(json!({"method": "GET", "legacy_field": true})).unwrap();
+        assert_eq!(stored.method.as_deref(), Some("GET"));
+    }
 }

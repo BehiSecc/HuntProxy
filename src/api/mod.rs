@@ -1665,6 +1665,7 @@ struct UpsertTab {
     name: String,
     base_exchange_id: Option<i64>,
     protocol: Option<String>,
+    #[serde(deserialize_with = "deserialize_reply_draft_request")]
     draft: ReplyDraft,
     revision: Option<i64>,
 }
@@ -1702,6 +1703,7 @@ async fn upsert_reply_tab(
 struct ReplySendBody {
     tab_id: Option<i64>,
     base_exchange_id: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_reply_draft_request")]
     draft: Option<ReplyDraft>,
     protocol: Option<String>,
     upstream_proxy: Option<String>,
@@ -1839,8 +1841,21 @@ async fn list_fuzz_jobs(State(state): State<Arc<AppState>>, Path(id): Path<i64>)
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartFuzzBody {
+    #[serde(deserialize_with = "deserialize_fuzz_template_request")]
     template: FuzzTemplate,
     confirm: Option<bool>,
+}
+
+/// Rejects unknown keys inside `template.draft` before they are silently dropped.
+fn deserialize_fuzz_template_request<'de, D>(deserializer: D) -> Result<FuzzTemplate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(draft) = value.get("draft") {
+        validate_reply_draft_request(draft).map_err(serde::de::Error::custom)?;
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 async fn start_fuzz(
@@ -2408,6 +2423,44 @@ mod tests {
     fn request_supplied_config_values_are_bad_requests() {
         let error = DomainError::new(ErrorCode::ConfigInvalid, "invalid upstream proxy URL");
         assert_eq!(status_for_error(&error), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn request_drafts_with_unknown_fields_are_rejected() {
+        let tab = |draft: serde_json::Value| {
+            serde_json::from_value::<UpsertTab>(serde_json::json!({"name": "t", "draft": draft}))
+        };
+        assert!(tab(serde_json::json!({"headers": []}))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("header_overrides"));
+        assert!(tab(serde_json::json!({"url": "https://example.test/"})).is_ok());
+
+        let send = |draft: serde_json::Value| {
+            serde_json::from_value::<ReplySendBody>(serde_json::json!({"draft": draft}))
+        };
+        assert!(send(serde_json::json!({"body": "x"}))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("body_text"));
+        assert!(send(serde_json::json!({"body_text": "x"})).is_ok());
+        assert!(serde_json::from_value::<ReplySendBody>(serde_json::json!({"tab_id": 1})).is_ok());
+
+        let fuzz = |draft: serde_json::Value| {
+            serde_json::from_value::<StartFuzzBody>(serde_json::json!({"template": {
+                "draft": draft,
+                "insertion_points": [{"name": "a", "location": "url"}],
+                "wordlists": [["x"]],
+            }}))
+        };
+        assert!(fuzz(serde_json::json!({"headers": []}))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("header_overrides"));
+        assert!(fuzz(serde_json::json!({"url": "https://example.test/§a§"})).is_ok());
     }
 
     #[test]

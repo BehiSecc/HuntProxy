@@ -724,7 +724,7 @@ pub async fn set_project_cookie(
         .browser
         .apply_cookie_profile(project_id, previous.as_ref(), &stored)
         .await?;
-    let _ = state
+    state
         .db
         .audit(
             Some(project_id),
@@ -734,7 +734,7 @@ pub async fn set_project_cookie(
             Some(&status.host),
             serde_json::json!({ "cookie_count": status.cookie_count }),
         )
-        .await;
+        .await?;
     Ok(CookieMutationResult {
         profile: status,
         active_browser_sessions_updated,
@@ -758,7 +758,7 @@ pub async fn clear_project_cookie(
         .browser
         .clear_cookie_profile(project_id, &stored)
         .await?;
-    let _ = state
+    state
         .db
         .audit(
             Some(project_id),
@@ -768,7 +768,7 @@ pub async fn clear_project_cookie(
             Some(&status.host),
             serde_json::json!({ "cookie_count": status.cookie_count }),
         )
-        .await;
+        .await?;
     Ok(Some(CookieMutationResult {
         profile: status,
         active_browser_sessions_updated,

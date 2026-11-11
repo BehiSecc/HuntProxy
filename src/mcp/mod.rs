@@ -36,18 +36,17 @@ trait ToolBackend: Send + Sync {
     }
 }
 
+/// In-process backend used by tests to compare against the daemon bridge.
+#[cfg(test)]
 struct LocalToolBackend {
     state: Arc<AppState>,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl ToolBackend for LocalToolBackend {
     async fn call(&self, name: &str, args: Value) -> DomainResult<Value> {
         call_tool(self.state.clone(), name, args).await
-    }
-
-    async fn definitions(&self) -> Value {
-        local_tool_defs()
     }
 }
 
@@ -146,12 +145,7 @@ impl ToolBackend for DaemonToolBackend {
         // Recover before sending a new operation. Never retry a tool after it
         // was dispatched: a lost response may still represent a completed send.
         crate::app::ensure_daemon(&self.config).await?;
-        let armed_stop_guard = name == "huntproxy_stop";
-        if armed_stop_guard {
-            arm_stop_guard(&self.config)?;
-        }
-        let result = call_daemon_tool(&self.config, name, args).await;
-        result
+        call_daemon_tool_guarded(&self.config, name, args).await
     }
 
     async fn definitions(&self) -> Value {
@@ -187,6 +181,20 @@ impl ToolBackend for DaemonToolBackend {
     fn supports_list_changed(&self) -> bool {
         true
     }
+}
+
+/// Arms the stop guard around `huntproxy_stop` and disarms it again when the
+/// call fails, so a failed stop cannot leave this client blocked.
+async fn call_daemon_tool_guarded(config: &Config, name: &str, args: Value) -> DomainResult<Value> {
+    let armed_stop_guard = name == "huntproxy_stop";
+    if armed_stop_guard {
+        arm_stop_guard(config)?;
+    }
+    let result = call_daemon_tool(config, name, args).await;
+    if armed_stop_guard && result.is_err() {
+        clear_stop_guard(config);
+    }
+    result
 }
 
 fn is_lifecycle_tool(name: &str) -> bool {
@@ -499,7 +507,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set requires target_url and exactly one of cookie or file_path; clear requires target_url unless profile_name is supplied. Set accepts a raw Cookie header, a browser-export JSON cookie array, or a session object {\"cookies\":[...],\"origins\":[{\"origin\":\"https://app.example\",\"localStorage\":[{\"name\",\"value\"}],\"sessionStorage\":[{\"name\",\"value\"}]}]} (Playwright storageState plus optional per-origin sessionStorage; cookies may be empty). Origins must be exact http(s) origins without a path, and storage requires profile_name (project cookies have no browser to seed). Input up to 4 MiB. list reports only an origin_count, never keys or values. Project cookies apply to HTTP tools and ephemeral sessions. Persistent browser jars change only with an explicit browser_start(cookie_profile=...). profile_name stores a reusable named cookie identity for extensions or browser_start(cookie_profile=...) without changing an already running browser.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Optional reusable identity name. Pass the same name as browser_start.cookie_profile to seed a persistent Chromium profile."},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array or session object."},{"type":"object","description":"Session object: cookies plus per-origin localStorage/sessionStorage. Requires profile_name when origins are present.","properties":{"cookies":{"type":"array","items":{"type":"object"}},"origins":{"type":"array","items":{"type":"object","properties":{"origin":{"type":"string"},"localStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}},"sessionStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}}},"required":["origin"]}}}},{"type":"array","description":"Browser-export or Playwright cookie array.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"path":{"type":"string"},"httpOnly":{"type":"boolean"},"secure":{"type":"boolean"},"sameSite":{"type":"string"},"session":{"type":"boolean"},"expirationDate":{"type":"number"},"expires":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file (up to 4 MiB) containing a raw Cookie header, JSON cookie array, or session object with cookies and origins."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
         {"name":"overview","description":"Summarize one project's saved activity: total exchanges and counts by source, captured replies sent, findings, distinct hosts, and last exchange time.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Comparisons attach directly to the field: status>=400 or time>2026-10-12T00:00:00Z. Supports AND/OR/NOT, parentheses, and quoted values. Query errors return repair guidance; correct q before retrying. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms. Search results identify exchanges but do not include full body content; use exchange_body with the matching exchange_id to read request or response bytes.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the saved format for precise cutoffs. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Bare words search summary fields. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Comparisons attach directly to the field: status>=400 or time>2026-10-12T00:00:00Z. Supports AND/OR/NOT, parentheses, and quoted values. Query errors return repair guidance; correct q before retrying. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms. Search results identify exchanges but do not include full body content; use exchange_body with the matching exchange_id to read request or response bytes.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the saved format for precise cutoffs. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Bare words search summary fields. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"description":"Pass the `next` value from the previous history_search result to fetch the following page.","oneOf":[{"type":"array","items":{"type":["string","integer"]},"minItems":2,"maxItems":2},{"type":"string"},{"type":"null"}]}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Discover saved routes without oversized responses. Omit host for a lightweight list of hosts and route counts. Provide one exact host for its detailed route tree, optionally limited to a path subtree.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive. Omit for host summaries."},"path_prefix":{"type":"string","description":"Optional slash-boundary path subtree, such as /api. Requires host."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
@@ -530,25 +538,6 @@ pub(crate) fn tool_defs() -> Value {
     ])
 }
 
-fn local_tool_defs() -> Value {
-    let mut definitions = tool_defs();
-    if let Some(tools) = definitions.as_array_mut() {
-        tools.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("huntproxy_restart"));
-        if let Some(stop) = tools
-            .iter_mut()
-            .find(|tool| tool["name"] == "huntproxy_stop")
-        {
-            stop["description"] = json!("Gracefully stop HuntProxy and all managed browsers. The in-process MCP server cannot restart itself; reconnect to continue. Use only when the user explicitly asks to stop HuntProxy.");
-        }
-    }
-    definitions
-}
-
-pub async fn run_stdio_mcp(state: Arc<AppState>) -> DomainResult<()> {
-    let idle_timeout = std::time::Duration::from_secs(state.config.idle_timeout_seconds);
-    run_stdio_backend(Arc::new(LocalToolBackend { state }), idle_timeout).await
-}
-
 /// Run the stdio MCP adapter as a thin client of the single daemon owner.
 pub async fn run_stdio_mcp_client(config: Config) -> DomainResult<()> {
     // The inexpensive bridge must outlive an idle/stopped daemon so restart
@@ -558,10 +547,6 @@ pub async fn run_stdio_mcp_client(config: Config) -> DomainResult<()> {
         std::time::Duration::ZERO,
     )
     .await
-}
-
-pub async fn run_stdio(state: Arc<AppState>) -> DomainResult<()> {
-    run_stdio_mcp(state).await
 }
 
 async fn run_stdio_backend(
@@ -616,8 +601,21 @@ async fn run_stdio_backend(
         let Some(line) = next_line else {
             break;
         };
-        let line =
-            line.map_err(|e| DomainError::new(ErrorCode::ProtocolError, format!("stdin: {e}")))?;
+        let line = match line {
+            Ok(line) => line,
+            // A line that is not valid UTF-8 is a malformed message, not a
+            // broken pipe: answer with a parse error and keep serving.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                write_response(parse_error_response(&e));
+                continue;
+            }
+            Err(e) => {
+                return Err(DomainError::new(
+                    ErrorCode::ProtocolError,
+                    format!("stdin: {e}"),
+                ))
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -625,48 +623,16 @@ async fn run_stdio_backend(
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
-                write_response(JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id: None,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("parse error: {e}"),
-                        data: None,
-                    }),
-                });
+                write_response(parse_error_response(&e));
                 continue;
             }
         };
-        let id = req.id.clone();
         if req.method == "initialize" {
             // Establish a catalog baseline before notifications become legal.
             let _ = backend.definitions().await;
         }
-        match handle_rpc(backend.clone(), &req).await {
-            Ok(Some(value)) => {
-                write_response(JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(value),
-                    error: None,
-                });
-            }
-            Ok(None) => {}
-            Err(e) => write_response(JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: match e.code() {
-                        ErrorCode::InvalidArgument => -32602,
-                        ErrorCode::NotFound => -32001,
-                        _ => -32000,
-                    },
-                    message: e.to_string(),
-                    data: Some(json!({ "code": e.code().as_str() })),
-                }),
-            }),
+        if let Some(response) = dispatch_rpc(backend.clone(), &req).await {
+            write_response(response);
         }
         if matches!(
             req.method.as_str(),
@@ -679,6 +645,90 @@ async fn run_stdio_backend(
         }
     }
     Ok(())
+}
+
+fn rpc_error_response(id: Option<Value>, code: i32, message: String) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code,
+            message,
+            data: None,
+        }),
+    }
+}
+
+fn parse_error_response(error: &dyn std::fmt::Display) -> JsonRpcResponse {
+    rpc_error_response(None, -32700, format!("parse error: {error}"))
+}
+
+fn is_known_method(method: &str) -> bool {
+    matches!(method, "initialize" | "ping" | "tools/list" | "tools/call")
+        || is_notification_method(method)
+}
+
+fn is_notification_method(method: &str) -> bool {
+    method == "initialized" || method.starts_with("notifications/")
+}
+
+/// Runs one decoded message and returns the response to write, if any.
+/// Messages without an id are notifications and never get a response; they
+/// are not executed unless they are known notification methods.
+async fn dispatch_rpc(
+    backend: Arc<dyn ToolBackend>,
+    req: &JsonRpcRequest,
+) -> Option<JsonRpcResponse> {
+    let Some(id) = req.id.clone() else {
+        if is_notification_method(&req.method) {
+            if let Err(error) = handle_rpc(backend, req).await {
+                eprintln!("HuntProxy mcp: notification {} failed: {error}", req.method);
+            }
+        } else {
+            eprintln!(
+                "HuntProxy mcp: ignoring request {} without an id",
+                req.method
+            );
+        }
+        return None;
+    };
+    if !is_known_method(&req.method) {
+        return Some(rpc_error_response(
+            Some(id),
+            -32601,
+            format!("method not found: {}", req.method),
+        ));
+    }
+    Some(match handle_rpc(backend, req).await {
+        Ok(Some(value)) => JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: Some(id),
+            result: Some(value),
+            error: None,
+        },
+        // A request with an id always gets exactly one response.
+        Ok(None) => JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: Some(id),
+            result: Some(json!({})),
+            error: None,
+        },
+        Err(e) => JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: Some(id),
+            result: None,
+            error: Some(JsonRpcError {
+                code: match e.code() {
+                    ErrorCode::InvalidArgument => -32602,
+                    ErrorCode::NotFound => -32001,
+                    _ => -32000,
+                },
+                message: e.to_string(),
+                data: Some(json!({ "code": e.code().as_str() })),
+            }),
+        },
+    })
 }
 
 fn write_response(resp: JsonRpcResponse) {
@@ -841,7 +891,7 @@ async fn handle_rpc(
             "capabilities": { "tools": { "listChanged": backend.supports_list_changed() } },
             "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
         }))),
-        "notifications/initialized" | "initialized" => Ok(None),
+        method if is_notification_method(method) => Ok(None),
         "ping" => Ok(Some(json!({}))),
         "tools/list" => Ok(Some(json!({ "tools": backend.definitions().await }))),
         "tools/call" => {
@@ -865,6 +915,44 @@ async fn handle_rpc(
             Ok(Some(tool_call_result(name, result, is_error)))
         }
         other => Err(DomainError::invalid(format!("unknown method {other}"))),
+    }
+}
+
+/// Parses a request-supplied `draft`, rejecting unknown keys so fields such as
+/// `headers` or `body` are never silently dropped from the sent request.
+fn parse_request_draft(draft: Option<&Value>) -> DomainResult<ReplyDraft> {
+    let Some(draft) = draft else {
+        return Ok(ReplyDraft::default());
+    };
+    validate_reply_draft_request(draft).map_err(DomainError::invalid)?;
+    serde_json::from_value(draft.clone()).map_err(|e| DomainError::invalid(e.to_string()))
+}
+
+/// Accepts the `next` value returned by history_search (`[started_at, id]`),
+/// or the HTTP API's `started_at:id` string form.
+fn parse_history_cursor(cursor: Option<&Value>) -> DomainResult<(Option<String>, Option<i64>)> {
+    let invalid = || {
+        DomainError::invalid(
+            "history_search cursor must be the `next` value from the previous page",
+        )
+    };
+    match cursor {
+        None | Some(Value::Null) => Ok((None, None)),
+        Some(Value::Array(parts)) => match parts.as_slice() {
+            [Value::String(started_at), Value::Number(id)] => Ok((
+                Some(started_at.clone()),
+                Some(id.as_i64().ok_or_else(invalid)?),
+            )),
+            _ => Err(invalid()),
+        },
+        Some(Value::String(text)) => {
+            let (started_at, id) = text.rsplit_once(':').ok_or_else(invalid)?;
+            Ok((
+                Some(started_at.to_string()),
+                Some(id.parse::<i64>().map_err(|_| invalid())?),
+            ))
+        }
+        Some(_) => Err(invalid()),
     }
 }
 
@@ -1553,9 +1641,10 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(|v| v.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 500) as u32;
+            let (before_started, before_id) = parse_history_cursor(args.get("cursor"))?;
             let (items, next) = state
                 .db
-                .list_history_filtered(project_id, filter, limit, None, None)
+                .list_history_filtered(project_id, filter, limit, before_started, before_id)
                 .await?;
             Ok(json!({
                 "items": items,
@@ -1888,7 +1977,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             )
             .await?;
             if include_secrets {
-                let _ = state
+                // Fail closed: secrets are only returned once the reveal is audited.
+                state
                     .db
                     .audit(
                         Some(project_id),
@@ -1898,7 +1988,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         Some(&exchange_id.get().to_string()),
                         json!({ "format": format }),
                     )
-                    .await;
+                    .await?;
             }
             Ok(json!(result))
         }
@@ -2010,7 +2100,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .find(|h| h.name.eq_ignore_ascii_case(&header))
                 .map(|h| String::from_utf8_lossy(&h.value).into_owned())
                 .ok_or_else(|| DomainError::not_found("header"))?;
-            let _ = state
+            // Fail closed: the secret is only returned once the reveal is audited.
+            state
                 .db
                 .audit(
                     Some(project_id),
@@ -2020,7 +2111,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Some(&format!("{}/{}", eid, header.to_ascii_lowercase())),
                     json!({ "side": match side { MessageSide::Request => "request", MessageSide::Response => "response" } }),
                 )
-                .await;
+                .await?;
             Ok(json!({ "header": header, "value": value }))
         }
         "reply_tabs" => {
@@ -2046,13 +2137,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .get("base_exchange_id")
                         .and_then(|v| v.as_i64())
                         .map(ExchangeId);
-                    let draft: ReplyDraft = args
-                        .get("draft")
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .map_err(|e| DomainError::invalid(e.to_string()))?
-                        .unwrap_or_default();
+                    let draft = parse_request_draft(args.get("draft"))?;
                     Ok(json!(
                         state
                             .db
@@ -2091,13 +2176,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     )));
                 }
             }
-            let draft: ReplyDraft = args
-                .get("draft")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|e| DomainError::invalid(e.to_string()))?
-                .unwrap_or_default();
+            let draft = parse_request_draft(args.get("draft"))?;
             let protocol = match args.get("protocol").and_then(Value::as_str) {
                 Some("h1") => ProtocolPreference::H1,
                 Some("h2") => ProtocolPreference::H2,
@@ -2197,12 +2276,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "put request field `identity` under `template.draft`",
                 ));
             }
-            let template: FuzzTemplate = serde_json::from_value(
-                args.get("template")
-                    .cloned()
-                    .ok_or_else(|| DomainError::invalid("template required"))?,
-            )
-            .map_err(|e| DomainError::invalid(e.to_string()))?;
+            let template = args
+                .get("template")
+                .cloned()
+                .ok_or_else(|| DomainError::invalid("template required"))?;
+            if let Some(draft) = template.get("draft") {
+                validate_reply_draft_request(draft).map_err(DomainError::invalid)?;
+            }
+            let template: FuzzTemplate = serde_json::from_value(template)
+                .map_err(|e| DomainError::invalid(e.to_string()))?;
             let confirm = args
                 .get("confirm_large")
                 .and_then(|v| v.as_bool())
@@ -3544,26 +3626,6 @@ mod tests {
     }
 
     #[test]
-    fn in_process_backend_does_not_advertise_daemon_restart() {
-        let tools = local_tool_defs();
-        assert!(!tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["name"] == "huntproxy_restart"));
-        let stop = tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "huntproxy_stop")
-            .unwrap();
-        assert!(stop["description"]
-            .as_str()
-            .unwrap()
-            .contains("cannot restart itself"));
-    }
-
-    #[test]
     fn structured_content_is_always_an_object_for_mcp_clients() {
         let object = json!({"ok": true});
         assert_eq!(object_structured_content(&object), object);
@@ -3899,5 +3961,112 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("pass the returned exchange_id to exchange_body"));
+    }
+
+    fn rpc(id: Option<Value>, method: &str) -> JsonRpcRequest {
+        JsonRpcRequest {
+            id,
+            method: method.into(),
+            params: Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn notifications_never_get_a_response_and_unknown_methods_are_not_found() {
+        let backend = || {
+            Arc::new(ErrorBackend {
+                code: ErrorCode::Internal,
+                details: None,
+            }) as Arc<dyn ToolBackend>
+        };
+        for method in [
+            "notifications/initialized",
+            "initialized",
+            "notifications/cancelled",
+            "notifications/anything/else",
+            "does/not/exist",
+            "tools/call",
+            "ping",
+        ] {
+            assert!(
+                dispatch_rpc(backend(), &rpc(None, method)).await.is_none(),
+                "{method} without an id must not be answered"
+            );
+        }
+
+        let unknown = dispatch_rpc(backend(), &rpc(Some(json!(7)), "does/not/exist"))
+            .await
+            .unwrap();
+        assert_eq!(unknown.id, Some(json!(7)));
+        assert_eq!(unknown.error.unwrap().code, -32601);
+
+        let pong = dispatch_rpc(backend(), &rpc(Some(json!("a")), "ping"))
+            .await
+            .unwrap();
+        assert_eq!(pong.result, Some(json!({})));
+    }
+
+    #[test]
+    fn invalid_utf8_input_is_a_parse_error() {
+        let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "not utf-8");
+        let response = parse_error_response(&error);
+        assert_eq!(response.error.unwrap().code, -32700);
+        assert!(response.id.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_stop_does_not_leave_the_stop_guard_armed() {
+        let directory = tempfile::tempdir().unwrap();
+        // No daemon is listening, so the stop call fails after arming the guard.
+        let config = Config {
+            data_dir: directory.path().to_path_buf(),
+            runtime_dir: directory.path().join("runtime"),
+            plugin_dir: directory.path().join("plugins"),
+            ..Config::default()
+        };
+        let error = call_daemon_tool_guarded(&config, "huntproxy_stop", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DaemonNotRunning);
+        assert!(!stop_guard_path(&config).exists());
+        assert!(!stop_guard_blocks_start(&config));
+    }
+
+    #[test]
+    fn history_cursor_accepts_the_returned_next_value() {
+        assert_eq!(parse_history_cursor(None).unwrap(), (None, None));
+        assert_eq!(
+            parse_history_cursor(Some(&Value::Null)).unwrap(),
+            (None, None)
+        );
+        let started = "2026-01-02T03:04:05.123456Z";
+        let expected = (Some(started.to_string()), Some(42));
+        assert_eq!(
+            parse_history_cursor(Some(&json!([started, 42]))).unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_history_cursor(Some(&json!(format!("{started}:42")))).unwrap(),
+            expected
+        );
+        for bad in [json!([started]), json!([1, 2]), json!("no-id"), json!(5)] {
+            assert_eq!(
+                parse_history_cursor(Some(&bad)).unwrap_err().code(),
+                ErrorCode::InvalidArgument,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_drafts_reject_unknown_fields_with_a_hint() {
+        let error = parse_request_draft(Some(&json!({"headers": []}))).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("header_overrides"));
+        let error = parse_request_draft(Some(&json!({"body": "x"}))).unwrap_err();
+        assert!(error.to_string().contains("body_text"));
+        let draft = parse_request_draft(Some(&json!({"url": "https://example.test/"}))).unwrap();
+        assert_eq!(draft.url.as_deref(), Some("https://example.test/"));
+        assert!(parse_request_draft(None).unwrap().url.is_none());
     }
 }
