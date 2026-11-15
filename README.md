@@ -258,9 +258,14 @@ Pass a query in `history_search`'s `q` argument. Keep each field, operator, and 
 | `host:example.com method:GET status>=400` | GET requests to this host with status 400 or higher |
 | `path:~"monthly report"` | Paths containing the literal phrase |
 | `request:~"monthly report"` | Request target, headers, or decoded body containing the phrase |
+| `response:~"access denied"` | Response headers or decoded body containing the phrase |
+| `query:~"page=2"` | URL query strings containing the text |
+| `url:~/api/v2/` | Full URLs (scheme, host, path, and query) containing the text |
 | `(status:200 OR status:304) NOT path:~.js` | Either status, excluding paths containing `.js` |
 | `time>2026-10-12T00:00:00Z time<=2026-10-13T00:00:00Z` | Exchanges within these timestamp bounds |
 | `duration>=1000 response_size>1024` | Duration of at least one second and response body larger than 1 KiB |
+
+Each page of rows fits one tool result; pass the returned `next` as `cursor` for the following page. When a query with several terms matches nothing, `no_match_terms` names the terms that match nothing on their own.
 
 Call `overview` with a `project_id` for exchange counts by source, captured replies sent, findings, distinct hosts, and the last exchange time.
 
