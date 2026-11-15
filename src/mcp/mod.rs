@@ -1,6 +1,7 @@
 //! Minimal stdio JSON-RPC MCP server. Protocol on stdout; diagnostics on stderr.
 
 mod budget;
+mod view;
 
 use crate::app::AppState;
 use crate::browser::BrowserAction;
