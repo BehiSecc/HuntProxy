@@ -86,7 +86,9 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
       <iframe name="legal" src="http://127.0.0.1:${widgetPort}/legal"></iframe>
       <script src="/app.js"></script>`);
   });
-  t.after(() => Promise.all([app, widget].map((server) => new Promise((resolve) => server.close(resolve)))));
+  // Hooks run in registration order, so the browser is still open here: drop
+  // its keep-alive connections, or close() waits for a browser that never goes.
+  t.after(() => Promise.all([app, widget].map((server) => new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); }))));
   const base = `http://127.0.0.1:${app.address().port}`;
   const require = createRequire(path.join(runtime.playwright_core_path, "package.json"));
   const { chromium } = require(runtime.playwright_core_path);

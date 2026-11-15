@@ -111,7 +111,8 @@ test("snapshots of a large page page exactly, scope to a locator, and actions ca
     } else response.end(form);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  // The browser is still open when this runs; see evaluate.test.js.
+  t.after(() => new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); }));
   const require = createRequire(path.join(runtime.playwright_core_path, "package.json"));
   const { chromium } = require(runtime.playwright_core_path);
   const browser = await chromium.launch({ executablePath: runtime.chromium_path, headless: true });

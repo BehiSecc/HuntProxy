@@ -147,7 +147,9 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
       <iframe name="pay" style="left:440px" src="http://localhost:${framesPort}/pay?order=7"></iframe>
       <script src="/page.js"></script>`);
   });
-  t.after(() => Promise.all([app, frames].map((server) => new Promise((resolve) => server.close(resolve)))));
+  // Hooks run in registration order, so the browser is still open here: drop
+  // its keep-alive connections, or close() waits for a browser that never goes.
+  t.after(() => Promise.all([app, frames].map((server) => new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); }))));
   const base = `http://127.0.0.1:${app.address().port}`;
   const require = createRequire(path.join(runtime.playwright_core_path, "package.json"));
   const { chromium } = require(runtime.playwright_core_path);
