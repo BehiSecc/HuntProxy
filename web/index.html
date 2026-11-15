@@ -2166,7 +2166,7 @@ test
       pointer: ['Value (unused)', '', '{"op":"click","x":100,"y":100}', 'Click, hover, or drag at a point or at the locator. Options: op click|hover|drag, x and y (omit them to use the locator), button, count, modifiers, and to_x/to_y or to_locator for drag.'],
       type: ['Text to type', 'hello', '{}', 'Send text as keystrokes to the located element, or to whatever has focus when the locator is empty.'],
       pages: ['Value (unused)', '', '{"op":"list"}', 'List, open, select, or close tabs, with the frames of each. Select and close also need page_id and runtime_generation.'],
-      events: ['Value (unused)', '', '{"after_sequence":0,"limit":50,"kinds":[],"wait_ms":0}', 'Read bounded browser events with an optional long-poll wait.'],
+      events: ['Value (unused)', '', '{"after_sequence":0,"limit":50,"kinds":[],"wait_ms":0}', 'Read bounded browser events with an optional long-poll wait. Console, page error, and dialog events include the start of their text.'],
       scroll: ['Value (unused)', '', '{"delta_y":640}', 'Scroll by a bounded delta or bring the located element into view.'],
       screenshot: ['Value (unused)', '', '{"full_page":false,"max_bytes":4194304}', 'Capture the page or located element as PNG.'],
       request: ['Same-origin URL', 'https://app.example.com/api/me', '{"method":"GET","headers":[],"timeout_ms":15000,"max_response_bytes":4096}', 'Send one normal same-origin browser request with redirects disabled.'],

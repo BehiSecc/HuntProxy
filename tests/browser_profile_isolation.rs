@@ -1608,8 +1608,9 @@ async fn verify_structured_playwright_actions(h: &Harness) {
         .unwrap();
     let dialog = &dialog_events["events"][0];
     assert_eq!(dialog["disposition"], "dismissed");
-    assert!(dialog["message_length"].as_u64().unwrap() > 0);
-    assert!(dialog.get("message").is_none());
+    // What the dialog said, which is the proof that a payload ran.
+    assert_eq!(dialog["message"], "Local fixture dialog");
+    assert_eq!(dialog["message_length"], 20);
 
     let dialog_cursor = dialog_events["latest_sequence"].as_u64().unwrap();
     h.service
@@ -2358,6 +2359,29 @@ async fn verify_native_file_selection(h: &Harness) {
     assert!(inspection["runtime_error_count"].as_u64().unwrap() >= 1);
     assert!(!inspection.to_string().contains("Local fixture diagnostic"));
     assert!(!inspection["url"].as_str().unwrap().contains('?'));
+    // Inspection stays free of page text; the events stream says what was logged.
+    let logged = h
+        .service
+        .action(
+            h.project,
+            first.id,
+            BrowserAction::Events {
+                after_sequence: 0,
+                runtime_generation: None,
+                limit: 100,
+                kinds: vec!["console".into()],
+                wait_ms: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert!(logged["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["level"] == "warning" && event["text"] == "Local fixture diagnostic"));
     let short = h
         .service
         .action(

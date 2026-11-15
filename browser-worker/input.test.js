@@ -359,5 +359,23 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     assert.equal(await read("confirm('Delete everything?')"), false);
     const [confirmed] = (await run({ type: "events", kinds: ["dialog"], after_sequence: dialogs.at(-1).sequence, runtime_generation: 1 })).data.events;
     assert.deepEqual([confirmed.dialog_type, confirmed.disposition], ["confirm", "dismissed"]);
+    // A dialog event says what the dialog said, which is the proof a payload ran.
+    assert.deepEqual([confirmed.message, confirmed.message_length], ["Delete everything?", 18]);
+    assert.equal(dialogs[0].message, undefined);
+    await read(`alert("${"x".repeat(1200)}"); 0`);
+    const [long] = (await run({ type: "events", kinds: ["dialog"], after_sequence: confirmed.sequence, runtime_generation: 1 })).data.events;
+    assert.deepEqual([long.message.length, long.message_length], [1000, 1200]);
+  });
+
+  await t.test("console and error events carry the start of their text", async () => {
+    const before = (await run({ type: "events" })).data.latest_sequence;
+    await read("console.error('token check failed', {code: 7}); console.warn('slow'); console.log('not recorded'); setTimeout(() => { throw new TypeError('late failure'); }); 0");
+    await page.waitForTimeout(300);
+    const rows = (await run({ type: "events", kinds: ["console", "page_error"], after_sequence: before, runtime_generation: 1 })).data.events;
+    assert.deepEqual(rows.map((event) => [event.kind, event.level, event.text]), [
+      ["console", "error", "token check failed {code: 7}"],
+      ["console", "warning", "slow"],
+      ["page_error", undefined, "TypeError: late failure"],
+    ]);
   });
 });
