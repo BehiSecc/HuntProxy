@@ -502,25 +502,12 @@ async function inspectRuntime(session, action) {
   result.recent_errors = (session.runtimeErrors || []).slice(-16);
   if (action.locator) {
     const locator = locatorFor(session.page, action.locator);
-    const element = await locator.elementHandle({ timeout: 10_000 });
-    const elementConnection = await session.context.newCDPSession(session.page);
-    let termination;
-    const timer = setTimeout(() => {
-      termination = elementConnection.send("Runtime.terminateExecution").catch(() => undefined);
-    }, 1000);
-    try {
-      result.element = await element.evaluate((element) => ({
-        tag: element.tagName.toLowerCase(), role: element.getAttribute("role"),
-        type: element.getAttribute("type"), disabled: Boolean(element.disabled),
-        read_only: Boolean(element.readOnly), checked: typeof element.checked === "boolean" ? element.checked : null,
-        file_count: element.files?.length ?? null,
-      }));
-    } finally {
-      clearTimeout(timer);
-      if (termination) await termination;
-      await element.dispose().catch(() => undefined);
-      await elementConnection.detach().catch(() => undefined);
-    }
+    result.element = await evaluateElement(session, session.page, locator, (element) => ({
+      tag: element.tagName.toLowerCase(), role: element.getAttribute("role"),
+      type: element.getAttribute("type"), disabled: Boolean(element.disabled),
+      read_only: Boolean(element.readOnly), checked: typeof element.checked === "boolean" ? element.checked : null,
+      file_count: element.files?.length ?? null,
+    }), 10_000);
     result.element.visible = await locator.isVisible();
     result.element.enabled = await locator.isEnabled({ timeout: 10_000 });
   }
@@ -1735,7 +1722,7 @@ async function performPages(session, action) {
 async function performEvents(session, action) {
   const { after, matching } = eventQuery(session, action);
   await drainWindowMessages(session);
-  const events = matching();
+  const events = matching().map(compactEvent);
   const oldestSequence = session.events[0]?.event.sequence ?? session.eventSequence + 1;
   return { message: "browser events read", data: {
     runtime_generation: session.runtimeGeneration,
@@ -1751,6 +1738,18 @@ async function performEvents(session, action) {
         page_id: pageIdFor(session, page), observer: "window_message", operation: state.error,
       })),
   } };
+}
+
+// An event row without null or empty members. Every row belongs to the
+// runtime_generation reported beside the rows, so it is not repeated.
+function compactEvent(event) {
+  const row = {};
+  for (const [key, value] of Object.entries(event)) {
+    if (key === "runtime_generation" || value == null || value === "") continue;
+    if (typeof value === "object" && !Object.keys(value).length) continue;
+    row[key] = value;
+  }
+  return row;
 }
 
 function eventQuery(session, action) {
@@ -2032,12 +2031,115 @@ async function navigateWithProxyCheck(page, operation) {
   }
 }
 
+// The MCP output budget. HuntProxy cuts the final result to fit exactly; a
+// larger slice could never be returned, so the worker never sends one.
+const MAX_SNAPSHOT_BYTES = 24_000;
+
+// Runs a fixed HuntProxy function on the element `locator` resolves to. Page
+// code can redefine DOM getters to never return, so the evaluation is
+// terminated after one second.
+async function evaluateElement(session, page, locator, fn, timeout) {
+  const element = await locator.elementHandle({ timeout });
+  const connection = await session.context.newCDPSession(page);
+  let termination;
+  const timer = setTimeout(() => {
+    termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
+  }, 1000);
+  try {
+    return await element.evaluate(fn);
+  } finally {
+    clearTimeout(timer);
+    if (termination) await termination;
+    await element.dispose().catch(() => undefined);
+    await connection.detach().catch(() => undefined);
+  }
+}
+
+// The UTF-8 bytes of `content` from `offset`, at most `maxBytes` of them, cut
+// on character boundaries. `next_offset` continues exactly where this ends.
+function snapshotSlice(content, offset, maxBytes) {
+  const bytes = Buffer.from(String(content), "utf8");
+  const continuation = (index) => index < bytes.length && (bytes[index] & 0xc0) === 0x80;
+  let start = Math.min(offset, bytes.length);
+  while (continuation(start)) start += 1;
+  let end = Math.min(start + maxBytes, bytes.length);
+  while (end > start && continuation(end)) end -= 1;
+  // Always advance, even when one character is larger than maxBytes.
+  if (end === start && start < bytes.length) {
+    end += 1;
+    while (continuation(end)) end += 1;
+  }
+  const slice = {
+    content: bytes.subarray(start, end).toString("utf8"),
+    truncated: end < bytes.length,
+    total_bytes: bytes.length,
+  };
+  if (start) slice.offset = start;
+  if (end < bytes.length) slice.next_offset = end;
+  return slice;
+}
+
+async function performSnapshot(session, page, action) {
+  // Anything but "dom" is the accessibility tree; report the format produced.
+  const format = action.format === "dom" ? "dom" : "accessibility";
+  const offset = Number(action.offset ?? 0);
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw rpcError(-32602, "snapshot offset must be a non-negative integer");
+  }
+  const maxBytes = Math.max(1, Math.min(Number(action.max_bytes) || MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES));
+  let content;
+  if (!action.locator) {
+    content = format === "dom" ? await page.content() : await page.locator("body").ariaSnapshot();
+  } else if (format === "dom") {
+    content = await evaluateElement(session, page, locatorFor(page, action.locator),
+      (element) => element.outerHTML, 30_000);
+  } else {
+    content = await locatorFor(page, action.locator).ariaSnapshot({ timeout: 30_000 });
+  }
+  return { message: "snapshot captured", data: { format, ...snapshotSlice(content, offset, maxBytes) } };
+}
+
+// Interactions that can return the resulting page with `snapshot: true`.
+const SNAPSHOT_AFTER_ACTIONS = new Set([
+  "navigate", "click", "fill", "select", "press", "wait", "back", "forward",
+]);
+
+// The accessibility snapshot of the active page once the action has settled:
+// Playwright has waited for any navigation the action started to commit, and
+// this waits for its DOM like navigate does. A failure is reported beside the
+// action result, which already happened and must not look failed.
+async function snapshotAfterAction(session) {
+  try {
+    const page = await activePage(session);
+    for (let attempt = 1; ; attempt += 1) {
+      await page.waitForLoadState("domcontentloaded", { timeout: 30_000 });
+      try {
+        const content = await page.locator("body").ariaSnapshot({ timeout: 30_000 });
+        return snapshotSlice(content, 0, MAX_SNAPSHOT_BYTES);
+      } catch (error) {
+        // A navigation can replace the document during the capture; retry once on the new one.
+        if (attempt > 1 || !/context was destroyed|navigat/i.test(String(error?.message))) throw error;
+      }
+    }
+  } catch (error) {
+    return { error: String(error?.message || error).split("\n")[0].slice(0, 512) };
+  }
+}
+
 const PAGE_ACTIONS = new Set([
   "navigate", "snapshot", "click", "fill", "select", "upload", "inspect",
   "scroll", "screenshot", "press", "wait", "back", "forward",
 ]);
 
 async function executeAction(session, action = {}) {
+  const result = await performAction(session, action);
+  if (action.snapshot === true && SNAPSHOT_AFTER_ACTIONS.has(action.type)) {
+    result.data = { ...result.data, snapshot: await snapshotAfterAction(session) };
+  }
+  return result;
+}
+
+async function performAction(session, action) {
   const page = await activePage(session);
   // A popup can take foreground focus without changing the selected page.
   // Restore it before page actions so Chromium runs animation frames and
@@ -2052,22 +2154,8 @@ async function executeAction(session, action = {}) {
       await reconcileCurrentOriginStorage(session);
       return { message: "navigation completed", data: { url: page.url(), status: response?.status() ?? null } };
     }
-    case "snapshot": {
-      // Anything but "dom" is the accessibility tree; report the format produced.
-      const format = action.format === "dom" ? "dom" : "accessibility";
-      const content = format === "dom" ? await page.content() : await page.locator("body").ariaSnapshot();
-      const maxBytes = Math.max(0, Math.min(Number(action.max_bytes || 200_000), 2_000_000));
-      const bytes = Buffer.from(String(content), "utf8");
-      return {
-        message: "snapshot captured",
-        data: {
-          format,
-          content: bytes.subarray(0, maxBytes).toString("utf8"),
-          truncated: bytes.length > maxBytes,
-          total_bytes: bytes.length,
-        },
-      };
-    }
+    case "snapshot":
+      return performSnapshot(session, page, action);
     case "click":
       await locatorFor(page, action.locator).click({ timeout: 30_000 });
       return { message: "element clicked", data: { url: page.url() } };

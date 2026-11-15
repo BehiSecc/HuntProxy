@@ -1274,11 +1274,11 @@ async fn history(
         _ => None,
     };
 
-    // `request:~text` may decode and scan every candidate request body. An
-    // exact total would execute that same expensive filter a second time.
+    // `request:~text` and `response:~text` may decode and scan every candidate
+    // body. An exact total would execute that same expensive filter a second time.
     let total_exact = filter
         .as_ref()
-        .is_none_or(|filter| !crate::history::uses_request_body_search(filter));
+        .is_none_or(|filter| !crate::history::uses_body_search(filter));
     let count_filter = total_exact.then(|| filter.clone()).flatten();
     match state
         .db
