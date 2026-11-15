@@ -517,6 +517,283 @@ async fn structured_playwright_actions_cover_live_browser_workflows() {
 
 #[tokio::test]
 #[ignore = "requires installed Node.js, playwright-core, and Chromium; uses only a local fixture"]
+async fn evaluate_runs_page_javascript_in_the_selected_page() {
+    let h = Harness::new_in(&std::env::temp_dir()).await;
+    let result = std::panic::AssertUnwindSafe(verify_page_evaluation(&h))
+        .catch_unwind()
+        .await;
+    h.service.force_stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn evaluate(expression: &str) -> BrowserAction {
+    BrowserAction::Evaluate {
+        expression: expression.into(),
+        frame: None,
+        timeout_ms: 10_000,
+    }
+}
+
+async fn verify_page_evaluation(h: &Harness) {
+    h.seed("default", "localhost").await;
+    let session = h
+        .service
+        .start_with_profile_and_cookie_profile(
+            h.project,
+            h.fixture.url("localhost", "default"),
+            "default",
+            Some("default"),
+        )
+        .await
+        .unwrap();
+    h.state(session.id).await;
+
+    // Page globals, the DOM and the live cookie jar in one call.
+    let result = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            evaluate(
+                "({title: document.title, identity: cookieIdentity(), path: location.pathname})",
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(result.ok && result.untrusted);
+    assert_eq!(result.message, "expression evaluated");
+    let original_page = result.browser.as_ref().unwrap().page_id;
+    let data = result.data.unwrap();
+    assert_eq!(data["type"], "object");
+    assert_eq!(data["truncated"], false);
+    assert_eq!(
+        serde_json::from_str::<Value>(data["content"].as_str().unwrap()).unwrap(),
+        json!({"title": "Profile fixture", "identity": "default", "path": "/app"})
+    );
+
+    // A request the page sends carries the session and is sent exactly once.
+    let mutations = h.fixture.mutation_count();
+    let sent = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            evaluate("const response = await fetch('/api/mutate', {method: 'POST', body: 'x=1'}); await response.json()"),
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    let sent: Value = serde_json::from_str(sent["content"].as_str().unwrap()).unwrap();
+    assert_eq!(sent["method"], "POST");
+    assert_eq!(sent["request_body_bytes"], 3);
+    assert!(sent["cookie"].as_str().unwrap().contains("sid=default"));
+    assert_eq!(h.fixture.mutation_count(), mutations + 1);
+
+    let node = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            evaluate("document.querySelector('#page-end')"),
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(node["type"], "node");
+    assert_eq!(
+        node["content"],
+        "<div id=\"page-end\" style=\"margin-top:3000px\">End of fixture</div>"
+    );
+
+    // A thrown exception is the result, not a failed action.
+    let thrown = h
+        .service
+        .action(h.project, session.id, evaluate("missing.value"))
+        .await
+        .unwrap();
+    assert_eq!(thrown.message, "expression threw");
+    let thrown = thrown.data.unwrap();
+    assert_eq!(thrown["type"], "exception");
+    assert!(thrown["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("ReferenceError: missing is not defined"));
+
+    // A result larger than the output budget is cut to it and says so.
+    let large = h
+        .service
+        .action(h.project, session.id, evaluate("'\"\\\\'.repeat(100000)"))
+        .await
+        .unwrap();
+    assert!(serde_json::to_string(&large).unwrap().len() <= 24_000);
+    let large = large.data.unwrap();
+    assert_eq!(large["truncated"], true);
+    assert_eq!(large["total_bytes"], 200_000);
+    assert!(large["content"].as_str().unwrap().len() > 10_000);
+    assert!(large.get("next_offset").is_none());
+
+    // A loop is stopped at the deadline and the session stays usable.
+    let started = std::time::Instant::now();
+    let error = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Evaluate {
+                expression: "while (true) {}".into(),
+                frame: None,
+                timeout_ms: 500,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("evaluate timed out after 500 ms"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(
+        h.service
+            .session_status(h.project, session.id)
+            .await
+            .unwrap()
+            .state,
+        huntproxy::domain::BrowserSessionState::Ready
+    );
+    let error = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Evaluate {
+                expression: "1".into(),
+                frame: Some("checkout".into()),
+                timeout_ms: 10_000,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), huntproxy::domain::ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("matches no frame"));
+
+    // The expression runs in whichever tab is selected. Opening one from
+    // script needs the user activation an evaluation carries.
+    let opened = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            evaluate("window.open('/popup', 'fixture-details') !== null"),
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(opened["content"], "true");
+    let mut popup = None;
+    for _ in 0..50 {
+        let listed = h
+            .service
+            .action(
+                h.project,
+                session.id,
+                BrowserAction::Pages {
+                    op: "list".into(),
+                    page_id: None,
+                    runtime_generation: None,
+                    url: None,
+                },
+            )
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        popup = listed["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| {
+                page["url"]
+                    .as_str()
+                    .is_some_and(|url| url.ends_with("/popup"))
+            })
+            .map(|page| {
+                (
+                    page["page_id"].as_u64().unwrap(),
+                    listed["runtime_generation"].as_u64().unwrap(),
+                )
+            });
+        if popup.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (popup_page, generation) = popup.expect("the popup opened by the expression");
+    assert_ne!(popup_page, original_page);
+    assert_eq!(
+        h.service
+            .action(h.project, session.id, evaluate("document.title"))
+            .await
+            .unwrap()
+            .data
+            .unwrap()["content"],
+        "Profile fixture"
+    );
+    h.service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Pages {
+                op: "select".into(),
+                page_id: Some(popup_page),
+                runtime_generation: Some(generation),
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
+    let in_popup = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            evaluate("[document.title, opener !== null]"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(in_popup.browser.unwrap().page_id, popup_page);
+    assert_eq!(
+        in_popup.data.unwrap()["content"],
+        "[\"Fixture details\",true]"
+    );
+
+    // While a person holds the browser through CDP, the agent does not script it.
+    h.service.enable_cdp(h.project, session.id).await.unwrap();
+    assert_eq!(
+        h.service
+            .action(h.project, session.id, evaluate("1"))
+            .await
+            .unwrap_err()
+            .code(),
+        huntproxy::domain::ErrorCode::Conflict
+    );
+    h.service.disable_cdp(h.project, session.id).await.unwrap();
+    assert_eq!(
+        h.service
+            .action(h.project, session.id, evaluate("1 + 1"))
+            .await
+            .unwrap()
+            .data
+            .unwrap()["content"],
+        "2"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; uses only a local fixture"]
 async fn empty_event_wait_does_not_block_another_browser_session() {
     let h = Harness::new_in(&std::env::temp_dir()).await;
     let result = std::panic::AssertUnwindSafe(verify_event_wait_is_session_local(&h))

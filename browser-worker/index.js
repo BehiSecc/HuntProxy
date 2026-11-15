@@ -2099,6 +2099,279 @@ async function performSnapshot(session, page, action) {
   return { message: "snapshot captured", data: { format, ...snapshotSlice(content, offset, maxBytes) } };
 }
 
+// Characters of result data the page builds before it stops descending.
+const MAX_EVALUATE_RESULT_CHARS = 1_000_000;
+
+// `() => ...`, `async x => ...` and `function ...` sources are called, so the
+// function style other browser tools take works as well as a plain expression.
+const FUNCTION_SOURCE = /^\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/;
+
+// A leading `{` or `function` is a statement to JavaScript: `{a: 1}` is a
+// block that yields 1 and a function declaration yields nothing.
+const STATEMENT_LOOKALIKE = /^\s*(?:\{|(?:async\s+)?function\b)/;
+
+const EVALUATE_INTERRUPTED = /navigated or closed|context was destroyed|cannot find context|could not find object|has been closed/i;
+
+// Runs in the page on the value an expression produced and returns it as data
+// CDP can copy out. Chromium's own deep serialization hangs and then kills the
+// browser when a getter throws, so every read here is guarded instead.
+// Strings, DOM nodes, errors and a returned function become text; anything
+// else becomes JSON data that stops at a depth and size limit.
+async function describeEvaluationResult(value, call, maxChars) {
+  if (call && typeof value === "function") value = value();
+  value = await value;
+  const MAX_DEPTH = 8;
+  const MAX_NESTED_NODE_CHARS = 400;
+  let remaining = maxChars;
+  const ancestors = [];
+  const isNode = (item) => typeof item.nodeType === "number" && typeof item.nodeName === "string";
+  // Never counts more than the JSON takes, so a result cut here is always
+  // larger than what the worker goes on to return.
+  const text = (string, limit) => {
+    string = String(string);
+    if (limit && string.length > limit) string = `${string.slice(0, limit)}…`;
+    if (string.length > remaining) string = string.slice(0, Math.max(remaining, 0));
+    remaining -= string.length + 2;
+    return string;
+  };
+  const nodeText = (node) => {
+    if (node.nodeType === 1) return node.outerHTML;
+    if (node.nodeType === 2) return `${node.name}="${node.value}"`;
+    if (node.nodeType === 9) return node.documentElement ? node.documentElement.outerHTML : "#document";
+    return node.nodeValue ?? node.innerHTML ?? node.textContent ?? node.nodeName;
+  };
+  const describe = (item, depth) => {
+    const kind = typeof item;
+    if (kind === "undefined") return undefined;
+    if (item === null || kind === "boolean") {
+      remaining -= 4;
+      return item;
+    }
+    if (kind === "number") {
+      remaining -= 1;
+      return Number.isFinite(item) ? item : String(item);
+    }
+    if (kind === "string") return text(item);
+    if (kind === "bigint") return text(`${item}n`);
+    if (kind === "symbol") return text(item.toString());
+    try {
+      if (kind === "function") {
+        return depth
+          ? text(`[Function${item.name ? `: ${item.name}` : ""}]`, 120)
+          : text(Function.prototype.toString.call(item));
+      }
+      // A cross-origin window allows `window` and refuses nearly everything else.
+      if (item.window === item) return text("[Window]");
+      if (isNode(item)) return text(nodeText(item), depth ? MAX_NESTED_NODE_CHARS : 0);
+      const tag = Object.prototype.toString.call(item).slice(8, -1);
+      if (tag === "Error" || tag === "DOMException") return text(`${item.name}: ${item.message}`);
+      if (tag === "RegExp") return text(item);
+      if (ancestors.includes(item)) return text("[Circular]");
+      if (typeof item.toJSON === "function") {
+        const json = item.toJSON();
+        if (json !== item) return describe(json, depth);
+      }
+      if (depth >= MAX_DEPTH) return text(`[${tag}]`);
+      remaining -= 2;
+      ancestors.push(item);
+      try {
+        if (typeof item[Symbol.iterator] === "function") {
+          const list = [];
+          for (const entry of item) {
+            if (remaining <= 0) break;
+            list.push(describe(entry, depth + 1) ?? null);
+          }
+          return list;
+        }
+        // No prototype, so a `__proto__` key is kept as an ordinary member.
+        const members = Object.create(null);
+        let kept = 0;
+        for (const key in item) {
+          if (remaining <= 0) break;
+          let member;
+          try {
+            member = item[key];
+          } catch (error) {
+            member = `[Throws: ${error?.message}]`;
+          }
+          // Methods a platform object inherits say nothing about its state.
+          if (typeof member === "function" && !Object.hasOwn(item, key)) continue;
+          const described = describe(member, depth + 1);
+          if (described === undefined) continue;
+          remaining -= key.length + 3;
+          members[key] = described;
+          kept += 1;
+        }
+        // An object that exposes nothing is named, never shown as `{}`.
+        return kept || tag === "Object" ? members : text(`[${tag}]`);
+      } finally {
+        ancestors.pop();
+      }
+    } catch (error) {
+      return text(`[Unreadable: ${error?.message}]`, 200);
+    }
+  };
+  let type = value === null ? "null" : typeof value;
+  if (type === "object") {
+    try {
+      if (value.window !== value && isNode(value)) type = "node";
+    } catch {
+      // A cross-origin object: reported by describe as unreadable.
+    }
+  }
+  return { type, value: describe(value, 0) };
+}
+
+// The CDP session and execution context an expression runs in: the selected
+// page, or with `selector` the one frame of it whose name equals the selector
+// or whose URL contains it. A cross-process frame has a CDP session of its
+// own; a same-process frame shares its nearest such ancestor's and is reached
+// through its default execution context.
+async function evaluationTarget(session, page, selector) {
+  if (selector == null) {
+    const connection = await session.context.newCDPSession(page);
+    return { connection, connections: [connection] };
+  }
+  const connections = [];
+  try {
+    const frames = [];
+    for (const frame of page.frames()) {
+      let connection;
+      try {
+        connection = await session.context.newCDPSession(frame);
+      } catch {
+        continue; // Listed in the frame tree of an ancestor's session.
+      }
+      connections.push(connection);
+      const main = frame === page.mainFrame();
+      const visit = (node, root) => {
+        if (!(main && root)) {
+          frames.push({ connection, root, id: node.frame.id, name: node.frame.name || "",
+            url: `${node.frame.url}${node.frame.urlFragment || ""}` });
+        }
+        for (const child of node.childFrames || []) visit(child, false);
+      };
+      visit((await connection.send("Page.getFrameTree")).frameTree, true);
+    }
+    const matches = frames.filter((frame) => frame.name === selector || frame.url.includes(selector));
+    const exact = matches.filter((frame) => frame.name === selector || frame.url === selector);
+    const chosen = exact.length === 1 ? exact[0] : matches.length === 1 ? matches[0] : null;
+    if (!chosen) {
+      const listed = (matches.length ? matches : frames).slice(0, 12)
+        .map((frame) => `${publicLocation(frame.url) || "(opaque URL)"}${frame.name ? ` name=${frame.name.slice(0, 64)}` : ""}`)
+        .join(", ");
+      throw rpcError(-32602, matches.length
+        ? `evaluate frame matches ${matches.length} frames; give its full URL or name: ${listed}`
+        : `evaluate frame matches no frame of the selected page; frames: ${listed || "none"}`);
+    }
+    let contextId;
+    if (!chosen.root) {
+      const contexts = [];
+      chosen.connection.on("Runtime.executionContextCreated", (event) => contexts.push(event.context));
+      await chosen.connection.send("Runtime.enable");
+      contextId = contexts.find((context) => context.auxData?.frameId === chosen.id && context.auxData?.isDefault)?.id;
+      if (!contextId) throw rpcError(-32000, "evaluate frame has no JavaScript context yet; retry once it has loaded");
+    }
+    return { connection: chosen.connection, contextId, url: chosen.url, connections };
+  } catch (error) {
+    await Promise.all(connections.map((connection) => connection.detach().catch(() => undefined)));
+    throw error;
+  }
+}
+
+// The text an evaluation reports: a string as it is, anything else as JSON.
+function evaluationContent(value) {
+  if (typeof value === "string") return value;
+  return value === undefined ? "undefined" : JSON.stringify(value);
+}
+
+// Runs agent JavaScript in the main world of the selected page, or of one of
+// its frames, the way the DevTools console does: statements and top-level
+// await are allowed, declarations can be repeated between calls, and the
+// console helpers such as getEventListeners() are in scope. CDP evaluation is
+// not subject to the page's CSP.
+async function performEvaluate(session, page, action) {
+  const timeout = action.timeout_ms ?? 10_000;
+  if (typeof action.expression !== "string" || !action.expression.trim()
+      || !Number.isInteger(timeout) || timeout < 1 || timeout > 30_000) {
+    throw rpcError(-32602, "evaluate requires an expression and timeout_ms in 1..30000");
+  }
+  const target = await evaluationTarget(session, page, action.frame);
+  const { connection } = target;
+  const context = target.contextId ? { contextId: target.contextId } : {};
+  const run = async () => {
+    let expression = action.expression;
+    if (STATEMENT_LOOKALIKE.test(expression)) {
+      // Read it as the expression it looks like when it parses as one, as the
+      // DevTools console does. Compiling runs nothing and needs the domain on.
+      const wrapped = `(${expression}\n)`;
+      await connection.send("Runtime.enable");
+      const compiled = await connection.send("Runtime.compileScript", {
+        expression: wrapped, sourceURL: "", persistScript: false,
+        ...(target.contextId ? { executionContextId: target.contextId } : {}),
+      });
+      if (!compiled.exceptionDetails) expression = wrapped;
+    }
+    const evaluated = await connection.send("Runtime.evaluate", {
+      expression, replMode: true, awaitPromise: true, userGesture: true,
+      includeCommandLineAPI: true, ...context,
+    });
+    if (evaluated.exceptionDetails) return { exception: evaluated.exceptionDetails };
+    const remote = evaluated.result;
+    if (!remote.objectId) {
+      if (remote.type === "undefined") return { type: "undefined" };
+      if (remote.subtype === "null") return { type: "null", value: null };
+      return { type: remote.type, value: remote.unserializableValue ?? remote.value };
+    }
+    // Calls a function source, awaits a promise, and copies the result out.
+    const described = await connection.send("Runtime.callFunctionOn", {
+      objectId: remote.objectId,
+      functionDeclaration: describeEvaluationResult.toString(),
+      arguments: [{ objectId: remote.objectId }, { value: FUNCTION_SOURCE.test(action.expression) },
+        { value: MAX_EVALUATE_RESULT_CHARS }],
+      awaitPromise: true, returnByValue: true, userGesture: true,
+    });
+    if (described.exceptionDetails) return { exception: described.exceptionDetails };
+    return described.result.value;
+  };
+  let timer;
+  let termination;
+  let outcome;
+  try {
+    const work = run();
+    work.catch(() => undefined); // Still pending when the deadline wins.
+    outcome = await Promise.race([work, new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        // Stops a synchronous loop. A promise that never settles stays with the page.
+        termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
+        reject(rpcError(-32000,
+          `evaluate timed out after ${timeout} ms; the expression may still be running in the page`));
+      }, timeout);
+    })]);
+  } catch (error) {
+    if (!Number.isSafeInteger(error?.code) && EVALUATE_INTERRUPTED.test(String(error?.message))) {
+      throw rpcError(-32000, "evaluate was interrupted because the page or frame navigated or closed");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    // The page must be responsive again before the next action; a renderer
+    // that cannot stop is not waited for.
+    if (termination) await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    await Promise.all(target.connections.map((opened) => opened.detach().catch(() => undefined)));
+  }
+  const thrown = outcome.exception;
+  const content = thrown
+    // The stack of a called function source ends in the function that called it here.
+    ? String(thrown.exception?.description ?? thrown.exception?.value ?? thrown.text)
+      .split("\n").filter((line) => !line.includes(describeEvaluationResult.name)).join("\n")
+    : evaluationContent(outcome.value);
+  const { next_offset: _unpaged, ...slice } = snapshotSlice(content, 0, MAX_SNAPSHOT_BYTES);
+  const data = { type: thrown ? "exception" : outcome.type, ...slice };
+  if (target.url !== undefined) data.frame_url = publicLocation(target.url);
+  return { message: thrown ? "expression threw" : "expression evaluated", data };
+}
+
 // Interactions that can return the resulting page with `snapshot: true`.
 const SNAPSHOT_AFTER_ACTIONS = new Set([
   "navigate", "click", "fill", "select", "press", "wait", "back", "forward",
@@ -2127,7 +2400,7 @@ async function snapshotAfterAction(session) {
 }
 
 const PAGE_ACTIONS = new Set([
-  "navigate", "snapshot", "click", "fill", "select", "upload", "inspect",
+  "navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "evaluate",
   "scroll", "screenshot", "press", "wait", "back", "forward",
 ]);
 
@@ -2169,6 +2442,8 @@ async function performAction(session, action) {
       return uploadFiles(session, action);
     case "inspect":
       return inspectRuntime(session, action);
+    case "evaluate":
+      return performEvaluate(session, page, action);
     case "pages":
       return performPages(session, action);
     case "events":

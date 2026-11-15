@@ -426,6 +426,78 @@ async fn browser_cdp_api_reports_control_state_and_validates_session_requirement
 }
 
 #[tokio::test]
+async fn browser_evaluate_validates_its_input_and_names_a_missing_session() {
+    let (_directory, state, project_id) = test_state().await;
+    let call = |arguments: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            huntproxy::mcp::call_tool(state, "browser_evaluate", arguments)
+                .await
+                .unwrap_err()
+        }
+    };
+    for (arguments, expected) in [
+        (
+            serde_json::json!({"session_id": 1, "expression": "1"}),
+            "project_id required",
+        ),
+        (
+            serde_json::json!({"project_id": project_id, "expression": "1"}),
+            "session_id required",
+        ),
+        (
+            serde_json::json!({"project_id": project_id, "session_id": 1}),
+            "missing field `expression`",
+        ),
+        (
+            serde_json::json!({"project_id": project_id, "session_id": 1, "expression": " "}),
+            "evaluate expression must be 1..65536 bytes of JavaScript",
+        ),
+        (
+            serde_json::json!({"project_id": project_id, "session_id": 1, "expression": "1", "frame": ""}),
+            "evaluate frame must be 1..2048 bytes of a frame name or URL",
+        ),
+        (
+            serde_json::json!({"project_id": project_id, "session_id": 1, "expression": "1", "timeout_ms": 60_000}),
+            "evaluate timeout_ms must be 1..30000",
+        ),
+        (
+            serde_json::json!({"project_id": project_id, "session_id": 1, "expression": 5}),
+            "invalid type",
+        ),
+    ] {
+        let error = call(arguments.clone()).await;
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{arguments}");
+        assert!(error.to_string().contains(expected), "{arguments}: {error}");
+    }
+    // Valid input reaches the browser service; null optional fields are absent ones.
+    let error = call(serde_json::json!({
+        "project_id": project_id, "session_id": 41, "expression": "document.title",
+        "frame": null, "timeout_ms": null,
+    }))
+    .await;
+    assert_eq!(error.code(), ErrorCode::NotFound);
+    assert!(error.to_string().contains("browser session 41 not found"));
+
+    // The same action is available to the HTTP API and the web UI.
+    let response = huntproxy::api::router(state)
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/projects/{}/browser-sessions/41/action",
+                project_id.get()
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"evaluate","expression":"document.title"}"#,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn browser_resource_status_is_additive_in_mcp_and_api() {
     let (_directory, state, project_id) = test_state().await;
     let expected = serde_json::json!({

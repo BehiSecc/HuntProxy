@@ -35,6 +35,7 @@ const MAX_PERSISTENT_PROFILE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_BROWSER_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BROWSER_REQUEST_RESPONSE_BYTES: u64 = 65_536;
 const MAX_BROWSER_SCREENSHOT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_BROWSER_EVALUATE_BYTES: usize = 65_536;
 /// Every action result is fitted to the MCP output budget by construction, so
 /// MCP clients and the generic safety net never have to cut it.
 const ACTION_OUTPUT_BYTES: usize = crate::mcp::budget::MAX_OUTPUT_BYTES;
@@ -354,6 +355,14 @@ pub enum BrowserAction {
         #[serde(default = "default_inspection_max_bytes")]
         max_bytes: u64,
     },
+    /// Runs JavaScript in the main world of the selected page.
+    Evaluate {
+        expression: String,
+        /// Runs in the one frame whose name equals this or whose URL contains it.
+        frame: Option<String>,
+        #[serde(default = "default_browser_action_timeout")]
+        timeout_ms: u64,
+    },
     Pages {
         op: String,
         page_id: Option<u64>,
@@ -500,6 +509,28 @@ fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
             return Err(DomainError::invalid(
                 "snapshot max_bytes must be at least 1",
             ));
+        }
+        BrowserAction::Evaluate {
+            expression,
+            frame,
+            timeout_ms,
+        } => {
+            if expression.trim().is_empty() || expression.len() > MAX_BROWSER_EVALUATE_BYTES {
+                return Err(DomainError::invalid(
+                    "evaluate expression must be 1..65536 bytes of JavaScript",
+                ));
+            }
+            if frame
+                .as_ref()
+                .is_some_and(|frame| frame.is_empty() || frame.len() > 2048)
+            {
+                return Err(DomainError::invalid(
+                    "evaluate frame must be 1..2048 bytes of a frame name or URL",
+                ));
+            }
+            if !(1..=30_000).contains(timeout_ms) {
+                return Err(DomainError::invalid("evaluate timeout_ms must be 1..30000"));
+            }
         }
         BrowserAction::Pages {
             op,
@@ -783,7 +814,9 @@ fn validate_browser_page_url(value: &str) -> DomainResult<()> {
 fn fit_action_result(action: &BrowserAction, result: &mut ActionResult) -> DomainResult<()> {
     match action {
         BrowserAction::Snapshot { .. } => fit_text_content(result, "", true),
-        BrowserAction::Inspect { .. } => fit_text_content(result, "", false),
+        BrowserAction::Inspect { .. } | BrowserAction::Evaluate { .. } => {
+            fit_text_content(result, "", false)
+        }
         BrowserAction::Events { .. } => fit_event_rows(result),
         _ if action.wants_snapshot() => fit_text_content(result, "/snapshot", true),
         _ => Ok(()),
@@ -4938,6 +4971,34 @@ mod tests {
         assert!(text.starts_with(data["content"].as_str().unwrap()));
         assert_eq!(data["truncated"], true);
         assert!(data.get("next_offset").is_none());
+
+        // An evaluation result is cut the same way and keeps what describes it.
+        let evaluate: BrowserAction =
+            serde_json::from_value(json!({"type": "evaluate", "expression": "document.body"}))
+                .unwrap();
+        let mut slice = worker_slice(&page, 0, 24_000);
+        let fields = slice.as_object_mut().unwrap();
+        fields.remove("format");
+        fields.remove("next_offset");
+        fields.insert("type".into(), json!("node"));
+        fields.insert("frame_url".into(), json!("https://app.test/embed"));
+        let mut result = result_with(slice);
+        fit_action_result(&evaluate, &mut result).unwrap();
+        fitted_len(&result);
+        let data = result.data.unwrap();
+        let content = data["content"].as_str().unwrap();
+        assert!(page.starts_with(content) && content.len() > 10_000);
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["total_bytes"], page.len());
+        assert_eq!(data["type"], "node");
+        assert_eq!(data["frame_url"], "https://app.test/embed");
+        assert!(data.get("next_offset").is_none());
+        // A result that fits is returned whole and says so.
+        let whole =
+            json!({"type": "string", "content": "Shop", "truncated": false, "total_bytes": 4});
+        let mut result = result_with(whole.clone());
+        fit_action_result(&evaluate, &mut result).unwrap();
+        assert_eq!(result.data.unwrap(), whole);
     }
 
     #[test]
@@ -5031,6 +5092,31 @@ mod tests {
         }))
         .unwrap();
         validate_browser_action(&observer_events).unwrap();
+
+        let evaluate: BrowserAction =
+            serde_json::from_value(json!({"type": "evaluate", "expression": "document.title"}))
+                .unwrap();
+        match &evaluate {
+            BrowserAction::Evaluate {
+                frame, timeout_ms, ..
+            } => {
+                assert!(frame.is_none());
+                assert_eq!(*timeout_ms, 10_000);
+            }
+            _ => panic!("wrong browser action"),
+        }
+        validate_browser_action(&evaluate).unwrap();
+        // The worker reads an absent frame as the selected page itself.
+        assert_eq!(
+            serde_json::to_value(&evaluate).unwrap()["frame"],
+            Value::Null
+        );
+        let largest: BrowserAction = serde_json::from_value(json!({
+            "type": "evaluate", "expression": "1".repeat(MAX_BROWSER_EVALUATE_BYTES),
+            "frame": "checkout", "timeout_ms": 30_000,
+        }))
+        .unwrap();
+        validate_browser_action(&largest).unwrap();
     }
 
     #[test]
@@ -5052,6 +5138,13 @@ mod tests {
             json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"Sec-Fetch-Site","value":"same-origin"}]}),
             json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"X-HTTP-Method-Override","value":"PATCH, TRACE"}]}),
             json!({"type":"request","method":"POST","url":"https://example.com/","headers":[{"name":"x-note","value":"one"},{"name":"X-Note","value":"two"}]}),
+            json!({"type":"evaluate","expression":""}),
+            json!({"type":"evaluate","expression":" \n\t"}),
+            json!({"type":"evaluate","expression":"1".repeat(MAX_BROWSER_EVALUATE_BYTES + 1)}),
+            json!({"type":"evaluate","expression":"1","frame":""}),
+            json!({"type":"evaluate","expression":"1","frame":"f".repeat(2049)}),
+            json!({"type":"evaluate","expression":"1","timeout_ms":0}),
+            json!({"type":"evaluate","expression":"1","timeout_ms":30_001}),
         ] {
             let action: BrowserAction = serde_json::from_value(value).unwrap();
             assert!(validate_browser_action(&action).is_err());
