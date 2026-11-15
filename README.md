@@ -60,6 +60,8 @@ The installer sets up HuntProxy, its browser runtime, and a private data directo
 
 HuntProxy speaks MCP over standard input/output. When your agent connects, the bridge starts the local HuntProxy daemon automatically and keeps the project available across prompts.
 
+Tool results are compact JSON capped at 24,000 bytes, so MCP clients never clip them mid-JSON. A result that had to be shortened carries an `output_truncated` note naming each cut and how to narrow the request.
+
 Set `HUNTPROXY_MCP_DISABLE_LIFECYCLE=1` on the MCP bridge to hide and reject `huntproxy_stop` and `huntproxy_restart`. The operator's `HuntProxy stop` command remains available.
 
 #### Codex

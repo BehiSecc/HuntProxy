@@ -1,5 +1,7 @@
 //! Minimal stdio JSON-RPC MCP server. Protocol on stdout; diagnostics on stderr.
 
+mod budget;
+
 use crate::app::AppState;
 use crate::browser::BrowserAction;
 use crate::codec::{apply_pipeline, Transform};
@@ -971,16 +973,20 @@ fn is_history_query_error(error: &DomainError) -> bool {
     is_query(details) || details.get("details").is_some_and(is_query)
 }
 
-fn object_structured_content(result: &Value) -> Value {
+fn object_structured_content(result: Value) -> Value {
     if result.is_object() {
-        result.clone()
+        result
     } else {
         json!({ "result": result })
     }
 }
 
+/// Builds the MCP `tools/call` result. The text content is the compact
+/// serialization of `structuredContent`, and both carry the same value fitted
+/// to [`budget::MAX_OUTPUT_BYTES`]. A browser screenshot moves to MCP image
+/// content first, so its base64 is never counted or cut.
 fn tool_call_result(name: &str, result: Value, is_error: bool) -> Value {
-    let mut structured_content = object_structured_content(&result);
+    let mut structured_content = object_structured_content(result);
     let image = if name == "browser_action" && !is_error {
         let encoded = structured_content
             .pointer("/data/image_base64")
@@ -994,8 +1000,7 @@ fn tool_call_result(name: &str, result: Value, is_error: bool) -> Value {
     } else {
         None
     };
-    let mut content = Vec::new();
-    if let Some((encoded, mime_type)) = image {
+    if image.is_some() {
         if let Some(data) = structured_content
             .get_mut("data")
             .and_then(Value::as_object_mut)
@@ -1003,19 +1008,17 @@ fn tool_call_result(name: &str, result: Value, is_error: bool) -> Value {
             data.remove("image_base64");
             data.insert("image_in_content".into(), Value::Bool(true));
         }
-        content.push(json!({
-            "type": "text",
-            "text": serde_json::to_string_pretty(&structured_content).unwrap_or_default()
-        }));
+    }
+    let structured_content = budget::fit_to_budget(structured_content, budget::MAX_OUTPUT_BYTES);
+    let mut content = vec![json!({
+        "type": "text",
+        "text": structured_content.to_string()
+    })];
+    if let Some((encoded, mime_type)) = image {
         content.push(json!({
             "type": "image",
             "data": encoded,
             "mimeType": mime_type
-        }));
-    } else {
-        content.push(json!({
-            "type": "text",
-            "text": serde_json::to_string_pretty(&result).unwrap_or_default()
         }));
     }
     json!({
@@ -3628,15 +3631,71 @@ mod tests {
     #[test]
     fn structured_content_is_always_an_object_for_mcp_clients() {
         let object = json!({"ok": true});
-        assert_eq!(object_structured_content(&object), object);
+        assert_eq!(object_structured_content(object.clone()), object);
         assert_eq!(
-            object_structured_content(&json!([1, 2])),
+            object_structured_content(json!([1, 2])),
             json!({"result": [1, 2]})
         );
         assert_eq!(
-            object_structured_content(&json!("value")),
+            object_structured_content(json!("value")),
             json!({"result": "value"})
         );
+    }
+
+    #[test]
+    fn tool_results_are_compact_and_text_matches_structured_content() {
+        for (result, structured) in [
+            (
+                json!({"items": [{"id": 1}], "next": null}),
+                json!({"items": [{"id": 1}], "next": null}),
+            ),
+            (json!([1, 2]), json!({"result": [1, 2]})),
+        ] {
+            let output = tool_call_result("history_search", result, false);
+            assert_eq!(output["structuredContent"], structured);
+            assert_eq!(output["content"][0]["text"], structured.to_string());
+            assert!(!output["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(['\n', ' ']));
+        }
+    }
+
+    #[test]
+    fn oversized_tool_results_and_errors_are_fitted_to_the_output_budget() {
+        let rows = (0..5_000)
+            .map(|id| json!({"exchange_id": id, "url": format!("https://example.test/{id}")}))
+            .collect::<Vec<_>>();
+        for is_error in [false, true] {
+            let output = tool_call_result("history_search", json!({"items": rows}), is_error);
+            let text = output["content"][0]["text"].as_str().unwrap();
+            assert!(text.len() <= budget::MAX_OUTPUT_BYTES);
+            let structured = &output["structuredContent"];
+            assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *structured);
+            assert_eq!(
+                structured["output_truncated"]["omitted"][0]["path"],
+                "/items"
+            );
+            assert_eq!(output["isError"], is_error);
+        }
+    }
+
+    #[test]
+    fn a_large_screenshot_is_not_counted_against_the_output_budget() {
+        let encoded = "A".repeat(budget::MAX_OUTPUT_BYTES * 4);
+        let output = tool_call_result(
+            "browser_action",
+            json!({
+                "ok": true,
+                "data": {"mime_type": "image/png", "image_base64": encoded}
+            }),
+            false,
+        );
+        assert_eq!(output["content"][1]["data"], encoded);
+        let structured = &output["structuredContent"];
+        assert!(structured.get("output_truncated").is_none());
+        assert_eq!(structured["data"]["image_in_content"], true);
+        assert_eq!(output["content"][0]["text"], structured.to_string());
     }
 
     #[test]
