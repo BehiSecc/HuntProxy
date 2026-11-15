@@ -2440,7 +2440,9 @@ async fn raw_reply_preserves_framing_and_collects_response_sequences() {
             .write_all(b"HTTP/1.1 201 OK\r\nContent-Length: 3\r\n\r\ntwo")
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Hold the connection well past the client's idle timeout, so the
+        // read ends on idle rather than on close.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     });
     let app = huntproxy::api::router(state.clone());
     let sent = app
@@ -2457,7 +2459,7 @@ async fn raw_reply_preserves_framing_and_collects_response_sequences() {
                     "request": raw_request,
                     "encoding": "utf8",
                     "response_mode": "until_idle",
-                    "idle_timeout_ms": 50,
+                    "idle_timeout_ms": 150,
                     "read_timeout_ms": 1000
                 })
                 .to_string(),
