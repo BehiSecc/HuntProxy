@@ -55,6 +55,10 @@ pub struct RawHttp1Options {
     /// aggregate budget. It can only lower the project limit.
     #[serde(skip)]
     pub response_cap_bytes: Option<u64>,
+    /// Slots a grouped send reserved for all of its members at once, so they
+    /// can start together. Without them the request takes its own slot.
+    #[serde(skip)]
+    pub request_slots: Option<super::RequestSlots>,
 }
 
 impl Default for RawHttp1Options {
@@ -71,6 +75,7 @@ impl Default for RawHttp1Options {
             release_barrier: None,
             start_barrier: None,
             response_cap_bytes: None,
+            request_slots: None,
         }
     }
 }
@@ -226,6 +231,10 @@ impl ReplyService {
             ));
         }
 
+        let _slots = match options.request_slots.clone() {
+            Some(slots) => slots,
+            None => self.request_limiter.acquire(&project, 1).await?,
+        };
         let started = Instant::now();
         let upstream_proxy = self
             .db

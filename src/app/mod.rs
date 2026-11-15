@@ -368,6 +368,7 @@ pub async fn bootstrap_state(config: Config) -> DomainResult<Arc<AppState>> {
         placeholder_key: placeholder_key.clone(),
         upstream_proxies: config.upstream_proxies.clone(),
         verify_upstream_tls: config.verify_upstream_tls,
+        request_limiter: Default::default(),
     });
     let fuzzer = Arc::new(FuzzerService::new(
         db.clone(),
