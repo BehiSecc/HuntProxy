@@ -36,6 +36,8 @@ const MAX_BROWSER_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BROWSER_REQUEST_RESPONSE_BYTES: u64 = 65_536;
 const MAX_BROWSER_SCREENSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BROWSER_EVALUATE_BYTES: usize = 65_536;
+const MAX_BROWSER_TYPE_BYTES: usize = 4096;
+const MAX_POINTER_COORDINATE: f64 = 100_000.0;
 /// Every action result is fitted to the MCP output budget by construction, so
 /// MCP clients and the generic safety net never have to cut it.
 const ACTION_OUTPUT_BYTES: usize = crate::mcp::budget::MAX_OUTPUT_BYTES;
@@ -363,6 +365,32 @@ pub enum BrowserAction {
         #[serde(default = "default_browser_action_timeout")]
         timeout_ms: u64,
     },
+    /// Mouse input aimed at an element or at a viewport point: `click`,
+    /// `hover`, or `drag` to a second element or point.
+    Pointer {
+        op: String,
+        locator: Option<Locator>,
+        x: Option<f64>,
+        y: Option<f64>,
+        to_locator: Option<Locator>,
+        to_x: Option<f64>,
+        to_y: Option<f64>,
+        #[serde(default = "default_pointer_button")]
+        button: String,
+        #[serde(default = "default_pointer_count")]
+        count: u8,
+        #[serde(default)]
+        modifiers: Vec<String>,
+        #[serde(default)]
+        snapshot: bool,
+    },
+    /// Sends text as keystrokes to `locator`, or to whatever has focus.
+    Type {
+        text: String,
+        locator: Option<Locator>,
+        #[serde(default)]
+        snapshot: bool,
+    },
     Pages {
         op: String,
         page_id: Option<u64>,
@@ -439,15 +467,47 @@ impl BrowserAction {
             | Self::Select { snapshot, .. }
             | Self::Press { snapshot, .. }
             | Self::Wait { snapshot, .. }
+            | Self::Pointer { snapshot, .. }
+            | Self::Type { snapshot, .. }
             | Self::Back { snapshot }
             | Self::Forward { snapshot } => *snapshot,
             _ => false,
+        }
+    }
+
+    /// Every locator the action carries.
+    fn locators(&self) -> Vec<&Locator> {
+        match self {
+            Self::Click { locator, .. }
+            | Self::Fill { locator, .. }
+            | Self::Select { locator, .. }
+            | Self::Upload { locator, .. } => vec![locator],
+            Self::Snapshot { locator, .. }
+            | Self::Inspect { locator, .. }
+            | Self::Scroll { locator, .. }
+            | Self::Screenshot { locator, .. }
+            | Self::Press { locator, .. }
+            | Self::Type { locator, .. } => locator.iter().collect(),
+            Self::Pointer {
+                locator,
+                to_locator,
+                ..
+            } => locator.iter().chain(to_locator).collect(),
+            _ => Vec::new(),
         }
     }
 }
 
 fn default_browser_action_timeout() -> u64 {
     10_000
+}
+
+fn default_pointer_button() -> String {
+    "left".into()
+}
+
+fn default_pointer_count() -> u8 {
+    1
 }
 
 fn default_inspection_max_bytes() -> u64 {
@@ -478,8 +538,91 @@ fn default_snapshot_max_bytes() -> u64 {
     MAX_SNAPSHOT_BYTES
 }
 
+/// A viewport point: both coordinates or neither, each within the range the
+/// worker accepts.
+fn pointer_point(x: Option<f64>, y: Option<f64>, label: &str) -> DomainResult<bool> {
+    let valid = |value: f64| value.is_finite() && (0.0..=MAX_POINTER_COORDINATE).contains(&value);
+    match (x, y) {
+        (None, None) => Ok(false),
+        (Some(x), Some(y)) if valid(x) && valid(y) => Ok(true),
+        _ => Err(DomainError::invalid(format!(
+            "{label} x and y must both be 0..100000"
+        ))),
+    }
+}
+
 fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
+    for locator in action.locators() {
+        if locator
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.is_empty() || frame.len() > 2048)
+        {
+            return Err(DomainError::invalid(
+                "locator frame must be 1..2048 bytes of a frame name or URL",
+            ));
+        }
+        if locator
+            .nth
+            .is_some_and(|nth| !(-1_000_000..=1_000_000).contains(&nth))
+        {
+            return Err(DomainError::invalid(
+                "locator nth must be -1000000..1000000",
+            ));
+        }
+    }
     match action {
+        BrowserAction::Pointer {
+            op,
+            locator,
+            x,
+            y,
+            to_locator,
+            to_x,
+            to_y,
+            button,
+            count,
+            modifiers,
+            ..
+        } => {
+            if !matches!(op.as_str(), "click" | "hover" | "drag") {
+                return Err(DomainError::invalid("pointer op must be click|hover|drag"));
+            }
+            const MODIFIERS: &[&str] = &["Alt", "Control", "Meta", "Shift"];
+            let mut held = HashSet::new();
+            if !matches!(button.as_str(), "left" | "right" | "middle")
+                || !(1..=3).contains(count)
+                || modifiers
+                    .iter()
+                    .any(|key| !MODIFIERS.contains(&key.as_str()) || !held.insert(key.as_str()))
+            {
+                return Err(DomainError::invalid(
+                    "pointer button must be left|right|middle, count 1..3, and modifiers unique Alt|Control|Meta|Shift",
+                ));
+            }
+            if locator.is_some() == pointer_point(*x, *y, "pointer")? {
+                return Err(DomainError::invalid(format!(
+                    "pointer {op} requires either a locator or x and y"
+                )));
+            }
+            let destination = pointer_point(*to_x, *to_y, "pointer destination")?;
+            if op == "drag" {
+                if to_locator.is_some() == destination {
+                    return Err(DomainError::invalid(
+                        "pointer drag destination requires either to_locator or to_x and to_y",
+                    ));
+                }
+            } else if to_locator.is_some() || destination {
+                return Err(DomainError::invalid(
+                    "pointer destination applies to drag only",
+                ));
+            }
+        }
+        BrowserAction::Type { text, .. }
+            if text.is_empty() || text.len() > MAX_BROWSER_TYPE_BYTES =>
+        {
+            return Err(DomainError::invalid("type text must be 1..4096 bytes"));
+        }
         BrowserAction::Upload {
             files,
             via_chooser,
@@ -900,7 +1043,7 @@ fn fit_event_rows(result: &mut ActionResult) -> DomainResult<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Locator {
     pub role: Option<String>,
     pub name: Option<String>,
@@ -908,6 +1051,12 @@ pub struct Locator {
     pub test_id: Option<String>,
     pub css: Option<String>,
     pub exact: Option<bool>,
+    /// Picks one of several matches: 0 is the first, -1 the last.
+    #[serde(default)]
+    pub nth: Option<i64>,
+    /// Looks inside the one frame whose name equals this or whose URL contains it.
+    #[serde(default)]
+    pub frame: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5117,6 +5266,55 @@ mod tests {
         }))
         .unwrap();
         validate_browser_action(&largest).unwrap();
+
+        let click: BrowserAction =
+            serde_json::from_value(json!({"type": "pointer", "op": "click", "x": 12.5, "y": 0}))
+                .unwrap();
+        match &click {
+            BrowserAction::Pointer {
+                button,
+                count,
+                modifiers,
+                snapshot,
+                ..
+            } => {
+                assert_eq!(button, "left");
+                assert_eq!(*count, 1);
+                assert!(modifiers.is_empty() && !snapshot);
+            }
+            _ => panic!("wrong browser action"),
+        }
+        validate_browser_action(&click).unwrap();
+        for value in [
+            json!({"type":"pointer","op":"click","locator":{"css":"#pad"},"button":"right","count":3,"modifiers":["Alt","Control","Meta","Shift"],"snapshot":true}),
+            json!({"type":"pointer","op":"hover","x":100000,"y":100000}),
+            json!({"type":"pointer","op":"drag","locator":{"css":"#card"},"to_x":1,"to_y":2}),
+            json!({"type":"pointer","op":"drag","x":1,"y":2,"to_locator":{"role":"listitem","nth":-1,"frame":"board"}}),
+            json!({"type":"type","text":"x".repeat(MAX_BROWSER_TYPE_BYTES)}),
+            json!({"type":"type","text":"a\nb","locator":{"css":"#editor","frame":"f".repeat(2048)},"snapshot":true}),
+            // Clients that send every locator field send the absent ones as null.
+            json!({"type":"click","locator":{"role":"button","name":"Delete","text":null,"test_id":null,"css":null,"exact":true,"nth":2,"frame":null}}),
+            json!({"type":"snapshot","locator":{"css":"body","frame":"checkout","nth":null}}),
+        ] {
+            let action: BrowserAction = serde_json::from_value(value.clone()).unwrap();
+            validate_browser_action(&action).unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(
+                action.wants_snapshot(),
+                value["snapshot"] == true,
+                "{value}"
+            );
+        }
+        // A locator the worker can read back: absent fields are null, never missing.
+        let locator = serde_json::to_value(css_only("#pay")).unwrap();
+        assert_eq!(locator["nth"], Value::Null);
+        assert_eq!(locator["frame"], Value::Null);
+    }
+
+    fn css_only(selector: &str) -> Locator {
+        Locator {
+            css: Some(selector.into()),
+            ..Locator::default()
+        }
     }
 
     #[test]
@@ -5145,6 +5343,29 @@ mod tests {
             json!({"type":"evaluate","expression":"1","frame":"f".repeat(2049)}),
             json!({"type":"evaluate","expression":"1","timeout_ms":0}),
             json!({"type":"evaluate","expression":"1","timeout_ms":30_001}),
+            json!({"type":"pointer","op":"tap","x":1,"y":1}),
+            json!({"type":"pointer","op":"click"}),
+            json!({"type":"pointer","op":"click","x":1}),
+            json!({"type":"pointer","op":"click","x":1,"y":-1}),
+            json!({"type":"pointer","op":"click","x":1,"y":100_001}),
+            json!({"type":"pointer","op":"click","x":1,"y":1,"locator":{"css":"#pad"}}),
+            json!({"type":"pointer","op":"click","x":1,"y":1,"button":"back"}),
+            json!({"type":"pointer","op":"click","x":1,"y":1,"count":0}),
+            json!({"type":"pointer","op":"click","x":1,"y":1,"count":4}),
+            json!({"type":"pointer","op":"click","x":1,"y":1,"modifiers":["Hyper"]}),
+            json!({"type":"pointer","op":"click","x":1,"y":1,"modifiers":["Shift","Shift"]}),
+            json!({"type":"pointer","op":"hover","x":1,"y":1,"to_x":2,"to_y":2}),
+            json!({"type":"pointer","op":"click","x":1,"y":1,"to_locator":{"css":"#bin"}}),
+            json!({"type":"pointer","op":"drag","x":1,"y":1}),
+            json!({"type":"pointer","op":"drag","x":1,"y":1,"to_x":2}),
+            json!({"type":"pointer","op":"drag","x":1,"y":1,"to_x":2,"to_y":2,"to_locator":{"css":"#bin"}}),
+            json!({"type":"pointer","op":"drag","to_x":2,"to_y":2}),
+            json!({"type":"type","text":""}),
+            json!({"type":"type","text":"x".repeat(MAX_BROWSER_TYPE_BYTES + 1)}),
+            json!({"type":"click","locator":{"css":"button","frame":""}}),
+            json!({"type":"fill","locator":{"css":"input","frame":"f".repeat(2049)},"value":"x"}),
+            json!({"type":"snapshot","locator":{"css":"li","nth":1_000_001}}),
+            json!({"type":"pointer","op":"drag","x":1,"y":1,"to_locator":{"css":"#bin","frame":""}}),
         ] {
             let action: BrowserAction = serde_json::from_value(value).unwrap();
             assert!(validate_browser_action(&action).is_err());

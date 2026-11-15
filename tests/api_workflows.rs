@@ -498,6 +498,100 @@ async fn browser_evaluate_validates_its_input_and_names_a_missing_session() {
 }
 
 #[tokio::test]
+async fn browser_input_maps_each_op_to_its_action_and_validates_it() {
+    let (_directory, state, project_id) = test_state().await;
+    let call = |arguments: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            huntproxy::mcp::call_tool(state, "browser_input", arguments)
+                .await
+                .unwrap_err()
+        }
+    };
+    let with = |fields: serde_json::Value| {
+        let mut arguments = serde_json::json!({"project_id": project_id, "session_id": 41});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        arguments
+    };
+    for (fields, expected) in [
+        (serde_json::json!({}), "op required"),
+        (
+            serde_json::json!({"op": "tap", "x": 1, "y": 1}),
+            "pointer op must be click|hover|drag",
+        ),
+        (
+            serde_json::json!({"op": "click"}),
+            "pointer click requires either a locator or x and y",
+        ),
+        (
+            serde_json::json!({"op": "click", "x": 5}),
+            "pointer x and y must both be 0..100000",
+        ),
+        (
+            serde_json::json!({"op": "click", "x": 5, "y": 5, "locator": {"css": "#pad"}}),
+            "pointer click requires either a locator or x and y",
+        ),
+        (
+            serde_json::json!({"op": "click", "x": 5, "y": 5, "count": 4}),
+            "count 1..3",
+        ),
+        (
+            serde_json::json!({"op": "hover", "x": 5, "y": 5, "to_x": 1, "to_y": 1}),
+            "pointer destination applies to drag only",
+        ),
+        (
+            serde_json::json!({"op": "drag", "x": 5, "y": 5}),
+            "pointer drag destination requires either to_locator or to_x and to_y",
+        ),
+        (
+            serde_json::json!({"op": "click", "x": 5, "y": 5, "text": "hello"}),
+            "text does not apply to op click",
+        ),
+        (serde_json::json!({"op": "type"}), "missing field `text`"),
+        (
+            serde_json::json!({"op": "type", "text": ""}),
+            "type text must be 1..4096 bytes",
+        ),
+        (
+            serde_json::json!({"op": "type", "text": "hello", "x": 5, "y": 5}),
+            "x does not apply to op type",
+        ),
+        (
+            serde_json::json!({"op": "type", "text": "hello", "to_locator": {"css": "#bin"}}),
+            "to_locator does not apply to op type",
+        ),
+        (
+            serde_json::json!({"op": "click", "locator": {"css": "button", "frame": ""}}),
+            "locator frame must be 1..2048 bytes",
+        ),
+    ] {
+        let arguments = with(fields);
+        let error = call(arguments.clone()).await;
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{arguments}");
+        assert!(error.to_string().contains(expected), "{arguments}: {error}");
+    }
+    // Valid input of every op reaches the browser service. Null is an absent
+    // field, and defaults a client fills in for another op are not an error.
+    for fields in [
+        serde_json::json!({"op": "click", "x": 12.5, "y": 40, "button": "right", "count": 2, "modifiers": ["Shift"], "snapshot": true, "locator": null, "text": null}),
+        serde_json::json!({"op": "click", "locator": {"role": "button", "name": "Delete", "nth": -1, "frame": "checkout"}}),
+        serde_json::json!({"op": "hover", "locator": {"css": "#menu"}}),
+        serde_json::json!({"op": "drag", "locator": {"css": "#card"}, "to_x": 300, "to_y": 80}),
+        serde_json::json!({"op": "drag", "x": 1, "y": 2, "to_locator": {"css": "#bin"}}),
+        serde_json::json!({"op": "type", "text": "hello\n", "locator": {"css": "#editor"}, "snapshot": true}),
+        serde_json::json!({"op": "type", "text": "4821", "button": "left", "count": 1, "modifiers": [], "x": null, "y": null}),
+    ] {
+        let arguments = with(fields);
+        let error = call(arguments.clone()).await;
+        assert_eq!(error.code(), ErrorCode::NotFound, "{arguments}: {error}");
+        assert!(error.to_string().contains("browser session 41 not found"));
+    }
+}
+
+#[tokio::test]
 async fn browser_resource_status_is_additive_in_mcp_and_api() {
     let (_directory, state, project_id) = test_state().await;
     let expected = serde_json::json!({

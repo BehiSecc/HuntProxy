@@ -123,6 +123,37 @@ document.getElementById('read').onclick = () => read().catch(failure);
 read().catch(failure);
 </script></body></html>"#;
 
+/// A page for pointer and keyboard input: everything it hears is appended to
+/// `window.heard`, so a test reads back which trusted events an action caused.
+const BOARD: &str = r#"<!doctype html><html><head><title>Board fixture</title><style>
+body { margin: 0; }
+#pad { position: absolute; left: 20px; top: 20px; width: 300px; height: 200px; background: #dde; }
+#rows { position: absolute; left: 20px; top: 240px; }
+iframe { position: absolute; left: 20px; top: 330px; width: 400px; height: 120px; }
+</style></head><body><div id="pad"></div>
+<div id="rows"><input id="note" aria-label="Note"><button class="row">Delete</button><button class="row">Delete</button>
+<button class="row">Delete</button><a id="export" href="/report.csv">Export</a></div>
+<iframe name="checkout" src="http://127.0.0.1:{port}/checkout?order=7"></iframe><script>
+window.heard = [];
+const pad = document.getElementById('pad');
+let moves = 0;
+pad.addEventListener('mousemove', () => { moves += 1; });
+for (const kind of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']) {
+  pad.addEventListener(kind, event => {
+    if (kind === 'contextmenu') event.preventDefault();
+    window.heard.push({kind, x: event.clientX, y: event.clientY, button: event.button, shift: event.shiftKey,
+      trusted: event.isTrusted, moves});
+  });
+}
+document.querySelectorAll('button.row').forEach((row, index) =>
+  row.addEventListener('click', () => window.heard.push({kind: 'row', index})));
+const note = document.getElementById('note');
+let dirty = false;
+note.addEventListener('keydown', event => window.heard.push({kind: 'key', key: event.key, trusted: event.isTrusted}));
+note.addEventListener('input', () => { dirty = true; });
+window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+</script></body></html>"#;
+
 struct LocalFixture {
     port: u16,
     task: JoinHandle<()>,
@@ -331,6 +362,34 @@ document.getElementById('read-popup-state').onclick = () => {
             "application/json",
             json!({"method": method, "cookie": cookie}).to_string(),
         )
+    } else if path == "/board" {
+        // The embedded checkout is another site, so it runs in its own process.
+        let port = stream
+            .local_addr()
+            .map(|address| address.port())
+            .unwrap_or(0);
+        (
+            "200 OK",
+            "text/html",
+            BOARD.replace("{port}", &port.to_string()),
+        )
+    } else if path == "/checkout" {
+        (
+            "200 OK",
+            "text/html",
+            r#"<!doctype html><title>Checkout</title><label>Card number <input id="card-number"></label>
+<button id="pay">Pay</button><p id="paid"></p><script>
+document.getElementById('pay').onclick = () => {
+  document.getElementById('paid').textContent = 'paid ' + document.getElementById('card-number').value;
+};
+</script>"#.to_owned(),
+        )
+    } else if path == "/report.csv" {
+        (
+            "200 OK\r\nContent-Disposition: attachment; filename=\"report.csv\"",
+            "text/csv",
+            "id,name\n1,one\n".to_owned(),
+        )
     } else if path == "/api/large" {
         ("200 OK", "application/octet-stream", "x".repeat(16 * 1024))
     } else if path == "/api/redirect" {
@@ -472,14 +531,7 @@ impl Harness {
                 self.project,
                 session,
                 BrowserAction::Click {
-                    locator: Locator {
-                        role: None,
-                        name: None,
-                        text: None,
-                        test_id: None,
-                        css: Some(selector.into()),
-                        exact: None,
-                    },
+                    locator: css_locator(selector),
                     snapshot: false,
                 },
             )
@@ -790,6 +842,392 @@ async fn verify_page_evaluation(h: &Harness) {
             .unwrap()["content"],
         "2"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires installed Node.js, playwright-core, and Chromium; uses only a local fixture"]
+async fn pointer_and_keyboard_input_reach_points_matches_and_frames() {
+    let h = Harness::new_in(&std::env::temp_dir()).await;
+    let result = std::panic::AssertUnwindSafe(verify_pointer_and_keyboard_input(&h))
+        .catch_unwind()
+        .await;
+    h.service.force_stop_all().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn pointer(op: &str, x: f64, y: f64) -> BrowserAction {
+    BrowserAction::Pointer {
+        op: op.into(),
+        locator: None,
+        x: Some(x),
+        y: Some(y),
+        to_locator: None,
+        to_x: None,
+        to_y: None,
+        button: "left".into(),
+        count: 1,
+        modifiers: vec![],
+        snapshot: false,
+    }
+}
+
+async fn verify_pointer_and_keyboard_input(h: &Harness) {
+    let board = format!("http://localhost:{}/board", h.fixture.port);
+    let session = h
+        .service
+        .start_with_profile(h.project, board.clone(), "default")
+        .await
+        .unwrap();
+    let run = |action: BrowserAction| async {
+        h.service
+            .action(h.project, session.id, action)
+            .await
+            .unwrap()
+    };
+    // What the page heard since the last read, and a value read in the frame.
+    let heard = || async {
+        let data = run(evaluate("window.heard.splice(0)")).await.data.unwrap();
+        serde_json::from_str::<Value>(data["content"].as_str().unwrap()).unwrap()
+    };
+    let in_checkout = |expression: &str| {
+        let expression = expression.to_owned();
+        async move {
+            run(BrowserAction::Evaluate {
+                expression,
+                frame: Some("checkout".into()),
+                timeout_ms: 10_000,
+            })
+            .await
+            .data
+            .unwrap()["content"]
+                .clone()
+        }
+    };
+    run(BrowserAction::Wait {
+        for_what: "load_state".into(),
+        value: "load".into(),
+        snapshot: false,
+    })
+    .await;
+
+    // The frames a locator or an evaluation can name are listed with the page.
+    let pages = run(BrowserAction::Pages {
+        op: "list".into(),
+        page_id: None,
+        runtime_generation: None,
+        url: None,
+    })
+    .await
+    .data
+    .unwrap();
+    assert_eq!(
+        pages["pages"][0]["frames"],
+        json!([{"url": format!("http://127.0.0.1:{}/checkout", h.fixture.port), "name": "checkout"}])
+    );
+
+    // A point: one trusted click exactly where it was aimed.
+    let clicked = run(pointer("click", 120.0, 90.0)).await;
+    assert_eq!(clicked.message, "pointer clicked");
+    let events = heard().await;
+    assert_eq!(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["mousedown", "mouseup", "click"]
+    );
+    for event in events.as_array().unwrap() {
+        assert_eq!(
+            (
+                &event["x"],
+                &event["y"],
+                &event["button"],
+                &event["trusted"]
+            ),
+            (&json!(120), &json!(90), &json!(0), &json!(true)),
+            "{event}"
+        );
+    }
+    // A drag is a press, movement, and a release somewhere else. It comes
+    // before the double-click below: pressing on the selection that leaves
+    // would drag the selection instead, as it does for a person.
+    let mut drag = pointer("drag", 40.0, 40.0);
+    if let BrowserAction::Pointer { to_x, to_y, .. } = &mut drag {
+        *to_x = Some(260.0);
+        *to_y = Some(180.0);
+    }
+    let dragged = run(drag).await;
+    assert_eq!(
+        dragged.data.unwrap(),
+        json!({"from": {"x": 40, "y": 40}, "to": {"x": 260, "y": 180}})
+    );
+    let events = heard().await;
+    let events = events.as_array().unwrap();
+    let event = |kind: &str| {
+        events
+            .iter()
+            .find(|event| event["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} in {events:?}"))
+    };
+    let (down, up) = (event("mousedown"), event("mouseup"));
+    assert_eq!((&down["x"], &down["y"]), (&json!(40), &json!(40)));
+    assert_eq!((&up["x"], &up["y"]), (&json!(260), &json!(180)));
+    assert!(up["moves"].as_u64().unwrap() >= down["moves"].as_u64().unwrap() + 10);
+
+    // Any button, a double-click, and held modifiers.
+    run(BrowserAction::Pointer {
+        op: "click".into(),
+        locator: Some(css_locator("#pad")),
+        x: None,
+        y: None,
+        to_locator: None,
+        to_x: None,
+        to_y: None,
+        button: "right".into(),
+        count: 1,
+        modifiers: vec!["Shift".into()],
+        snapshot: false,
+    })
+    .await;
+    let context_menu = heard().await;
+    let context_menu = context_menu
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "contextmenu")
+        .expect("a context-menu click")
+        .clone();
+    assert_eq!(
+        (
+            &context_menu["x"],
+            &context_menu["y"],
+            &context_menu["shift"]
+        ),
+        (&json!(170), &json!(120), &json!(true))
+    );
+    let mut double = pointer("click", 40.0, 40.0);
+    if let BrowserAction::Pointer {
+        count, snapshot, ..
+    } = &mut double
+    {
+        *count = 2;
+        *snapshot = true;
+    }
+    let double = run(double).await.data.unwrap();
+    assert!(double["snapshot"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("button \"Delete\""));
+    assert!(heard()
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "dblclick"));
+
+    run(pointer("hover", 200.0, 100.0)).await;
+
+    // Several elements match: the error says how to pick one, and nth does.
+    let delete = Locator {
+        role: Some("button".into()),
+        name: Some("Delete".into()),
+        ..Locator::default()
+    };
+    let ambiguous = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Click {
+                locator: delete.clone(),
+                snapshot: false,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(ambiguous.contains("strict mode violation"), "{ambiguous}");
+    assert!(
+        ambiguous.ends_with("Set locator.nth to pick one of them: 0 is the first, -1 the last.")
+    );
+    for nth in [1, -1] {
+        run(BrowserAction::Click {
+            locator: Locator {
+                nth: Some(nth),
+                ..delete.clone()
+            },
+            snapshot: false,
+        })
+        .await;
+    }
+    assert_eq!(
+        heard().await,
+        json!([{"kind": "row", "index": 1}, {"kind": "row", "index": 2}])
+    );
+
+    // Keystrokes, to an element and then to whatever has focus.
+    let typed = run(BrowserAction::Type {
+        text: "ab".into(),
+        locator: Some(css_locator("#note")),
+        snapshot: false,
+    })
+    .await;
+    assert_eq!(typed.data.unwrap(), json!({"characters": 2}));
+    run(BrowserAction::Type {
+        text: "c".into(),
+        locator: None,
+        snapshot: false,
+    })
+    .await;
+    assert_eq!(
+        heard().await,
+        json!([
+            {"kind": "key", "key": "a", "trusted": true},
+            {"kind": "key", "key": "b", "trusted": true},
+            {"kind": "key", "key": "c", "trusted": true},
+        ])
+    );
+
+    // The same actions inside a cross-site frame.
+    let in_frame = |selector: &str| Locator {
+        frame: Some("checkout".into()),
+        ..css_locator(selector)
+    };
+    run(BrowserAction::Fill {
+        locator: in_frame("#card-number"),
+        value: "4111".into(),
+        snapshot: false,
+    })
+    .await;
+    run(BrowserAction::Type {
+        text: "22".into(),
+        locator: Some(in_frame("#card-number")),
+        snapshot: false,
+    })
+    .await;
+    run(BrowserAction::Click {
+        locator: in_frame("#pay"),
+        snapshot: false,
+    })
+    .await;
+    assert_eq!(
+        in_checkout("document.getElementById('paid').textContent").await,
+        "paid 411122"
+    );
+    let frame_tree = run(BrowserAction::Snapshot {
+        format: "accessibility".into(),
+        max_bytes: 24_000,
+        offset: 0,
+        locator: Some(in_frame("body")),
+    })
+    .await
+    .data
+    .unwrap();
+    assert!(frame_tree["content"]
+        .as_str()
+        .unwrap()
+        .contains("textbox \"Card number\": \"411122\""));
+    let inspected = runtime_inspection_of(h, session.id, in_frame("#pay")).await;
+    assert_eq!(inspected["element"]["tag"], "button");
+    let missing = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Click {
+                locator: Locator {
+                    frame: Some("basket".into()),
+                    ..css_locator("#pay")
+                },
+                snapshot: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing.code(),
+        huntproxy::domain::ErrorCode::InvalidArgument
+    );
+    assert!(missing
+        .to_string()
+        .contains("frame matches no frame of the selected page; frames: "));
+
+    // A download leaves the page and the session as they were.
+    run(BrowserAction::Click {
+        locator: css_locator("#export"),
+        snapshot: false,
+    })
+    .await;
+    assert_eq!(
+        run(evaluate("document.title")).await.data.unwrap()["content"],
+        "Board fixture"
+    );
+
+    // The note is unsaved, and the page asks before it lets go. The agent leaves.
+    let left = run(BrowserAction::Navigate {
+        url: h.fixture.url("localhost", "default"),
+        snapshot: false,
+    })
+    .await
+    .data
+    .unwrap();
+    assert!(left["url"]
+        .as_str()
+        .unwrap()
+        .contains("/app?profile=default"));
+    let dialogs = run(BrowserAction::Events {
+        after_sequence: 0,
+        runtime_generation: None,
+        limit: 100,
+        kinds: vec!["dialog".into()],
+        wait_ms: 0,
+    })
+    .await
+    .data
+    .unwrap();
+    assert_eq!(
+        dialogs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| (
+                event["dialog_type"].as_str().unwrap(),
+                event["disposition"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        // Following the download link asked once, and leaving asked again.
+        [("beforeunload", "accepted"), ("beforeunload", "accepted")]
+    );
+    assert_eq!(
+        h.service
+            .session_status(h.project, session.id)
+            .await
+            .unwrap()
+            .state,
+        huntproxy::domain::BrowserSessionState::Ready
+    );
+}
+
+async fn runtime_inspection_of(h: &Harness, session: BrowserSessionId, locator: Locator) -> Value {
+    let data = h
+        .service
+        .action(
+            h.project,
+            session,
+            BrowserAction::Inspect {
+                locator: Some(locator),
+                max_bytes: 65_536,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    serde_json::from_str(data["content"].as_str().unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -1402,12 +1840,8 @@ async fn verify_structured_playwright_actions(h: &Harness) {
 
 fn css_locator(selector: &str) -> Locator {
     Locator {
-        role: None,
-        name: None,
-        text: None,
-        test_id: None,
         css: Some(selector.into()),
-        exact: None,
+        ..Locator::default()
     }
 }
 
