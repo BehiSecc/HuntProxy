@@ -160,7 +160,7 @@ HuntProxy gives agents a complete hunting loop: build context â†’ investigate â†
 | **Projects** | Keep a target's traffic, browser state, cookies, notes, and test results together. |
 | **Capture proxy & History** | Record HTTP/HTTPS traffic and search it by host, path, method, status, source, labels, request content, and Boolean expressions. |
 | **Persistent browser profiles** | Run separate named Chromium identities in one project for cross-account testing. Each profile keeps its own cookies and site storage across restarts. |
-| **Browser actions** | Click, fill, upload, use tabs and events, take screenshots, run JavaScript in the page or one of its frames, send same-origin requests with the live session, and hand control to a person through CDP; up to two profiles can be open per project by default. |
+| **Browser actions** | Click, fill, upload, use tabs and events, take screenshots, act inside iframes, click, hover and drag at any point, type real keystrokes, run JavaScript in the page or one of its frames, send same-origin requests with the live session, and hand control to a person through CDP; up to two profiles can be open per project by default. |
 | **Sitemap** | Turn saved traffic into a host-and-route tree with methods, statuses, parameters, content types, and exchange counts. |
 | **JavaScript & page discovery** | Find JavaScript and the pages that loaded it, extract endpoints, URLs, emails, and request parameter names, and build target-specific wordlists. |
 | **WebSockets** | Inspect captured connections and messages, then inject text or binary frames into a live connection. |
