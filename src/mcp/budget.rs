@@ -54,13 +54,6 @@ pub(crate) fn json_len(value: &Value) -> usize {
 /// example `MAX_OUTPUT_BYTES.saturating_sub(json_len(&envelope_without_rows))`.
 /// At least one row is kept when `rows` is not empty so paging always advances;
 /// an oversized single row is left to the [`fit_to_budget`] safety net.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into list tools by the follow-up MCP output changes"
-    )
-)]
 pub(crate) fn rows_that_fit<T: Serialize>(rows: &[T], max_bytes: usize) -> DomainResult<usize> {
     let mut used = 2; // `[` and `]`
     for (index, row) in rows.iter().enumerate() {

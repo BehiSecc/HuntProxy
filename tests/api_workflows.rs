@@ -516,7 +516,7 @@ async fn history_query_errors_explain_repairs_without_returning_items() {
         ("status:>=400", "status>=VALUE"),
         ("started_at>1970-01-01T00:00:00Z", "use time"),
         ("method:GET OR", "require a following term"),
-        ("request:monthly", "request:~text"),
+        ("request>monthly", "request:~text"),
         (r#"path:~"monthly report"#, "close the double quote"),
     ] {
         let encoded = url::form_urlencoded::Serializer::new(String::new())
@@ -603,8 +603,7 @@ async fn mcp_history_query_validation_never_broadens_invalid_queries() {
             .await
             .unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), expected);
-        assert_eq!(result["saved_only"], true);
-        assert_eq!(result["noise_filtered"], false);
+        assert!(result.get("saved_only").is_none());
     }
 }
 
@@ -1344,31 +1343,19 @@ async fn js_files_reports_nested_session_provenance_and_excludes_unrelated_scrip
     .await
     .unwrap();
     assert_eq!(result["source"], "history");
-    assert_eq!(result["count"], 3);
     let files = result["files"].as_array().unwrap();
-    let nested = files
-        .iter()
-        .find(|file| file["path"] == "/frame.js")
-        .unwrap();
+    assert_eq!(files.len(), 3);
+    let file = |url: &str| files.iter().find(|file| file["url"] == url).unwrap();
+    let nested = file("https://cdn.vendor.test/frame.js");
     assert_eq!(nested["exchange_id"], exchange_id.get());
     assert_eq!(nested["related_via_session"], true);
     assert_eq!(
-        nested["related_page_urls"],
+        nested["pages"],
         serde_json::json!(["https://frames.vendor.test/nested"])
     );
-    assert_eq!(
-        nested["related_page_hosts"],
-        serde_json::json!(["frames.vendor.test"])
-    );
-    let direct = files
-        .iter()
-        .find(|file| file["path"] == "/main.js")
-        .unwrap();
-    assert_eq!(direct["related_via_session"], false);
-    let document_frame = files
-        .iter()
-        .find(|file| file["path"] == "/document-frame.js")
-        .unwrap();
+    let direct = file("https://cdn.vendor.test/main.js");
+    assert!(direct.get("related_via_session").is_none());
+    let document_frame = file("https://cdn.vendor.test/document-frame.js");
     assert_eq!(document_frame["related_via_session"], true);
     let unfiltered = huntproxy::mcp::call_tool(
         state,
@@ -1377,12 +1364,11 @@ async fn js_files_reports_nested_session_provenance_and_excludes_unrelated_scrip
     )
     .await
     .unwrap();
-    assert_eq!(unfiltered["count"], 5);
-    assert!(unfiltered["files"]
-        .as_array()
-        .unwrap()
+    let files = unfiltered["files"].as_array().unwrap();
+    assert_eq!(files.len(), 5);
+    assert!(files
         .iter()
-        .all(|file| file["related_via_session"] == false));
+        .all(|file| file.get("related_via_session").is_none()));
 }
 
 #[tokio::test]
@@ -2081,12 +2067,20 @@ async fn mcp_sitemap_starts_with_host_summaries_and_supports_path_subtrees() {
     )
     .await
     .unwrap();
+    let paths = |result: &serde_json::Value| {
+        result["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|route| route["path"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(paths(&subtree), ["/api", "/api/users"]);
+    assert_eq!(subtree["routes"][1]["exchange_count"], 2);
     assert_eq!(
-        subtree["hosts"][0]["paths"],
-        serde_json::json!(["/api", "/api/users"])
+        subtree["routes"][1]["methods"],
+        serde_json::json!(["GET", "POST"])
     );
-    assert_eq!(subtree["hosts"][0]["routes"][1]["exchange_count"], 2);
-    assert_eq!(subtree["hosts"][0]["tree"][0]["path"], "/api");
 
     let root = huntproxy::mcp::call_tool(
         state.clone(),
@@ -2099,10 +2093,7 @@ async fn mcp_sitemap_starts_with_host_summaries_and_supports_path_subtrees() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        root["hosts"][0]["paths"],
-        serde_json::json!(["/api", "/api/users", "/api2", "/other"])
-    );
+    assert_eq!(paths(&root), ["/api", "/api/users", "/api2", "/other"]);
 
     let no_match = huntproxy::mcp::call_tool(
         state.clone(),
@@ -2115,7 +2106,7 @@ async fn mcp_sitemap_starts_with_host_summaries_and_supports_path_subtrees() {
     )
     .await
     .unwrap();
-    assert_eq!(no_match, serde_json::json!({ "hosts": [] }));
+    assert_eq!(no_match, serde_json::json!({ "routes": [] }));
 
     let error = huntproxy::mcp::call_tool(
         state,

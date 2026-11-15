@@ -1,6 +1,7 @@
 //! Minimal stdio JSON-RPC MCP server. Protocol on stdout; diagnostics on stderr.
 
 mod budget;
+mod history_view;
 mod view;
 
 use crate::app::AppState;
@@ -9,13 +10,12 @@ use crate::codec::{apply_pipeline, Transform};
 use crate::config::Config;
 use crate::domain::*;
 use crate::fuzzer::FuzzTemplate;
-use crate::history::{parse_text_query, query_error, HISTORY_QUERY_SYNTAX};
+use crate::history::HISTORY_QUERY_SYNTAX;
 use crate::policy::{is_sensitive_header, PresentationOptions};
 use crate::storage::CreateCaptureSession;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -510,8 +510,8 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set requires target_url and exactly one of cookie or file_path; clear requires target_url unless profile_name is supplied. Set accepts a raw Cookie header, a browser-export JSON cookie array, or a session object {\"cookies\":[...],\"origins\":[{\"origin\":\"https://app.example\",\"localStorage\":[{\"name\",\"value\"}],\"sessionStorage\":[{\"name\",\"value\"}]}]} (Playwright storageState plus optional per-origin sessionStorage; cookies may be empty). Origins must be exact http(s) origins without a path, and storage requires profile_name (project cookies have no browser to seed). Input up to 4 MiB. list reports only an origin_count, never keys or values. Project cookies apply to HTTP tools and ephemeral sessions. Persistent browser jars change only with an explicit browser_start(cookie_profile=...). profile_name stores a reusable named cookie identity for extensions or browser_start(cookie_profile=...) without changing an already running browser.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Optional reusable identity name. Pass the same name as browser_start.cookie_profile to seed a persistent Chromium profile."},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array or session object."},{"type":"object","description":"Session object: cookies plus per-origin localStorage/sessionStorage. Requires profile_name when origins are present.","properties":{"cookies":{"type":"array","items":{"type":"object"}},"origins":{"type":"array","items":{"type":"object","properties":{"origin":{"type":"string"},"localStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}},"sessionStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}}},"required":["origin"]}}}},{"type":"array","description":"Browser-export or Playwright cookie array.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"path":{"type":"string"},"httpOnly":{"type":"boolean"},"secure":{"type":"boolean"},"sameSite":{"type":"string"},"session":{"type":"boolean"},"expirationDate":{"type":"number"},"expires":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file (up to 4 MiB) containing a raw Cookie header, JSON cookie array, or session object with cookies and origins."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
         {"name":"overview","description":"Summarize one project's saved activity: total exchanges and counts by source, captured replies sent, findings, distinct hosts, and last exchange time.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"history_search","description":"Search saved project history without hiding hosts or MIME types. Active browser responses appear after capture completion. Comparisons attach directly to the field: status>=400 or time>2026-10-12T00:00:00Z. Supports AND/OR/NOT, parentheses, and quoted values. Query errors return repair guidance; correct q before retrying. Full request search can scan decoded bodies, so narrow large projects with host, method, source, size, or time terms. Search results identify exchanges but do not include full body content; use exchange_body with the matching exchange_id to read request or response bytes.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 timestamp text, not Unix seconds; copy the saved format for precise cutoffs. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request. request:~text searches the request target, headers, and decoded request body and can be expensive on broad queries. Bare words search summary fields. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"description":"Pass the `next` value from the previous history_search result to fetch the following page.","oneOf":[{"type":"array","items":{"type":["string","integer"]},"minItems":2,"maxItems":2},{"type":"string"},{"type":"null"}]}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"sitemap","description":"Discover saved routes without oversized responses. Omit host for a lightweight list of hosts and route counts. Provide one exact host for its detailed route tree, optionally limited to a path subtree.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Optional exact hostname, case-insensitive. Omit for host summaries."},"path_prefix":{"type":"string","description":"Optional slash-boundary path subtree, such as /api. Requires host."}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"history_search","description":format!("Search saved project history, newest first, across all hosts and MIME types; active browser responses appear once captured. {} Pages fit the output budget; pass next as cursor to continue. When an AND query matches nothing, no_match_terms lists its terms that match nothing alone. Rows omit bodies; read them with exchange_body.", view::EXCHANGE_ROW_NOTE),"inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 text, not Unix seconds. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, query, url (scheme://authority/path?query), method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request, response. request:~text searches the request line, headers and decoded body; response:~text searches response headers and decoded body; both are slow on broad queries, so add host, method, time or size terms. Bare words search host, path, mime, title and error. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50},"cursor":{"description":"next from the previous page.","oneOf":[{"type":"array","items":{"type":["string","integer"]},"minItems":2,"maxItems":2},{"type":"string"},{"type":"null"}]}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"sitemap","description":"Discover saved routes. Omit host for a lightweight list of hosts and route counts. With one exact host, list its routes sorted by path, optionally under path_prefix; routes omit empty lists and exchange_count 1. Pass next_offset as offset to continue.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Exact hostname, case-insensitive."},"path_prefix":{"type":"string","description":"Slash-boundary path subtree, such as /api. Requires host."},"offset":{"type":"integer","minimum":0}},"required":["project_id"],"additionalProperties":false}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
         {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
         {"name":"exchange_compare","description":"Compare the saved request and response of two exchanges. Sensitive values stay redacted, while changes are still detected. Text body diffs are bounded.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"left_exchange_id":{"type":"integer"},"right_exchange_id":{"type":"integer"},"include_noisy_headers":{"type":"boolean","default":false}},"required":["project_id","left_exchange_id","right_exchange_id"],"additionalProperties":false}},
@@ -530,7 +530,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. browser_cdp remains available for interactions these actions cannot express.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
         {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on an available port from 9222 to 9321, inspect handoff status, or return control to the agent. While enabled, browser_action is paused for that session. Status accepts an optional session_id; without it, active_sessions lists the project’s handoffs. On a VPS, use ssh_forward_command when returned; otherwise forward the returned cdp_port to the same port on 127.0.0.1 over SSH. Try hosted_devtools_url first, then devtools_url if the browser restricts the hosted frontend’s local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; optional for status."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions and resources: per-project capacity including ephemeral sessions, verified profile ownership, and cdp_port_in_use, which is true when the CDP port range is exhausted. Reuse these observations until a lifecycle transition or browser error; capacity is not a reservation. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
-        {"name":"js_files","description":"Return JavaScript files with the page URLs and hosts that included or loaded them. Without url, search saved history and provenance; with url, load that page in Chromium. A domain filter matches the JavaScript host or its related page host, including subdomains. Saved history also includes scripts from browser sessions with a matching saved exchange or JavaScript page/resource provenance. related_via_session is true only when this session relationship alone includes a file for the domain filter; it is false for direct host/page matches and unfiltered results. Related page URLs remain the immediate pages that loaded each script.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Optional exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000}},"required":["project_id"]}},
+        {"name":"js_files","description":"List JavaScript files sorted by URL, with the pages that loaded them. Without url, search saved history and provenance; with url, load that page in Chromium first. domain matches the script host or its page host, including subdomains; saved history also includes scripts from browser sessions with matching evidence, and related_via_session marks files included only that way. Rows omit status_code 200, nulls and false; pages lists up to 3 page URLs, with page_count when there are more. Pass next_offset as offset to continue.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000},"offset":{"type":"integer","minimum":0}},"required":["project_id"]}},
         {"name":"get_words","description":"Build a sorted target-specific wordlist from saved request paths, parameter names, and textual responses. Related JavaScript files are included by default. Optionally filter by a domain and its subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"domain":{"type":"string","description":"Optional hostname, wildcard hostname, or HTTP URL."},"include_js":{"type":"boolean","default":true},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":5000}},"required":["project_id"],"additionalProperties":false}},
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Keeps this MCP connection available; call huntproxy_restart to continue later. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"huntproxy_restart","description":"Restart or recover HuntProxy without reconnecting the agent's MCP session. Preserves saved projects, traffic, findings, Reply/Fuzzer state, and browser profiles. Active browsers close and can be resumed using browser_start. Running jobs are interrupted; memory-only plugin results/checkpoints are lost. Use when the user asks to restart or to continue after HuntProxy has stopped.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -1141,19 +1141,6 @@ fn page_analysis_tree_fields(
     })
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct JavascriptFileOutput {
-    exchange_id: Option<ExchangeId>,
-    url: String,
-    path: String,
-    host: String,
-    mime: Option<String>,
-    status_code: Option<u16>,
-    related_page_urls: Vec<String>,
-    related_page_hosts: Vec<String>,
-    related_via_session: bool,
-}
-
 fn normalize_domain_filter(value: Option<&str>) -> DomainResult<Option<String>> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -1176,35 +1163,6 @@ fn normalize_domain_filter(value: Option<&str>) -> DomainResult<Option<String>> 
 fn host_matches_domain(host: &str, domain: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     host == domain || host.ends_with(&format!(".{domain}"))
-}
-
-fn javascript_files_response(
-    source: &str,
-    files: Vec<JavascriptFileOutput>,
-    truncated: bool,
-    domain: Option<&str>,
-    browser: Option<Value>,
-) -> Value {
-    let urls = files
-        .iter()
-        .map(|file| file.url.clone())
-        .collect::<Vec<_>>();
-    let paths = files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    json!({
-        "source": source,
-        "domain": domain,
-        "count": files.len(),
-        "truncated": truncated,
-        "files": files,
-        "urls": urls,
-        "paths": paths,
-        "browser": browser,
-    })
 }
 
 fn emit_event(state: &AppState, project_id: ProjectId, kind: &str, payload: Value) {
@@ -1622,70 +1580,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 )),
             }
         }
-        "history_search" => {
-            let project_id = require_project_id(&args)?;
-            let query = match args.get("q") {
-                None => None,
-                Some(Value::String(query)) => Some(query.as_str()),
-                Some(_) => {
-                    return Err(query_error(format!(
-                        "history_search q must be a query string; omit q to list history. {HISTORY_QUERY_SYNTAX}"
-                    )))
-                }
-            };
-            let filter = query
-                .filter(|query| !query.trim().is_empty())
-                .map(parse_text_query)
-                .transpose()?;
-            if let Some(filter) = &filter {
-                crate::history::validate_filter(filter)?;
-            }
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50)
-                .clamp(1, 500) as u32;
-            let (before_started, before_id) = parse_history_cursor(args.get("cursor"))?;
-            let (items, next) = state
-                .db
-                .list_history_filtered(project_id, filter, limit, before_started, before_id)
-                .await?;
-            Ok(json!({
-                "items": items,
-                "next": next,
-                "saved_only": true,
-                "noise_filtered": false
-            }))
-        }
-        "sitemap" => {
-            let project_id = require_project_id(&args)?;
-            let host = args
-                .get("host")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let path_prefix = args
-                .get("path_prefix")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            match host {
-                Some(host) => Ok(json!({
-                    "hosts": state
-                        .db
-                        .list_sitemap_subtree(project_id, Some(host), path_prefix)
-                        .await?
-                })),
-                None if path_prefix.is_some() => {
-                    Err(DomainError::invalid("sitemap path_prefix requires host"))
-                }
-                None => Ok(json!({
-                    "hosts": state.db.list_sitemap_hosts(project_id).await?
-                })),
-            }
-        }
+        "history_search" => history_view::history_search(&state, &args).await,
+        "sitemap" => history_view::sitemap(&state, &args).await,
         "findings" => {
             let project_id = require_project_id(&args)?;
             match args.get("action").and_then(Value::as_str).unwrap_or("list") {
@@ -2671,109 +2567,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 )),
             }
         }
-        "js_files" => {
-            let project_id = require_project_id(&args)?;
-            let domain = normalize_domain_filter(args.get("domain").and_then(Value::as_str))?;
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(2_000)
-                .clamp(1, 10_000) as usize;
-            if let Some(url) = args.get("url").and_then(Value::as_str) {
-                let parsed = url::Url::parse(url)
-                    .map_err(|error| DomainError::invalid(format!("invalid load URL: {error}")))?;
-                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err(DomainError::invalid(
-                        "load URL must be an absolute http or https URL",
-                    ));
-                }
-                let session = state
-                    .browser
-                    .start_ephemeral(project_id, url.to_string())
-                    .await?;
-                let settle_ms = args
-                    .get("settle_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(2_000)
-                    .min(30_000);
-                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
-                let files_result = state.browser.javascript_files(project_id, session.id).await;
-                let stop_result = state.browser.stop(project_id, session.id).await;
-                let mut files = files_result?
-                    .into_iter()
-                    .filter(|file| {
-                        domain.as_deref().is_none_or(|domain| {
-                            host_matches_domain(&file.host, domain)
-                                || file
-                                    .source_page_url
-                                    .as_deref()
-                                    .and_then(|url| url::Url::parse(url).ok())
-                                    .and_then(|url| url.host_str().map(str::to_string))
-                                    .is_some_and(|host| host_matches_domain(&host, domain))
-                        })
-                    })
-                    .map(|file| JavascriptFileOutput {
-                        exchange_id: None,
-                        url: file.url,
-                        path: file.path,
-                        host: file.host,
-                        mime: file.mime,
-                        status_code: file.status_code,
-                        related_page_urls: file.source_page_url.clone().into_iter().collect(),
-                        related_via_session: false,
-                        related_page_hosts: file
-                            .source_page_url
-                            .as_deref()
-                            .and_then(|url| url::Url::parse(url).ok())
-                            .and_then(|url| url.host_str().map(str::to_string))
-                            .into_iter()
-                            .collect(),
-                    })
-                    .collect::<Vec<_>>();
-                stop_result?;
-                let truncated = files.len() > limit;
-                if truncated {
-                    files.truncate(limit);
-                }
-                Ok(javascript_files_response(
-                    "load",
-                    files,
-                    truncated,
-                    domain.as_deref(),
-                    Some(json!({
-                        "session_id": session.id,
-                        "engine": session.engine,
-                        "stopped": true,
-                    })),
-                ))
-            } else {
-                let (files, truncated) = state
-                    .db
-                    .list_javascript_files(project_id, None, domain.clone(), limit as u32)
-                    .await?;
-                let files = files
-                    .into_iter()
-                    .map(|file| JavascriptFileOutput {
-                        exchange_id: file.exchange_id,
-                        url: file.url,
-                        path: file.path,
-                        host: file.host,
-                        mime: file.mime,
-                        status_code: file.status_code,
-                        related_page_urls: file.related_page_urls,
-                        related_page_hosts: file.related_page_hosts,
-                        related_via_session: file.related_via_session,
-                    })
-                    .collect();
-                Ok(javascript_files_response(
-                    "history",
-                    files,
-                    truncated,
-                    domain.as_deref(),
-                    None,
-                ))
-            }
-        }
+        "js_files" => history_view::js_files(&state, &args).await,
         "get_words" => {
             let project_id = require_project_id(&args)?;
             let include_js = args
@@ -3495,8 +3289,7 @@ mod tests {
             }));
             let result = handle_rpc(backend, &corrected).await.unwrap().unwrap();
             assert_eq!(result["isError"], false);
-            assert_eq!(result["structuredContent"]["items"], json!([]));
-            assert_eq!(result["structuredContent"]["saved_only"], true);
+            assert_eq!(result["structuredContent"], json!({"items": []}));
         }
         cancel.cancel();
         server.await.unwrap().unwrap();
@@ -3567,7 +3360,7 @@ mod tests {
             .unwrap();
         let query = &tool["inputSchema"]["properties"]["q"];
         for example in query["examples"].as_array().unwrap() {
-            let filter = parse_text_query(example.as_str().unwrap()).unwrap();
+            let filter = crate::history::parse_text_query(example.as_str().unwrap()).unwrap();
             crate::history::filter_to_sql(&filter).unwrap();
         }
         let description = query["description"].as_str().unwrap();

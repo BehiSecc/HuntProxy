@@ -5,10 +5,6 @@ use crate::domain::ExchangeSummary;
 use serde_json::{json, Map, Value};
 
 /// One sentence for tool descriptions that return [`exchange_row`] rows.
-#[expect(
-    dead_code,
-    reason = "pasted into tool descriptions by the follow-up MCP output changes"
-)]
 pub(crate) const EXCHANGE_ROW_NOTE: &str = "Rows give url instead of host/path/query and omit null fields and defaults (source proxy, completion complete, capture_quality semantic, no labels).";
 
 const OPTIONAL_FIELDS: [&str; 8] = [
@@ -31,13 +27,6 @@ const DEFAULTED_FIELDS: [(&str, &str); 3] = [
 /// Compact row for one exchange: `exchange_id`, `started_at` (the stored
 /// RFC 3339 value), `method` and a single `url`, plus only the fields that are
 /// set or differ from their default. See [`EXCHANGE_ROW_NOTE`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into list tools by the follow-up MCP output changes"
-    )
-)]
 pub(crate) fn exchange_row(summary: &ExchangeSummary) -> Value {
     // Reuse the domain serialization so values match the REST shape exactly.
     let Value::Object(mut full) = json!(summary) else {
