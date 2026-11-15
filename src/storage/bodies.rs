@@ -144,12 +144,13 @@ pub fn store_body_file_conn(
             "body spool length exceeds SQLite limits",
         )
     })?;
-    let blob_length = i32::try_from(length).map_err(|_| {
-        DomainError::new(
+    // Incremental BLOB writes take `int` offsets.
+    if i32::try_from(length).is_err() {
+        return Err(DomainError::new(
             ErrorCode::BodyTooLarge,
             "body spool exceeds SQLite incremental BLOB limit",
-        )
-    })?;
+        ));
+    }
 
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -191,7 +192,7 @@ pub fn store_body_file_conn(
             original_length,
             original_length,
             mime_class,
-            ZeroBlob(blob_length)
+            ZeroBlob(length)
         ],
     )
     .map_err(storage_error)?;

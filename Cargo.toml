@@ -48,9 +48,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = { version = "0.13", features = ["x509-parser"] }
 webpki-roots = "0.26"
 
-# SQLite — deadpool-sqlite 0.14 pulls rusqlite 0.40
-deadpool-sqlite = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
-rusqlite = { version = "0.40", features = ["bundled", "blob", "backup", "functions", "limits"] }
+# SQLite — pooled through deadpool directly, so rusqlite (and the SQLite it
+# bundles) is not held back by deadpool-sqlite's rusqlite pin
+deadpool = { version = "0.13.1", default-features = false, features = ["managed", "rt_tokio_1"] }
+deadpool-sync = "0.2"
+rusqlite = { version = "0.41.1", features = ["bundled", "blob", "backup", "functions", "limits"] }
 
 # Parsing / codecs
 serde = { version = "1", features = ["derive"] }

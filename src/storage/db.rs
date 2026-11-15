@@ -3,12 +3,52 @@
 use crate::config::Config;
 use crate::domain::{DomainError, DomainResult, ErrorCode};
 use crate::storage::migrations;
-use deadpool_sqlite::{Config as PoolConfig, Pool, Runtime};
+use deadpool::managed::{self, Metrics, RecycleError, RecycleResult};
+use deadpool::Runtime;
+use deadpool_sync::SyncWrapper;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+
+type Pool = managed::Pool<SqliteManager>;
+
+/// Opens pooled SQLite connections. Each connection runs its queries on a
+/// blocking thread.
+#[derive(Debug)]
+struct SqliteManager {
+    path: String,
+}
+
+impl managed::Manager for SqliteManager {
+    type Type = SyncWrapper<Connection>;
+    type Error = rusqlite::Error;
+
+    async fn create(&self) -> Result<Self::Type, Self::Error> {
+        let path = self.path.clone();
+        SyncWrapper::new(Runtime::Tokio1, move || Connection::open(path)).await
+    }
+
+    async fn recycle(&self, conn: &mut Self::Type, _: &Metrics) -> RecycleResult<Self::Error> {
+        if conn.is_mutex_poisoned() {
+            return Err(RecycleError::message(
+                "a query panicked while holding this connection",
+            ));
+        }
+        conn.interact(|conn| conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)))
+            .await
+            .map_err(|error| RecycleError::message(error.to_string()))??;
+        Ok(())
+    }
+}
+
+fn open_pool(path: String) -> DomainResult<Pool> {
+    Pool::builder(SqliteManager { path })
+        .runtime(Runtime::Tokio1)
+        .build()
+        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))
+}
 
 #[derive(Clone)]
 pub struct Db {
@@ -23,10 +63,7 @@ impl Db {
     pub async fn open(cfg: &Config) -> DomainResult<Self> {
         cfg.ensure_layout()?;
         let path = cfg.db_path();
-        let pool_cfg = PoolConfig::new(path.display().to_string());
-        let pool = pool_cfg
-            .create_pool(Runtime::Tokio1)
-            .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+        let pool = open_pool(path.display().to_string())?;
 
         let sync = cfg.sqlite_synchronous.clone();
         let busy = cfg.busy_timeout_ms;
@@ -66,13 +103,10 @@ impl Db {
         // Each SQLite :memory: connection is a separate database. Give this
         // pool a private shared-memory database so every connection sees the
         // migrated schema and the same data.
-        let pool_cfg = PoolConfig::new(format!(
+        let pool = open_pool(format!(
             "file:huntproxy-{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
-        ));
-        let pool = pool_cfg
-            .create_pool(Runtime::Tokio1)
-            .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+        ))?;
         {
             let conn = pool
                 .get()
@@ -92,10 +126,6 @@ impl Db {
             synchronous: "NORMAL".into(),
             ip_rotation_cursors: Arc::new(dashmap::DashMap::new()),
         })
-    }
-
-    pub fn pool(&self) -> &Pool {
-        &self.pool
     }
 
     pub async fn with_conn<F, T>(&self, f: F) -> DomainResult<T>
@@ -215,8 +245,11 @@ mod tests {
 
     #[test]
     fn sqlite_includes_unix_locking_and_wal_fixes() {
+        // 3.51.3 fixes Unix locking and WAL; 3.54.0 fixes stale page-cache
+        // reads when a WAL's page size differs from the database's
+        // (RUSTSEC-2026-0459).
         assert!(
-            rusqlite::version_number() >= 3_051_003,
+            rusqlite::version_number() >= 3_054_000,
             "SQLite {} predates the Unix locking and WAL fixes",
             rusqlite::version()
         );
@@ -226,11 +259,11 @@ mod tests {
     async fn in_memory_pool_shares_database_between_connections_but_not_pools() {
         let db = Db::open_in_memory().await.unwrap();
         let other = Db::open_in_memory().await.unwrap();
-        let first = db.pool().get().await.unwrap();
+        let first = db.pool.get().await.unwrap();
         first.interact(|conn| {
             conn.execute_batch("CREATE TABLE shared_fixture (value TEXT); INSERT INTO shared_fixture VALUES ('shared');")
         }).await.unwrap().unwrap();
-        let second = db.pool().get().await.unwrap();
+        let second = db.pool.get().await.unwrap();
         let value: String = second
             .interact(|conn| {
                 conn.query_row("SELECT value FROM shared_fixture", [], |row| row.get(0))
