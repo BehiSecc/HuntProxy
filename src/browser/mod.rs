@@ -35,6 +35,12 @@ const MAX_PERSISTENT_PROFILE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_BROWSER_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BROWSER_REQUEST_RESPONSE_BYTES: u64 = 65_536;
 const MAX_BROWSER_SCREENSHOT_BYTES: u64 = 8 * 1024 * 1024;
+/// Every action result is fitted to the MCP output budget by construction, so
+/// MCP clients and the generic safety net never have to cut it.
+const ACTION_OUTPUT_BYTES: usize = crate::mcp::budget::MAX_OUTPUT_BYTES;
+/// A larger snapshot slice could never fit the result: JSON escaping only adds
+/// bytes. The worker uses the same cap.
+const MAX_SNAPSHOT_BYTES: u64 = ACTION_OUTPUT_BYTES as u64;
 const EMBEDDED_WORKER: &str = include_str!("../../browser-worker/index.js");
 const EMBEDDED_WORKER_HEADLESS: &str = include_str!("../../browser-worker/headless.js");
 const EMBEDDED_WORKER_PACKAGE: &str = include_str!("../../browser-worker/package.json");
@@ -302,23 +308,38 @@ fn cookie_seed_hash(cookies: &[Value], origins: &[StorageOrigin]) -> DomainResul
 pub enum BrowserAction {
     Navigate {
         url: String,
+        /// Also return the resulting page's accessibility snapshot.
+        #[serde(default)]
+        snapshot: bool,
     },
     Snapshot {
         #[serde(default = "default_snapshot_format")]
         format: String,
+        /// Clamped to what fits the action output budget.
         #[serde(default = "default_snapshot_max_bytes")]
         max_bytes: u64,
+        /// UTF-8 byte offset into the full snapshot content.
+        #[serde(default)]
+        offset: u64,
+        /// Captures only this element's subtree.
+        locator: Option<Locator>,
     },
     Click {
         locator: Locator,
+        #[serde(default)]
+        snapshot: bool,
     },
     Fill {
         locator: Locator,
         value: String,
+        #[serde(default)]
+        snapshot: bool,
     },
     Select {
         locator: Locator,
         value: String,
+        #[serde(default)]
+        snapshot: bool,
     },
     Upload {
         locator: Locator,
@@ -379,14 +400,41 @@ pub enum BrowserAction {
     Press {
         locator: Option<Locator>,
         key: String,
+        #[serde(default)]
+        snapshot: bool,
     },
     Wait {
         for_what: String,
         value: String,
+        #[serde(default)]
+        snapshot: bool,
     },
-    Back,
-    Forward,
+    Back {
+        #[serde(default)]
+        snapshot: bool,
+    },
+    Forward {
+        #[serde(default)]
+        snapshot: bool,
+    },
     Close,
+}
+
+impl BrowserAction {
+    /// Whether the worker appends the resulting page's snapshot as `data.snapshot`.
+    fn wants_snapshot(&self) -> bool {
+        match self {
+            Self::Navigate { snapshot, .. }
+            | Self::Click { snapshot, .. }
+            | Self::Fill { snapshot, .. }
+            | Self::Select { snapshot, .. }
+            | Self::Press { snapshot, .. }
+            | Self::Wait { snapshot, .. }
+            | Self::Back { snapshot }
+            | Self::Forward { snapshot } => *snapshot,
+            _ => false,
+        }
+    }
 }
 
 fn default_browser_action_timeout() -> u64 {
@@ -418,7 +466,7 @@ fn default_snapshot_format() -> String {
 }
 
 fn default_snapshot_max_bytes() -> u64 {
-    200_000
+    MAX_SNAPSHOT_BYTES
 }
 
 fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
@@ -447,6 +495,11 @@ fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
         }
         BrowserAction::Inspect { max_bytes, .. } if !(1..=65_536).contains(max_bytes) => {
             return Err(DomainError::invalid("inspect max_bytes must be 1..65536"));
+        }
+        BrowserAction::Snapshot { max_bytes: 0, .. } => {
+            return Err(DomainError::invalid(
+                "snapshot max_bytes must be at least 1",
+            ));
         }
         BrowserAction::Pages {
             op,
@@ -721,6 +774,97 @@ fn validate_browser_page_url(value: &str) -> DomainResult<()> {
             "page URL must be about:blank, HTTP, or HTTPS",
         ))
     }
+}
+
+/// Fits `result` to [`ACTION_OUTPUT_BYTES`] of compact JSON by construction.
+/// Snapshot and inspection text is cut on a char boundary after accounting for
+/// JSON escaping; snapshots then carry the exact `next_offset` to continue
+/// from. Event rows end at a whole row whose sequence becomes `next_sequence`.
+fn fit_action_result(action: &BrowserAction, result: &mut ActionResult) -> DomainResult<()> {
+    match action {
+        BrowserAction::Snapshot { .. } => fit_text_content(result, "", true),
+        BrowserAction::Inspect { .. } => fit_text_content(result, "", false),
+        BrowserAction::Events { .. } => fit_event_rows(result),
+        _ if action.wants_snapshot() => fit_text_content(result, "/snapshot", true),
+        _ => Ok(()),
+    }
+}
+
+fn result_len(result: &ActionResult) -> DomainResult<usize> {
+    let value = serde_json::to_value(result).map_err(|error| DomainError::Other(error.into()))?;
+    Ok(crate::mcp::budget::json_len(&value))
+}
+
+/// Cuts the `content` of the object at `pointer` in `result.data`, which also
+/// holds `total_bytes` and, past the start, the `offset` the content begins at.
+fn fit_text_content(result: &mut ActionResult, pointer: &str, pageable: bool) -> DomainResult<()> {
+    fn target<'a>(
+        result: &'a mut ActionResult,
+        pointer: &str,
+    ) -> Option<&'a mut serde_json::Map<String, Value>> {
+        result.data.as_mut()?.pointer_mut(pointer)?.as_object_mut()
+    }
+    let Some(object) = target(result, pointer) else {
+        return Ok(());
+    };
+    let mut content = match object.get_mut("content") {
+        Some(Value::String(content)) => std::mem::take(content),
+        _ => return Ok(()),
+    };
+    let start = object.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let total = object
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(start + content.len() as u64);
+    // Measure with the widest values the fields below can take.
+    object.insert("truncated".into(), Value::Bool(false));
+    if pageable {
+        object.insert("next_offset".into(), json!(total));
+    }
+    let available = ACTION_OUTPUT_BYTES.saturating_sub(result_len(result)?);
+    content.truncate(crate::mcp::budget::escaped_prefix_len(&content, available));
+    let end = start + content.len() as u64;
+    let object = target(result, pointer).expect("the content object was found above");
+    object.insert("content".into(), Value::String(content));
+    object.insert("truncated".into(), Value::Bool(end < total));
+    if pageable && end < total {
+        object.insert("next_offset".into(), json!(end));
+    } else {
+        object.remove("next_offset");
+    }
+    Ok(())
+}
+
+/// Keeps the leading event rows that fit; `truncated` marks a page the byte
+/// budget ended, and `next_sequence` resumes right after the last row kept.
+fn fit_event_rows(result: &mut ActionResult) -> DomainResult<()> {
+    fn data(result: &mut ActionResult) -> Option<&mut serde_json::Map<String, Value>> {
+        result.data.as_mut()?.as_object_mut()
+    }
+    let Some(object) = data(result) else {
+        return Ok(());
+    };
+    let mut rows = match object.get_mut("events") {
+        Some(Value::Array(rows)) => std::mem::take(rows),
+        _ => return Ok(()),
+    };
+    object.insert("truncated".into(), Value::Bool(true));
+    // The empty `[]` is already counted; rows_that_fit counts it as well.
+    let available = ACTION_OUTPUT_BYTES.saturating_sub(result_len(result)?) + 2;
+    let kept = crate::mcp::budget::rows_that_fit(&rows, available)?;
+    let object = data(result).expect("the events object was found above");
+    if kept < rows.len() {
+        rows.truncate(kept);
+        // The last kept row's sequence has no more digits than the original
+        // cursor, so the result still fits.
+        if let Some(sequence) = rows.last().and_then(|row| row.get("sequence")) {
+            object.insert("next_sequence".into(), sequence.clone());
+        }
+    } else {
+        object.remove("truncated");
+    }
+    object.insert("events".into(), Value::Array(rows));
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2558,6 +2702,10 @@ impl BrowserService {
         action: BrowserAction,
     ) -> DomainResult<ActionResult> {
         validate_browser_action(&action)?;
+        let mut action = action;
+        if let BrowserAction::Snapshot { max_bytes, .. } = &mut action {
+            *max_bytes = (*max_bytes).min(MAX_SNAPSHOT_BYTES);
+        }
         if matches!(&action, BrowserAction::Close) {
             self.stop(project_id, session_id).await?;
             return Ok(ActionResult {
@@ -2699,7 +2847,7 @@ impl BrowserService {
         }
         schedule_page_title_association(self.db.clone(), &session);
 
-        Ok(ActionResult {
+        let mut action_result = ActionResult {
             ok: result.get("ok").and_then(Value::as_bool).unwrap_or(true),
             untrusted: result
                 .get("untrusted")
@@ -2722,7 +2870,9 @@ impl BrowserService {
                         format!("invalid browser action context: {error}"),
                     )
                 })?,
-        })
+        };
+        fit_action_result(&action, &mut action_result)?;
+        Ok(action_result)
     }
 
     /// Returns once the worker holds an event the `events` action would return,
@@ -4595,12 +4745,246 @@ mod tests {
     fn snapshot_action_has_agent_friendly_defaults() {
         let action: BrowserAction = serde_json::from_value(json!({ "type": "snapshot" })).unwrap();
         match action {
-            BrowserAction::Snapshot { format, max_bytes } => {
+            BrowserAction::Snapshot {
+                format,
+                max_bytes,
+                offset,
+                locator,
+            } => {
                 assert_eq!(format, "accessibility");
-                assert_eq!(max_bytes, 200_000);
+                assert_eq!(max_bytes, 24_000);
+                assert_eq!(offset, 0);
+                assert!(locator.is_none());
             }
             _ => panic!("wrong browser action"),
         }
+        let zero: BrowserAction =
+            serde_json::from_value(json!({"type": "snapshot", "max_bytes": 0})).unwrap();
+        assert!(validate_browser_action(&zero).is_err());
+    }
+
+    #[test]
+    fn post_action_snapshots_are_opt_in_for_interactions() {
+        for action in [
+            json!({"type": "navigate", "url": "https://app.test/"}),
+            json!({"type": "click", "locator": {"css": "button"}}),
+            json!({"type": "fill", "locator": {"css": "input"}, "value": "a"}),
+            json!({"type": "select", "locator": {"css": "select"}, "value": "a"}),
+            json!({"type": "press", "key": "Enter"}),
+            json!({"type": "wait", "for_what": "timeout", "value": "0"}),
+            json!({"type": "back"}),
+            json!({"type": "forward"}),
+        ] {
+            let plain: BrowserAction = serde_json::from_value(action.clone()).unwrap();
+            assert!(!plain.wants_snapshot(), "{action}");
+            let mut requested = action.clone();
+            requested["snapshot"] = json!(true);
+            let requested: BrowserAction = serde_json::from_value(requested).unwrap();
+            assert!(requested.wants_snapshot(), "{action}");
+            // The worker receives the flag.
+            assert_eq!(serde_json::to_value(&requested).unwrap()["snapshot"], true);
+        }
+        let back: BrowserAction = serde_json::from_value(json!({"type": "back"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(back).unwrap(),
+            json!({"type": "back", "snapshot": false})
+        );
+    }
+
+    fn result_with(data: Value) -> ActionResult {
+        ActionResult {
+            ok: true,
+            untrusted: true,
+            message: "snapshot captured".into(),
+            data: Some(data),
+            browser: Some(BrowserActionContext {
+                session_id: BrowserSessionId(7),
+                profile: Some("default".into()),
+                runtime_generation: 1,
+                page_id: 1,
+            }),
+        }
+    }
+
+    /// The worker's `snapshotSlice`: whole chars from `offset`, at most `max_bytes`.
+    fn worker_slice(content: &str, offset: usize, max_bytes: usize) -> Value {
+        let mut start = offset.min(content.len());
+        while !content.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = (start + max_bytes).min(content.len());
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut data = json!({
+            "format": "dom",
+            "content": &content[start..end],
+            "truncated": end < content.len(),
+            "total_bytes": content.len(),
+        });
+        if start > 0 {
+            data["offset"] = json!(start);
+        }
+        if end < content.len() {
+            data["next_offset"] = json!(end);
+        }
+        data
+    }
+
+    /// Escapes, multi-byte chars and control chars, as large pages have them.
+    fn hostile_page(bytes: usize) -> String {
+        let unit = "<a href=\"/x?q=\\\"\">é🦀\t\u{1}</a>\n";
+        unit.repeat(bytes / unit.len() + 1)
+    }
+
+    fn fitted_len(result: &ActionResult) -> usize {
+        let text = serde_json::to_string(result).unwrap();
+        assert!(
+            text.len() <= ACTION_OUTPUT_BYTES,
+            "{} > {ACTION_OUTPUT_BYTES}",
+            text.len()
+        );
+        text.len()
+    }
+
+    #[test]
+    fn snapshot_results_fit_the_output_budget_and_page_exactly() {
+        let snapshot = BrowserAction::Snapshot {
+            format: "dom".into(),
+            max_bytes: MAX_SNAPSHOT_BYTES,
+            offset: 0,
+            locator: None,
+        };
+        for page in [hostile_page(1_700_000), "plain ".repeat(40_000)] {
+            let mut reassembled = String::new();
+            let mut offset = 0;
+            let mut calls = 0;
+            loop {
+                let mut result = result_with(worker_slice(&page, offset, 24_000));
+                fit_action_result(&snapshot, &mut result).unwrap();
+                let size = fitted_len(&result);
+                let data = result.data.unwrap();
+                let content = data["content"].as_str().unwrap();
+                assert_eq!(data["total_bytes"], page.len());
+                reassembled.push_str(content);
+                calls += 1;
+                match data.get("next_offset") {
+                    Some(next) => {
+                        assert_eq!(data["truncated"], true);
+                        // Each page is nearly the whole budget.
+                        assert!(size > ACTION_OUTPUT_BYTES - 64, "{size}");
+                        let next = next.as_u64().unwrap() as usize;
+                        assert_eq!(next, offset + content.len());
+                        offset = next;
+                    }
+                    None => {
+                        assert_eq!(data["truncated"], false);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(reassembled, page);
+            assert!(calls > page.len() / ACTION_OUTPUT_BYTES);
+        }
+    }
+
+    #[test]
+    fn a_small_snapshot_is_returned_whole() {
+        let snapshot: BrowserAction = serde_json::from_value(json!({"type": "snapshot"})).unwrap();
+        let page = "- heading \"Sign in\" [level=1]\n- button \"Continue\"";
+        let mut result = result_with(worker_slice(page, 0, 24_000));
+        let before = result.data.clone();
+        fit_action_result(&snapshot, &mut result).unwrap();
+        assert_eq!(result.data, before);
+    }
+
+    #[test]
+    fn post_action_snapshots_and_inspections_fit_the_output_budget() {
+        let click: BrowserAction = serde_json::from_value(json!({
+            "type": "click", "locator": {"css": "button"}, "snapshot": true
+        }))
+        .unwrap();
+        let page = hostile_page(100_000);
+        let mut snapshot = worker_slice(&page, 0, 24_000);
+        snapshot.as_object_mut().unwrap().remove("format");
+        let mut result = result_with(json!({"url": "https://app.test/next", "snapshot": snapshot}));
+        fit_action_result(&click, &mut result).unwrap();
+        fitted_len(&result);
+        let data = result.data.unwrap();
+        assert_eq!(data["url"], "https://app.test/next");
+        let snapshot = &data["snapshot"];
+        let content = snapshot["content"].as_str().unwrap();
+        assert!(page.starts_with(content) && content.len() > 10_000);
+        assert_eq!(snapshot["next_offset"], content.len());
+        assert_eq!(snapshot["truncated"], true);
+        assert_eq!(snapshot["total_bytes"], page.len());
+
+        // A failed capture is reported as is.
+        let failed = json!({"url": "https://app.test/", "snapshot": {"error": "Timeout"}});
+        let mut result = result_with(failed.clone());
+        fit_action_result(&click, &mut result).unwrap();
+        assert_eq!(result.data.unwrap(), failed);
+
+        let inspect: BrowserAction =
+            serde_json::from_value(json!({"type": "inspect", "max_bytes": 65_536})).unwrap();
+        let text = serde_json::to_string(&json!({"resources": [page]})).unwrap();
+        let mut result = result_with(json!({
+            "format": "runtime", "content": &text[..65_536], "truncated": true,
+            "total_bytes": text.len(),
+        }));
+        fit_action_result(&inspect, &mut result).unwrap();
+        fitted_len(&result);
+        let data = result.data.unwrap();
+        assert!(text.starts_with(data["content"].as_str().unwrap()));
+        assert_eq!(data["truncated"], true);
+        assert!(data.get("next_offset").is_none());
+    }
+
+    #[test]
+    fn an_event_page_ends_at_a_whole_row_and_resumes_without_loss() {
+        let events: BrowserAction =
+            serde_json::from_value(json!({"type": "events", "limit": 100})).unwrap();
+        let all = (1..=100)
+            .map(|sequence| {
+                json!({
+                    "sequence": sequence, "kind": "request", "page_id": 1,
+                    "observed_at": "2026-11-15T07:47:53.123Z", "method": "GET",
+                    "url": format!("https://app.test/assets/{}.js", "a".repeat(400)),
+                    "resource_type": "script", "navigation": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let page = |after: u64| {
+            let rows = all
+                .iter()
+                .filter(|row| row["sequence"].as_u64().unwrap() > after)
+                .cloned()
+                .collect::<Vec<_>>();
+            json!({
+                "runtime_generation": 1,
+                "next_sequence": rows.last().map_or(json!(after), |row| row["sequence"].clone()),
+                "events": rows, "latest_sequence": 100, "oldest_sequence": 1,
+                "cursor_expired": false, "dropped_events": 0, "observer_errors": [],
+            })
+        };
+        let mut seen = Vec::new();
+        let mut after = 0;
+        loop {
+            let mut result = result_with(page(after));
+            fit_action_result(&events, &mut result).unwrap();
+            fitted_len(&result);
+            let data = result.data.unwrap();
+            let rows = data["events"].as_array().unwrap();
+            assert!(!rows.is_empty());
+            seen.extend(rows.iter().cloned());
+            assert_eq!(data["next_sequence"], rows.last().unwrap()["sequence"]);
+            after = data["next_sequence"].as_u64().unwrap();
+            if data.get("truncated").is_none() {
+                break;
+            }
+            assert_eq!(data["truncated"], true);
+        }
+        assert_eq!(seen, all);
     }
 
     #[test]
@@ -6994,6 +7378,47 @@ done
             started.elapsed()
         );
         waiting.await.unwrap().unwrap();
+        fixture.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_requests_are_clamped_and_whatever_the_worker_returns_fits() {
+        let arms = r#"
+    *'"method":"session.action"'*) printf '{"id":%s,"result":' "$n"; cat '@DIR@/result.json'; printf '}\n' ;;
+    *'"method":"session.javascript_files"'*) printf '{"id":%s,"result":{"files":[],"cursor":0}}\n' "$n" ;;"#;
+        let fixture = ScriptedSession::start(arms).await;
+        // A worker that ignores max_bytes and sends a whole 300 KB page.
+        let page = hostile_page(300_000);
+        let result = json!({
+            "ok": true, "untrusted": true, "message": "snapshot captured",
+            "data": {"format": "dom", "content": page, "truncated": false, "total_bytes": page.len()},
+            "browser": {"session_id": fixture.session_id.get(), "profile": null, "runtime_generation": 1, "page_id": 1},
+            "checkpoint": {"url": "https://app.test/", "_private": {}},
+        });
+        std::fs::write(
+            fixture.directory.path().join("result.json"),
+            result.to_string(),
+        )
+        .unwrap();
+        for action in [
+            json!({"type": "snapshot", "format": "dom"}),
+            json!({"type": "snapshot", "format": "dom", "max_bytes": 1_000_000}),
+        ] {
+            let result = fixture.run(action).await.unwrap();
+            fitted_len(&result);
+            let data = result.data.unwrap();
+            let content = data["content"].as_str().unwrap();
+            assert!(page.starts_with(content) && content.len() > 10_000);
+            assert_eq!(data["next_offset"], content.len());
+            assert_eq!(data["truncated"], true);
+        }
+        let asked = fixture
+            .requests("session.action")
+            .iter()
+            .map(|request| request["params"]["action"]["max_bytes"].as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(asked, [Some(24_000), Some(24_000)]);
         fixture.service.force_stop_all().await;
     }
 

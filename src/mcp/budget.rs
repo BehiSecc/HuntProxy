@@ -191,17 +191,7 @@ fn shrink(
             Value::Array(items[..kept].to_vec())
         }
         Value::String(text) => {
-            let max_content = budget.saturating_sub(2); // the quotes
-            let mut used = 0;
-            let mut end = 0;
-            for (index, ch) in text.char_indices() {
-                let ch_len = escaped_len(ch);
-                if used + ch_len > max_content {
-                    break;
-                }
-                used += ch_len;
-                end = index + ch.len_utf8();
-            }
+            let end = escaped_prefix_len(text, budget.saturating_sub(2)); // the quotes
             omitted.push(json!({
                 "path": path.clone(),
                 "kept_bytes": end,
@@ -229,6 +219,19 @@ fn water_level(sizes: &[usize], available: usize) -> usize {
         remaining -= size;
     }
     usize::MAX
+}
+
+/// Byte length of the longest prefix of `text`, cut on a char boundary, whose
+/// JSON string escaping (without the quotes) takes at most `max_bytes`.
+pub(crate) fn escaped_prefix_len(text: &str, max_bytes: usize) -> usize {
+    let mut used = 0;
+    for (index, ch) in text.char_indices() {
+        used += escaped_len(ch);
+        if used > max_bytes {
+            return index;
+        }
+    }
+    text.len()
 }
 
 /// Bytes `ch` takes inside a serde_json string literal.
@@ -372,6 +375,22 @@ mod tests {
             *omitted(&result),
             vec![json!({"path": "", "kept_bytes": 0, "of_bytes": original_len})]
         );
+    }
+
+    #[test]
+    fn escaped_prefix_len_counts_json_escaping_and_keeps_whole_chars() {
+        let text = "a\"é\n🦀\u{1}";
+        for max_bytes in 0..=text.len() * 6 {
+            let end = escaped_prefix_len(text, max_bytes);
+            assert!(text.is_char_boundary(end));
+            let escaped = json_len(&json!(&text[..end])) - 2;
+            assert!(escaped <= max_bytes, "{escaped} > {max_bytes}");
+            if end < text.len() {
+                let next = end + text[end..].chars().next().unwrap().len_utf8();
+                assert!(json_len(&json!(&text[..next])) - 2 > max_bytes);
+            }
+        }
+        assert_eq!(escaped_prefix_len(text, usize::MAX), text.len());
     }
 
     #[test]
