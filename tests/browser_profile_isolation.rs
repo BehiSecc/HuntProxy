@@ -427,6 +427,7 @@ impl Harness {
                 BrowserAction::Wait {
                     for_what: "selector".into(),
                     value: "#state[data-ready='true']".into(),
+                    snapshot: false,
                 },
             )
             .await
@@ -438,7 +439,9 @@ impl Harness {
                 session,
                 BrowserAction::Snapshot {
                     format: "dom".into(),
-                    max_bytes: 200_000,
+                    max_bytes: 24_000,
+                    offset: 0,
+                    locator: None,
                 },
             )
             .await
@@ -477,6 +480,7 @@ impl Harness {
                         css: Some(selector.into()),
                         exact: None,
                     },
+                    snapshot: false,
                 },
             )
             .await
@@ -627,6 +631,59 @@ async fn verify_structured_playwright_actions(h: &Harness) {
     let generation = context.runtime_generation;
     let original_page_id = context.page_id;
     let event_cursor = events.data.unwrap()["latest_sequence"].as_u64().unwrap();
+
+    // A scoped snapshot read in small pages reassembles exactly.
+    let scoped_snapshot = |offset, max_bytes| BrowserAction::Snapshot {
+        format: "dom".into(),
+        max_bytes,
+        offset,
+        locator: Some(css_locator("#page-end")),
+    };
+    let whole = h
+        .service
+        .action(h.project, session.id, scoped_snapshot(0, 24_000))
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(
+        whole["content"],
+        "<div id=\"page-end\" style=\"margin-top:3000px\">End of fixture</div>"
+    );
+    let (mut paged, mut offset) = (String::new(), 0);
+    loop {
+        let page = h
+            .service
+            .action(h.project, session.id, scoped_snapshot(offset, 16))
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        paged.push_str(page["content"].as_str().unwrap());
+        match page.get("next_offset") {
+            Some(next) => offset = next.as_u64().unwrap(),
+            None => break,
+        }
+    }
+    assert_eq!(paged, whole["content"].as_str().unwrap());
+    let clicked = h
+        .service
+        .action(
+            h.project,
+            session.id,
+            BrowserAction::Click {
+                locator: css_locator("#warning"),
+                snapshot: true,
+            },
+        )
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert!(clicked["snapshot"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("button \"Show diagnostic\""));
 
     let screenshot = h
         .service
@@ -782,6 +839,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             session.id,
             BrowserAction::Click {
                 locator: css_locator("#popup"),
+                snapshot: false,
             },
         )
         .await
@@ -812,6 +870,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             session.id,
             BrowserAction::Click {
                 locator: css_locator("#dialog"),
+                snapshot: false,
             },
         )
         .await
@@ -845,6 +904,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             session.id,
             BrowserAction::Click {
                 locator: css_locator("#message"),
+                snapshot: false,
             },
         )
         .await
@@ -919,6 +979,8 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Snapshot {
                 format: "dom".into(),
                 max_bytes: 4096,
+                offset: 0,
+                locator: None,
             },
         )
         .await
@@ -932,6 +994,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             session.id,
             BrowserAction::Click {
                 locator: css_locator("#save-popup-state"),
+                snapshot: false,
             },
         )
         .await
@@ -983,6 +1046,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             session.id,
             BrowserAction::Click {
                 locator: css_locator("#read-popup-state"),
+                snapshot: false,
             },
         )
         .await
@@ -995,6 +1059,8 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Snapshot {
                 format: "dom".into(),
                 max_bytes: 4096,
+                offset: 0,
+                locator: None,
             },
         )
         .await
@@ -1185,6 +1251,7 @@ async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
                 BrowserAction::Wait {
                     for_what: "selector".into(),
                     value: "#upload-state[data-ready='true']".into(),
+                    snapshot: false,
                 },
             )
             .await
@@ -1429,6 +1496,7 @@ async fn verify_native_file_selection(h: &Harness) {
             BrowserAction::Wait {
                 for_what: "selector".into(),
                 value: "#upload-state[data-ready='true']".into(),
+                snapshot: false,
             },
         )
         .await
@@ -1460,7 +1528,9 @@ async fn verify_native_file_selection(h: &Harness) {
             first.id,
             BrowserAction::Snapshot {
                 format: "dom".into(),
-                max_bytes: 200_000,
+                max_bytes: 24_000,
+                offset: 0,
+                locator: None,
             },
         )
         .await
@@ -1569,6 +1639,7 @@ async fn verify_native_file_selection(h: &Harness) {
             first.id,
             BrowserAction::Click {
                 locator: css_locator("#warning"),
+                snapshot: false,
             },
         )
         .await
@@ -2110,6 +2181,7 @@ async fn verify_named_profiles(h: &Harness) {
             www.id,
             BrowserAction::Navigate {
                 url: h.fixture.url("localhost", "www-account"),
+                snapshot: false,
             },
         )
         .await
@@ -2124,6 +2196,7 @@ async fn verify_named_profiles(h: &Harness) {
             www.id,
             BrowserAction::Navigate {
                 url: h.fixture.url("www.localhost", "www-account"),
+                snapshot: false,
             },
         )
         .await
