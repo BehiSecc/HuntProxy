@@ -160,7 +160,8 @@ function trackRuntimeErrors(session, page) {
   });
 }
 
-const MAX_EVENT_TEXT_CHARS = 300;
+// Room for a CSP violation with its directive, or a framework's error text.
+const MAX_EVENT_TEXT_CHARS = 1000;
 
 // The start of what a page said, for an event. `text_length` is the whole
 // text's size in bytes, given only when the text was cut.

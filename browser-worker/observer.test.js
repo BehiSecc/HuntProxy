@@ -159,12 +159,12 @@ test("observer setup failure preserves console/page events and stays visible thr
     { kind: "console", level: "warning", url: "http://localhost/workspace", line: 1, column: 1 }, { kind: "page_error" },
   ]);
   // A long message is cut, and says how long it was. Other levels are not recorded.
-  page.emit("console", warning(`${"é".repeat(299)}😀 and the rest`));
+  page.emit("console", warning(`${"é".repeat(999)}😀 and the rest`));
   page.emit("console", { ...warning("just a log line"), type: () => "log" });
   const long = (await tracker.performEvents(session, { runtime_generation: 1, after_sequence: first.data.latest_sequence })).data.events;
   assert.equal(long.length, 1);
-  assert.equal(long[0].text.length, 300);
-  assert.equal(long[0].text_length, 2 * 299 + 4 + " and the rest".length);
+  assert.equal(long[0].text.length, 1000);
+  assert.equal(long[0].text_length, 2 * 999 + 4 + " and the rest".length);
   assert.equal(first.data.observer_errors[0].operation, "initialization");
   const filtered = await tracker.performEvents(session, { kinds: ["window_message"] });
   assert.equal(filtered.data.events.length, 0);

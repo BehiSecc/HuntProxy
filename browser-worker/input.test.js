@@ -362,9 +362,9 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     // A dialog event says what the dialog said, which is the proof a payload ran.
     assert.deepEqual([confirmed.message, confirmed.message_length], ["Delete everything?", 18]);
     assert.equal(dialogs[0].message, undefined);
-    await read(`alert("${"x".repeat(400)}"); 0`);
+    await read(`alert("${"x".repeat(1200)}"); 0`);
     const [long] = (await run({ type: "events", kinds: ["dialog"], after_sequence: confirmed.sequence, runtime_generation: 1 })).data.events;
-    assert.deepEqual([long.message.length, long.message_length], [300, 400]);
+    assert.deepEqual([long.message.length, long.message_length], [1000, 1200]);
   });
 
   await t.test("console and error events carry the start of their text", async () => {
