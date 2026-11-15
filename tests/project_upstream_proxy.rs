@@ -491,6 +491,7 @@ async fn an_existing_reply_service_uses_runtime_updates_and_request_override_pri
             default: Some("http://static.example:8080".into()),
             ..Default::default()
         },
+        request_limiter: Default::default(),
     };
     let draft = ReplyDraft {
         url: Some("http://127.0.0.1/".into()),

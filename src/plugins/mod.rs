@@ -3363,6 +3363,12 @@ impl PluginService {
                     ));
                 }
                 let member_count = prepared.len();
+                // Members wait for each other at the barrier, so they take
+                // their slots together instead of one by one.
+                let slots = tokio::select! {
+                    _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                    slots = self.reply.request_limiter.acquire(&project, member_count) => slots?,
+                };
                 let barrier = Arc::new(tokio::sync::Barrier::new(member_count));
                 let group_id = group.id;
                 let target_url = group.target_url;
@@ -3370,6 +3376,7 @@ impl PluginService {
                     let service = self.clone();
                     let cancel = cancel.clone();
                     let barrier = barrier.clone();
+                    let slots = slots.clone();
                     let target_url = target_url.clone();
                     let plugin_id = plugin_id.to_string();
                     let plugin_name = plugin_name.to_string();
@@ -3377,6 +3384,7 @@ impl PluginService {
                     async move {
                         options.start_barrier = Some(barrier);
                         options.response_cap_bytes = Some(member_response_cap);
+                        options.request_slots = Some(slots);
                         let result = tokio::select! {
                             _ = cancel.cancelled() => Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
                             response = service.reply.send_raw_http1_with_context(
@@ -3569,6 +3577,7 @@ impl PluginService {
                                     scope,
                                     target_host,
                                     cancel,
+                                    None,
                                 )
                                 .await,
                             );
@@ -3576,8 +3585,15 @@ impl PluginService {
                         responses
                     }
                     RaceTechnique::Parallel => {
+                        // The members race each other, so they start together
+                        // on slots the group takes at once.
+                        let slots = tokio::select! {
+                            _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                            slots = self.reply.request_limiter.acquire(&project, group.requests.len()) => slots?,
+                        };
                         stream::iter(group.requests.into_iter().map(|request| {
                             let service = self.clone();
+                            let slots = slots.clone();
                             let cancel = cancel.clone();
                             let scope = scope.clone();
                             let plugin_id = plugin_id.to_string();
@@ -3593,6 +3609,7 @@ impl PluginService {
                                         &scope,
                                         target_host.as_deref(),
                                         &cancel,
+                                        Some(slots),
                                     )
                                     .await
                             }
@@ -3602,6 +3619,12 @@ impl PluginService {
                         .await
                     }
                     RaceTechnique::LastByteSync => {
+                        // Every connection must be open before the last bytes
+                        // go out, so the group takes all of its slots at once.
+                        let slots = tokio::select! {
+                            _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
+                            slots = self.reply.request_limiter.acquire(&project, group.requests.len()) => slots?,
+                        };
                         let barrier = Arc::new(tokio::sync::Barrier::new(group.requests.len()));
                         let hold_timeout_ms = group
                             .options
@@ -3611,6 +3634,7 @@ impl PluginService {
                         let futures = group.requests.into_iter().map(|request| {
                             let service = self.clone();
                             let barrier = barrier.clone();
+                            let slots = slots.clone();
                             let cancel = cancel.clone();
                             let scope = scope.clone();
                             let plugin_id = plugin_id.to_string();
@@ -3627,6 +3651,7 @@ impl PluginService {
                                         target_host.as_deref(),
                                         &cancel,
                                         barrier,
+                                        slots,
                                         hold_timeout_ms,
                                         member_response_cap,
                                     )
@@ -3944,6 +3969,7 @@ impl PluginService {
         scope: &ScopePolicy,
         target_host: Option<&str>,
         cancel: &CancellationToken,
+        slots: Option<crate::reply::RequestSlots>,
     ) -> Value {
         let result = async {
             let requires_extraction = !request.extract.is_empty();
@@ -3960,7 +3986,7 @@ impl PluginService {
             enforce_plugin_scope(&url, scope, target_host)?;
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() }, plugin_target_host: target_host.map(str::to_string) }) => response?,
+                response = self.reply.send_with_context_and_slots(project_id, request.base_exchange_id, &draft, request.protocol, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() }, plugin_target_host: target_host.map(str::to_string) }, slots) => response?,
             };
             if let Some(exchange_id) = response.exchange_id {
                 self.annotate_plugin_exchange(
@@ -4252,6 +4278,7 @@ impl PluginService {
         target_host: Option<&str>,
         cancel: &CancellationToken,
         barrier: Arc<tokio::sync::Barrier>,
+        slots: crate::reply::RequestSlots,
         hold_timeout_ms: u64,
         response_cap_bytes: u64,
     ) -> Value {
@@ -4275,7 +4302,7 @@ impl PluginService {
             enforce_plugin_scope(&target_url, scope, target_host)?;
             let bytes = materialized_http1_bytes(&materialized)?;
             if bytes.len() < 2 { return Err(DomainError::invalid("saved request is too short for last_byte_sync")); }
-            let options = crate::reply::RawHttp1Options { pause_at_byte: Some(bytes.len() - 1), pause_ms: Some(hold_timeout_ms), release_barrier: Some(barrier), response_cap_bytes: Some(response_cap_bytes), ..Default::default() };
+            let options = crate::reply::RawHttp1Options { pause_at_byte: Some(bytes.len() - 1), pause_ms: Some(hold_timeout_ms), release_barrier: Some(barrier), response_cap_bytes: Some(response_cap_bytes), request_slots: Some(slots), ..Default::default() };
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
                 response = self.reply.send_raw_http1_with_context(
@@ -6797,6 +6824,117 @@ mod tests {
         }
     }
 
+    /// Answers every request and records when it was sent.
+    #[derive(Default)]
+    struct TimedTransport {
+        sent: parking_lot::Mutex<Vec<std::time::Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transport::SemanticTransport for TimedTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            _request: crate::transport::OutboundRequest,
+        ) -> DomainResult<crate::transport::OutboundResponse> {
+            self.sent.lock().push(std::time::Instant::now());
+            Ok(crate::transport::OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                body: bytes::Bytes::from_static(b"ok"),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test".into(),
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_race_members_start_together_under_a_slow_project_rate() {
+        let db = Arc::new(crate::storage::Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "race".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let limits = ProjectLimits {
+            requests_per_second: 2.0,
+            max_concurrent_requests: 4,
+            ..Default::default()
+        };
+        let project = db
+            .update_project_scope(project.id, project.scope.clone(), Some(limits))
+            .await
+            .unwrap();
+        let transport = Arc::new(TimedTransport::default());
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: transport.clone(),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service = PluginService {
+            directory: PathBuf::from("plugins"),
+            reply,
+            db,
+            browser: None,
+            plugins: Arc::new(HashMap::new()),
+            load_issues: Arc::new(Vec::new()),
+            jobs: Arc::new(DashMap::new()),
+            active_jobs: Arc::new(tokio::sync::Semaphore::new(1)),
+            preview_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            analysis_retry_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            analysis_checkpoint_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        let operation: PluginOperation = serde_json::from_value(json!({
+            "type": "race_group",
+            "id": "race-1",
+            "technique": "parallel",
+            "attempt": 1,
+            "requests": [
+                {"id":"copy-0","url":"http://127.0.0.1:9/race"},
+                {"id":"copy-1","url":"http://127.0.0.1:9/race"},
+                {"id":"copy-2","url":"http://127.0.0.1:9/race"}
+            ]
+        }))
+        .unwrap();
+        let result = service
+            .execute_operation(
+                project.id,
+                "race-test",
+                "Race test",
+                operation,
+                &project.scope,
+                Some("127.0.0.1"),
+                &HashMap::new(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let sent = transport.sent.lock().clone();
+        assert_eq!(sent.len(), 3, "{result}");
+        let spread = *sent.iter().max().unwrap() - *sent.iter().min().unwrap();
+        assert!(
+            spread < Duration::from_millis(300),
+            "race members were spaced by the project rate: {spread:?}"
+        );
+    }
+
     fn test_job(state: PluginJobState) -> Arc<PluginJob> {
         Arc::new(PluginJob {
             sequence: next_job_sequence(),
@@ -7118,6 +7256,7 @@ mod tests {
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let service = PluginService {
             directory: PathBuf::from("plugins"),
@@ -7484,6 +7623,7 @@ mod tests {
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
 
@@ -7600,6 +7740,7 @@ mod tests {
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
         let input = json!({"allow_state_change":true,"identity":{"profile":"victim"}});
@@ -7731,6 +7872,7 @@ mod tests {
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
         let job = service
@@ -7881,6 +8023,7 @@ mod tests {
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
         let initial = service
@@ -8292,6 +8435,7 @@ mod tests {
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![7; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let service =
             PluginService::load(directory.path().join("plugins"), db.clone(), reply).unwrap();
@@ -8515,6 +8659,7 @@ mod tests {
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![7; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let plugin_directory = directory.path().join("plugins-under-test");
         let service = PluginService::load(plugin_directory, db.clone(), reply).unwrap();

@@ -1,8 +1,10 @@
 //! Reply drafts, placeholder resolution, send orchestration.
 
+mod limits;
 pub(crate) mod raw;
 mod raw_h2;
 
+pub use limits::*;
 pub use raw::*;
 pub use raw_h2::*;
 
@@ -658,6 +660,8 @@ pub struct ReplyService {
     pub placeholder_key: PlaceholderKey,
     pub upstream_proxies: crate::config::UpstreamProxyConfig,
     pub verify_upstream_tls: bool,
+    /// The per-project request budget every send path shares.
+    pub request_limiter: RequestLimiter,
 }
 
 impl ReplyService {
@@ -727,6 +731,7 @@ impl ReplyService {
             upstream_proxy,
             None,
             None,
+            None,
         )
         .await
     }
@@ -750,10 +755,38 @@ impl ReplyService {
             None,
             None,
             None,
+            None,
         )
         .await
     }
 
+    /// Send with slots a group reserved for all of its members, or take one.
+    pub(crate) async fn send_with_context_and_slots(
+        &self,
+        project_id: ProjectId,
+        base_exchange_id: Option<ExchangeId>,
+        draft: &ReplyDraft,
+        protocol: ProtocolPreference,
+        context: ReplySendContext,
+        slots: Option<RequestSlots>,
+    ) -> DomainResult<ReplySendResult> {
+        self.send_with_context_and_proxy(
+            project_id,
+            base_exchange_id,
+            draft,
+            protocol,
+            0,
+            context,
+            None,
+            None,
+            None,
+            slots,
+        )
+        .await
+    }
+
+    /// Send with slots the caller already took from the project's budget, so
+    /// it can stop waiting for them when its job is cancelled.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_with_context_and_pinned_identity(
         &self,
@@ -763,6 +796,7 @@ impl ReplyService {
         protocol: ProtocolPreference,
         context: ReplySendContext,
         identity: Option<&crate::cookies::StoredCookieProfile>,
+        slots: RequestSlots,
     ) -> DomainResult<ReplySendResult> {
         self.send_with_context_and_proxy(
             project_id,
@@ -774,6 +808,7 @@ impl ReplyService {
             None,
             identity,
             None,
+            Some(slots),
         )
         .await
     }
@@ -798,6 +833,7 @@ impl ReplyService {
             None,
             None,
             Some(expected_origin),
+            None,
         )
         .await
     }
@@ -814,6 +850,7 @@ impl ReplyService {
         upstream_proxy_override: Option<&str>,
         pinned_identity: Option<&crate::cookies::StoredCookieProfile>,
         expected_origin: Option<&str>,
+        slots: Option<RequestSlots>,
     ) -> DomainResult<ReplySendResult> {
         let project = self.db.get_project(project_id).await?;
         let named_identity = match pinned_identity {
@@ -1006,6 +1043,10 @@ impl ReplyService {
         if rotation.is_some() {
             wire_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
         }
+        let _slots = match slots {
+            Some(slots) => slots,
+            None => self.request_limiter.acquire(&project, 1).await?,
+        };
         let started = std::time::Instant::now();
         let out = self
             .transport
@@ -1395,6 +1436,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         };
 
         let error = service
@@ -1552,6 +1594,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         };
 
         service
@@ -1683,6 +1726,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         };
         let result = service
             .send(
@@ -1784,6 +1828,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         };
 
         let result = service
@@ -2126,6 +2171,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         };
         let result = service
             .send(
@@ -2150,5 +2196,147 @@ mod tests {
             result.response_preview.content_encoding.as_deref(),
             Some("gzip")
         );
+    }
+
+    /// Records when each request reaches the transport.
+    #[derive(Default)]
+    struct TimedTransport {
+        sent: parking_lot::Mutex<Vec<std::time::Instant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for TimedTransport {
+        async fn send(
+            &self,
+            dial: &ValidatedDial,
+            request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            self.sent.lock().push(std::time::Instant::now());
+            CannedTransport.send(dial, request).await
+        }
+
+        fn profile_name(&self) -> &str {
+            "test"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    async fn rate_limited_project(db: &Db, requests_per_second: f64) -> Project {
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "rate limited".into(),
+                target_url: "http://127.0.0.1/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let limits = ProjectLimits {
+            requests_per_second,
+            max_concurrent_requests: 1,
+            ..Default::default()
+        };
+        db.update_project_scope(project.id, project.scope.clone(), Some(limits))
+            .await
+            .unwrap()
+    }
+
+    /// At 10 requests per second, starts are 100 ms apart. The bounds leave
+    /// room for a loaded machine and still fail on the old millisecond gaps.
+    fn assert_rate_limited(times: &[std::time::Instant], expected: usize) {
+        let gaps = times
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        assert_eq!(gaps.len(), expected - 1);
+        assert!(
+            gaps.iter().all(|gap| *gap >= Duration::from_millis(60))
+                && gaps.iter().sum::<Duration>()
+                    >= Duration::from_millis(250 * (expected as u64 - 1) / 3),
+            "requests ignored the 10 requests/second limit: {gaps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_replies_respect_the_project_rate() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = rate_limited_project(&db, 10.0).await;
+        let transport = Arc::new(TimedTransport::default());
+        let service = ReplyService {
+            db,
+            transport: transport.clone(),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        };
+        for n in 0..4 {
+            service
+                .send(
+                    project.id,
+                    None,
+                    None,
+                    &ReplyDraft {
+                        method: Some("GET".into()),
+                        url: Some(format!("http://127.0.0.1:9/r{n}")),
+                        ..Default::default()
+                    },
+                    ProtocolPreference::H1,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+        assert_rate_limited(&transport.sent.lock(), 4);
+    }
+
+    #[tokio::test]
+    async fn sequential_raw_replies_respect_the_project_rate() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = rate_limited_project(&db, 10.0).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let arrivals = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let server = tokio::spawn({
+            let arrivals = arrivals.clone();
+            async move {
+                for _ in 0..3 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    arrivals.lock().push(std::time::Instant::now());
+                    let mut request = [0_u8; 256];
+                    let _ = socket.read(&mut request).await.unwrap();
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let service = ReplyService {
+            db,
+            transport: Arc::new(CannedTransport),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        };
+        for n in 0..3 {
+            service
+                .send_raw_http1(
+                    project.id,
+                    None,
+                    &format!("http://{address}/"),
+                    format!("GET /r{n} HTTP/1.1\r\nHost: {address}\r\n\r\n").into_bytes(),
+                    false,
+                    RawHttp1Options::default(),
+                )
+                .await
+                .unwrap();
+        }
+        server.await.unwrap();
+        assert_rate_limited(&arrivals.lock(), 3);
     }
 }

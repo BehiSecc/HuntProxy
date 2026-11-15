@@ -11,9 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 mod generators;
@@ -257,59 +254,6 @@ pub struct FuzzerService {
     pub reply: Arc<ReplyService>,
     pub placeholder_key: PlaceholderKey,
     pub cancel_flags: Arc<dashmap::DashMap<i64, CancellationToken>>,
-    project_limiters: Arc<dashmap::DashMap<i64, Arc<ProjectFuzzLimiter>>>,
-}
-
-#[derive(Debug)]
-struct ProjectFuzzLimiter {
-    concurrency: Arc<Semaphore>,
-    next_dispatch: Mutex<Instant>,
-    dispatch_interval: Duration,
-}
-
-impl ProjectFuzzLimiter {
-    fn new(limits: &ProjectLimits) -> DomainResult<Self> {
-        if limits.max_concurrent_requests == 0 {
-            return Err(DomainError::invalid(
-                "max_concurrent_requests must be greater than zero",
-            ));
-        }
-        if !limits.requests_per_second.is_finite() || limits.requests_per_second <= 0.0 {
-            return Err(DomainError::invalid(
-                "requests_per_second must be a finite positive number",
-            ));
-        }
-        Ok(Self {
-            concurrency: Arc::new(Semaphore::new(limits.max_concurrent_requests as usize)),
-            next_dispatch: Mutex::new(Instant::now()),
-            dispatch_interval: Duration::from_secs_f64(1.0 / limits.requests_per_second),
-        })
-    }
-
-    async fn acquire(
-        &self,
-        cancel: &CancellationToken,
-    ) -> DomainResult<Option<OwnedSemaphorePermit>> {
-        let permit = tokio::select! {
-            _ = cancel.cancelled() => return Ok(None),
-            permit = self.concurrency.clone().acquire_owned() => permit
-                .map_err(|_| DomainError::new(ErrorCode::Unavailable, "fuzzer limiter closed"))?,
-        };
-        let wait = {
-            let mut next_dispatch = self.next_dispatch.lock().await;
-            let now = Instant::now();
-            let scheduled = (*next_dispatch).max(now);
-            *next_dispatch = scheduled + self.dispatch_interval;
-            scheduled.saturating_duration_since(now)
-        };
-        if !wait.is_zero() {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(None),
-                _ = tokio::time::sleep(wait) => {}
-            }
-        }
-        Ok(Some(permit))
-    }
 }
 
 impl FuzzerService {
@@ -319,24 +263,11 @@ impl FuzzerService {
             reply,
             placeholder_key,
             cancel_flags: Arc::new(dashmap::DashMap::new()),
-            project_limiters: Arc::new(dashmap::DashMap::new()),
         }
     }
 
     pub fn has_active_jobs(&self) -> bool {
         !self.cancel_flags.is_empty()
-    }
-
-    fn project_limiter(&self, project: &Project) -> DomainResult<Arc<ProjectFuzzLimiter>> {
-        if let Some(existing) = self.project_limiters.get(&project.id.get()) {
-            return Ok(existing.clone());
-        }
-        let limiter = Arc::new(ProjectFuzzLimiter::new(&project.limits)?);
-        let entry = self
-            .project_limiters
-            .entry(project.id.get())
-            .or_insert_with(|| limiter.clone());
-        Ok(entry.clone())
     }
 
     pub async fn start(
@@ -386,7 +317,8 @@ impl FuzzerService {
             .resolve_named_identity(project_id, &template.draft)
             .await?
             .map(Arc::new);
-        let limiter = self.project_limiter(&project)?;
+        // Cases share the project's request budget with Reply and plugins.
+        let limiter = self.reply.request_limiter.budget(&project);
 
         let template_json = serde_json::to_string(&template)
             .map_err(|error| DomainError::new(ErrorCode::InvalidArgument, error.to_string()))?;
@@ -944,7 +876,7 @@ async fn run_job(
     job_id: FuzzJobId,
     template: FuzzTemplate,
     max_concurrency: usize,
-    limiter: Arc<ProjectFuzzLimiter>,
+    limiter: Arc<crate::reply::ProjectBudget>,
     cancel: CancellationToken,
     identity: Option<Arc<crate::cookies::StoredCookieProfile>>,
 ) -> DomainResult<()> {
@@ -1046,7 +978,7 @@ async fn execute_case(
     job_id: FuzzJobId,
     template: Arc<FuzzTemplate>,
     case: FuzzCasePayloads,
-    limiter: Arc<ProjectFuzzLimiter>,
+    limiter: Arc<crate::reply::ProjectBudget>,
     cancel: CancellationToken,
     identity: Option<Arc<crate::cookies::StoredCookieProfile>>,
 ) -> DomainResult<()> {
@@ -1095,7 +1027,11 @@ async fn execute_case(
     };
     db.mark_fuzz_case_running(project_id, job_id, persisted.id)
         .await?;
-    let Some(_permit) = limiter.acquire(&cancel).await? else {
+    let slots = tokio::select! {
+        _ = cancel.cancelled() => None,
+        slots = limiter.acquire(1) => Some(slots?),
+    };
+    let Some(slots) = slots else {
         return db
             .finish_fuzz_case(
                 project_id,
@@ -1135,6 +1071,7 @@ async fn execute_case(
             ProtocolPreference::Auto,
             ReplySendContext::fuzzer(template.base_exchange_id, job_id, persisted.id),
             identity.as_deref(),
+            slots,
         )
         .await;
     match result {
@@ -1482,13 +1419,13 @@ mod tests {
     fn test_limiter(
         max_concurrent_requests: u32,
         requests_per_second: f64,
-    ) -> Arc<ProjectFuzzLimiter> {
+    ) -> Arc<crate::reply::ProjectBudget> {
         let limits = ProjectLimits {
             max_concurrent_requests,
             requests_per_second,
             ..Default::default()
         };
-        Arc::new(ProjectFuzzLimiter::new(&limits).unwrap())
+        Arc::new(crate::reply::ProjectBudget::new(&limits))
     }
 
     #[async_trait::async_trait]
@@ -1836,68 +1773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_limiter_enforces_concurrency_and_rate() {
-        let limiter = test_limiter(1, 20.0);
-        let cancel = CancellationToken::new();
-        let first = limiter.acquire(&cancel).await.unwrap().unwrap();
-        let blocked =
-            tokio::time::timeout(Duration::from_millis(20), limiter.acquire(&cancel)).await;
-        assert!(
-            blocked.is_err(),
-            "second request bypassed concurrency limit"
-        );
-        drop(first);
-        let second = tokio::time::timeout(Duration::from_millis(100), limiter.acquire(&cancel))
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        drop(second);
-
-        let limiter = test_limiter(4, 20.0);
-        let started = Instant::now();
-        for _ in 0..3 {
-            drop(limiter.acquire(&cancel).await.unwrap().unwrap());
-        }
-        assert!(
-            started.elapsed() >= Duration::from_millis(90),
-            "three dispatches exceeded the shared 20 requests/second limit"
-        );
-    }
-
-    #[tokio::test]
-    async fn queued_requests_remain_rate_limited_after_concurrency_frees() {
-        let limiter = test_limiter(2, 10.0);
-        let cancel = CancellationToken::new();
-        let first = limiter.acquire(&cancel).await.unwrap().unwrap();
-        let second = limiter.acquire(&cancel).await.unwrap().unwrap();
-
-        let acquire_at = |limiter: Arc<ProjectFuzzLimiter>, cancel: CancellationToken| async move {
-            let permit = limiter.acquire(&cancel).await.unwrap().unwrap();
-            let acquired_at = Instant::now();
-            (permit, acquired_at)
-        };
-        let third = tokio::spawn(acquire_at(limiter.clone(), cancel.clone()));
-        let fourth = tokio::spawn(acquire_at(limiter.clone(), cancel.clone()));
-        tokio::time::sleep(Duration::from_millis(220)).await;
-        drop(first);
-        drop(second);
-
-        let (_, third_at) = third.await.unwrap();
-        let (_, fourth_at) = fourth.await.unwrap();
-        let gap = if third_at >= fourth_at {
-            third_at.duration_since(fourth_at)
-        } else {
-            fourth_at.duration_since(third_at)
-        };
-        assert!(
-            gap >= Duration::from_millis(80),
-            "queued requests burst after permits became available: gap was {gap:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_jobs_in_one_project_share_the_same_limiter() {
+    async fn fuzz_jobs_and_reply_share_the_project_budget() {
         let db = Arc::new(Db::open_in_memory().await.unwrap());
         let project = db
             .create_project(CreateProjectRequest {
@@ -1913,11 +1789,14 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![5; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
+        let budget = reply.request_limiter.budget(&project);
         let service = FuzzerService::new(db, reply, PlaceholderKey::from_bytes(vec![6; 32]));
-        let first = service.project_limiter(&project).unwrap();
-        let second = service.project_limiter(&project).unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(
+            &budget,
+            &service.reply.request_limiter.budget(&project)
+        ));
     }
 
     #[tokio::test]
@@ -1964,6 +1843,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![7; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
 
         run_job(
@@ -2066,6 +1946,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![11; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
 
         let error = run_job(
@@ -2144,6 +2025,7 @@ mod tests {
             placeholder_key: PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
 
         run_job(

@@ -1,8 +1,6 @@
 //! Scope policy resolution and ValidatedDial.
 
-use crate::domain::{
-    DomainError, DomainResult, ErrorCode, ProjectLimits, ScopePolicy, ValidatedDial,
-};
+use crate::domain::{DomainError, DomainResult, ErrorCode, ScopePolicy, ValidatedDial};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -222,44 +220,6 @@ pub async fn resolve_validated_dial(
         scheme: t.scheme,
         path: t.path,
     })
-}
-
-/// Simple token-bucket / concurrency limiter state for a project.
-#[derive(Debug)]
-pub struct LimitTracker {
-    pub concurrent: std::sync::atomic::AtomicU32,
-    pub limits: ProjectLimits,
-}
-
-impl LimitTracker {
-    pub fn new(limits: ProjectLimits) -> Self {
-        Self {
-            concurrent: std::sync::atomic::AtomicU32::new(0),
-            limits,
-        }
-    }
-
-    pub fn try_acquire(&self) -> DomainResult<Permit<'_>> {
-        let cur = self.concurrent.load(Ordering::SeqCst);
-        if cur >= self.limits.max_concurrent_requests {
-            return Err(DomainError::new(
-                ErrorCode::ConcurrencyLimited,
-                "max concurrent requests reached",
-            ));
-        }
-        self.concurrent.fetch_add(1, Ordering::SeqCst);
-        Ok(Permit { tracker: self })
-    }
-}
-
-pub struct Permit<'a> {
-    tracker: &'a LimitTracker,
-}
-
-impl Drop for Permit<'_> {
-    fn drop(&mut self) {
-        self.tracker.concurrent.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 #[cfg(test)]

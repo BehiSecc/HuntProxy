@@ -1394,6 +1394,7 @@ mod tests {
             placeholder_key: key.clone(),
             upstream_proxies: Default::default(),
             verify_upstream_tls: true,
+            request_limiter: Default::default(),
         });
         let fuzzer = Arc::new(FuzzerService::new(db.clone(), reply.clone(), key));
         let browser = Arc::new(BrowserService::new_with_proxy_and_ca(

@@ -126,6 +126,12 @@ impl ReplyService {
             .unwrap_or(usize::MAX)
             .min(MAX_BODY_BYTES);
         let prepared = prepare_streams(streams, request_cap, options.final_data_together)?;
+        // Every stream starts at once on one connection, so the send takes a
+        // slot and a start time for each of them.
+        let _slots = self
+            .request_limiter
+            .acquire(&project, prepared.len())
+            .await?;
         let timeout_ms = options
             .timeout_ms
             .unwrap_or(60_000)
