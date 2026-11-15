@@ -78,7 +78,8 @@ test("isolated message queues preserve page events, navigation, popups and diagn
   const first = events.find((event) => event.kind === "window_message" && event.data_size === 14);
   assert.equal(first.data_type, "string");
   assert.equal(first.origin, `${base}/`);
-  assert.equal(events.some((event) => event.kind === "console" && event.level === "warning"), true);
+  assert.equal(events.some((event) => event.kind === "console" && event.level === "warning"
+    && event.text === "workspace diagnostic"), true);
   assert.equal(events.some((event) => event.kind === "window_message" && event.data_type === "array" && event.data_size === 3), true);
 
   const popupPromise = page.waitForEvent("popup");
@@ -98,6 +99,7 @@ test("isolated message queues preserve page events, navigation, popups and diagn
   await page.getByRole("link", { name: "Continue" }).click();
   events = await observed(tracker, session, (items) => items.some((event) => event.kind === "window_message"
     && event.data_size === 13) && items.some((event) => event.kind === "page_error"));
+  assert.equal(events.find((event) => event.kind === "page_error").text, "Error: workspace diagnostic");
   assert.deepEqual(await page.evaluate(() => Object.getOwnPropertyNames(window)
     .filter((name) => name.startsWith("__huntproxy_messages_"))), []);
   const beforeCrossOrigin = session.eventSequence;
@@ -141,20 +143,35 @@ test("observer setup failure preserves console/page events and stays visible thr
   };
   const session = { context, page };
   await tracker.initializeSessionTracking(session);
-  page.emit("console", {
-    type: () => "warning",
-    location: () => ({ url: "http://localhost/workspace", lineNumber: 1, columnNumber: 1 }),
+  const warning = (text) => ({
+    type: () => "warning", text: () => text,
+    location: () => ({ url: "http://localhost/workspace?token=1", lineNumber: 1, columnNumber: 1 }),
   });
+  page.emit("console", warning("workspace warning"));
   page.emit("pageerror", new Error("workspace diagnostic"));
   const first = await tracker.performEvents(session, {});
   assert.deepEqual(Array.from(first.data.events, (event) => event.kind), ["observer_error", "console", "page_error"]);
+  // Events carry what the page said; runtime inspection still keeps only where.
+  const [, said, thrown] = JSON.parse(JSON.stringify(first.data.events));
+  assert.deepEqual([said.level, said.url, said.text, said.text_length], ["warning", "http://localhost/workspace", "workspace warning", undefined]);
+  assert.equal(thrown.text, "Error: workspace diagnostic");
+  assert.deepEqual(JSON.parse(JSON.stringify(session.runtimeErrors)), [
+    { kind: "console", level: "warning", url: "http://localhost/workspace", line: 1, column: 1 }, { kind: "page_error" },
+  ]);
+  // A long message is cut, and says how long it was. Other levels are not recorded.
+  page.emit("console", warning(`${"é".repeat(299)}😀 and the rest`));
+  page.emit("console", { ...warning("just a log line"), type: () => "log" });
+  const long = (await tracker.performEvents(session, { runtime_generation: 1, after_sequence: first.data.latest_sequence })).data.events;
+  assert.equal(long.length, 1);
+  assert.equal(long[0].text.length, 300);
+  assert.equal(long[0].text_length, 2 * 299 + 4 + " and the rest".length);
   assert.equal(first.data.observer_errors[0].operation, "initialization");
   const filtered = await tracker.performEvents(session, { kinds: ["window_message"] });
   assert.equal(filtered.data.events.length, 0);
   assert.equal(filtered.data.observer_errors[0].observer, "window_message");
   page.emit("pageerror", new Error("later diagnostic"));
   const later = await tracker.performEvents(session, {
-    runtime_generation: 1, after_sequence: first.data.latest_sequence,
+    runtime_generation: 1, after_sequence: long[0].sequence,
   });
   assert.deepEqual(Array.from(later.data.events, (event) => event.kind), ["page_error"]);
   assert.equal(later.data.observer_errors.length, 1);

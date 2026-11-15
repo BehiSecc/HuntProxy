@@ -139,8 +139,10 @@ function trackRuntimeErrors(session, page) {
     session.runtimeErrors.push(event);
     if (session.runtimeErrors.length > 32) session.runtimeErrors.shift();
   };
-  // Console/error text can contain application credentials. Retain only
-  // diagnostic type and source location, never message or stack contents.
+  // Runtime inspection keeps only a diagnostic's type and source location,
+  // never its message or stack. An event also carries the start of the text,
+  // which is what says why a script was refused or what a payload printed;
+  // that text is the page's own and can contain application credentials.
   page.on("console", (message) => {
     if (!new Set(["error", "warning"]).has(message.type())) return;
     const location = message.location();
@@ -149,12 +151,23 @@ function trackRuntimeErrors(session, page) {
     record(event);
     recordSessionEvent(session, "console", {
       level: event.level, url: event.url, line: event.line, column: event.column,
+      ...eventText(message.text()),
     }, page);
   });
-  page.on("pageerror", () => {
+  page.on("pageerror", (error) => {
     record({ kind: "page_error" });
-    recordSessionEvent(session, "page_error", {}, page);
+    recordSessionEvent(session, "page_error", eventText(error), page);
   });
+}
+
+const MAX_EVENT_TEXT_CHARS = 300;
+
+// The start of what a page said, for an event. `text_length` is the whole
+// text's size in bytes, given only when the text was cut.
+function eventText(value) {
+  const text = String(value ?? "");
+  if (text.length <= MAX_EVENT_TEXT_CHARS) return { text };
+  return { text: text.slice(0, MAX_EVENT_TEXT_CHARS), text_length: Buffer.byteLength(text) };
 }
 
 function trackPage(session, page, initial = false) {
@@ -173,6 +186,8 @@ function trackPage(session, page, initial = false) {
     const leave = dialog.type() === "beforeunload";
     recordSessionEvent(session, "dialog", {
       dialog_type: dialog.type(),
+      // The start of what the dialog said; message_length is all of it.
+      message: (dialog.message() || "").slice(0, MAX_EVENT_TEXT_CHARS),
       message_length: Buffer.byteLength(dialog.message() || ""),
       default_value_length: Buffer.byteLength(dialog.defaultValue() || ""),
       disposition: leave ? "accepted" : "dismissed",
