@@ -49,7 +49,18 @@ const ALLOWED_FIELDS: &[&str] = &[
     "time",
     "error",
     "request",
+    "response",
+    "query",
+    "url",
+    "project_id",
+    "project",
 ];
+
+/// Fields a bare word searches; the group counts as one term.
+const BARE_WORD_FIELDS: [&str; 6] = ["host", "authority", "path", "mime", "title", "error"];
+
+/// Full URL as `scheme://authority/path?query`, matching the MCP row `url`.
+const URL_SQL: &str = "(scheme || '://' || authority || path || CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END)";
 
 const ALLOWED_OPS: &[&str] = &[
     "eq",
@@ -70,7 +81,7 @@ const MAX_DEPTH: usize = 6;
 const MAX_INPUT_LEN: usize = 2048;
 
 /// Shared guidance for adapters that surface history-query errors.
-pub const HISTORY_QUERY_SYNTAX: &str = "Use field:value, field:~text, or field>=value (no colon before comparisons); combine terms with AND, OR, NOT and parentheses. Quote values containing spaces. Example: host:example.com status>=400";
+pub const HISTORY_QUERY_SYNTAX: &str = "Use field:value, field:~text, or field>=value (no colon before comparisons); combine terms with AND, OR, NOT and parentheses. Quote values containing spaces. URL parameters: query:~\"id=5\". Example: host:example.com status>=400";
 
 pub(crate) fn query_error(message: impl Into<String>) -> DomainError {
     DomainError::with_details(
@@ -84,17 +95,43 @@ pub fn validate_filter(node: &FilterNode) -> DomainResult<()> {
     validate_filter_depth(node, 0, &mut 0)
 }
 
-/// Full request search includes decoded body bytes and is intentionally
-/// treated as expensive by API callers (for example, they skip an exact
-/// second-pass count). Keep this structural check next to the filter model so
-/// every adapter can make the same decision without inspecting generated SQL.
-pub fn uses_request_body_search(node: &FilterNode) -> bool {
+/// `request` and `response` searches include decoded body bytes and are
+/// intentionally treated as expensive by callers (for example, they skip an
+/// exact second-pass count). Keep this structural check next to the filter
+/// model so every adapter can make the same decision without inspecting
+/// generated SQL.
+pub fn uses_body_search(node: &FilterNode) -> bool {
     match node {
-        FilterNode::And { and } => and.iter().any(uses_request_body_search),
-        FilterNode::Or { or } => or.iter().any(uses_request_body_search),
-        FilterNode::Not { not } => uses_request_body_search(not),
-        FilterNode::Term { field, .. } => field == "request",
+        FilterNode::And { and } => and.iter().any(uses_body_search),
+        FilterNode::Or { or } => or.iter().any(uses_body_search),
+        FilterNode::Not { not } => uses_body_search(not),
+        FilterNode::Term { field, .. } => is_body_field(field),
     }
+}
+
+fn is_body_field(field: &str) -> bool {
+    matches!(field, "request" | "response")
+}
+
+/// The word when `node` is the OR group a bare word expands to.
+fn bare_word(node: &FilterNode) -> Option<&serde_json::Value> {
+    let FilterNode::Or { or } = node else {
+        return None;
+    };
+    if or.len() != BARE_WORD_FIELDS.len() {
+        return None;
+    }
+    let mut word = None;
+    for (child, expected) in or.iter().zip(BARE_WORD_FIELDS) {
+        let FilterNode::Term { field, op, value } = child else {
+            return None;
+        };
+        if field != expected || op != "contains" || word.is_some_and(|word| word != value) {
+            return None;
+        }
+        word = Some(value);
+    }
+    word.filter(|value| value.is_string() || value.is_number())
 }
 
 fn validate_filter_depth(node: &FilterNode, depth: usize, terms: &mut usize) -> DomainResult<()> {
@@ -104,21 +141,17 @@ fn validate_filter_depth(node: &FilterNode, depth: usize, terms: &mut usize) -> 
         )));
     }
     match node {
+        node if bare_word(node).is_some() => count_term(terms)?,
         FilterNode::And { and } | FilterNode::Or { or: and } => {
             for c in and {
                 validate_filter_depth(c, depth + 1, terms)?;
             }
         }
         FilterNode::Not { not } => validate_filter_depth(not, depth + 1, terms)?,
-        FilterNode::Term { field, op, .. } => {
-            *terms += 1;
-            if *terms > MAX_TERMS {
-                return Err(query_error(format!(
-                    "too many filter terms; use at most {MAX_TERMS} field terms (each bare word searches six fields)"
-                )));
-            }
+        FilterNode::Term { field, op, value } => {
+            count_term(terms)?;
             if !ALLOWED_FIELDS.contains(&field.as_str()) {
-                return Err(unknown_field_error(field, op));
+                return Err(unknown_field_error(field, op, value));
             }
             if !ALLOWED_OPS.contains(&op.as_str()) {
                 return Err(query_error(format!(
@@ -132,25 +165,64 @@ fn validate_filter_depth(node: &FilterNode, depth: usize, terms: &mut usize) -> 
     Ok(())
 }
 
+fn count_term(terms: &mut usize) -> DomainResult<()> {
+    *terms += 1;
+    if *terms > MAX_TERMS {
+        return Err(query_error(format!(
+            "too many filter terms; use at most {MAX_TERMS} terms"
+        )));
+    }
+    Ok(())
+}
+
 fn field_example(field: &str) -> String {
     match field {
         "time" => "time>2026-10-12T00:00:00Z".into(),
         "status" => "status>=400".into(),
         "duration" => "duration>=1000".into(),
         "request_size" | "response_size" => format!("{field}>1024"),
-        "request" => "request:~text".into(),
+        "request" | "response" => format!("{field}:~text"),
+        "query" => "query:~\"id=5\"".into(),
+        "url" => "url:~/api/".into(),
         _ => format!("{field}:value"),
     }
 }
 
-fn unknown_field_error(field: &str, op: &str) -> DomainError {
+/// Field names agents borrow from other tools, with the field to use.
+const FIELD_ALIASES: &[(&str, &str)] = &[
+    ("status_code", "status"),
+    ("code", "status"),
+    ("started_at", "time"),
+    ("timestamp", "time"),
+    ("duration_ms", "duration"),
+    ("request_length", "request_size"),
+    ("response_length", "response_size"),
+    ("request_body", "request"),
+    ("response_body", "response"),
+    ("body", "request or response"),
+    ("header", "request or response"),
+    ("headers", "request or response"),
+    ("params", "query"),
+    ("param", "query"),
+    ("query_string", "query"),
+    ("uri", "url"),
+    ("href", "url"),
+    ("domain", "host"),
+    ("hostname", "host"),
+    ("content_type", "mime"),
+    ("content-type", "mime"),
+    ("labels", "label"),
+    ("tag", "label"),
+];
+
+fn unknown_field_error(field: &str, op: &str, value: &serde_json::Value) -> DomainError {
     if let Some(correct) = field.strip_suffix(':').filter(|field| {
         ALLOWED_FIELDS.contains(field) && matches!(op, "gt" | "gte" | "lt" | "lte" | "ne")
     }) {
-        if correct == "request" {
-            return query_error(
-                "unknown filter field: request:; request supports only contains searches. Use request:~text",
-            );
+        if is_body_field(correct) {
+            return query_error(format!(
+                "unknown filter field: {correct}:; {correct} supports only text searches. Use {correct}:~text"
+            ));
         }
         if correct == "label" && !matches!(op, "eq" | "ne") {
             return query_error(
@@ -170,21 +242,63 @@ fn unknown_field_error(field: &str, op: &str) -> DomainError {
             field_example(correct),
         ));
     }
-    let correction = match field {
-        "status_code" => Some("status"),
-        "started_at" => Some("time"),
-        "duration_ms" => Some("duration"),
-        "request_length" => Some("request_size"),
-        "response_length" => Some("response_size"),
-        _ => None,
-    };
-    let hint = correction
-        .map(|correct| format!("use {correct}; example: {}. ", field_example(correct)))
+    let lower = field.to_ascii_lowercase();
+    if let Some((_, correct)) = FIELD_ALIASES.iter().find(|(alias, _)| *alias == lower) {
+        let example = if correct.contains(' ') {
+            "request:~text or response:~text".into()
+        } else {
+            field_example(correct)
+        };
+        return query_error(format!(
+            "unknown filter field: {field}; use {correct}. Example: {example}"
+        ));
+    }
+    let closest = closest_field(&lower)
+        .map(|correct| format!("did you mean {correct}? "))
         .unwrap_or_default();
+    let value = match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    let parameter = format!("{field}={value}")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     query_error(format!(
-        "unknown filter field: {field}; {hint}Supported fields: {}",
+        "unknown filter field: {field}; {closest}For a URL parameter use query:~\"{parameter}\". Supported fields: {}",
         ALLOWED_FIELDS.join(", "),
     ))
+}
+
+/// The supported field within two edits of `field`, for typos such as `stauts`.
+fn closest_field(field: &str) -> Option<&'static str> {
+    if field.len() < 4 {
+        return None;
+    }
+    ALLOWED_FIELDS
+        .iter()
+        .map(|candidate| (edit_distance(field, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= 2)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (row, left_char) in left.chars().enumerate() {
+        let mut current = vec![row + 1];
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != *right_char);
+            current.push(
+                substitution
+                    .min(previous[column + 1] + 1)
+                    .min(current[column] + 1),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 /// Compile filter AST to parameterized SQL WHERE clause (without leading WHERE).
@@ -242,6 +356,9 @@ fn col(field: &str) -> DomainResult<&'static str> {
         "response_hash" => "response_body_hash",
         "time" => "started_at",
         "error" => "error_message",
+        "query" => "query",
+        "url" => URL_SQL,
+        "project_id" | "project" => "project_id",
         "label" => "exchange_id", // special-cased
         other => {
             return Err(query_error(format!("unsupported field {other}")));
@@ -258,8 +375,8 @@ fn compile_term(
     if field == "label" {
         return compile_label_term(op, value, binds);
     }
-    if field == "request" {
-        return compile_request_term(op, value, binds);
+    if is_body_field(field) {
+        return compile_body_term(field, op, value, binds);
     }
     let c = col(field)?;
     match op {
@@ -326,35 +443,49 @@ fn compile_term(
     }
 }
 
-fn compile_request_term(
+/// `request` searches the request target, headers and decoded body; `response`
+/// searches response headers and the decoded body. Both are contains searches,
+/// so `request:text` and `request:text*` search the same way as `request:~text`.
+fn compile_body_term(
+    side: &str,
     op: &str,
     value: &serde_json::Value,
     binds: &mut Vec<String>,
 ) -> DomainResult<String> {
-    if op != "contains" {
-        return Err(query_error(
-            "request supports only the contains operator; use request:~text",
-        ));
+    if !matches!(op, "contains" | "eq" | "starts_with" | "ends_with") {
+        return Err(query_error(format!(
+            "{side} supports only text searches; use {side}:~text"
+        )));
     }
-    let value = value_as_string("request", value)?;
+    let value = value_as_string(side, value)?;
     binds.push(format!("%{}%", escape_like(&value)));
     let like_index = binds.len();
     binds.push(value);
     let body_index = binds.len();
+    let (target, body_column) = if side == "request" {
+        (
+            format!(
+                "method LIKE ?{like_index} ESCAPE '\\' \
+                 OR scheme LIKE ?{like_index} ESCAPE '\\' \
+                 OR authority LIKE ?{like_index} ESCAPE '\\' \
+                 OR path LIKE ?{like_index} ESCAPE '\\' \
+                 OR COALESCE(query, '') LIKE ?{like_index} ESCAPE '\\' \
+                 OR "
+            ),
+            "request_body_id",
+        )
+    } else {
+        (String::new(), "response_body_id")
+    };
     Ok(format!(
-        "(method LIKE ?{like_index} ESCAPE '\\' \
-          OR scheme LIKE ?{like_index} ESCAPE '\\' \
-          OR authority LIKE ?{like_index} ESCAPE '\\' \
-          OR path LIKE ?{like_index} ESCAPE '\\' \
-          OR COALESCE(query, '') LIKE ?{like_index} ESCAPE '\\' \
-          OR EXISTS (SELECT 1 FROM message_headers mh \
+        "({target}EXISTS (SELECT 1 FROM message_headers mh \
                      WHERE mh.project_id=exchanges.project_id \
                        AND mh.exchange_id=exchanges.exchange_id \
-                       AND mh.side='request' \
+                       AND mh.side='{side}' \
                        AND (mh.name LIKE ?{like_index} ESCAPE '\\' \
                             OR CAST(mh.value AS TEXT) LIKE ?{like_index} ESCAPE '\\')) \
           OR EXISTS (SELECT 1 FROM bodies b \
-                     WHERE b.id=exchanges.request_body_id \
+                     WHERE b.id=exchanges.{body_column} \
                        AND huntproxy_body_contains(b.codec, b.content, ?{body_index})))"
     ))
 }
@@ -458,7 +589,78 @@ pub fn parse_text_query(input: &str) -> DomainResult<FilterNode> {
     if input.is_empty() {
         return Ok(FilterNode::And { and: vec![] });
     }
-    QueryParser::new(tokenize_query(input)?).parse()
+    let tokens = match tokenize_query(input) {
+        // Agents often send JSON-escaped quotes (`path:~\"value\"`); read
+        // `\"` as `"` before reporting the unterminated quote.
+        Err(error) if input.contains("\\\"") => {
+            tokenize_query(&input.replace("\\\"", "\"")).map_err(|_| error)?
+        }
+        tokens => tokens?,
+    };
+    QueryParser::new(tokens).parse()
+}
+
+/// Renders `node` in the text syntax accepted by [`parse_text_query`], for
+/// messages that point at one term of a query.
+pub fn filter_to_text(node: &FilterNode) -> String {
+    let join = |nodes: &[FilterNode], separator: &str| {
+        nodes
+            .iter()
+            .map(filter_to_text)
+            .collect::<Vec<_>>()
+            .join(separator)
+    };
+    if let Some(word) = bare_word(node) {
+        return quote_value(&text_value(word));
+    }
+    match node {
+        FilterNode::And { and } => format!("({})", join(and, " ")),
+        FilterNode::Or { or } => format!("({})", join(or, " OR ")),
+        FilterNode::Not { not } => format!("NOT {}", filter_to_text(not)),
+        FilterNode::Term { field, op, value } => {
+            if let serde_json::Value::Array(values) = value {
+                let alternatives = values
+                    .iter()
+                    .map(|value| format!("{field}:{}", quote_value(&text_value(value))))
+                    .collect::<Vec<_>>();
+                return format!("({})", alternatives.join(" OR "));
+            }
+            let text = quote_value(&text_value(value));
+            match op.as_str() {
+                "ne" => format!("{field}!={text}"),
+                "gt" => format!("{field}>{text}"),
+                "gte" => format!("{field}>={text}"),
+                "lt" => format!("{field}<{text}"),
+                "lte" => format!("{field}<={text}"),
+                "contains" => format!("{field}:~{text}"),
+                "starts_with" => format!("{field}:{text}*"),
+                "ends_with" => format!("{field}:*{text}"),
+                "exists" if value.as_bool() == Some(false) => format!("NOT {field}:*"),
+                "exists" => format!("{field}:*"),
+                _ => format!("{field}:{text}"),
+            }
+        }
+    }
+}
+
+fn text_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// `value` as one token: quoted when it holds spaces, parentheses or quotes.
+fn quote_value(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || "()\"\\".contains(character))
+    {
+        return value.to_owned();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,17 +674,35 @@ fn tokenize_query(input: &str) -> DomainResult<Vec<QueryToken>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
+    // Opened by an over-escaped `\"` (agents JSON-escape quotes twice); in such
+    // a value `\"` closes the quote too.
+    let mut opened_escaped = false;
     let mut escaped = false;
     let flush = |current: &mut String, tokens: &mut Vec<QueryToken>| {
         if !current.is_empty() {
             tokens.push(QueryToken::Text(std::mem::take(current)));
         }
     };
-    for character in input.chars() {
+    let mut characters = input.chars().peekable();
+    while let Some(character) = characters.next() {
         if escaped {
             current.push(character);
             escaped = false;
             continue;
+        }
+        if character == '\\' && characters.peek() == Some(&'"') {
+            if !quoted && (current.is_empty() || current.ends_with([':', '~', '=', '>', '<'])) {
+                characters.next();
+                quoted = true;
+                opened_escaped = true;
+                continue;
+            }
+            if quoted && opened_escaped {
+                characters.next();
+                quoted = false;
+                opened_escaped = false;
+                continue;
+            }
         }
         if quoted && character == '\\' {
             escaped = true;
@@ -490,6 +710,7 @@ fn tokenize_query(input: &str) -> DomainResult<Vec<QueryToken>> {
         }
         if character == '"' {
             quoted = !quoted;
+            opened_escaped = false;
             continue;
         }
         if !quoted {
@@ -645,6 +866,13 @@ fn parse_one_term(part: &str) -> Result<FilterNode, String> {
     if let Some((field, rest)) = part.split_once("!=") {
         return Ok(term(field, "ne", rest));
     }
+    // `field=value` for a known field; any other `a=b` stays a bare word.
+    if let Some((field, rest)) = part
+        .split_once('=')
+        .filter(|(field, _)| ALLOWED_FIELDS.contains(field))
+    {
+        return parse_one_term(&format!("{field}:{rest}"));
+    }
     if let Some((field, rest)) = part.split_once('>') {
         return Ok(term(field, "gt", rest));
     }
@@ -667,7 +895,7 @@ fn parse_one_term(part: &str) -> Result<FilterNode, String> {
         return Ok(term(field, "eq", rest));
     }
     Ok(FilterNode::Or {
-        or: ["host", "authority", "path", "mime", "title", "error"]
+        or: BARE_WORD_FIELDS
             .into_iter()
             .map(|field| term(field, "contains", part))
             .collect(),
@@ -819,16 +1047,146 @@ mod tests {
         assert!(sql.contains("method="));
         assert!(binds.iter().any(|value| value == ":smtg"));
         assert!(binds.iter().any(|value| value == "PUT"));
-        assert!(uses_request_body_search(&filter));
+        assert!(uses_body_search(&filter));
     }
 
     #[test]
-    fn only_request_terms_are_classified_as_full_body_searches() {
-        let ordinary = parse_text_query("host:example.com method:POST").unwrap();
-        assert!(!uses_request_body_search(&ordinary));
+    fn only_request_and_response_terms_are_classified_as_full_body_searches() {
+        let ordinary = parse_text_query("host:example.com method:POST query:~a url:~b").unwrap();
+        assert!(!uses_body_search(&ordinary));
 
         let nested = parse_text_query("NOT (status:404 OR request:~needle)").unwrap();
-        assert!(uses_request_body_search(&nested));
+        assert!(uses_body_search(&nested));
+        assert!(uses_body_search(
+            &parse_text_query("response:~needle").unwrap()
+        ));
+    }
+
+    #[test]
+    fn json_escaped_quotes_are_read_as_quotes_when_the_query_would_not_tokenize() {
+        for (input, expected) in [
+            (r#"path:~\"monthly report\""#, vec!["%monthly report%"]),
+            (r#"path:~\"a\" method:GET"#, vec!["%a%", "GET"]),
+            // Escaped opening quote with a plain closing quote.
+            (r#"path:~\"api/v2" method:POST"#, vec!["%api/v2%", "POST"]),
+            (r#"path:~\"api/v2\" method:POST"#, vec!["%api/v2%", "POST"]),
+            (r#"host:\"a.test" status>\"400""#, vec!["a.test", "400"]),
+            (
+                r#"request:~\"monthly report""#,
+                vec!["%monthly report%", "monthly report"],
+            ),
+            // An escaped quote inside a plainly quoted value keeps its meaning.
+            (r#"path:~"say \"hi\"""#, vec![r#"%say "hi"%"#]),
+            (r#"path:~"a \"quoted\" word""#, vec![r#"%a "quoted" word%"#]),
+            (r#"path:~"a\""#, vec!["%a%"]),
+        ] {
+            let (_, binds) = filter_to_sql(&parse_text_query(input).unwrap()).unwrap();
+            assert_eq!(binds, expected, "{input}");
+        }
+        let error = parse_text_query(r#"path:~\"open"#).unwrap_err();
+        assert!(error.to_string().contains("unterminated quote"), "{error}");
+    }
+
+    #[test]
+    fn request_and_response_accept_any_text_operator_as_contains() {
+        for input in [
+            "request:token",
+            "request=token",
+            "request:token*",
+            "request:*token",
+            "request:~token",
+        ] {
+            let (sql, binds) = filter_to_sql(&parse_text_query(input).unwrap()).unwrap();
+            assert!(sql.contains("request_body_id"), "{input}");
+            assert_eq!(binds, ["%token%", "token"], "{input}");
+        }
+        let (sql, binds) = filter_to_sql(&parse_text_query("response:~secret").unwrap()).unwrap();
+        assert!(sql.contains("mh.side='response'"));
+        assert!(sql.contains("exchanges.response_body_id"));
+        assert!(!sql.contains("method LIKE"));
+        assert_eq!(binds, ["%secret%", "secret"]);
+        for input in ["request>1", "response!=x"] {
+            let error = filter_to_sql(&parse_text_query(input).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("only text searches"), "{error}");
+        }
+    }
+
+    #[test]
+    fn query_url_and_project_fields_compile_to_columns() {
+        for (input, sql_part, bind) in [
+            (r#"query:~"id=5""#, "query LIKE", "%id=5%"),
+            ("url:~/api/items?x", "'://'", "%/api/items?x%"),
+            ("project_id:7", "project_id=", "7"),
+            ("project:7", "project_id=", "7"),
+            ("host=example.com", "host=", "example.com"),
+        ] {
+            let (sql, binds) = filter_to_sql(&parse_text_query(input).unwrap()).unwrap();
+            assert!(sql.contains(sql_part), "{input}: {sql}");
+            assert_eq!(binds, [bind], "{input}");
+        }
+        // `a=b` with an unknown left side is still a bare word.
+        let bare = parse_text_query("token=abc").unwrap();
+        assert_eq!(bare_word(&bare), Some(&serde_json::json!("token=abc")));
+    }
+
+    #[test]
+    fn bare_words_count_as_one_term_each() {
+        let words = (0..MAX_TERMS)
+            .map(|index| format!("word{index}"))
+            .collect::<Vec<_>>();
+        let filter = parse_text_query(&words.join(" OR ")).unwrap();
+        filter_to_sql(&filter).unwrap();
+        let filter = parse_text_query(&format!("{} OR 404", words.join(" OR "))).unwrap();
+        let error = filter_to_sql(&filter).unwrap_err();
+        assert!(error.to_string().contains("too many filter terms"));
+    }
+
+    #[test]
+    fn unknown_fields_name_the_fix() {
+        let error = |input: &str| {
+            filter_to_sql(&parse_text_query(input).unwrap())
+                .unwrap_err()
+                .to_string()
+        };
+        let message = error("redirect_uri:https://x.test");
+        assert!(
+            message.contains(r#"query:~"redirect_uri=https://x.test""#),
+            "{message}"
+        );
+        assert!(message.contains("Supported fields: exchange_id"));
+        assert!(error("stauts:200").contains("did you mean status?"));
+        assert!(error("response_body:~x").contains("use response."));
+        let message = error("content_type:json");
+        assert!(message.contains("use mime"), "{message}");
+        assert!(!message.contains("Supported fields"), "{message}");
+        assert!(error("body:~x").contains("request:~text or response:~text"));
+    }
+
+    #[test]
+    fn filter_text_round_trips_through_the_parser() {
+        for input in [
+            "path:/foo",
+            "path:~\"monthly report\"",
+            "status>=400",
+            "status!=404",
+            "time<2026-10-12T00:00:00Z",
+            "path:/api/*",
+            "path:*.js",
+            "javascript",
+            "NOT host:a.test",
+            "(method:GET OR method:POST)",
+            r#"query:~"q=\"x\"""#,
+        ] {
+            let node = parse_text_query(input).unwrap();
+            let text = filter_to_text(&node);
+            assert_eq!(text, input);
+            let reparsed = parse_text_query(&text).unwrap();
+            assert_eq!(
+                filter_to_sql(&reparsed).unwrap(),
+                filter_to_sql(&node).unwrap(),
+                "{input}"
+            );
+        }
     }
 
     #[test]
@@ -884,7 +1242,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Text example: status>=400"));
-        assert!(filter_to_sql(&term("request", "eq", "text"))
+        assert!(filter_to_sql(&term("request", "gt", "text"))
             .unwrap_err()
             .to_string()
             .contains("request:~text"));
