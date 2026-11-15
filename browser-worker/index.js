@@ -2110,7 +2110,7 @@ const FUNCTION_SOURCE = /^\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*=>|[A-Za-z_
 // block that yields 1 and a function declaration yields nothing.
 const STATEMENT_LOOKALIKE = /^\s*(?:\{|(?:async\s+)?function\b)/;
 
-const EVALUATE_INTERRUPTED = /navigated or closed|context was destroyed|cannot find context|has been closed/i;
+const EVALUATE_INTERRUPTED = /navigated or closed|context was destroyed|cannot find context|could not find object|has been closed/i;
 
 // Runs in the page on the value an expression produced and returns it as data
 // CDP can copy out. Chromium's own deep serialization hangs and then kills the
@@ -2258,7 +2258,7 @@ async function evaluationTarget(session, page, selector) {
     const chosen = exact.length === 1 ? exact[0] : matches.length === 1 ? matches[0] : null;
     if (!chosen) {
       const listed = (matches.length ? matches : frames).slice(0, 12)
-        .map((frame) => `${publicLocation(frame.url) || "(opaque URL)"}${frame.name ? ` name=${frame.name}` : ""}`)
+        .map((frame) => `${publicLocation(frame.url) || "(opaque URL)"}${frame.name ? ` name=${frame.name.slice(0, 64)}` : ""}`)
         .join(", ");
       throw rpcError(-32602, matches.length
         ? `evaluate frame matches ${matches.length} frames; give its full URL or name: ${listed}`

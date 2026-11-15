@@ -52,6 +52,7 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
   // A second local origin, embedded both same-site and cross-site.
   const widget = await listen((request, response) => {
     response.setHeader("Content-Type", "text/html; charset=utf-8");
+    if (request.url.startsWith("/legal")) return response.end("<!doctype html><title>Legal</title><p>No scripts here</p>");
     response.end(`<!doctype html><title>Widget</title><p id="who">widget</p>
       <script>window.widget = { host: location.host, path: location.pathname };</script>`);
   });
@@ -82,6 +83,7 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
       <iframe name="help" src="http://127.0.0.1:${widgetPort}/help?topic=cart#top"></iframe>
       <iframe src="http://localhost:${widgetPort}/ads/slot"></iframe>
       <iframe src="http://localhost:${widgetPort}/ads/other"></iframe>
+      <iframe name="legal" src="http://127.0.0.1:${widgetPort}/legal"></iframe>
       <script src="/app.js"></script>`);
   });
   t.after(() => Promise.all([app, widget].map((server) => new Promise((resolve) => server.close(resolve)))));
@@ -236,6 +238,8 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
     assert.equal((await evaluate("await new Promise((resolve) => setTimeout(() => resolve(widget.host), 50))", { frame: `http://localhost:${widgetPort}/ads/other` })).content, `localhost:${widgetPort}`);
     assert.equal((await evaluate("{host: location.host}", { frame: "help" })).content, `{"host":"127.0.0.1:${widgetPort}"}`);
     assert.match((await evaluate("nope()", { frame: "help" })).content, /^ReferenceError: nope is not defined/);
+    // A frame whose document runs no script of its own can still be evaluated in.
+    assert.equal((await evaluate("document.title + ' ' + typeof widget", { frame: "legal" })).content, "Legal undefined");
     await assert.rejects(evaluate("1", { frame: "/ads/" }),
       (error) => error.code === -32602 && /matches 2 frames/.test(error.message) && error.message.includes("/ads/slot") && error.message.includes("/ads/other"));
     await assert.rejects(evaluate("1", { frame: "checkout" }),
