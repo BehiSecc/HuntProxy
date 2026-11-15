@@ -366,13 +366,14 @@ pub enum BrowserAction {
         timeout_ms: u64,
     },
     /// Mouse input aimed at an element or at a viewport point: `click`,
-    /// `hover`, or `drag` to a second element or point.
+    /// `hover`, or `drag` to a second element or point. The locators are
+    /// boxed so that two of them do not make every action this large.
     Pointer {
         op: String,
-        locator: Option<Locator>,
+        locator: Option<Box<Locator>>,
         x: Option<f64>,
         y: Option<f64>,
-        to_locator: Option<Locator>,
+        to_locator: Option<Box<Locator>>,
         to_x: Option<f64>,
         to_y: Option<f64>,
         #[serde(default = "default_pointer_button")]
@@ -492,7 +493,11 @@ impl BrowserAction {
                 locator,
                 to_locator,
                 ..
-            } => locator.iter().chain(to_locator).collect(),
+            } => locator
+                .as_deref()
+                .into_iter()
+                .chain(to_locator.as_deref())
+                .collect(),
             _ => Vec::new(),
         }
     }

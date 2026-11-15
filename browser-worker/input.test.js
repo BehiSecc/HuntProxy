@@ -224,6 +224,12 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     await run({ type: "pointer", op: "drag", locator: { css: "#chip" }, to_locator: { css: "#bin" } });
     assert.deepEqual((await heard()).filter((entry) => entry.kind === "dragstart" || entry.kind === "drop"),
       [{ kind: "dragstart" }, { kind: "drop", data: "chip-7" }]);
+    // A destination that cannot be found fails before the button goes down:
+    // pressing first would end in a release, and so a click, on the source.
+    for (const destination of [{}, { css: "#pad", frame: "nowhere" }, { css: "button.row" }]) {
+      await assert.rejects(executeAction(session, { type: "pointer", op: "drag", locator: { css: "#pad" }, to_locator: destination }));
+    }
+    assert.deepEqual(await heard(), []);
   });
 
   await t.test("types keystrokes into a locator or whatever has focus", async () => {
@@ -254,7 +260,7 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     await assert.rejects(executeAction(session, { type: "click", locator: { role: "button", name: "Delete" } }), (error) => {
       assert.match(error.message, /strict mode violation/);
       assert.match(error.message, /resolved to 3 elements/);
-      assert.match(error.message, /Set locator\.nth to pick one of them: 0 is the first, -1 the last\.$/);
+      assert.match(error.message, /Set nth on the locator to pick one of them: 0 is the first, -1 the last\.$/);
       assert.ok(!error.message.includes("Call log"));
       return true;
     });
@@ -299,6 +305,19 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
       { url: `http://127.0.0.1:${framesPort}/help`, name: "help" },
       { url: `http://localhost:${framesPort}/pay`, name: "pay" },
     ] }]);
+    // A page full of frames lists a bounded number and says how many it left out.
+    await read("for (let index = 0; index < 14; index += 1) { const frame = document.createElement('iframe'); frame.className = 'extra'; frame.srcdoc = '<p>extra</p>'; document.body.append(frame); } 14");
+    await page.waitForFunction(() => window.frames.length === 16);
+    const [crowded] = (await run({ type: "pages", op: "list" })).data.pages;
+    assert.equal(crowded.frames.length, 12);
+    assert.equal(crowded.frames_omitted, 4);
+    assert.deepEqual(crowded.frames.at(-1), { url: "about:srcdoc" });
+    await read("document.querySelectorAll('iframe.extra').forEach((frame) => frame.remove()); 0");
+    // Only the selected page's frames are listed.
+    const opened = (await run({ type: "pages", op: "new", url: `${base}/next` })).data;
+    assert.deepEqual(opened.pages.map((entry) => [entry.active, entry.frames?.length]), [[false, undefined], [true, undefined]]);
+    await run({ type: "pages", op: "close", page_id: opened.page_id, runtime_generation: opened.runtime_generation });
+    assert.equal((await run({ type: "pages", op: "list" })).data.pages[0].frames.length, 2);
   });
 
   await t.test("pointer input is validated", async () => {

@@ -128,6 +128,12 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
     assert.equal(await value("async () => (await fetch('/api/items')).status"), 200);
     assert.equal(await value("function () { return location.pathname; }"), "/");
     assert.equal(await value("function double(n) { return n * 2; }\ndouble(21)"), 42);
+    // Statements that end with a function show it; only a source that is one
+    // function is called.
+    assert.equal(await value("window.calls = 0"), 0);
+    assert.equal(await value("function make() { return () => { window.calls += 1; }; }\nmake()"), "() => { window.calls += 1; }");
+    assert.equal(await value("window.calls"), 0);
+    assert.equal(await value("(n = Math.max(1, 2)) => n"), "(n = Math.max(1, 2)) => n");
     const signer = await evaluate("app.sign");
     assert.equal(signer.type, "function");
     assert.match(signer.content, /^sign\(value\) \{ return "sig:" \+ value; \}$/);

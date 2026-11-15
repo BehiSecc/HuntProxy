@@ -603,11 +603,19 @@ if (inspectRuntimeOnly) {
   process.exit(0);
 }
 
+// A page chooses its title, its frame names and much of an error's text, and
+// can put half a surrogate pair in any of them, or have one cut in half by a
+// length limit. JSON writes such a half as an escape that the daemon's parser
+// rejects, which it treats as a broken worker; so no string leaves with one.
+function wellFormed(key, value) {
+  return typeof value === "string" ? value.toWellFormed() : value;
+}
+
 function respond(id, result, error) {
   const message = error
     ? { jsonrpc: "2.0", id, error }
     : { jsonrpc: "2.0", id, result };
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  process.stdout.write(`${JSON.stringify(message, wellFormed)}\n`);
 }
 
 function logMeta(event, fields = {}) {
@@ -1641,6 +1649,8 @@ function chooseFrame(candidates, selector) {
     : `frame matches no frame of the selected page; frames: ${listed || "none"}`);
 }
 
+const MAX_LISTED_FRAMES = 12;
+
 function childFrames(page) {
   return page.frames().filter((frame) => frame !== page.mainFrame() && !frame.isDetached());
 }
@@ -1684,13 +1694,18 @@ async function pageSummaries(session) {
       url: publicLocation(page.url()),
       title: title ? title.slice(0, 256) : null,
     };
-    // What the `frame` of a locator or an evaluation can name.
-    const frames = childFrames(page).slice(0, 20).map((frame) => {
-      const listed = { url: publicLocation(frame.url()) };
-      if (frame.name()) listed.name = frame.name().slice(0, 64);
-      return listed;
-    });
-    if (frames.length) summary.frames = frames;
+    // What the `frame` of a locator or an evaluation can name. Only the
+    // selected page's are listed, and briefly: the result has a byte budget.
+    if (page === active) {
+      const all = childFrames(page);
+      const frames = all.slice(0, MAX_LISTED_FRAMES).map((frame) => {
+        const listed = { url: (publicLocation(frame.url()) || "").slice(0, 200) || null };
+        if (frame.name()) listed.name = frame.name().slice(0, 64);
+        return listed;
+      });
+      if (frames.length) summary.frames = frames;
+      if (all.length > frames.length) summary.frames_omitted = all.length - frames.length;
+    }
     summaries.push(summary);
   }
   return summaries.sort((left, right) => left.page_id - right.page_id);
@@ -2094,18 +2109,20 @@ async function frameSession(session, page, frame) {
 // terminated after one second.
 async function evaluateElement(session, page, locator, fn, timeout) {
   const element = await locator.elementHandle({ timeout });
-  const connection = await frameSession(session, page, await element.ownerFrame());
+  let connection;
   let termination;
-  const timer = setTimeout(() => {
-    termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
-  }, 1000);
+  let timer;
   try {
+    connection = await frameSession(session, page, await element.ownerFrame());
+    timer = setTimeout(() => {
+      termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
+    }, 1000);
     return await element.evaluate(fn);
   } finally {
     clearTimeout(timer);
     if (termination) await termination;
     await element.dispose().catch(() => undefined);
-    await connection.detach().catch(() => undefined);
+    await connection?.detach().catch(() => undefined);
   }
 }
 
@@ -2340,12 +2357,17 @@ async function performEvaluate(session, page, action) {
       || !Number.isInteger(timeout) || timeout < 1 || timeout > 30_000) {
     throw rpcError(-32602, "evaluate requires an expression and timeout_ms in 1..30000");
   }
-  const target = await evaluationTarget(session, page, action.frame);
-  const { connection } = target;
-  const context = target.contextId ? { contextId: target.contextId } : {};
+  let target;
+  let abandoned = false;
   const run = async () => {
+    // Finding the frame is part of the work the deadline covers.
+    target = await evaluationTarget(session, page, action.frame);
+    if (abandoned) return null;
+    const { connection } = target;
+    const context = target.contextId ? { contextId: target.contextId } : {};
     let expression = action.expression;
-    if (STATEMENT_LOOKALIKE.test(expression)) {
+    let call = false;
+    if (STATEMENT_LOOKALIKE.test(expression) || FUNCTION_SOURCE.test(expression)) {
       // Read it as the expression it looks like when it parses as one, as the
       // DevTools console does. Compiling runs nothing and needs the domain on.
       const wrapped = `(${expression}\n)`;
@@ -2354,7 +2376,12 @@ async function performEvaluate(session, page, action) {
         expression: wrapped, sourceURL: "", persistScript: false,
         ...(target.contextId ? { executionContextId: target.contextId } : {}),
       });
-      if (!compiled.exceptionDetails) expression = wrapped;
+      if (!compiled.exceptionDetails) {
+        expression = wrapped;
+        // Only a source that is one function is called. A function that
+        // statements merely end with is a value to show, not to run.
+        call = FUNCTION_SOURCE.test(action.expression);
+      }
     }
     const evaluated = await connection.send("Runtime.evaluate", {
       expression, replMode: true, awaitPromise: true, userGesture: true,
@@ -2371,23 +2398,24 @@ async function performEvaluate(session, page, action) {
     const described = await connection.send("Runtime.callFunctionOn", {
       objectId: remote.objectId,
       functionDeclaration: describeEvaluationResult.toString(),
-      arguments: [{ objectId: remote.objectId }, { value: FUNCTION_SOURCE.test(action.expression) },
-        { value: MAX_EVALUATE_RESULT_CHARS }],
+      arguments: [{ objectId: remote.objectId }, { value: call }, { value: MAX_EVALUATE_RESULT_CHARS }],
       awaitPromise: true, returnByValue: true, userGesture: true,
     });
     if (described.exceptionDetails) return { exception: described.exceptionDetails };
     return described.result.value;
   };
+  const release = () => Promise.all((target?.connections || []).map((opened) => opened.detach().catch(() => undefined)));
   let timer;
   let termination;
   let outcome;
+  const work = run();
+  work.catch(() => undefined); // Still pending when the deadline wins.
   try {
-    const work = run();
-    work.catch(() => undefined); // Still pending when the deadline wins.
     outcome = await Promise.race([work, new Promise((_, reject) => {
       timer = setTimeout(() => {
+        abandoned = true;
         // Stops a synchronous loop. A promise that never settles stays with the page.
-        termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
+        termination = target?.connection.send("Runtime.terminateExecution").catch(() => undefined);
         reject(rpcError(-32000,
           `evaluate timed out after ${timeout} ms; the expression may still be running in the page`));
       }, timeout);
@@ -2402,7 +2430,9 @@ async function performEvaluate(session, page, action) {
     // The page must be responsive again before the next action; a renderer
     // that cannot stop is not waited for.
     if (termination) await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2_000))]);
-    await Promise.all(target.connections.map((opened) => opened.detach().catch(() => undefined)));
+    // A frame found only after the deadline is let go of when it turns up.
+    if (target) await release();
+    else void work.then(release, release);
   }
   const thrown = outcome.exception;
   const content = thrown
@@ -2447,6 +2477,7 @@ const POINTER_BUTTONS = new Set(["left", "right", "middle"]);
 const POINTER_MODIFIERS = new Set(["Alt", "Control", "Meta", "Shift"]);
 const MAX_POINTER_COORDINATE = 100_000;
 const MAX_TYPE_BYTES = 4096;
+const TYPE_TIMEOUT_MS = 30_000;
 
 // A viewport point of the selected page, in CSS pixels, or null when neither
 // coordinate was given.
@@ -2459,13 +2490,13 @@ function pointerPoint(x, y, label) {
 
 // Where a pointer action aims: the point given, or the centre of the element
 // a locator resolves to once it has been scrolled into view.
-async function pointerTarget(page, locator, point, label) {
+async function pointerTarget(page, locator, point, label, scroll = true) {
   if (Boolean(locator) === Boolean(point)) {
     throw rpcError(-32602, `${label} requires either a locator or x and y`);
   }
   if (point) return point;
   const element = locatorFor(page, locator);
-  await element.scrollIntoViewIfNeeded({ timeout: 30_000 });
+  if (scroll) await element.scrollIntoViewIfNeeded({ timeout: 30_000 });
   const box = await element.boundingBox({ timeout: 30_000 });
   if (!box) throw rpcError(-32000, `${label} element is not visible`);
   return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
@@ -2518,14 +2549,23 @@ async function performPointer(page, action) {
       if (action.locator) await locatorFor(page, action.locator).hover({ modifiers, timeout: 30_000 });
       else await holdingModifiers(page, modifiers, () => page.mouse.move(point.x, point.y));
       return { message: "pointer moved", data: null };
-    case "drag":
+    case "drag": {
+      // Both ends are found before the button goes down: a destination that
+      // failed afterwards would release over the source, which clicks it.
+      let from = await pointerTarget(page, action.locator, point, "pointer drag");
+      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination");
+      if (action.locator) {
+        // Bringing the destination into view may have moved the source.
+        from = await pointerTarget(page, action.locator, point, "pointer drag", false);
+        const view = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+        if (from.x < 0 || from.y < 0 || from.x > view.width || from.y > view.height) {
+          throw rpcError(-32000, "pointer drag source and destination are not in view together");
+        }
+      }
       return holdingModifiers(page, modifiers, async () => {
-        const from = await pointerTarget(page, action.locator, point, "pointer drag");
         await page.mouse.move(from.x, from.y);
         await page.mouse.down({ button });
-        let to;
         try {
-          to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination");
           // Drag-and-drop code follows the movement, not only where it ends.
           await page.mouse.move(to.x, to.y, { steps: 12 });
         } finally {
@@ -2533,6 +2573,7 @@ async function performPointer(page, action) {
         }
         return { message: "pointer dragged", data: { from: rounded(from), to: rounded(to) } };
       });
+    }
     default:
       throw rpcError(-32602, "pointer op must be click|hover|drag");
   }
@@ -2546,9 +2587,19 @@ async function performType(page, action) {
   if (typeof text !== "string" || !text || Buffer.byteLength(text) > MAX_TYPE_BYTES) {
     throw rpcError(-32602, `type requires text of 1..${MAX_TYPE_BYTES} bytes`);
   }
-  if (action.locator) await locatorFor(page, action.locator).pressSequentially(text, { timeout: 30_000 });
-  else await page.keyboard.type(text);
-  return { message: "text typed", data: { characters: [...text].length } };
+  if (action.locator) await locatorFor(page, action.locator).focus({ timeout: 30_000 });
+  // One character at a time, so a page whose key handlers are slow is given
+  // up on at a deadline instead of being typed at until the worker is killed.
+  const characters = [...text];
+  const deadline = Date.now() + TYPE_TIMEOUT_MS;
+  for (const [index, character] of characters.entries()) {
+    if (Date.now() > deadline) {
+      throw rpcError(-32000,
+        `type timed out after ${TYPE_TIMEOUT_MS} ms; ${index} of ${characters.length} characters were sent`);
+    }
+    await page.keyboard.type(character);
+  }
+  return { message: "text typed", data: { characters: characters.length } };
 }
 
 const PAGE_ACTIONS = new Set([
@@ -2558,10 +2609,13 @@ const PAGE_ACTIONS = new Set([
 
 // Playwright's own text for a locator that matches several elements lists
 // them; say how to choose one instead of the call log that follows.
-function actionError(error) {
+function actionError(error, action) {
   const message = String(error?.message || "");
-  if (Number.isSafeInteger(error?.code) || !message.includes("strict mode violation")) return error;
-  return rpcError(-32000, `${message.split("\nCall log:")[0].trimEnd()}\nSet locator.nth to pick one of them: 0 is the first, -1 the last.`);
+  if (Number.isSafeInteger(error?.code) || !message.includes("strict mode violation")
+      || !(action.locator || action.to_locator)) {
+    return error;
+  }
+  return rpcError(-32000, `${message.split("\nCall log:")[0].trimEnd()}\nSet nth on the locator to pick one of them: 0 is the first, -1 the last.`);
 }
 
 async function executeAction(session, action = {}) {
@@ -2569,7 +2623,7 @@ async function executeAction(session, action = {}) {
   try {
     result = await performAction(session, action);
   } catch (error) {
-    throw actionError(error);
+    throw actionError(error, action);
   }
   if (action.snapshot === true && SNAPSHOT_AFTER_ACTIONS.has(action.type)) {
     result.data = { ...result.data, snapshot: await snapshotAfterAction(session) };

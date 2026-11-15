@@ -560,6 +560,18 @@ async fn browser_input_maps_each_op_to_its_action_and_validates_it() {
             "x does not apply to op type",
         ),
         (
+            serde_json::json!({"op": "type", "text": "a", "modifiers": ["Shift"]}),
+            "modifiers does not apply to op type",
+        ),
+        (
+            serde_json::json!({"op": "type", "text": "a", "count": 2}),
+            "count does not apply to op type",
+        ),
+        (
+            serde_json::json!({"op": "type", "text": "a", "button": "right"}),
+            "button does not apply to op type",
+        ),
+        (
             serde_json::json!({"op": "type", "text": "hello", "to_locator": {"css": "#bin"}}),
             "to_locator does not apply to op type",
         ),

@@ -2449,8 +2449,17 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("op required"))?;
             // Typing and pointer input are separate browser actions.
-            const POINTER_ONLY: &[&str] = &["x", "y", "to_locator", "to_x", "to_y"];
-            const SHARED: &[&str] = &["locator", "button", "count", "modifiers", "snapshot"];
+            const POINTER_ONLY: &[&str] = &[
+                "x",
+                "y",
+                "to_locator",
+                "to_x",
+                "to_y",
+                "button",
+                "count",
+                "modifiers",
+            ];
+            const SHARED: &[&str] = &["locator", "snapshot"];
             let typing = op == "type";
             let mut action = serde_json::Map::new();
             action.insert(
@@ -2472,6 +2481,16 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     *field == "text"
                 };
                 if misplaced {
+                    // A client may fill in the default of a field it does not use.
+                    let default = match *field {
+                        "button" => value == "left",
+                        "count" => value == 1,
+                        "modifiers" => value.as_array().is_some_and(Vec::is_empty),
+                        _ => false,
+                    };
+                    if default {
+                        continue;
+                    }
                     return Err(DomainError::invalid(format!(
                         "{field} does not apply to op {op}"
                     )));

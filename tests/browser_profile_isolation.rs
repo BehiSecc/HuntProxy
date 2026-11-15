@@ -981,7 +981,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
     // Any button, a double-click, and held modifiers.
     run(BrowserAction::Pointer {
         op: "click".into(),
-        locator: Some(css_locator("#pad")),
+        locator: Some(Box::new(css_locator("#pad"))),
         x: None,
         y: None,
         to_locator: None,
@@ -1051,9 +1051,8 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
         .unwrap_err()
         .to_string();
     assert!(ambiguous.contains("strict mode violation"), "{ambiguous}");
-    assert!(
-        ambiguous.ends_with("Set locator.nth to pick one of them: 0 is the first, -1 the last.")
-    );
+    assert!(ambiguous
+        .ends_with("Set nth on the locator to pick one of them: 0 is the first, -1 the last."));
     for nth in [1, -1] {
         run(BrowserAction::Click {
             locator: Locator {
