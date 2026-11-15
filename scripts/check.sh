@@ -24,7 +24,11 @@ echo "== release asset validation =="
 python3 scripts/test-prepare-release-assets.py
 
 echo "== clippy =="
-cargo clippy --locked --all-targets -- -D warnings
+# cargo clippy sets RUSTC_WORKSPACE_WRAPPER, which the BoringSSL build script
+# watches. In a target directory shared with the test build below, every
+# switch between the two would rebuild BoringSSL, so clippy keeps its own.
+cargo clippy --locked --all-targets \
+  --target-dir "${CARGO_TARGET_DIR:-target}/clippy" -- -D warnings
 
 echo "== test =="
 cargo test --locked --all-targets
