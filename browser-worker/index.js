@@ -168,13 +168,16 @@ function trackPage(session, page, initial = false) {
     recordSessionEvent(session, "navigation", { url: publicLocation(frame.url()) }, page);
   });
   page.on("dialog", (dialog) => {
+    // Dismissing "Leave site?" keeps the page where it is, so a document with
+    // an unsaved-changes guard could never be navigated away from.
+    const leave = dialog.type() === "beforeunload";
     recordSessionEvent(session, "dialog", {
       dialog_type: dialog.type(),
       message_length: Buffer.byteLength(dialog.message() || ""),
       default_value_length: Buffer.byteLength(dialog.defaultValue() || ""),
-      disposition: "dismissed",
+      disposition: leave ? "accepted" : "dismissed",
     }, page);
-    void dialog.dismiss().catch(() => undefined);
+    void (leave ? dialog.accept() : dialog.dismiss()).catch(() => undefined);
   });
   page.on("request", (request) => recordSessionEvent(session, "request", {
     method: request.method(),
@@ -600,11 +603,19 @@ if (inspectRuntimeOnly) {
   process.exit(0);
 }
 
+// A page chooses its title, its frame names and much of an error's text, and
+// can put half a surrogate pair in any of them, or have one cut in half by a
+// length limit. JSON writes such a half as an escape that the daemon's parser
+// rejects, which it treats as a broken worker; so no string leaves with one.
+function wellFormed(key, value) {
+  return typeof value === "string" ? value.toWellFormed() : value;
+}
+
 function respond(id, result, error) {
   const message = error
     ? { jsonrpc: "2.0", id, error }
     : { jsonrpc: "2.0", id, result };
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  process.stdout.write(`${JSON.stringify(message, wellFormed)}\n`);
 }
 
 function logMeta(event, fields = {}) {
@@ -1599,17 +1610,49 @@ async function extractCheckpoint(session) {
   };
 }
 
+// `frame` looks inside one frame of the page instead of its top document, and
+// `nth` picks one of several matches: 0 is the first, -1 the last.
 function locatorFor(page, descriptor = {}) {
+  const root = descriptor.frame == null ? page
+    : chooseFrame(childFrames(page).map((frame) => ({ frame, name: frame.name(), url: frame.url() })),
+      descriptor.frame).frame;
   const exact = Boolean(descriptor.exact);
+  let locator;
   if (descriptor.role) {
     const options = { exact };
     if (descriptor.name != null) options.name = descriptor.name;
-    return page.getByRole(descriptor.role, options);
+    locator = root.getByRole(descriptor.role, options);
+  } else if (descriptor.test_id) locator = root.getByTestId(descriptor.test_id);
+  else if (descriptor.text != null) locator = root.getByText(descriptor.text, { exact });
+  else if (descriptor.css) locator = root.locator(descriptor.css);
+  else throw rpcError(-32602, "locator requires role, test_id, text, or css");
+  if (descriptor.nth == null) return locator;
+  if (!Number.isInteger(descriptor.nth)) throw rpcError(-32602, "locator nth must be an integer");
+  return locator.nth(descriptor.nth);
+}
+
+// The one frame a selector names: its name equals the selector, or its URL
+// contains it. The page's own document is never a candidate.
+function chooseFrame(candidates, selector) {
+  if (typeof selector !== "string" || !selector) {
+    throw rpcError(-32602, "frame must be a frame name or part of its URL");
   }
-  if (descriptor.test_id) return page.getByTestId(descriptor.test_id);
-  if (descriptor.text != null) return page.getByText(descriptor.text, { exact });
-  if (descriptor.css) return page.locator(descriptor.css);
-  throw rpcError(-32602, "locator requires role, test_id, text, or css");
+  const matches = candidates.filter((frame) => frame.name === selector || frame.url.includes(selector));
+  const exact = matches.filter((frame) => frame.name === selector || frame.url === selector);
+  const chosen = exact.length === 1 ? exact[0] : matches.length === 1 ? matches[0] : null;
+  if (chosen) return chosen;
+  const listed = (matches.length ? matches : candidates).slice(0, 12)
+    .map((frame) => `${publicLocation(frame.url) || "(opaque URL)"}${frame.name ? ` name=${frame.name.slice(0, 64)}` : ""}`)
+    .join(", ");
+  throw rpcError(-32602, matches.length
+    ? `frame matches ${matches.length} frames; give its full URL or name: ${listed}`
+    : `frame matches no frame of the selected page; frames: ${listed || "none"}`);
+}
+
+const MAX_LISTED_FRAMES = 12;
+
+function childFrames(page) {
+  return page.frames().filter((frame) => frame !== page.mainFrame() && !frame.isDetached());
 }
 
 async function performWait(page, forWhat, value) {
@@ -1645,12 +1688,25 @@ async function pageSummaries(session) {
   for (const [pageId, page] of session.pages.entries()) {
     if (page.isClosed()) continue;
     const title = await page.title().catch(() => "");
-    summaries.push({
+    const summary = {
       page_id: pageId,
       active: page === active,
       url: publicLocation(page.url()),
       title: title ? title.slice(0, 256) : null,
-    });
+    };
+    // What the `frame` of a locator or an evaluation can name. Only the
+    // selected page's are listed, and briefly: the result has a byte budget.
+    if (page === active) {
+      const all = childFrames(page);
+      const frames = all.slice(0, MAX_LISTED_FRAMES).map((frame) => {
+        const listed = { url: (publicLocation(frame.url()) || "").slice(0, 200) || null };
+        if (frame.name()) listed.name = frame.name().slice(0, 64);
+        return listed;
+      });
+      if (frames.length) summary.frames = frames;
+      if (all.length > frames.length) summary.frames_omitted = all.length - frames.length;
+    }
+    summaries.push(summary);
   }
   return summaries.sort((left, right) => left.page_id - right.page_id);
 }
@@ -2035,23 +2091,38 @@ async function navigateWithProxyCheck(page, operation) {
 // larger slice could never be returned, so the worker never sends one.
 const MAX_SNAPSHOT_BYTES = 24_000;
 
+// The CDP session that runs `frame`'s JavaScript: its own when it is a
+// cross-process frame, otherwise its nearest such ancestor's or the page's.
+async function frameSession(session, page, frame) {
+  for (let current = frame; current && current !== page.mainFrame(); current = current.parentFrame()) {
+    try {
+      return await session.context.newCDPSession(current);
+    } catch {
+      // A same-process frame shares an ancestor's session.
+    }
+  }
+  return session.context.newCDPSession(page);
+}
+
 // Runs a fixed HuntProxy function on the element `locator` resolves to. Page
 // code can redefine DOM getters to never return, so the evaluation is
 // terminated after one second.
 async function evaluateElement(session, page, locator, fn, timeout) {
   const element = await locator.elementHandle({ timeout });
-  const connection = await session.context.newCDPSession(page);
+  let connection;
   let termination;
-  const timer = setTimeout(() => {
-    termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
-  }, 1000);
+  let timer;
   try {
+    connection = await frameSession(session, page, await element.ownerFrame());
+    timer = setTimeout(() => {
+      termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
+    }, 1000);
     return await element.evaluate(fn);
   } finally {
     clearTimeout(timer);
     if (termination) await termination;
     await element.dispose().catch(() => undefined);
-    await connection.detach().catch(() => undefined);
+    await connection?.detach().catch(() => undefined);
   }
 }
 
@@ -2253,17 +2324,7 @@ async function evaluationTarget(session, page, selector) {
       };
       visit((await connection.send("Page.getFrameTree")).frameTree, true);
     }
-    const matches = frames.filter((frame) => frame.name === selector || frame.url.includes(selector));
-    const exact = matches.filter((frame) => frame.name === selector || frame.url === selector);
-    const chosen = exact.length === 1 ? exact[0] : matches.length === 1 ? matches[0] : null;
-    if (!chosen) {
-      const listed = (matches.length ? matches : frames).slice(0, 12)
-        .map((frame) => `${publicLocation(frame.url) || "(opaque URL)"}${frame.name ? ` name=${frame.name.slice(0, 64)}` : ""}`)
-        .join(", ");
-      throw rpcError(-32602, matches.length
-        ? `evaluate frame matches ${matches.length} frames; give its full URL or name: ${listed}`
-        : `evaluate frame matches no frame of the selected page; frames: ${listed || "none"}`);
-    }
+    const chosen = chooseFrame(frames, selector);
     let contextId;
     if (!chosen.root) {
       const contexts = [];
@@ -2296,12 +2357,17 @@ async function performEvaluate(session, page, action) {
       || !Number.isInteger(timeout) || timeout < 1 || timeout > 30_000) {
     throw rpcError(-32602, "evaluate requires an expression and timeout_ms in 1..30000");
   }
-  const target = await evaluationTarget(session, page, action.frame);
-  const { connection } = target;
-  const context = target.contextId ? { contextId: target.contextId } : {};
+  let target;
+  let abandoned = false;
   const run = async () => {
+    // Finding the frame is part of the work the deadline covers.
+    target = await evaluationTarget(session, page, action.frame);
+    if (abandoned) return null;
+    const { connection } = target;
+    const context = target.contextId ? { contextId: target.contextId } : {};
     let expression = action.expression;
-    if (STATEMENT_LOOKALIKE.test(expression)) {
+    let call = false;
+    if (STATEMENT_LOOKALIKE.test(expression) || FUNCTION_SOURCE.test(expression)) {
       // Read it as the expression it looks like when it parses as one, as the
       // DevTools console does. Compiling runs nothing and needs the domain on.
       const wrapped = `(${expression}\n)`;
@@ -2310,7 +2376,12 @@ async function performEvaluate(session, page, action) {
         expression: wrapped, sourceURL: "", persistScript: false,
         ...(target.contextId ? { executionContextId: target.contextId } : {}),
       });
-      if (!compiled.exceptionDetails) expression = wrapped;
+      if (!compiled.exceptionDetails) {
+        expression = wrapped;
+        // Only a source that is one function is called. A function that
+        // statements merely end with is a value to show, not to run.
+        call = FUNCTION_SOURCE.test(action.expression);
+      }
     }
     const evaluated = await connection.send("Runtime.evaluate", {
       expression, replMode: true, awaitPromise: true, userGesture: true,
@@ -2327,23 +2398,24 @@ async function performEvaluate(session, page, action) {
     const described = await connection.send("Runtime.callFunctionOn", {
       objectId: remote.objectId,
       functionDeclaration: describeEvaluationResult.toString(),
-      arguments: [{ objectId: remote.objectId }, { value: FUNCTION_SOURCE.test(action.expression) },
-        { value: MAX_EVALUATE_RESULT_CHARS }],
+      arguments: [{ objectId: remote.objectId }, { value: call }, { value: MAX_EVALUATE_RESULT_CHARS }],
       awaitPromise: true, returnByValue: true, userGesture: true,
     });
     if (described.exceptionDetails) return { exception: described.exceptionDetails };
     return described.result.value;
   };
+  const release = () => Promise.all((target?.connections || []).map((opened) => opened.detach().catch(() => undefined)));
   let timer;
   let termination;
   let outcome;
+  const work = run();
+  work.catch(() => undefined); // Still pending when the deadline wins.
   try {
-    const work = run();
-    work.catch(() => undefined); // Still pending when the deadline wins.
     outcome = await Promise.race([work, new Promise((_, reject) => {
       timer = setTimeout(() => {
+        abandoned = true;
         // Stops a synchronous loop. A promise that never settles stays with the page.
-        termination = connection.send("Runtime.terminateExecution").catch(() => undefined);
+        termination = target?.connection.send("Runtime.terminateExecution").catch(() => undefined);
         reject(rpcError(-32000,
           `evaluate timed out after ${timeout} ms; the expression may still be running in the page`));
       }, timeout);
@@ -2358,7 +2430,9 @@ async function performEvaluate(session, page, action) {
     // The page must be responsive again before the next action; a renderer
     // that cannot stop is not waited for.
     if (termination) await Promise.race([termination, new Promise((resolve) => setTimeout(resolve, 2_000))]);
-    await Promise.all(target.connections.map((opened) => opened.detach().catch(() => undefined)));
+    // A frame found only after the deadline is let go of when it turns up.
+    if (target) await release();
+    else void work.then(release, release);
   }
   const thrown = outcome.exception;
   const content = thrown
@@ -2374,7 +2448,7 @@ async function performEvaluate(session, page, action) {
 
 // Interactions that can return the resulting page with `snapshot: true`.
 const SNAPSHOT_AFTER_ACTIONS = new Set([
-  "navigate", "click", "fill", "select", "press", "wait", "back", "forward",
+  "navigate", "click", "fill", "select", "press", "wait", "back", "forward", "pointer", "type",
 ]);
 
 // The accessibility snapshot of the active page once the action has settled:
@@ -2399,13 +2473,158 @@ async function snapshotAfterAction(session) {
   }
 }
 
+const POINTER_BUTTONS = new Set(["left", "right", "middle"]);
+const POINTER_MODIFIERS = new Set(["Alt", "Control", "Meta", "Shift"]);
+const MAX_POINTER_COORDINATE = 100_000;
+const MAX_TYPE_BYTES = 4096;
+const TYPE_TIMEOUT_MS = 30_000;
+
+// A viewport point of the selected page, in CSS pixels, or null when neither
+// coordinate was given.
+function pointerPoint(x, y, label) {
+  if (x == null && y == null) return null;
+  const valid = (value) => Number.isFinite(value) && value >= 0 && value <= MAX_POINTER_COORDINATE;
+  if (!valid(x) || !valid(y)) throw rpcError(-32602, `${label} x and y must both be 0..${MAX_POINTER_COORDINATE}`);
+  return { x, y };
+}
+
+// Where a pointer action aims: the point given, or the centre of the element
+// a locator resolves to once it has been scrolled into view.
+async function pointerTarget(page, locator, point, label, scroll = true) {
+  if (Boolean(locator) === Boolean(point)) {
+    throw rpcError(-32602, `${label} requires either a locator or x and y`);
+  }
+  if (point) return point;
+  const element = locatorFor(page, locator);
+  if (scroll) await element.scrollIntoViewIfNeeded({ timeout: 30_000 });
+  const box = await element.boundingBox({ timeout: 30_000 });
+  if (!box) throw rpcError(-32000, `${label} element is not visible`);
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+// Holds modifier keys around pointer input given as a point; Playwright only
+// takes them as an option for input aimed at a locator.
+async function holdingModifiers(page, modifiers, run) {
+  for (const key of modifiers) await page.keyboard.down(key);
+  try {
+    return await run();
+  } finally {
+    for (const key of [...modifiers].reverse()) await page.keyboard.up(key).catch(() => undefined);
+  }
+}
+
+// Mouse input the locator actions cannot express: any button, repeated
+// clicks, held modifiers, hovering, dragging, and points instead of elements.
+async function performPointer(page, action) {
+  const button = action.button ?? "left";
+  const count = action.count ?? 1;
+  const modifiers = action.modifiers ?? [];
+  if (!POINTER_BUTTONS.has(button) || !Number.isInteger(count) || count < 1 || count > 3
+      || !Array.isArray(modifiers) || modifiers.some((key) => !POINTER_MODIFIERS.has(key))) {
+    throw rpcError(-32602,
+      "pointer button must be left|right|middle, count 1..3, and modifiers Alt|Control|Meta|Shift");
+  }
+  const point = pointerPoint(action.x, action.y, "pointer");
+  const destination = pointerPoint(action.to_x, action.to_y, "pointer destination");
+  if (action.op !== "drag" && (destination || action.to_locator)) {
+    throw rpcError(-32602, "pointer destination applies to drag only");
+  }
+  const rounded = ({ x, y }) => ({ x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 });
+  switch (action.op) {
+    case "click":
+      if (Boolean(action.locator) === Boolean(point)) {
+        throw rpcError(-32602, "pointer click requires either a locator or x and y");
+      }
+      // An element gets Playwright's actionability checks; a point is clicked as it is.
+      if (action.locator) {
+        await locatorFor(page, action.locator).click({ button, clickCount: count, modifiers, timeout: 30_000 });
+      } else {
+        await holdingModifiers(page, modifiers, () => page.mouse.click(point.x, point.y, { button, clickCount: count }));
+      }
+      return { message: "pointer clicked", data: { url: page.url() } };
+    case "hover":
+      if (Boolean(action.locator) === Boolean(point)) {
+        throw rpcError(-32602, "pointer hover requires either a locator or x and y");
+      }
+      if (action.locator) await locatorFor(page, action.locator).hover({ modifiers, timeout: 30_000 });
+      else await holdingModifiers(page, modifiers, () => page.mouse.move(point.x, point.y));
+      return { message: "pointer moved", data: null };
+    case "drag": {
+      // Both ends are found before the button goes down: a destination that
+      // failed afterwards would release over the source, which clicks it.
+      let from = await pointerTarget(page, action.locator, point, "pointer drag");
+      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination");
+      if (action.locator) {
+        // Bringing the destination into view may have moved the source.
+        from = await pointerTarget(page, action.locator, point, "pointer drag", false);
+        const view = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+        if (from.x < 0 || from.y < 0 || from.x > view.width || from.y > view.height) {
+          throw rpcError(-32000, "pointer drag source and destination are not in view together");
+        }
+      }
+      return holdingModifiers(page, modifiers, async () => {
+        await page.mouse.move(from.x, from.y);
+        await page.mouse.down({ button });
+        try {
+          // Drag-and-drop code follows the movement, not only where it ends.
+          await page.mouse.move(to.x, to.y, { steps: 12 });
+        } finally {
+          await page.mouse.up({ button });
+        }
+        return { message: "pointer dragged", data: { from: rounded(from), to: rounded(to) } };
+      });
+    }
+    default:
+      throw rpcError(-32602, "pointer op must be click|hover|drag");
+  }
+}
+
+// Sends text as keystrokes, which editors, autocomplete fields and one-character
+// inputs react to; fill only replaces a value. Without a locator the keys go to
+// whatever has focus, in any frame.
+async function performType(page, action) {
+  const text = action.text;
+  if (typeof text !== "string" || !text || Buffer.byteLength(text) > MAX_TYPE_BYTES) {
+    throw rpcError(-32602, `type requires text of 1..${MAX_TYPE_BYTES} bytes`);
+  }
+  if (action.locator) await locatorFor(page, action.locator).focus({ timeout: 30_000 });
+  // One character at a time, so a page whose key handlers are slow is given
+  // up on at a deadline instead of being typed at until the worker is killed.
+  const characters = [...text];
+  const deadline = Date.now() + TYPE_TIMEOUT_MS;
+  for (const [index, character] of characters.entries()) {
+    if (Date.now() > deadline) {
+      throw rpcError(-32000,
+        `type timed out after ${TYPE_TIMEOUT_MS} ms; ${index} of ${characters.length} characters were sent`);
+    }
+    await page.keyboard.type(character);
+  }
+  return { message: "text typed", data: { characters: characters.length } };
+}
+
 const PAGE_ACTIONS = new Set([
   "navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "evaluate",
-  "scroll", "screenshot", "press", "wait", "back", "forward",
+  "pointer", "type", "scroll", "screenshot", "press", "wait", "back", "forward",
 ]);
 
+// Playwright's own text for a locator that matches several elements lists
+// them; say how to choose one instead of the call log that follows.
+function actionError(error, action) {
+  const message = String(error?.message || "");
+  if (Number.isSafeInteger(error?.code) || !message.includes("strict mode violation")
+      || !(action.locator || action.to_locator)) {
+    return error;
+  }
+  return rpcError(-32000, `${message.split("\nCall log:")[0].trimEnd()}\nSet nth on the locator to pick one of them: 0 is the first, -1 the last.`);
+}
+
 async function executeAction(session, action = {}) {
-  const result = await performAction(session, action);
+  let result;
+  try {
+    result = await performAction(session, action);
+  } catch (error) {
+    throw actionError(error, action);
+  }
   if (action.snapshot === true && SNAPSHOT_AFTER_ACTIONS.has(action.type)) {
     result.data = { ...result.data, snapshot: await snapshotAfterAction(session) };
   }
@@ -2444,6 +2663,10 @@ async function performAction(session, action) {
       return inspectRuntime(session, action);
     case "evaluate":
       return performEvaluate(session, page, action);
+    case "pointer":
+      return performPointer(page, action);
+    case "type":
+      return performType(page, action);
     case "pages":
       return performPages(session, action);
     case "events":

@@ -23,18 +23,20 @@ function startWorker(t) {
   const pending = new Map();
   let nextId = 1;
   let buffer = "";
+  const lines = [];
   worker.stdout.on("data", (chunk) => {
     buffer += chunk;
     for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
       const line = buffer.slice(0, end);
       buffer = buffer.slice(end + 1);
+      lines.push(line);
       try {
         const message = JSON.parse(line);
         pending.get(message.id)?.(message);
       } catch {}
     }
   });
-  return (method, params) => new Promise((resolve, reject) => {
+  const call = (method, params) => new Promise((resolve, reject) => {
     const id = nextId++;
     const timer = setTimeout(() => reject(new Error(`${method} did not answer`)), 60_000);
     pending.set(id, (message) => {
@@ -44,7 +46,52 @@ function startWorker(t) {
     });
     worker.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
   });
+  // The lines exactly as written, for what a stricter JSON parser would see.
+  call.lines = lines;
+  return call;
 }
+
+test("no response carries half a surrogate pair, whatever the page puts in its strings", {
+  skip: available ? false : "Playwright and Chromium are required for the browser regression",
+  timeout: 120_000,
+}, async (t) => {
+  // The daemon's parser rejects an unpaired surrogate escape and then treats
+  // the worker as broken, so a page must not be able to make it write one.
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { "content-type": "text/html" });
+    if (request.url === "/frame") return response.end("<!doctype html><p>frame</p>");
+    response.end(`<!doctype html><title>start</title><script>
+      document.title = "half \\ud83d";
+      const frame = document.createElement("iframe");
+      // 63 characters and then a pair that a 64-character limit cuts in two.
+      frame.name = "n".repeat(63) + "\\ud83d\\ude00";
+      frame.src = "/frame";
+      document.documentElement.append(frame);
+    </script>`);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); }));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const call = startWorker(t);
+  await call("session.start", { session_id: 1, engine: "chromium", persistent: false, url: `${base}/` });
+  await call("session.action", { session_id: 1, action: { type: "wait", for_what: "load_state", value: "load" } });
+  const listed = await call("session.action", { session_id: 1, action: { type: "pages", op: "list" } });
+  const [page] = listed.data.pages;
+  assert.equal(page.title, "half �");
+  assert.equal(page.frames[0].name, `${"n".repeat(63)}�`);
+  assert.equal(listed.checkpoint.title, "half �");
+  await assert.rejects(call("session.action", { session_id: 1, action: { type: "click", locator: { css: "p", frame: "missing" } } }),
+    (error) => error.code === -32602 && error.message.includes(`name=${"n".repeat(63)}�`));
+  const half = await call("session.action", { session_id: 1, action: { type: "evaluate", expression: "({ key: 'v\\ud83d' })" } });
+  assert.equal(half.data.content, "{\"key\":\"v\\ud83d\"}");
+  const unpaired = /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})|(?<!\\ud[89ab][0-9a-f]{2})\\ud[c-f][0-9a-f]{2}/i;
+  for (const line of call.lines) {
+    // An escaped backslash before "ud83d" is page text that spells an escape, not one.
+    assert.equal(unpaired.test(line.replaceAll("\\\\", "")), false, line.slice(0, 300));
+    assert.equal(line.isWellFormed(), true);
+  }
+  await call("session.stop", { session_id: 1 });
+});
 
 test("the worker lists JavaScript files after a cursor and waits for events in short requests", {
   skip: available ? false : "Playwright and Chromium are required for the browser regression",

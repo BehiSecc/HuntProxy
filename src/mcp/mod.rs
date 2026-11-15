@@ -340,14 +340,16 @@ fn reply_draft_schema() -> Value {
 fn locator_schema() -> Value {
     json!({
         "type": "object",
-        "description": "One strategy: role/name, text, test_id, css. Required for click/fill/select/upload; optional otherwise. snapshot: only its subtree.",
+        "description": "One strategy: role/name, text, test_id, css. nth picks one match (0 first, -1 last); frame: iframe name or URL part. Required for click/fill/select/upload; optional otherwise. snapshot: only its subtree.",
         "properties": {
             "role": {"type": ["string", "null"]},
             "name": {"type": ["string", "null"]},
             "text": {"type": ["string", "null"]},
             "test_id": {"type": ["string", "null"]},
             "css": {"type": ["string", "null"]},
-            "exact": {"type": ["boolean", "null"]}
+            "exact": {"type": ["boolean", "null"]},
+            "nth": {"type": ["integer", "null"]},
+            "frame": {"type": ["string", "null"]}
         },
         "additionalProperties": false
     })
@@ -359,33 +361,32 @@ fn browser_action_schema() -> Value {
     // Keep the action flat: Codex renders allOf as unknown and hides its properties.
     json!({
         "type": "object",
-        "description": "Playwright action.",
         "properties": {
             "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "pages", "events", "scroll", "screenshot", "request", "press", "wait", "back", "forward", "close"]},
             "url": {"type": "string", "description":"Required for navigate/request; optional for pages new. request requires the active page origin."},
             "locator": locator_schema(),
             "value": {"type": "string","description":"Required for fill/select/wait. wait modes: selector=Playwright selector; text=visible text; url=URL pattern; timeout=string 0..60000 ms; load_state=load/domcontentloaded/networkidle (empty: domcontentloaded). Other waits: 30000 ms."},
             "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Upload requires <=16 absolute readable regular-file paths, <=4096 bytes each. [] clears input; chooser needs a file."},
-            "via_chooser": {"type":"boolean","default":false,"description":"Upload via trusted locator click/file chooser. Default false."},
+            "via_chooser": {"type":"boolean","default":false,"description":"Upload via trusted locator click/file chooser."},
             "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"description":"Upload ms: 1..30000 (default 10000); request: 1000..30000 (default 15000). wait uses for_what/value."},
             "key": {"type": "string","description":"Required for press: Playwright key (Enter, Control+A)."},
-            "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"],"description":"Required with value for wait; select the wait mode."},
+            "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"],"description":"Required with value for wait."},
             "format": {"type": "string", "enum": ["accessibility", "dom"],"description":"Snapshot; default accessibility."},
-            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"Bytes: inspect 1..65536 (default 4096); screenshot 1..8388608 (default 4194304); snapshot default/cap 24000, cut to fit the result."},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"inspect 1..65536 (default 4096); screenshot 1..8388608 (default 4194304); snapshot default/cap 24000, cut to fit the result."},
             "offset": {"type":"integer","minimum":0,"default":0,"description":"Snapshot byte offset; continue with next_offset."},
             "snapshot": {"type":"boolean","default":false,"description":"navigate/click/fill/select/press/wait/back/forward: add data.snapshot of the resulting page."},
             "op": {"type":"string","enum":["list","select","new","close"],"description":"Required for pages: list omits IDs/url; new permits url only; select/close need page_id/runtime_generation, no url."},
             "page_id": {"type":"integer","minimum":1,"description":"Positive pages ID; required with runtime_generation for select/close, omitted for list/new."},
             "runtime_generation": {"type":"integer","minimum":1,"description":"Positive generation from pages/events/context. Required with its page ID for select/close or nonzero event cursor; omit for list/new."},
             "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"Events cursor: integer >=0, default 0; pass next_sequence; nonzero requires matching runtime_generation."},
-            "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Events limit: integer 1..100, default 50."},
+            "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Events limit: 1..100, default 50."},
             "kinds": {"type":"array","maxItems":11,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message","observer_error"]},"description":"Event filter: <=11 unique kinds, default all. Filtered observer failures remain in observer_errors."},
             "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"Events wait: 0..30000 ms, default 0."},
-            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal scroll: integer -100000..100000, default 0; needs locator or nonzero delta."},
-            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical scroll: integer -100000..100000, default 0."},
-            "full_page": {"type":"boolean","default":false,"description":"Full screenshot; excludes locator. Default false."},
+            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal scroll: -100000..100000, default 0; needs locator or nonzero delta."},
+            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical scroll: -100000..100000, default 0."},
+            "full_page": {"type":"boolean","default":false,"description":"Full screenshot; excludes locator."},
             "method": {"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"],"description":"Required for request."},
-            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"Headers: <=64, <=65536 bytes total; default []. Rejects duplicates, browser-managed/Fetch-forbidden transport, identity, origin, host, length, proxy, Sec-*, internal headers."},
+            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"<=64, <=65536 bytes total; default []. Rejects duplicates, browser-managed/Fetch-forbidden transport, identity, origin, host, length, proxy, Sec-*, internal headers."},
             "body_text": {"type":"string","description":"UTF-8 body, at most 2 MiB; excludes body_base64. GET/HEAD cannot have a body."},
             "body_base64": {"type":"string","description":"Base64 body, at most 2 MiB decoded; excludes body_text."},
             "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Response preview bytes: 1..65536, default 4096."}
@@ -497,6 +498,40 @@ fn request_rules_tool_def() -> Value {
     }"#).expect("request rules tool schema is valid JSON")
 }
 
+fn browser_input_tool_def() -> Value {
+    let mut element = locator_schema();
+    element["description"] = json!("Element to click, hover, drag from, or type into. One strategy: role/name, text, test_id, css. nth picks one match (0 first, -1 last); frame: iframe name or URL part. Omit to use x and y, or to type into the focused element.");
+    let mut destination = locator_schema();
+    destination["description"] =
+        json!("Drag destination element, with the same fields as locator; or give to_x and to_y.");
+    // Flat and compact for the same Codex reasons as browser_action_schema.
+    json!({
+        "name": "browser_input",
+        "description": "Mouse and keyboard input on the selected page that browser_action click, fill and press cannot express. click presses a mouse button (count 2 is a double-click, button right a context-menu click) with optional held modifiers; hover moves the pointer; drag presses at the start, moves in steps and releases at the destination, which mouse-driven and native HTML drag and drop both follow; type sends text as real keystrokes to locator, or to whatever has focus when locator is omitted (fill replaces a value at once; type suits editors, autocomplete and one-character boxes). Aim click, hover and drag at a locator or at x and y: CSS pixels in the selected page's viewport, as getBoundingClientRect() reports in its top document, so a point reaches a canvas or anything a locator cannot name. An element is clicked with Playwright's checks; a point is clicked as it is. For single keys and chords use browser_action press.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type":"integer","description":"Required integer ID returned by projects; owns session."},
+                "session_id": {"type":"integer","description":"Required integer ID returned by browser_start."},
+                "op": {"type":"string","enum":["click","hover","drag","type"]},
+                "locator": element,
+                "x": {"type":"number","minimum":0,"maximum":100000,"description":"Viewport X in CSS pixels, 0..100000; give x and y instead of locator."},
+                "y": {"type":"number","minimum":0,"maximum":100000,"description":"Viewport Y in CSS pixels, 0..100000."},
+                "to_locator": destination,
+                "to_x": {"type":"number","minimum":0,"maximum":100000,"description":"Drag destination X, 0..100000; give to_x and to_y instead of to_locator."},
+                "to_y": {"type":"number","minimum":0,"maximum":100000,"description":"Drag destination Y, 0..100000."},
+                "button": {"type":"string","enum":["left","right","middle"],"default":"left","description":"Button for click and drag; default left."},
+                "count": {"type":"integer","minimum":1,"maximum":3,"default":1,"description":"Clicks, 1..3 (default 1); 2 is a double-click."},
+                "modifiers": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","enum":["Alt","Control","Meta","Shift"]},"description":"Keys held during click, hover or drag; default none."},
+                "text": {"type":"string","minLength":1,"maxLength":4096,"description":"Required for type: 1..4096 bytes; a newline presses Enter."},
+                "snapshot": {"type":"boolean","default":false,"description":"Add data.snapshot of the resulting page."}
+            },
+            "required": ["project_id", "session_id", "op"],
+            "additionalProperties": false
+        }
+    })
+}
+
 pub(crate) fn tool_defs() -> Value {
     json!([
         {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations. set_upstream_proxy persists live routing; proxy null inherits config.toml, direct selects direct traffic, and a URL selects that proxy. Existing connections reconnect naturally.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope","set_upstream_proxy"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults; set_upstream_proxy needs project_id and an explicit proxy URL, direct, or null."},"project_id":{"type":"integer","description":"Optional for list; required for usage, set_scope and set_upstream_proxy."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}},"proxy":{"type":["string","null"],"description":"For set_upstream_proxy: http://, socks5:// or socks5h:// URL, direct to route directly, or null to inherit config.toml."}},"required":["action"],"additionalProperties":false}},
@@ -529,9 +564,10 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. Prefer accessibility snapshots: scope large pages with locator or page with offset, and add snapshot:true to an interaction instead of a separate snapshot call. Use browser_evaluate to run JavaScript in the page for anything these actions cannot express.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
-        {"name":"browser_evaluate","description":"Run JavaScript in the selected page of an active browser session and return its result. Use it to read page state and globals, call the application's own functions and APIs with the live session, or reach DOM that locators cannot; do not enable browser_cdp to script the page. expression runs in the page's main world as in the DevTools console: statements and top-level await work, declarations may be repeated between calls, a () => ... function source is called, and console helpers such as getEventListeners() and $$() are available. The page's CSP does not restrict it. frame runs it in one frame of the page instead, including cross-origin frames. data.content is the result: a string or DOM node (its outerHTML) as text, anything else as JSON; data.type names the JavaScript type, and a thrown exception is returned with type exception. content is cut to fit and then reports truncated with total_bytes, so return only what you need. Requests the page sends are captured in History like other browser traffic. Choose the tab with browser_action pages.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"expression":{"type":"string","minLength":1,"maxLength":65536,"description":"JavaScript, at most 65536 bytes. The value of the last expression is returned, and a promise is awaited."},"frame":{"type":"string","minLength":1,"maxLength":2048,"description":"Frame name, or part of its URL, matching exactly one frame of the selected page. Omit for the page itself."},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Stop waiting after 1..30000 ms, default 10000; a running loop is terminated."}},"required":["project_id","session_id","expression"],"additionalProperties":false}},
-        {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on an available port from 9222 to 9321, inspect handoff status, or return control to the agent. This is a handoff to a person, not a scripting interface: to run JavaScript in the page yourself, call browser_evaluate. While enabled, browser_action and browser_evaluate are paused for that session. Status accepts an optional session_id; without it, active_sessions lists the project’s handoffs. On a VPS, use ssh_forward_command when returned; otherwise forward the returned cdp_port to the same port on 127.0.0.1 over SSH. Try hosted_devtools_url first, then devtools_url if the browser restricts the hosted frontend’s local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; optional for status."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
+        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. Prefer accessibility snapshots: scope large pages with locator or page with offset, and add snapshot:true to an interaction instead of a separate snapshot call. A locator's nth picks one of several matches and its frame acts inside an iframe; pages list names each page's frames. Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
+        {"name":"browser_evaluate","description":"Run JavaScript in the selected page of an active browser session and return its result. Use it to read page state and globals, call the application's own functions and APIs with the live session, or reach DOM that locators cannot; do not enable browser_cdp to script the page. expression runs in the page's main world as in the DevTools console: statements and top-level await work, declarations may be repeated between calls, a () => ... function source is called, and console helpers such as getEventListeners() and $$() are available. The page's CSP does not restrict it. frame runs it in one frame of the page instead, including cross-origin frames; browser_action pages lists them. data.content is the result: a string or DOM node (its outerHTML) as text, anything else as JSON; data.type names the JavaScript type, and a thrown exception is returned with type exception. content is cut to fit and then reports truncated with total_bytes, so return only what you need. Requests the page sends are captured in History like other browser traffic. Choose the tab with browser_action pages.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"expression":{"type":"string","minLength":1,"maxLength":65536,"description":"JavaScript, at most 65536 bytes. The value of the last expression is returned, and a promise is awaited."},"frame":{"type":"string","minLength":1,"maxLength":2048,"description":"Frame name, or part of its URL, matching exactly one frame of the selected page. Omit for the page itself."},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Stop waiting after 1..30000 ms, default 10000; a running loop is terminated."}},"required":["project_id","session_id","expression"],"additionalProperties":false}},
+        browser_input_tool_def(),
+        {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on an available port from 9222 to 9321, inspect handoff status, or return control to the agent. This is a handoff to a person, not a scripting interface: to run JavaScript in the page yourself, call browser_evaluate, and for mouse or keyboard input browser_input. While enabled, browser_action, browser_evaluate and browser_input are paused for that session. Status accepts an optional session_id; without it, active_sessions lists the project’s handoffs. On a VPS, use ssh_forward_command when returned; otherwise forward the returned cdp_port to the same port on 127.0.0.1 over SSH. Try hosted_devtools_url first, then devtools_url if the browser restricts the hosted frontend’s local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; optional for status."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions and resources: per-project capacity including ephemeral sessions, verified profile ownership, and cdp_port_in_use, which is true when the CDP port range is exhausted. Reuse these observations until a lifecycle transition or browser error; capacity is not a reservation. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"js_files","description":"List JavaScript files sorted by URL, with the pages that loaded them. Without url, search saved history and provenance; with url, load that page in Chromium first. domain matches the script host or its page host, including subdomains; saved history also includes scripts from browser sessions with matching evidence, and related_via_session marks files included only that way. Rows omit status_code 200, nulls and false; pages lists up to 3 page URLs, with page_count when there are more. Pass next_offset as offset to continue.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"url":{"type":"string","description":"When provided, perform a fresh browser load before collecting files."},"domain":{"type":"string","description":"Exact domain plus subdomains; accepts target.com, *.target.com, or a full URL."},"settle_ms":{"type":"integer","minimum":0,"maximum":30000,"default":2000},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":2000},"offset":{"type":"integer","minimum":0}},"required":["project_id"]}},
         {"name":"get_words","description":"Build a sorted target-specific wordlist from saved request paths, parameter names, and textual responses. Related JavaScript files are included by default. Optionally filter by a domain and its subdomains.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"domain":{"type":"string","description":"Optional hostname, wildcard hostname, or HTTP URL."},"include_js":{"type":"boolean","default":true},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":5000}},"required":["project_id"],"additionalProperties":false}},
@@ -2402,6 +2438,74 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     .await?
             ))
         }
+        "browser_input" => {
+            let project_id = require_project_id(&args)?;
+            let sid = args
+                .get("session_id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let op = args
+                .get("op")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DomainError::invalid("op required"))?;
+            // Typing and pointer input are separate browser actions.
+            const POINTER_ONLY: &[&str] = &[
+                "x",
+                "y",
+                "to_locator",
+                "to_x",
+                "to_y",
+                "button",
+                "count",
+                "modifiers",
+            ];
+            const SHARED: &[&str] = &["locator", "snapshot"];
+            let typing = op == "type";
+            let mut action = serde_json::Map::new();
+            action.insert(
+                "type".into(),
+                json!(if typing { "type" } else { "pointer" }),
+            );
+            if !typing {
+                action.insert("op".into(), json!(op));
+            }
+            for field in POINTER_ONLY.iter().chain(SHARED).chain(&["text"]) {
+                let Some(value) = args.get(*field).filter(|value| !value.is_null()) else {
+                    continue;
+                };
+                // A point with type, or text with a pointer op, is a
+                // misunderstanding to report rather than input to drop.
+                let misplaced = if typing {
+                    POINTER_ONLY.contains(field)
+                } else {
+                    *field == "text"
+                };
+                if misplaced {
+                    // A client may fill in the default of a field it does not use.
+                    let default = match *field {
+                        "button" => value == "left",
+                        "count" => value == 1,
+                        "modifiers" => value.as_array().is_some_and(Vec::is_empty),
+                        _ => false,
+                    };
+                    if default {
+                        continue;
+                    }
+                    return Err(DomainError::invalid(format!(
+                        "{field} does not apply to op {op}"
+                    )));
+                }
+                action.insert((*field).into(), value.clone());
+            }
+            let action: BrowserAction = serde_json::from_value(Value::Object(action))
+                .map_err(|e| DomainError::invalid(e.to_string()))?;
+            Ok(json!(
+                state
+                    .browser
+                    .action(project_id, BrowserSessionId(sid), action)
+                    .await?
+            ))
+        }
         "browser_cdp" => {
             let project_id = require_project_id(&args)?;
             let op = args
@@ -2907,21 +3011,60 @@ mod tests {
         }
 
         let definitions = tool_defs();
-        let tool = definitions
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "browser_action")
-            .unwrap();
+        let named = |name: &str| {
+            definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        // Past the budget Codex drops every description of a tool's schema.
+        for name in ["browser_action", "browser_evaluate", "browser_input"] {
+            let mut normalized = named(name)["inputSchema"].clone();
+            remove_ignored_keywords(&mut normalized);
+            let normalized_size = serde_json::to_vec(&normalized).unwrap().len();
+            println!("{name} normalized schema: {normalized_size} bytes");
+            assert!(
+                normalized_size <= 5_000,
+                "{name} normalized schema is {normalized_size} bytes"
+            );
+        }
+        let pointer = named("browser_input");
+        let pointer = &pointer["inputSchema"];
+        assert_eq!(pointer["additionalProperties"], false);
+        for keyword in ["allOf", "anyOf", "oneOf", "$ref", "if", "then", "else"] {
+            assert!(pointer.get(keyword).is_none(), "unexpected {keyword}");
+        }
+        let tool = named("browser_action");
         let input = &tool["inputSchema"];
-        let mut normalized = input.clone();
-        remove_ignored_keywords(&mut normalized);
-        let normalized_size = serde_json::to_vec(&normalized).unwrap().len();
-        assert!(
-            normalized_size <= 5_000,
-            "normalized schema is {normalized_size} bytes"
-        );
         let action = &input["properties"]["action"];
+        // One locator shape everywhere, and clients that send every field may
+        // send the unused ones as null.
+        for locator in [
+            &action["properties"]["locator"],
+            &pointer["properties"]["locator"],
+            &pointer["properties"]["to_locator"],
+        ] {
+            assert_eq!(locator["additionalProperties"], false);
+            assert_eq!(
+                locator["properties"]["nth"]["type"],
+                json!(["integer", "null"])
+            );
+            assert_eq!(
+                locator["properties"]["frame"]["type"],
+                json!(["string", "null"])
+            );
+        }
+        for locator in [
+            &action["properties"]["locator"],
+            &pointer["properties"]["locator"],
+        ] {
+            let description = locator["description"].as_str().unwrap();
+            assert!(description.contains("nth picks one match (0 first, -1 last)"));
+            assert!(description.contains("frame: iframe name or URL part"));
+        }
         for schema in [input, action] {
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["additionalProperties"], false);
@@ -3023,7 +3166,7 @@ mod tests {
         assert!(tool["description"]
             .as_str()
             .unwrap()
-            .contains("Use browser_evaluate to run JavaScript in the page"));
+            .contains("Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page."));
         let inputs = &tool["inputSchema"];
         assert_eq!(
             inputs["required"],
@@ -3188,6 +3331,86 @@ mod tests {
             })
         ));
         assert!(action(json!({"type": "evaluate"})).is_err());
+    }
+
+    #[test]
+    fn browser_input_describes_pointer_and_keyboard_input() {
+        let definitions = tool_defs();
+        let tools = definitions.as_array().unwrap();
+        let tool = |name: &str| tools.iter().find(|tool| tool["name"] == name).unwrap();
+        let input = tool("browser_input");
+        let schema = &input["inputSchema"];
+        assert_eq!(
+            schema["required"],
+            json!(["project_id", "session_id", "op"])
+        );
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["op"]["enum"],
+            json!(["click", "hover", "drag", "type"])
+        );
+        assert_eq!(
+            properties["button"]["enum"],
+            json!(["left", "right", "middle"])
+        );
+        assert_eq!(
+            properties["modifiers"]["items"]["enum"],
+            json!(["Alt", "Control", "Meta", "Shift"])
+        );
+        // Codex drops the numeric keywords, so the descriptions carry the bounds.
+        for (field, fragments) in [
+            ("x", vec!["0..100000", "instead of locator"]),
+            ("y", vec!["0..100000"]),
+            ("to_x", vec!["0..100000", "instead of to_locator"]),
+            ("to_y", vec!["0..100000"]),
+            ("button", vec!["default left"]),
+            ("count", vec!["1..3", "default 1", "double-click"]),
+            ("modifiers", vec!["default none"]),
+            ("text", vec!["Required for type", "1..4096 bytes", "Enter"]),
+            ("snapshot", vec!["data.snapshot"]),
+            ("locator", vec!["Omit to use x and y", "focused element"]),
+            ("to_locator", vec!["Drag destination"]),
+        ] {
+            let description = properties[field]["description"].as_str().unwrap();
+            for fragment in fragments {
+                assert!(
+                    description.contains(fragment),
+                    "{field} must describe {fragment}"
+                );
+            }
+        }
+        for field in ["x", "y", "to_x", "to_y"] {
+            assert_eq!(properties[field]["maximum"], 100_000);
+        }
+        assert_eq!(properties["count"]["maximum"], 3);
+        assert_eq!(properties["text"]["maxLength"], 4096);
+        let description = input["description"].as_str().unwrap();
+        for fragment in [
+            "selected page",
+            "double-click",
+            "context-menu click",
+            "hover moves the pointer",
+            "native HTML drag and drop",
+            "real keystrokes",
+            "whatever has focus",
+            "getBoundingClientRect()",
+            "browser_action press",
+        ] {
+            assert!(description.contains(fragment), "must describe {fragment}");
+        }
+        for (name, fragment) in [
+            ("browser_cdp", "for mouse or keyboard input browser_input"),
+            ("browser_evaluate", "browser_action pages lists them"),
+            ("browser_action", "pages list names each page's frames"),
+        ] {
+            assert!(
+                tool(name)["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(fragment),
+                "{name} must mention {fragment}"
+            );
+        }
     }
 
     #[cfg(unix)]
