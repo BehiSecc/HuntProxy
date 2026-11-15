@@ -7117,6 +7117,7 @@ mod tests {
             transport: Arc::new(UnusedTransport),
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         let service = PluginService {
             directory: PathBuf::from("plugins"),
@@ -7482,6 +7483,7 @@ mod tests {
             transport: Arc::new(UnusedTransport),
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
 
@@ -7597,6 +7599,7 @@ mod tests {
             transport: Arc::new(UnusedTransport),
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
         let input = json!({"allow_state_change":true,"identity":{"profile":"victim"}});
@@ -7727,6 +7730,7 @@ mod tests {
             transport: Arc::new(UnusedTransport),
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
         let job = service
@@ -7876,6 +7880,7 @@ mod tests {
             transport: Arc::new(UnusedTransport),
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         let service = PluginService::load(plugin_directory, db, reply).unwrap();
         let initial = service
@@ -8286,6 +8291,7 @@ mod tests {
             transport: Arc::new(UnusedTransport),
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![7; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         let service =
             PluginService::load(directory.path().join("plugins"), db.clone(), reply).unwrap();
@@ -8508,6 +8514,7 @@ mod tests {
             transport: Arc::new(UnusedTransport),
             placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![7; 32]),
             upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
         });
         let plugin_directory = directory.path().join("plugins-under-test");
         let service = PluginService::load(plugin_directory, db.clone(), reply).unwrap();

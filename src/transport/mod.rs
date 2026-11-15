@@ -5,6 +5,10 @@
 //! and policy epoch remain unchanged; the resolver never performs a hidden
 //! second DNS lookup.
 
+#[cfg(test)]
+pub(crate) mod test_tls;
+pub(crate) mod tls;
+
 use crate::domain::{
     CaptureSession, DomainError, DomainResult, ErrorCode, ProjectId, TransportProvenance,
     ValidatedDial,
@@ -320,6 +324,7 @@ pub struct WreqTransport {
     clients: Mutex<HashMap<ClientKey, CachedClient>>,
     emulation: wreq_util::Profile,
     profile_name: String,
+    verify_upstream_tls: bool,
     #[cfg(test)]
     test_cert_store: Option<wreq::tls::trust::CertStore>,
 }
@@ -330,6 +335,14 @@ impl WreqTransport {
     }
 
     pub fn with_chrome_major(major: u32) -> DomainResult<Self> {
+        Self::with_chrome_major_and_tls_verification(major, true)
+    }
+
+    /// The TLS policy is fixed for this transport's connection pools and sessions.
+    pub fn with_chrome_major_and_tls_verification(
+        major: u32,
+        verify_upstream_tls: bool,
+    ) -> DomainResult<Self> {
         let emulation = match major {
             146 => Emulation::Chrome146,
             149 => Emulation::Chrome149,
@@ -347,6 +360,7 @@ impl WreqTransport {
             clients: Mutex::new(HashMap::new()),
             emulation,
             profile_name: format!("wreq_chrome{major}_protocol_profile"),
+            verify_upstream_tls,
             #[cfg(test)]
             test_cert_store: None,
         })
@@ -390,7 +404,9 @@ impl WreqTransport {
             .pool_idle_timeout(ttl)
             .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .pool_max_size(MAX_CACHED_CLIENTS)
-            .emulation(self.emulation);
+            .emulation(self.emulation)
+            .tls_cert_verification(self.verify_upstream_tls)
+            .tls_verify_hostname(self.verify_upstream_tls);
 
         #[cfg(test)]
         if let Some(store) = &self.test_cert_store {
