@@ -1,6 +1,7 @@
 //! Minimal stdio JSON-RPC MCP server. Protocol on stdout; diagnostics on stderr.
 
 pub(crate) mod budget;
+mod exchange_view;
 mod history_view;
 mod view;
 
@@ -11,9 +12,8 @@ use crate::config::Config;
 use crate::domain::*;
 use crate::fuzzer::FuzzTemplate;
 use crate::history::HISTORY_QUERY_SYNTAX;
-use crate::policy::{is_sensitive_header, PresentationOptions};
+use crate::policy::is_sensitive_header;
 use crate::storage::CreateCaptureSession;
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -515,17 +515,17 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"history_search","description":format!("Search saved project history, newest first, across all hosts and MIME types; active browser responses appear once captured. {} Pages fit the output budget; pass next as cursor to continue. When an AND query matches nothing, no_match_terms lists its terms that match nothing alone. Rows omit bodies; read them with exchange_body.", view::EXCHANGE_ROW_NOTE),"inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 text, not Unix seconds. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, query, url (scheme://authority/path?query), method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request, response. request:~text searches the request line, headers and decoded body; response:~text searches response headers and decoded body; both are slow on broad queries, so add host, method, time or size terms. Bare words search host, path, mime, title and error. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50},"cursor":{"description":"next from the previous page.","oneOf":[{"type":"array","items":{"type":["string","integer"]},"minItems":2,"maxItems":2},{"type":"string"},{"type":"null"}]}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Discover saved routes. Omit host for a lightweight list of hosts and route counts. With one exact host, list its routes sorted by path, optionally under path_prefix; routes omit empty lists and exchange_count 1. Pass next_offset as offset to continue.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Exact hostname, case-insensitive."},"path_prefix":{"type":"string","description":"Slash-boundary path subtree, such as /api. Requires host."},"offset":{"type":"integer","minimum":0}},"required":["project_id"],"additionalProperties":false}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
-        {"name":"exchange_get","description":"Get exchange detail (secrets redacted)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
-        {"name":"exchange_compare","description":"Compare the saved request and response of two exchanges. Sensitive values stay redacted, while changes are still detected. Text body diffs are bounded.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"left_exchange_id":{"type":"integer"},"right_exchange_id":{"type":"integer"},"include_noisy_headers":{"type":"boolean","default":false}},"required":["project_id","left_exchange_id","right_exchange_id"],"additionalProperties":false}},
+        {"name":"exchange_get","description":"Read exchanges in one call: summary, headers as \"name: value\" (secrets redacted, noisy hidden) and bodies inline up to body_bytes per side. A cut body has next_offset; continue, search or save it with exchange_body. exchange_ids reads up to 20; ids that do not fit are in not_returned.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"exchange_ids":{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":exchange_view::MAX_BATCH_IDS,"description":"Instead of exchange_id."},"body_bytes":{"type":"integer","minimum":0,"maximum":exchange_view::MAX_INLINE_BODY_BYTES,"default":4096,"description":"0 omits bodies."}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"exchange_compare","description":"Compare the saved request and response of two exchanges. Lists only differences; unchanged names matching parts. Sensitive values stay redacted but are still compared. Cuts are marked (text_diff_truncated, headers_omitted).","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"left_exchange_id":{"type":"integer"},"right_exchange_id":{"type":"integer"},"include_noisy_headers":{"type":"boolean","default":false}},"required":["project_id","left_exchange_id","right_exchange_id"],"additionalProperties":false}},
         {"name":"page_analyzer","description":"Extract sorted, unique endpoints, absolute URLs, emails, and request parameter names from JavaScript or HTML without executing it. Provide exactly one saved exchange_id or absolute URL. The tool analyzes that page and sequentially fetches bounded same-origin JavaScript bundles referenced by script tags or a Modern.js route manifest; URL mode first sends a semantic GET with project cookies. CSS and other non-JavaScript assets are skipped. Extracted values may contain secrets.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer","description":"Saved exchange whose decoded response body and same-origin JavaScript bundles should be analyzed."},"url":{"type":"string","description":"Absolute http/https URL to fetch and analyze, including its same-origin JavaScript bundles."}},"required":["project_id"],"oneOf":[{"required":["exchange_id"]},{"required":["url"]}],"additionalProperties":false}},
         {"name":"copy_as","description":"Convert a saved request to cURL or Python requests. The output includes the original sensitive headers by default so it is immediately runnable; set include_secrets=false to produce a redacted copy.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"format":{"type":"string","enum":["curl","python_requests"]},"include_secrets":{"type":"boolean","default":true}},"required":["project_id","exchange_id","format"],"additionalProperties":false}},
-        {"name":"exchange_body","description":"Read a captured request or response body in pages up to 1 MiB per call. reply_send returns exchange_id and only a 4 KiB preview; pass that exchange_id here to read the full captured response without re-fetching it or using HTTP Range. Use side=request for the captured request body; raw HTTP/1.1 request headers are redacted. available=false means that side has no captured body. UTF-8 output is lossy for arbitrary bytes; set encoding=base64 for exact page bytes. gzip/br/deflate/zstd responses are decoded by default; set raw=true to read captured response bytes before decoding. Continue with next_offset while truncated is true.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"response"},"offset":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576,"default":4096},"raw":{"type":"boolean","default":false},"encoding":{"type":"string","enum":["utf8","base64"],"default":"utf8","description":"Representation of preview. utf8 is lossy for non-UTF-8 bytes; base64 preserves every byte in this page."}},"required":["project_id","exchange_id"],"additionalProperties":false}},
+        {"name":"exchange_body","description":"Read a body beyond what exchange_get inlines. Pages fit the output budget; continue at next_offset while truncated. search finds a literal, ASCII case-insensitive string; match offsets work as offset. save writes the whole body to a private file and returns its path for local tools. Responses are decoded (gzip/br/deflate/zstd) unless raw=true; side=request redacts raw HTTP/1.1 request headers. available=false means no body. utf8 is lossy for non-UTF-8 bytes; encoding=base64 is exact.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"response"},"offset":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384},"raw":{"type":"boolean","default":false},"encoding":{"type":"string","enum":["utf8","base64"],"default":"utf8"},"search":{"type":"string"},"context_bytes":{"type":"integer","minimum":0,"maximum":exchange_view::MAX_CONTEXT_BYTES,"default":160,"description":"Context around each search match."},"save":{"type":"boolean","default":false}},"required":["project_id","exchange_id"],"additionalProperties":false}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"request"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a semantic HTTP request and return status plus a decoded 4 KiB response preview. For the full captured response, pass the returned exchange_id to exchange_body with side=response; use its next_offset for further pages. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"reply_send","description":"Send a semantic HTTP request and return status, a decoded 4 KiB response preview and the saved exchange_id; read more of the response with exchange_body. With base_exchange_id, diff gives the base status, length and whether the body is identical. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
-        {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; use exchange_body to read the full response without replaying it. Continue case pages with next_before_case_index.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"],"additionalProperties":false}},
+        {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Continue case pages with next_before_case_index.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
@@ -537,7 +537,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"huntproxy_stop","description":"Gracefully stop HuntProxy and all managed browsers. Keeps this MCP connection available; call huntproxy_restart to continue later. Use only when the user explicitly asks to stop HuntProxy.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"huntproxy_restart","description":"Restart or recover HuntProxy without reconnecting the agent's MCP session. Preserves saved projects, traffic, findings, Reply/Fuzzer state, and browser profiles. Active browsers close and can be resumed using browser_start. Running jobs are interrupted; memory-only plugin results/checkpoints are lost. Use when the user asks to restart or to continue after HuntProxy has stopped.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"codec_transform","description":"Apply byte transforms, including gzip_decode/gunzip and brotli_decode","inputSchema":{"type":"object","properties":{"input":{"type":"string"},"input_encoding":{"type":"string","enum":["utf8","base64","hex"],"default":"utf8"},"pipeline":{"type":"array","items":{"type":"string"}}},"required":["input","pipeline"]}},
-        {"name":"evidence_export","description":"Export exchange evidence metadata","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"}},"required":["project_id","exchange_id"]}},
+        {"name":"evidence_export","description":"Write one exchange to a private JSON file: metadata, redacted headers and decoded bodies (text, or base64 when not UTF-8). Returns path and bytes.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"include_bodies":{"type":"boolean","default":true}},"required":["project_id","exchange_id"],"additionalProperties":false}},
         {"name":"project_transfer","description":"Import or export a project bundle or HAR through a local file. By default HAR omits sensitive headers including cookies but keeps URLs, queries, and bodies; project bundles omit credentials, bodies, replay and browser state. include_secrets includes credentials; browser state also requires include_chromium_profile=true. Returns a summary/path, never archive bytes.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["export","import"]},"format":{"type":"string","enum":["huntproxy","har"]},"project_id":{"type":"integer","description":"Required for export and HAR import."},"file_path":{"type":"string","description":"Required for import; optional export destination. Defaults to the configured exports directory."},"include_secrets":{"type":"boolean","default":false},"include_chromium_profile":{"type":"boolean","default":false}},"required":["action","format"],"additionalProperties":false}},
         {"name":"exchange_annotate","description":"Replace an exchange title, note, and labels; omitted fields are cleared","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"display_title":{"type":["string","null"]},"note":{"type":["string","null"]},"labels":{"type":"array","items":{"type":"string"}},"expected_revision":{"type":"integer"}},"required":["project_id","exchange_id"]}}
     ])
@@ -1662,29 +1662,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 _ => Err(DomainError::invalid("action must be list|add|remove")),
             }
         }
-        "exchange_get" => {
-            let project_id = require_project_id(&args)?;
-            let eid = args
-                .get("exchange_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
-            let detail = state
-                .db
-                .get_exchange_detail(project_id, ExchangeId(eid), PresentationOptions::default())
-                .await?;
-            let annotation = state.db.get_annotation(project_id, ExchangeId(eid)).await?;
-            let applied_rules = state
-                .db
-                .list_exchange_request_rules(project_id, ExchangeId(eid))
-                .await?;
-            let mut value = serde_json::to_value(detail)
-                .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?;
-            if let Some(object) = value.as_object_mut() {
-                object.insert("annotation".into(), json!(annotation));
-                object.insert("applied_request_rules".into(), json!(applied_rules));
-            }
-            Ok(value)
-        }
+        "exchange_get" => exchange_view::exchange_get(&state, &args).await,
         "exchange_compare" => {
             let project_id = require_project_id(&args)?;
             let left = args
@@ -1695,8 +1673,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("right_exchange_id")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| DomainError::invalid("right_exchange_id required"))?;
-            Ok(json!(
-                crate::compare::compare_saved_exchanges(
+            exchange_view::compare_view(
+                &crate::compare::compare_saved_exchanges(
                     &state.db,
                     project_id,
                     ExchangeId(left),
@@ -1708,8 +1686,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             .unwrap_or(false),
                     },
                 )
-                .await?
-            ))
+                .await?,
+            )
         }
         "page_analyzer" => {
             let project_id = require_project_id(&args)?;
@@ -1894,81 +1872,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             }
             Ok(json!(result))
         }
-        "exchange_body" => {
-            let project_id = require_project_id(&args)?;
-            let eid = args
-                .get("exchange_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
-            let encoding = args
-                .get("encoding")
-                .and_then(Value::as_str)
-                .unwrap_or("utf8");
-            if !matches!(encoding, "utf8" | "base64") {
-                return Err(DomainError::invalid("encoding must be utf8|base64"));
-            }
-            let side = match args
-                .get("side")
-                .and_then(|v| v.as_str())
-                .unwrap_or("response")
-            {
-                "request" => MessageSide::Request,
-                "response" => MessageSide::Response,
-                _ => return Err(DomainError::invalid("side must be request|response")),
-            };
-            let offset = args
-                .get("offset")
-                .and_then(|value| value.as_u64())
-                .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-                .unwrap_or(0);
-            let max = args
-                .get("max_bytes")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(4096)
-                .clamp(1, 1024 * 1024) as usize;
-            let prepared = state
-                .prepared_body(
-                    project_id,
-                    ExchangeId(eid),
-                    side,
-                    args.get("raw").and_then(Value::as_bool).unwrap_or(false),
-                )
-                .await?;
-            let available = prepared.is_some();
-            let (body, raw_total, content_encoding, decoded) = match &prepared {
-                Some(prepared) => (
-                    prepared.data.as_slice(),
-                    prepared.raw_total,
-                    prepared.content_encoding.clone(),
-                    prepared.decoded,
-                ),
-                None => (&[][..], 0, None, false),
-            };
-            let end = offset.saturating_add(max).min(body.len());
-            let slice = if offset >= body.len() {
-                &body[..0]
-            } else {
-                &body[offset..end]
-            };
-            let preview = match encoding {
-                "utf8" => String::from_utf8_lossy(slice).into_owned(),
-                "base64" => base64::engine::general_purpose::STANDARD.encode(slice),
-                _ => unreachable!("encoding validated above"),
-            };
-            Ok(json!({
-                "available": available,
-                "total": body.len(),
-                "offset": offset,
-                "length": slice.len(),
-                "preview": preview,
-                "encoding": encoding,
-                "truncated": end < body.len(),
-                "next_offset": (end < body.len()).then_some(end),
-                "decoded": decoded,
-                "content_encoding": content_encoding,
-                "raw_total": raw_total,
-            }))
-        }
+        "exchange_body" => exchange_view::exchange_body(&state, &args).await,
         "secret_reveal" => {
             let project_id = require_project_id(&args)?;
             let eid = args
@@ -2107,8 +2011,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
                 );
             }
-            serde_json::to_value(result)
-                .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))
+            exchange_view::reply_send_view(
+                &state,
+                project_id,
+                args.get("base_exchange_id")
+                    .and_then(|v| v.as_i64())
+                    .map(ExchangeId),
+                &result,
+            )
+            .await
         }
         "reply_send_raw" => {
             let project_id = require_project_id(&args)?;
@@ -2656,38 +2567,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             });
             Ok(json!({ "output": text, "bytes": out.len() }))
         }
-        "evidence_export" => {
-            let project_id = require_project_id(&args)?;
-            let eid = args
-                .get("exchange_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
-            let detail = state
-                .db
-                .get_exchange_detail(project_id, ExchangeId(eid), PresentationOptions::default())
-                .await?;
-            let path =
-                state
-                    .config
-                    .export_dir
-                    .join(format!("exchange_{}_{}.json", project_id.get(), eid));
-            crate::config::create_private_dir(&state.config.export_dir)?;
-            let data = serde_json::to_vec_pretty(&detail)
-                .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-            crate::config::write_private_file(&path, &data)?;
-            let _ = state
-                .db
-                .audit(
-                    Some(project_id),
-                    "evidence_export",
-                    Some("mcp"),
-                    Some("exchange"),
-                    Some(&eid.to_string()),
-                    json!({ "path": path.display().to_string() }),
-                )
-                .await;
-            Ok(json!({ "path": path.display().to_string() }))
-        }
+        "evidence_export" => exchange_view::evidence_export(&state, &args).await,
         "project_transfer" => {
             let action = args
                 .get("action")
@@ -3809,14 +3689,14 @@ mod tests {
         assert!(body["description"]
             .as_str()
             .unwrap()
-            .contains("without re-fetching it or using HTTP Range"));
+            .contains("beyond what exchange_get inlines"));
         assert!(tools
             .iter()
             .find(|tool| tool["name"] == "reply_send")
             .unwrap()["description"]
             .as_str()
             .unwrap()
-            .contains("pass the returned exchange_id to exchange_body"));
+            .contains("read more of the response with exchange_body"));
     }
 
     fn rpc(id: Option<Value>, method: &str) -> JsonRpcRequest {

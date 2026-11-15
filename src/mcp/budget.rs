@@ -207,7 +207,7 @@ fn shrink(
 /// Largest cap such that cutting every size above it down to the cap makes the
 /// sizes sum to at most `available` (water filling). Small children keep their
 /// full size and the largest ones share what is left equally.
-fn water_level(sizes: &[usize], available: usize) -> usize {
+pub(crate) fn water_level(sizes: &[usize], available: usize) -> usize {
     let mut sorted = sizes.to_vec();
     sorted.sort_unstable();
     let mut remaining = available;
@@ -235,7 +235,7 @@ pub(crate) fn escaped_prefix_len(text: &str, max_bytes: usize) -> usize {
 }
 
 /// Bytes `ch` takes inside a serde_json string literal.
-fn escaped_len(ch: char) -> usize {
+pub(crate) fn escaped_len(ch: char) -> usize {
     match ch {
         '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
         '\u{00}'..='\u{1f}' => 6,

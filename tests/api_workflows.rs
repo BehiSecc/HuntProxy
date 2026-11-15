@@ -2607,7 +2607,10 @@ async fn zstd_response_body_preserves_exact_decoded_pages_and_raw_access() {
         )
         .await
         .unwrap();
-        assert_eq!(page["available"], true);
+        assert!(
+            page.get("available").is_none(),
+            "only an absent body is flagged"
+        );
         assert_eq!(page["decoded"], true);
         assert_eq!(page["content_encoding"], "zstd");
         assert_eq!(page["total"], response_body.len());
@@ -2642,7 +2645,7 @@ async fn zstd_response_body_preserves_exact_decoded_pages_and_raw_access() {
     )
     .await
     .unwrap();
-    assert_eq!(raw["decoded"], false);
+    assert!(raw.get("decoded").is_none());
     assert_eq!(
         base64::engine::general_purpose::STANDARD
             .decode(raw["preview"].as_str().unwrap())
@@ -2695,7 +2698,7 @@ async fn exchange_body_base64_pages_preserve_exact_request_bytes() {
     )
     .await
     .unwrap();
-    assert_eq!(first["available"], true);
+    assert!(first.get("available").is_none());
     assert_eq!(first["encoding"], "base64");
     assert_eq!(first["total"], request_body.len());
     let first_bytes = base64::engine::general_purpose::STANDARD
