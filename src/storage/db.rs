@@ -255,6 +255,47 @@ mod tests {
         );
     }
 
+    /// Why every write transaction that reads before it writes must use
+    /// `write_transaction`: a deferred one that read first fails at once when
+    /// another connection commits meanwhile, and no busy timeout helps.
+    #[test]
+    fn write_transactions_hold_the_write_lock_from_their_first_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("locks.db");
+        let open = || {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.pragma_update(None, "busy_timeout", 200).unwrap();
+            conn
+        };
+        let (first, second) = (open(), open());
+        first.execute_batch("CREATE TABLE t(v INTEGER)").unwrap();
+
+        let deferred = first.unchecked_transaction().unwrap();
+        deferred
+            .query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        second.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        let error = deferred
+            .execute("INSERT INTO t VALUES (2)", [])
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        drop(deferred);
+
+        let immediate = write_transaction(&first).unwrap();
+        immediate
+            .query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        // The other writer waits for the lock instead of invalidating the read.
+        assert!(second.execute("INSERT INTO t VALUES (3)", []).is_err());
+        immediate.execute("INSERT INTO t VALUES (4)", []).unwrap();
+        immediate.commit().unwrap();
+        second.execute("INSERT INTO t VALUES (5)", []).unwrap();
+    }
+
     #[tokio::test]
     async fn in_memory_pool_shares_database_between_connections_but_not_pools() {
         let db = Db::open_in_memory().await.unwrap();

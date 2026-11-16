@@ -184,7 +184,7 @@ impl Db {
         let opcode = opcode.to_string();
         let created_at = now_rfc3339();
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             tx.execute(
                 "INSERT INTO websocket_messages
                  (project_id, connection_id, direction, opcode, payload, payload_length, truncated, created_at)

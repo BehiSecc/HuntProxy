@@ -177,7 +177,7 @@ impl Db {
         if rules.is_empty() {
             return Ok(());
         }
-        self.with_conn(move |conn| { let tx=conn.unchecked_transaction().map_err(storage)?; for rule in rules { tx.execute("INSERT OR IGNORE INTO exchange_request_rules(project_id,exchange_id,rule_id,rule_name) VALUES(?1,?2,?3,?4)",params![project_id.get(),exchange_id.get(),rule.id,rule.name]).map_err(storage)?; } tx.commit().map_err(storage) }).await
+        self.with_conn(move |conn| { let tx=crate::storage::write_transaction(conn).map_err(storage)?; for rule in rules { tx.execute("INSERT OR IGNORE INTO exchange_request_rules(project_id,exchange_id,rule_id,rule_name) VALUES(?1,?2,?3,?4)",params![project_id.get(),exchange_id.get(),rule.id,rule.name]).map_err(storage)?; } tx.commit().map_err(storage) }).await
     }
 
     pub async fn list_exchange_request_rules(

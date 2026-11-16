@@ -4,6 +4,7 @@ pub(crate) mod budget;
 mod exchange_view;
 mod fuzz_view;
 mod history_view;
+mod job_view;
 mod view;
 
 use crate::app::AppState;
@@ -1311,7 +1312,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 };
                 let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(25) as usize;
-                Ok(state.plugins.results(id, view, offset, limit)?)
+                job_view::findings_page(state.plugins.results(id, view, offset, limit)?)
             } else {
                 let job = if name == "job_cancel" {
                     state.plugins.cancel(id)?

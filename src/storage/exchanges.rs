@@ -9,7 +9,6 @@ use crate::storage::projects::{now_rfc3339, parse_time};
 use crate::storage::Db;
 use rusqlite::params;
 use rusqlite::types::Value;
-use rusqlite::{Transaction, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use time::{Duration, OffsetDateTime};
@@ -483,7 +482,7 @@ impl Db {
                 ));
             }
             let now = now_rfc3339();
-            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            let tx = crate::storage::write_transaction(conn)
                 .map_err(storage_error)?;
             let mut changed = 0;
             for file in files {
@@ -528,8 +527,7 @@ impl Db {
 
     pub async fn insert_exchange(&self, ex: NewExchange) -> DomainResult<ExchangeId> {
         self.with_conn(move |conn| {
-            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-                .map_err(storage_error)?;
+            let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             let exchange_id = insert_exchange_conn(&tx, ex)?;
             tx.commit().map_err(storage_error)?;
             Ok(exchange_id)
@@ -550,8 +548,7 @@ impl Db {
             ));
         }
         self.with_conn(move |conn| {
-            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-                .map_err(storage_error)?;
+            let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             let request_body = request_spool
                 .as_deref()
                 .map(|path| store_body_file_conn(&tx, path, None))
