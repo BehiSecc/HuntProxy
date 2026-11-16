@@ -223,7 +223,7 @@ test("cleanup failure retains the session and shutdown closes independent browse
   const events = [];
   let finishSecond;
   const second = new Promise((resolve) => { finishSecond = resolve; });
-  const close = source.slice(source.indexOf("async function closeSession("), source.indexOf("let queue ="));
+  const close = source.slice(source.indexOf("async function closeSession("), source.indexOf("const lanes ="));
   const shutdown = source.slice(source.indexOf("async function shutdown("), source.indexOf('readline.on("close"'));
   const api = vm.runInNewContext(`${close}; ${shutdown}; ({closeSession, shutdown})`, {
     sessions, shuttingDown: false, ownedChromeChildren: new Set(["first", "second", "starting"]),
@@ -253,7 +253,7 @@ test("daemon EOF stops browsers without waiting for a stalled RPC", async () => 
   const events = [];
   const process = new EventEmitter();
   process.exit = (code) => events.push(code);
-  vm.runInNewContext(source.slice(source.indexOf("let queue =")), {
+  vm.runInNewContext(source.slice(source.indexOf("const lanes =")), {
     createInterface: () => readline, process, shuttingDown: false,
     sessions: new Map([[1, {}]]), ownedChromeChildren: new Set(),
     handle: () => new Promise(() => {}),

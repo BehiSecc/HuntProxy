@@ -18,6 +18,9 @@ import { fileURLToPath } from "node:url";
 
 const PROTOCOL = 1;
 const sessions = new Map();
+// Sessions the daemon gave up on before they had launched. The daemon never
+// reuses a session id, so an id whose start had already failed stays harmless.
+const abortedStarts = new Set();
 const ownedChromeChildren = new Set();
 let shuttingDown = false;
 const MAX_SESSION_EVENTS = 256;
@@ -2811,6 +2814,8 @@ async function handle(req) {
           throw rpcError(-32602, "session_id must be a positive integer");
         }
         if (sessions.has(sessionId)) throw rpcError(-32602, "session_id is already active");
+        // Given up on while it waited behind other starts: never launch it.
+        if (abortedStarts.delete(sessionId)) throw rpcError(-32000, "browser session was aborted while it launched");
         const engine = params.engine || "chromium";
         if (engine !== "chromium") {
           throw rpcError(-32602, "engine must be chromium");
@@ -2851,6 +2856,10 @@ async function handle(req) {
           throw error;
         }
         sessions.set(sessionId, session);
+        if (abortedStarts.delete(sessionId)) {
+          await closeSession(sessionId);
+          throw rpcError(-32000, "browser session was aborted while it launched");
+        }
         try {
           await initializeSessionTracking(session);
           await restoreProjectState(session, params.restore_state);
@@ -2881,6 +2890,27 @@ async function handle(req) {
           await closeSession(sessionId);
           throw error;
         }
+      }
+      case "session.abort": {
+        // The daemon gave up on a call of this session that may still be
+        // running: close the session at once, whatever it is doing.
+        const sessionId = Number(params.session_id);
+        if (!Number.isSafeInteger(sessionId) || sessionId <= 0) {
+          throw rpcError(-32602, "session_id must be a positive integer");
+        }
+        const session = sessions.get(sessionId);
+        if (!session) {
+          abortedStarts.add(sessionId); // Closed by session.start once it has launched.
+          return respond(id, { aborted: false });
+        }
+        sessions.delete(sessionId);
+        // A browser that does not close soon is left to the worker's exit.
+        await Promise.race([
+          closeRuntime(session).catch(() => undefined),
+          new Promise((resolve) => { const timer = setTimeout(resolve, 5_000); timer.unref(); }),
+        ]);
+        logMeta("session.abort", { session_id: sessionId });
+        return respond(id, { aborted: true });
       }
       case "session.status": {
         const sessionId = Number(params.session_id);
@@ -3193,7 +3223,19 @@ async function closeSession(sessionId) {
   logMeta("session.stop", { session_id: sessionId });
 }
 
-let queue = Promise.resolve();
+// A session's requests run in order and different sessions' side by side, so
+// a slow call holds up only its own session. Starts take turns, since each
+// checks that no other session holds its profile before it launches. hello
+// and session.abort are answered at once: abort is how the daemon ends a
+// session whose call is still running.
+const lanes = new Map();
+function laneOf(request) {
+  const method = request?.method;
+  if (method === "hello" || method === "session.abort") return null;
+  if (method === "session.start") return "start";
+  const sessionId = Number(request?.params?.session_id);
+  return Number.isSafeInteger(sessionId) ? `session ${sessionId}` : "worker";
+}
 const readline = createInterface({ input: process.stdin });
 readline.on("line", (line) => {
   if (!line.trim()) return;
@@ -3204,7 +3246,14 @@ readline.on("line", (line) => {
     respond(null, null, rpcError(-32700, "parse error"));
     return;
   }
-  queue = queue.then(() => handle(request)).catch(() => undefined);
+  const lane = laneOf(request);
+  if (lane === null) {
+    void handle(request);
+    return;
+  }
+  const tail = (lanes.get(lane) ?? Promise.resolve()).then(() => handle(request)).catch(() => undefined);
+  lanes.set(lane, tail);
+  void tail.then(() => { if (lanes.get(lane) === tail) lanes.delete(lane); });
 });
 async function shutdown(exitCode) {
   if (shuttingDown) return;

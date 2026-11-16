@@ -20,9 +20,12 @@ use tokio::sync::{Mutex, RwLock};
 
 const WORKER_PROTOCOL_VERSION: u64 = 1;
 const WORKER_RPC_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a worker has to close one session whose call ran out of time
+/// before the worker itself counts as stuck.
+const WORKER_ABORT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest a single worker request waits for browser events. The worker
-/// answers one request at a time, so a longer wait would hold up every other
-/// session of the project.
+/// runs one session's requests in order, so a longer wait would hold up that
+/// session's other requests, such as status checks.
 const EVENT_WAIT_SLICE: Duration = Duration::from_millis(100);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
 const BROWSER_CDP_PORT: u16 = 9222;
@@ -1124,26 +1127,215 @@ struct WorkerRpcError {
 }
 
 enum WorkerCallFailure {
+    /// The worker answered with an error.
     Rpc(DomainError),
+    /// This call ran out of time. The worker may still be serving others.
+    Timeout(DomainError),
+    /// The worker cannot be used: it exited, closed its output, or wrote
+    /// something that is not a response.
     Transport(DomainError),
 }
 
 impl WorkerCallFailure {
     fn into_domain(self) -> DomainError {
         match self {
-            Self::Rpc(error) | Self::Transport(error) => error,
+            Self::Rpc(error) | Self::Timeout(error) | Self::Transport(error) => error,
         }
     }
 }
 
+/// Calls in flight to one worker. Each waits for the response carrying its
+/// id, so a slow call holds up only its caller.
+struct PendingCalls {
+    next_id: u64,
+    waiters: HashMap<u64, tokio::sync::oneshot::Sender<WorkerResponse>>,
+    /// Why the worker can no longer be used, once it cannot.
+    closed: Option<(ErrorCode, String)>,
+}
+
+/// The worker's request and response pipes, shared by every call to it.
+struct WorkerIo {
+    stdin: Mutex<ChildStdin>,
+    pending: std::sync::Mutex<PendingCalls>,
+}
+
+impl WorkerIo {
+    fn pending(&self) -> std::sync::MutexGuard<'_, PendingCalls> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Fails every waiting call, and every later one, with `code` and `message`.
+    fn close(&self, code: ErrorCode, message: impl Into<String>) {
+        let mut pending = self.pending();
+        if pending.closed.is_none() {
+            pending.closed = Some((code, message.into()));
+        }
+        // A dropped sender wakes its caller, which then reports `closed`.
+        pending.waiters.clear();
+    }
+
+    fn closed_error(&self) -> DomainError {
+        let (code, message) = self
+            .pending()
+            .closed
+            .clone()
+            .unwrap_or((ErrorCode::Unavailable, "browser worker stopped".into()));
+        DomainError::new(code, message)
+    }
+
+    async fn call(
+        &self,
+        timeout: Duration,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, WorkerCallFailure> {
+        let (id, response) = {
+            // Ids are taken while writing, so requests reach the worker in id order.
+            let mut stdin = self.stdin.lock().await;
+            let (id, response) = {
+                let mut pending = self.pending();
+                if pending.closed.is_some() {
+                    drop(pending);
+                    return Err(WorkerCallFailure::Transport(self.closed_error()));
+                }
+                let id = pending.next_id;
+                pending.next_id = id.saturating_add(1);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                pending.waiters.insert(id, sender);
+                (id, receiver)
+            };
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            });
+            let mut encoded = match serde_json::to_vec(&request) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.pending().waiters.remove(&id);
+                    return Err(WorkerCallFailure::Transport(DomainError::new(
+                        ErrorCode::ProtocolError,
+                        format!("encode browser worker request: {error}"),
+                    )));
+                }
+            };
+            encoded.push(b'\n');
+            let written = match stdin.write_all(&encoded).await {
+                Ok(()) => stdin.flush().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = written {
+                let message = format!("write browser worker request: {error}");
+                self.close(ErrorCode::Unavailable, message.clone());
+                return Err(WorkerCallFailure::Transport(DomainError::new(
+                    ErrorCode::Unavailable,
+                    message,
+                )));
+            }
+            (id, response)
+        };
+        let response = match tokio::time::timeout(timeout, response).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(WorkerCallFailure::Transport(self.closed_error())),
+            Err(_) => {
+                self.pending().waiters.remove(&id);
+                return Err(WorkerCallFailure::Timeout(DomainError::new(
+                    ErrorCode::Timeout,
+                    format!("browser worker {method} timed out"),
+                )));
+            }
+        };
+        if let Some(error) = response.error {
+            let code = match error.code {
+                -32602 => ErrorCode::InvalidArgument,
+                -32001 => ErrorCode::NotFound,
+                -32003 => ErrorCode::ChromiumNotInstalled,
+                _ => ErrorCode::Unavailable,
+            };
+            return Err(WorkerCallFailure::Rpc(DomainError::new(
+                code,
+                error.message,
+            )));
+        }
+        response.result.ok_or_else(|| {
+            WorkerCallFailure::Transport(DomainError::new(
+                ErrorCode::ProtocolError,
+                "browser worker response missing result",
+            ))
+        })
+    }
+}
+
+/// Hands each response line to the call waiting for its id, until the
+/// worker's output ends or stops being responses.
+async fn read_worker_responses(io: Arc<WorkerIo>, mut stdout: BufReader<ChildStdout>) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdout.read_line(&mut line).await {
+            Ok(0) => return io.close(ErrorCode::Unavailable, "browser worker closed stdout"),
+            Ok(_) => {}
+            Err(error) => {
+                return io.close(
+                    ErrorCode::Unavailable,
+                    format!("read browser worker response: {error}"),
+                )
+            }
+        }
+        let response: WorkerResponse = match serde_json::from_str(line.trim()) {
+            Ok(response) => response,
+            Err(error) => {
+                return io.close(
+                    ErrorCode::ProtocolError,
+                    format!("decode browser worker response: {error}"),
+                )
+            }
+        };
+        let Some(id) = response.id else {
+            // An error about no request in particular: the two sides no
+            // longer agree on the protocol.
+            return io.close(
+                ErrorCode::ProtocolError,
+                "browser worker response without an id",
+            );
+        };
+        // Nobody waits for the answer to a call that already timed out.
+        let waiter = io.pending().waiters.remove(&id);
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(response);
+        }
+    }
+}
+
+/// What a call needs of a worker. Cheap to clone, so callers wait for their
+/// response without holding the project's worker lock.
+#[derive(Clone)]
+struct WorkerHandle {
+    io: Arc<WorkerIo>,
+    rpc_timeout: Duration,
+}
+
+impl WorkerHandle {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, WorkerCallFailure> {
+        self.io.call(self.rpc_timeout, method, params).await
+    }
+
+    /// Whether `worker` is the process this handle calls.
+    fn is(&self, worker: &WorkerProcess) -> bool {
+        Arc::ptr_eq(&self.io, &worker.io)
+    }
+}
+
 struct WorkerProcess {
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    io: Arc<WorkerIo>,
+    reader: tokio::task::JoinHandle<()>,
     child: Child,
     #[cfg(unix)]
     process_group: nix::unistd::Pid,
     terminated: bool,
-    next_id: u64,
     rpc_timeout: Duration,
 }
 
@@ -1212,14 +1404,22 @@ impl WorkerProcess {
                 "browser worker stdout unavailable",
             ))
         })?;
+        let io = Arc::new(WorkerIo {
+            stdin: Mutex::new(stdin),
+            pending: std::sync::Mutex::new(PendingCalls {
+                next_id: 1,
+                waiters: HashMap::new(),
+                closed: None,
+            }),
+        });
+        let reader = tokio::spawn(read_worker_responses(io.clone(), BufReader::new(stdout)));
         let mut process = Self {
-            stdin,
-            stdout: BufReader::new(stdout),
+            io,
+            reader,
             child,
             #[cfg(unix)]
             process_group,
             terminated: false,
-            next_id: 1,
             rpc_timeout: WORKER_RPC_TIMEOUT,
         };
         let hello = process.call("hello", json!({})).await?;
@@ -1249,98 +1449,24 @@ impl WorkerProcess {
         Ok(process)
     }
 
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, WorkerCallFailure> {
-        if let Ok(Some(status)) = self.child.try_wait() {
-            return Err(WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::Unavailable,
-                format!("browser worker exited with {status}"),
-            )));
+    fn handle(&self) -> WorkerHandle {
+        WorkerHandle {
+            io: self.io.clone(),
+            rpc_timeout: self.rpc_timeout,
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        let mut encoded = serde_json::to_vec(&request).map_err(|error| {
-            WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::ProtocolError,
-                format!("encode browser worker request: {error}"),
-            ))
-        })?;
-        encoded.push(b'\n');
-        self.stdin.write_all(&encoded).await.map_err(|error| {
-            WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::Unavailable,
-                format!("write browser worker request: {error}"),
-            ))
-        })?;
-        self.stdin.flush().await.map_err(|error| {
-            WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::Unavailable,
-                format!("flush browser worker request: {error}"),
-            ))
-        })?;
+    }
 
-        let mut line = String::new();
-        let bytes_read = tokio::time::timeout(self.rpc_timeout, self.stdout.read_line(&mut line))
-            .await
-            .map_err(|_| {
-                WorkerCallFailure::Transport(DomainError::new(
-                    ErrorCode::Timeout,
-                    format!("browser worker {method} timed out"),
-                ))
-            })?
-            .map_err(|error| {
-                WorkerCallFailure::Transport(DomainError::new(
-                    ErrorCode::Unavailable,
-                    format!("read browser worker response: {error}"),
-                ))
-            })?;
-        if bytes_read == 0 {
-            return Err(WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::Unavailable,
-                "browser worker closed stdout",
-            )));
-        }
-        let response: WorkerResponse = serde_json::from_str(line.trim()).map_err(|error| {
-            WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::ProtocolError,
-                format!("decode browser worker response: {error}"),
-            ))
-        })?;
-        if response.id != Some(id) {
-            return Err(WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::ProtocolError,
-                "browser worker response id mismatch",
-            )));
-        }
-        if let Some(error) = response.error {
-            let code = match error.code {
-                -32602 => ErrorCode::InvalidArgument,
-                -32001 => ErrorCode::NotFound,
-                -32003 => ErrorCode::ChromiumNotInstalled,
-                _ => ErrorCode::Unavailable,
-            };
-            return Err(WorkerCallFailure::Rpc(DomainError::new(
-                code,
-                error.message,
-            )));
-        }
-        response.result.ok_or_else(|| {
-            WorkerCallFailure::Transport(DomainError::new(
-                ErrorCode::ProtocolError,
-                "browser worker response missing result",
-            ))
-        })
+    async fn call(&self, method: &str, params: Value) -> Result<Value, WorkerCallFailure> {
+        self.handle().call(method, params).await
     }
 
     async fn terminate(&mut self) {
         if self.terminated {
             return;
         }
+        // Calls still waiting fail now instead of at their deadlines.
+        self.io
+            .close(ErrorCode::Unavailable, "browser worker stopped");
         #[cfg(unix)]
         if let Some(pid) = self.child.id() {
             let _ = nix::sys::signal::kill(
@@ -1362,15 +1488,19 @@ impl WorkerProcess {
         // cannot, and its surviving Chromium would keep the profile locked.
         #[cfg(unix)]
         let _ = nix::sys::signal::killpg(self.process_group, nix::sys::signal::Signal::SIGKILL);
+        self.reader.abort();
         self.terminated = true;
     }
 }
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
+        self.reader.abort();
         if self.terminated {
             return;
         }
+        self.io
+            .close(ErrorCode::Unavailable, "browser worker stopped");
         #[cfg(unix)]
         let _ = nix::sys::signal::killpg(self.process_group, nix::sys::signal::Signal::SIGKILL);
         #[cfg(not(unix))]
@@ -2718,19 +2848,10 @@ impl BrowserService {
         let Some(entry) = entry else {
             return;
         };
-        let mut worker = entry.lock().await;
-        if !self
-            .runtime_sessions
-            .lock()
-            .await
-            .contains_key(&session_id.get())
-        {
-            return;
-        }
-        let Some(process) = worker.as_mut() else {
+        let Some(handle) = self.session_worker_handle(&entry, session_id).await else {
             return;
         };
-        match process
+        match handle
             .call("session.cdp_state", json!({"session_id": session_id.get()}))
             .await
         {
@@ -2745,18 +2866,31 @@ impl BrowserService {
                 }
                 self.release_cdp_reservation(session_id.get());
             }
+            // A worker that broke has lost every session; a query that ran
+            // out of time changes nothing.
             Err(WorkerCallFailure::Transport(_)) => {
-                if let Some(mut process) = worker.take() {
-                    process.terminate().await;
-                }
-                self.sandbox
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&project_id.get());
-                self.interrupt_runtime_sessions(Some(project_id)).await;
+                self.fail_worker(project_id, &entry, &handle).await;
             }
             _ => {}
         }
+    }
+
+    /// A handle to the project worker that runs `session_id`, if it still does.
+    async fn session_worker_handle(
+        &self,
+        entry: &Mutex<Option<WorkerProcess>>,
+        session_id: BrowserSessionId,
+    ) -> Option<WorkerHandle> {
+        let worker = entry.lock().await;
+        if !self
+            .runtime_sessions
+            .lock()
+            .await
+            .contains_key(&session_id.get())
+        {
+            return None;
+        }
+        worker.as_ref().map(WorkerProcess::handle)
     }
 
     async fn rollback_cdp_enable(&self, project_id: ProjectId, session_id: BrowserSessionId) {
@@ -2764,19 +2898,10 @@ impl BrowserService {
         let Some(entry) = entry else {
             return;
         };
-        let mut worker = entry.lock().await;
-        if !self
-            .runtime_sessions
-            .lock()
-            .await
-            .contains_key(&session_id.get())
-        {
-            return;
-        }
-        let Some(process) = worker.as_mut() else {
+        let Some(handle) = self.session_worker_handle(&entry, session_id).await else {
             return;
         };
-        if process
+        if handle
             .call(
                 "session.cdp_disable",
                 json!({"session_id": session_id.get()}),
@@ -2786,14 +2911,7 @@ impl BrowserService {
         {
             // An unsuccessful rollback leaves ownership uncertain: terminate
             // this worker before releasing the reservation.
-            if let Some(mut process) = worker.take() {
-                process.terminate().await;
-            }
-            self.sandbox
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&project_id.get());
-            self.interrupt_runtime_sessions(Some(project_id)).await;
+            self.fail_worker(project_id, &entry, &handle).await;
         }
     }
 
@@ -3064,8 +3182,8 @@ impl BrowserService {
 
     /// Returns once the worker holds an event the `events` action would return,
     /// or `wait_ms` has passed. The worker does the waiting, in slices of at
-    /// most `EVENT_WAIT_SLICE`, and the other sessions of the project are
-    /// served between slices.
+    /// most `EVENT_WAIT_SLICE`, and the session's other requests are served
+    /// between slices.
     async fn wait_for_browser_events(
         &self,
         project_id: ProjectId,
@@ -3452,56 +3570,57 @@ impl BrowserService {
             )
         })?;
         let worker_entry = self.worker_entry(project_id).await;
-        let mut worker = worker_entry.lock().await;
-        if let Some(session_id) = params
+        let session_id = params
             .get("session_id")
             .and_then(Value::as_i64)
-            .filter(|_| method.starts_with("session."))
-        {
-            // A request may have waited here while a previous RPC failed and
-            // interrupted this session. Never send it to a replacement worker.
-            let active = self
-                .runtime_sessions
-                .lock()
-                .await
-                .get(&session_id)
-                .is_some_and(|runtime| runtime.project_id == project_id);
-            if !active {
-                let message = if method == "session.start" {
-                    "browser worker failed during startup"
-                } else {
-                    "browser session is not active"
-                };
-                return Err(DomainError::new(ErrorCode::Unavailable, message));
+            .filter(|_| method.starts_with("session."));
+        // The worker lock is held only to find the worker, so a slow call
+        // holds up its own session and no other.
+        let handle = {
+            let mut worker = worker_entry.lock().await;
+            if let Some(session_id) = session_id {
+                // A request may have waited here while a previous RPC failed and
+                // interrupted this session. Never send it to a replacement worker.
+                let active = self
+                    .runtime_sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .is_some_and(|runtime| runtime.project_id == project_id);
+                if !active {
+                    let message = if method == "session.start" {
+                        "browser worker failed during startup"
+                    } else {
+                        "browser session is not active"
+                    };
+                    return Err(DomainError::new(ErrorCode::Unavailable, message));
+                }
             }
-        }
-        if worker.is_none() {
-            self.sandbox
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&project_id.get());
-            *worker = Some(
-                match WorkerProcess::spawn(
-                    node_path,
-                    worker_path,
-                    self.runtime.playwright_core_path.as_deref(),
-                    self.runtime.chromium_path.as_deref(),
-                )
-                .await
-                {
-                    Ok(worker) => worker,
-                    Err(error) => {
-                        self.interrupt_runtime_sessions(Some(project_id)).await;
-                        return Err(error.into_domain());
-                    }
-                },
-            );
-        }
-        let result = worker
-            .as_mut()
-            .expect("worker initialized")
-            .call(method, params)
-            .await;
+            if worker.is_none() {
+                self.sandbox
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&project_id.get());
+                *worker = Some(
+                    match WorkerProcess::spawn(
+                        node_path,
+                        worker_path,
+                        self.runtime.playwright_core_path.as_deref(),
+                        self.runtime.chromium_path.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            self.interrupt_runtime_sessions(Some(project_id)).await;
+                            return Err(error.into_domain());
+                        }
+                    },
+                );
+            }
+            worker.as_ref().expect("worker initialized").handle()
+        };
+        let result = handle.call(method, params).await;
         match result {
             Ok(value) => {
                 if method == "session.start" {
@@ -3525,28 +3644,82 @@ impl BrowserService {
                 Ok(value)
             }
             Err(WorkerCallFailure::Rpc(error)) => Err(error),
-            Err(WorkerCallFailure::Transport(error)) => {
-                if let Some(mut failed) = worker.take() {
-                    failed.terminate().await;
+            Err(WorkerCallFailure::Timeout(error)) => {
+                // A session's call that ran out of time costs that session
+                // alone while the worker still answers: the worker closes it.
+                // A worker that cannot even do that is stuck and is replaced.
+                let aborted = match session_id {
+                    Some(session_id) => handle
+                        .io
+                        .call(
+                            handle.rpc_timeout.min(WORKER_ABORT_TIMEOUT),
+                            "session.abort",
+                            json!({"session_id": session_id}),
+                        )
+                        .await
+                        .is_ok(),
+                    None => false,
+                };
+                match session_id.filter(|_| aborted) {
+                    Some(session_id) => {
+                        // Held while interrupting, as wait_for_worker_interruption expects.
+                        let _worker = worker_entry.lock().await;
+                        self.interrupt_runtimes(
+                            |id, runtime| id == session_id && runtime.project_id == project_id,
+                            "session_timed_out",
+                        )
+                        .await;
+                    }
+                    None => self.fail_worker(project_id, &worker_entry, &handle).await,
                 }
-                self.sandbox
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .remove(&project_id.get());
-                self.interrupt_runtime_sessions(Some(project_id)).await;
+                Err(error)
+            }
+            Err(WorkerCallFailure::Transport(error)) => {
+                self.fail_worker(project_id, &worker_entry, &handle).await;
                 Err(error)
             }
         }
     }
 
+    /// Stops `handle`'s worker if it is still the project's, and interrupts the
+    /// project's sessions: a worker that broke has lost them all.
+    async fn fail_worker(
+        &self,
+        project_id: ProjectId,
+        entry: &Mutex<Option<WorkerProcess>>,
+        handle: &WorkerHandle,
+    ) {
+        let mut worker = entry.lock().await;
+        // Whoever saw it fail first has already replaced or stopped it.
+        if !worker.as_ref().is_some_and(|current| handle.is(current)) {
+            return;
+        }
+        if let Some(mut failed) = worker.take() {
+            failed.terminate().await;
+        }
+        self.sandbox
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&project_id.get());
+        self.interrupt_runtime_sessions(Some(project_id)).await;
+    }
+
     async fn interrupt_runtime_sessions(&self, project_id: Option<ProjectId>) {
+        self.interrupt_runtimes(
+            |_, runtime| project_id.is_none_or(|project_id| project_id == runtime.project_id),
+            "worker_interrupted",
+        )
+        .await;
+    }
+
+    /// Ends the runtimes `pick` chooses: their sessions are marked interrupted
+    /// with `status`, and their captures and reservations are released.
+    async fn interrupt_runtimes(&self, pick: impl Fn(i64, &RuntimeSession) -> bool, status: &str) {
         let runtimes = {
             let mut active = self.runtime_sessions.lock().await;
             let ids = active
                 .iter()
-                .filter_map(|(id, runtime)| {
-                    (project_id.is_none() || project_id == Some(runtime.project_id)).then_some(*id)
-                })
+                .filter_map(|(id, runtime)| pick(*id, runtime).then_some(*id))
                 .collect::<Vec<_>>();
             ids.into_iter()
                 .filter_map(|id| active.remove(&id).map(|runtime| (id, runtime)))
@@ -3568,7 +3741,7 @@ impl BrowserService {
                 .await
             {
                 session.state = BrowserSessionState::Interrupted;
-                session.checkpoint_status = Some("worker_interrupted".into());
+                session.checkpoint_status = Some(status.into());
                 let _ = self.db.update_browser_session(&session).await;
             }
             let _ = self
@@ -7133,7 +7306,7 @@ done
         let mut worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
             .await
             .unwrap_or_else(|_| panic!("start fixture worker"));
-        worker.rpc_timeout = Duration::from_millis(1_500);
+        worker.rpc_timeout = Duration::from_secs(4);
         *service.worker_entry(project.id).await.lock().await = Some(worker);
         let service = Arc::new(service);
         let failing_call = {
@@ -7169,7 +7342,7 @@ done
             }
         })
         .await
-        .expect("action did not queue while the worker was busy");
+        .expect("action did not reach the worker while it was busy");
         let queued_start = {
             let service = service.clone();
             tokio::spawn(async move {
@@ -7392,6 +7565,232 @@ done
             Some(&9223)
         );
         service.force_stop_all().await;
+    }
+
+    /// A fake worker that answers `session.slow` a second late and out of
+    /// order, never answers `session.hang`, and answers `session.abort` only
+    /// when `abort_answers`. It counts its starts in `<script>.spawns` and
+    /// marks a slow request's arrival in `<script>.slow`.
+    #[cfg(unix)]
+    fn session_lane_worker(abort_answers: bool) -> String {
+        let abort = if abort_answers {
+            r#"printf '{"id":%s,"result":{"aborted":true}}\n' "$n""#
+        } else {
+            ":"
+        };
+        r#"
+printf 'spawn\n' >> "$0.spawns"
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  case "$request" in
+    *'"method":"hello"'*) printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}' ;;
+    *'"method":"session.slow"'*) : > "$0.slow"; ( sleep 1; printf '{"id":%s,"result":{"slow":true}}\n' "$n" ) & ;;
+    *'"method":"session.hang"'*) ;;
+    *'"method":"session.abort"'*) @ABORT@ ;;
+    *) printf '{"id":%s,"result":{"quick":true}}\n' "$n" ;;
+  esac
+done
+"#
+        .replace("@ABORT@", abort)
+    }
+
+    /// Two ready sessions of one project on one started fake worker.
+    #[cfg(unix)]
+    struct SessionLanes {
+        service: Arc<BrowserService>,
+        db: Arc<Db>,
+        project_id: ProjectId,
+        sessions: [BrowserSessionId; 2],
+        script: PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl SessionLanes {
+        async fn start(abort_answers: bool, rpc_timeout: Duration) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("worker.sh");
+            std::fs::write(&script, session_lane_worker(abort_answers)).unwrap();
+            let db = Arc::new(Db::open_in_memory().await.unwrap());
+            let project = db
+                .create_project(CreateProjectRequest {
+                    name: "Session lanes".into(),
+                    target_url: "https://example.test".into(),
+                    advanced: None,
+                })
+                .await
+                .unwrap();
+            let mut service = BrowserService::new_with_proxy_and_ca(
+                db.clone(),
+                None,
+                None,
+                "http://127.0.0.1:17891".into(),
+                None,
+                directory.path().join("profiles"),
+            );
+            service.node_path = Some(PathBuf::from("/bin/sh"));
+            service.worker_path = Some(script.clone());
+            let mut sessions = Vec::new();
+            for _ in 0..2 {
+                let mut session = db.create_browser_session(project.id, None).await.unwrap();
+                session.state = BrowserSessionState::Ready;
+                db.update_browser_session(&session).await.unwrap();
+                let capture = db
+                    .create_capture_session(CreateCaptureSession {
+                        project_id: project.id,
+                        browser_session_id: Some(session.id),
+                        browser_action_id: None,
+                        is_browser_bound: true,
+                        ttl: None,
+                    })
+                    .await
+                    .unwrap();
+                service.runtime_sessions.lock().await.insert(
+                    session.id.get(),
+                    RuntimeSession {
+                        project_id: project.id,
+                        capture_session_id: capture.id,
+                        persistent: false,
+                        profile: None,
+                        cdp: None,
+                        javascript_cursor: 0,
+                    },
+                );
+                sessions.push(session.id);
+            }
+            let mut worker = WorkerProcess::spawn(Path::new("/bin/sh"), &script, None, None)
+                .await
+                .unwrap_or_else(|_| panic!("start fixture worker"));
+            worker.rpc_timeout = rpc_timeout;
+            *service.worker_entry(project.id).await.lock().await = Some(worker);
+            Self {
+                service: Arc::new(service),
+                db,
+                project_id: project.id,
+                sessions: [sessions[0], sessions[1]],
+                script,
+                _directory: directory,
+            }
+        }
+
+        async fn call(&self, method: &str, session: BrowserSessionId) -> DomainResult<Value> {
+            self.service
+                .call_worker(
+                    self.project_id,
+                    method,
+                    json!({"session_id": session.get()}),
+                )
+                .await
+        }
+
+        fn spawns(&self) -> usize {
+            std::fs::read_to_string(self.script.with_extension("sh.spawns"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+
+        async fn is_attached(&self, session: BrowserSessionId) -> bool {
+            self.service
+                .runtime_sessions
+                .lock()
+                .await
+                .contains_key(&session.get())
+        }
+
+        async fn session(&self, session: BrowserSessionId) -> BrowserSession {
+            self.db
+                .get_browser_session(self.project_id, session)
+                .await
+                .unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_session_call_holds_up_no_other_session() {
+        let lanes = SessionLanes::start(true, Duration::from_secs(5)).await;
+        let [slow, other] = lanes.sessions;
+        let slow_call = {
+            let service = lanes.service.clone();
+            let project_id = lanes.project_id;
+            tokio::spawn(async move {
+                service
+                    .call_worker(
+                        project_id,
+                        "session.slow",
+                        json!({"session_id": slow.get()}),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !lanes.script.with_extension("sh.slow").is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture did not receive the slow request");
+        // Answered while the slow call still waits, and each caller gets its
+        // own answer although they arrive out of order.
+        assert_eq!(
+            lanes.call("session.quick", other).await.unwrap(),
+            json!({"quick": true})
+        );
+        assert!(!slow_call.is_finished());
+        assert_eq!(slow_call.await.unwrap().unwrap(), json!({"slow": true}));
+        assert_eq!(lanes.spawns(), 1);
+        lanes.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_call_that_times_out_interrupts_only_its_session() {
+        let lanes = SessionLanes::start(true, Duration::from_secs(1)).await;
+        let [stuck, other] = lanes.sessions;
+        let error = lanes.call("session.hang", stuck).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        let interrupted = lanes.session(stuck).await;
+        assert_eq!(interrupted.state, BrowserSessionState::Interrupted);
+        assert_eq!(
+            interrupted.checkpoint_status.as_deref(),
+            Some("session_timed_out")
+        );
+        assert!(!lanes.is_attached(stuck).await);
+        // The other session keeps its browser on the same worker.
+        assert!(lanes.is_attached(other).await);
+        assert_eq!(lanes.session(other).await.state, BrowserSessionState::Ready);
+        assert_eq!(
+            lanes.call("session.quick", other).await.unwrap(),
+            json!({"quick": true})
+        );
+        assert_eq!(lanes.spawns(), 1);
+        assert_eq!(
+            lanes.call("session.quick", stuck).await.unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+        lanes.service.force_stop_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_that_cannot_abort_a_session_is_replaced() {
+        let lanes = SessionLanes::start(false, Duration::from_secs(1)).await;
+        let [stuck, other] = lanes.sessions;
+        let error = lanes.call("session.hang", stuck).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Timeout);
+        for session in [stuck, other] {
+            assert!(!lanes.is_attached(session).await);
+            let interrupted = lanes.session(session).await;
+            assert_eq!(interrupted.state, BrowserSessionState::Interrupted);
+            assert_eq!(
+                interrupted.checkpoint_status.as_deref(),
+                Some("worker_interrupted")
+            );
+        }
+        assert!(!lanes.service.worker_is_running(lanes.project_id).await);
+        lanes.service.force_stop_all().await;
     }
 
     /// A service with one ready browser session whose worker is a shell
@@ -7983,8 +8382,11 @@ IFS= read -r request
     async fn worker_lifecycle_terminate_kills_group_after_leader_is_reaped() {
         let (mut worker, _directory) = lifecycle_worker().await;
         let mut member = lifecycle_group_member(worker.process_group);
-        worker.stdin.write_all(b"exit\n").await.unwrap();
-        worker.stdin.flush().await.unwrap();
+        {
+            let mut stdin = worker.io.stdin.lock().await;
+            stdin.write_all(b"exit\n").await.unwrap();
+            stdin.flush().await.unwrap();
+        }
         let status = tokio::time::timeout(Duration::from_secs(5), worker.child.wait())
             .await
             .expect("worker leader did not exit")
