@@ -8058,8 +8058,20 @@ done
             .await
             .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(350));
-        let waits = fixture.requests("session.events_wait").len();
-        assert!((2..=8).contains(&waits), "{waits} waits");
+        // Sliced, whatever each round trip costs on a busy machine: no
+        // request asks for more than a slice, and together they cover the wait.
+        let asked = fixture
+            .requests("session.events_wait")
+            .iter()
+            .map(|request| request["params"]["wait_ms"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            asked
+                .iter()
+                .all(|&ms| (1..=EVENT_WAIT_SLICE.as_millis() as u64).contains(&ms)),
+            "{asked:?}"
+        );
+        assert!(asked.len() <= 8, "{asked:?}");
         assert_eq!(fixture.requests("session.action").len(), 1);
         fixture.service.force_stop_all().await;
     }

@@ -2981,12 +2981,14 @@ async function handle(req) {
           return respond(id, { aborted: false });
         }
         sessions.delete(sessionId);
-        // A browser that does not close soon is left to the worker's exit.
-        await Promise.race([
-          closeRuntime(session).catch(() => undefined),
-          new Promise((resolve) => { const timer = setTimeout(resolve, 5_000); timer.unref(); }),
+        const closed = await Promise.race([
+          closeRuntime(session).then(() => true, () => false),
+          new Promise((resolve) => { const timer = setTimeout(() => resolve(false), 5_000); timer.unref(); }),
         ]);
-        logMeta("session.abort", { session_id: sessionId });
+        logMeta("session.abort", { session_id: sessionId, closed });
+        // A browser left running could keep its profile locked: the daemon
+        // then replaces this worker, which stops every browser it started.
+        if (!closed) throw rpcError(-32000, "aborted browser session did not close");
         return respond(id, { aborted: true });
       }
       case "session.status": {
