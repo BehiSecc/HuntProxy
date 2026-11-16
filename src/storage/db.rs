@@ -75,16 +75,19 @@ struct WriteLock {
     wait: Duration,
 }
 
-/// One lock per database file; in-memory databases share the `""` entry.
+/// One lock per database file.
 static WRITE_LOCKS: LazyLock<dashmap::DashMap<String, Arc<WriteLock>>> =
     LazyLock::new(Default::default);
 
 /// Connections that are not pooled wait as long as the default busy timeout.
 const DEFAULT_WRITE_WAIT: Duration = Duration::from_millis(5_000);
 
-fn write_lock(conn: &Connection, wait: Option<Duration>) -> Arc<WriteLock> {
-    let key = conn.path().unwrap_or_default().to_owned();
-    WRITE_LOCKS
+/// The write lock of `conn`'s database file. In-memory databases, which only
+/// tests use, report no file name and so no lock: one shared lock would make
+/// unrelated databases wait for each other.
+fn write_lock(conn: &Connection, wait: Option<Duration>) -> Option<Arc<WriteLock>> {
+    let key = conn.path().filter(|path| !path.is_empty())?.to_owned();
+    let lock = WRITE_LOCKS
         .entry(key)
         .or_insert_with(|| {
             Arc::new(WriteLock {
@@ -93,7 +96,8 @@ fn write_lock(conn: &Connection, wait: Option<Duration>) -> Arc<WriteLock> {
                 wait: wait.unwrap_or(DEFAULT_WRITE_WAIT),
             })
         })
-        .clone()
+        .clone();
+    Some(lock)
 }
 
 /// A writer's turn; the next writer goes when it is dropped.
@@ -258,7 +262,7 @@ fn backup_before_migration(
 pub(crate) struct WriteTransaction<'conn> {
     // Declared first so a dropped transaction rolls back before the turn ends.
     tx: rusqlite::Transaction<'conn>,
-    _turn: WriteTurn,
+    _turn: Option<WriteTurn>,
 }
 
 impl WriteTransaction<'_> {
@@ -285,12 +289,16 @@ impl DerefMut for WriteTransaction<'_> {
 /// the write lock is held from the first statement: a deferred transaction
 /// that reads first fails when another writer commits before its first write.
 pub(crate) fn write_transaction(conn: &Connection) -> rusqlite::Result<WriteTransaction<'_>> {
-    let turn = WriteTurn::take(write_lock(conn, None)).ok_or_else(|| {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            Some("timed out waiting for this database's write lock".into()),
-        )
-    })?;
+    let turn = write_lock(conn, None)
+        .map(|lock| {
+            WriteTurn::take(lock).ok_or_else(|| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("timed out waiting for this database's write lock".into()),
+                )
+            })
+        })
+        .transpose()?;
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     Ok(WriteTransaction { tx, _turn: turn })
 }
