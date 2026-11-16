@@ -224,6 +224,17 @@
         <p class="small muted">Sanitized exports omit authentication state. Full exports contain credentials and browser state; keep them private.</p>
       </details>
 
+      <details id="requestLimitsPanel" style="margin-top:.75rem">
+        <summary>Request limits</summary>
+        <p class="small muted">Shared by Reply, Fuzzer, the crawler and extensions. Running fuzz jobs keep the limits they started with.</p>
+        <div class="row">
+          <div><label for="limitRate">Requests per second</label><input id="limitRate" type="number" min="0.1" max="1000" step="any" /></div>
+          <div><label for="limitConcurrency">In flight at once</label><input id="limitConcurrency" type="number" min="1" max="256" step="1" /></div>
+        </div>
+        <button class="btn" id="saveRequestLimits" style="width:100%;margin-top:.4rem">Save request limits</button>
+        <div class="status" id="requestLimitsStatus"></div>
+      </details>
+
       <details id="ipRotationPanel" style="margin-top:.75rem">
         <summary>IP rotation</summary>
         <p class="small muted">Route this exact origin through regional AWS API Gateways until disabled. Credentials are read from the IpRotate plugin's <code>aws-credentials.toml</code>; raw HTTP remains direct.</p>
@@ -500,6 +511,8 @@ test
             </div>
             <label for="fuzzTransforms">Transforms applied to payloads</label>
             <input id="fuzzTransforms" placeholder="url_encode,base64_encode" />
+            <label for="fuzzTimeout">Timeout per case <span class="muted">(ms, optional)</span></label>
+            <input id="fuzzTimeout" type="number" min="100" max="60000" step="100" placeholder="60000" />
             <button class="btn primary" id="startFuzz" style="width:100%;margin-top:.65rem">Start</button>
             <div class="status" id="fuzzStatus"></div>
           </div>
@@ -824,13 +837,14 @@ test
       $('analyzePage').disabled = true;
       $('pageAnalysis').classList.add('hidden');
       connectEvents();
-      if (!state.projectId) { renderIpRotationProfiles([]); status('ipRotationStatus', 'Select a project.'); return; }
+      if (!state.projectId) { renderIpRotationProfiles([]); renderRequestLimits(null); status('ipRotationStatus', 'Select a project.'); return; }
       try {
         const project = await api(`/api/v1/projects/${browserSelection.projectId}`);
         if (!isCurrentBrowserContext(browserSelection)) return;
         $('scopeHosts').value = (project.scope?.host_patterns || []).join(', ');
         $('scopeExcludedHosts').value = (project.scope?.excluded_host_patterns || []).join(', ');
         $('renameProjectName').value = project.name || '';
+        renderRequestLimits(project.limits);
         renderUpstreamProxyStatus(project.upstream_proxy);
         $('browserUrl').value = project.target_url || '';
         $('cookieTarget').value = project.target_url || '';
@@ -1037,6 +1051,27 @@ test
         });
         status('sideStatus', (hosts.length || excludedHosts.length) ? 'Capture scope saved' : 'Capture scope cleared; saving all traffic', 'ok');
       } catch (e) { status('sideStatus', e.message, 'err'); }
+    };
+
+    function renderRequestLimits(limits) {
+      $('limitRate').value = limits?.requests_per_second ?? '';
+      $('limitConcurrency').value = limits?.max_concurrent_requests ?? '';
+      status('requestLimitsStatus');
+    }
+    $('saveRequestLimits').onclick = async () => {
+      if (!state.projectId) return status('requestLimitsStatus', 'Select a project', 'err');
+      const projectId = state.projectId;
+      const rate = $('limitRate').value.trim();
+      const concurrency = $('limitConcurrency').value.trim();
+      const body = {};
+      if (rate) body.requests_per_second = Number(rate);
+      if (concurrency) body.max_concurrent_requests = Number(concurrency);
+      try {
+        const project = await api(`/api/v1/projects/${projectId}/limits`, { method: 'POST', body: JSON.stringify(body) });
+        if (projectId !== state.projectId) return;
+        renderRequestLimits(project.limits);
+        status('requestLimitsStatus', `Saved: ${project.limits.requests_per_second}/s, ${project.limits.max_concurrent_requests} in flight`, 'ok');
+      } catch (e) { status('requestLimitsStatus', e.message, 'err'); }
     };
 
     async function loadCookies() {
@@ -1808,6 +1843,8 @@ test
           draft: replyDraftFromForm(), insertion_points: parsePoints(), ...fuzzPayloadInput(),
           transforms: $('fuzzTransforms').value.split(',').map(s => s.trim()).filter(Boolean), strategy: $('fuzzStrategy').value,
         };
+        const timeout = $('fuzzTimeout').value.trim();
+        if (timeout) template.request_timeout_ms = Number(timeout);
         let job;
         try {
           job = await api(`/api/v1/projects/${state.projectId}/fuzz-jobs`, { method: 'POST', body: JSON.stringify({ template, confirm: false }) });

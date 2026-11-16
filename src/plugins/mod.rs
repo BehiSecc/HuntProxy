@@ -3127,6 +3127,7 @@ impl PluginService {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
                     plugin_target_host: target_host.map(str::to_string),
+                    request_timeout: None,
                 };
                 if let Some(cookie) = identity_cookie {
                     header_overrides.retain(|header| !header.name.eq_ignore_ascii_case("cookie"));
@@ -3272,6 +3273,7 @@ impl PluginService {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
                             plugin_target_host: None,
+                            request_timeout: None,
                         },
                     ) => response?,
                 };
@@ -3393,7 +3395,7 @@ impl PluginService {
                                 bytes,
                                 use_project_cookies,
                                 options,
-                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default(), plugin_target_host: None },
+                                ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage::default(), plugin_target_host: None, request_timeout: None },
                             ) => response,
                         };
                         let observation = match result {
@@ -3442,6 +3444,7 @@ impl PluginService {
                             source: ExchangeSource::Plugin,
                             lineage: ExchangeLineage::default(),
                             plugin_target_host: None,
+                            request_timeout: None,
                         },
                     ) => response?,
                 };
@@ -3986,7 +3989,7 @@ impl PluginService {
             enforce_plugin_scope(&url, scope, target_host)?;
             let response = tokio::select! {
                 _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
-                response = self.reply.send_with_context_and_slots(project_id, request.base_exchange_id, &draft, request.protocol, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() }, plugin_target_host: target_host.map(str::to_string) }, slots) => response?,
+                response = self.reply.send_with_context_and_slots(project_id, request.base_exchange_id, &draft, request.protocol, ReplySendContext { source: ExchangeSource::Plugin, lineage: ExchangeLineage { parent_exchange_id: request.base_exchange_id, ..Default::default() }, plugin_target_host: target_host.map(str::to_string), request_timeout: None }, slots) => response?,
             };
             if let Some(exchange_id) = response.exchange_id {
                 self.annotate_plugin_exchange(
@@ -4204,6 +4207,7 @@ impl PluginService {
                     source: ExchangeSource::Plugin,
                     lineage: ExchangeLineage::default(),
                     plugin_target_host: None,
+                    request_timeout: None,
                 },
             ) => result,
         };
@@ -4318,6 +4322,7 @@ impl PluginService {
                             ..Default::default()
                         },
                         plugin_target_host: None,
+                        request_timeout: None,
                     },
                 ) => response?,
             };

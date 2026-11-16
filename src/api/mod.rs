@@ -163,6 +163,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(update_project_scope).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
         )
         .route(
+            "/api/v1/projects/{id}/limits",
+            post(update_project_request_budget).layer(DefaultBodyLimit::max(SMALL_BODY_LIMIT)),
+        )
+        .route(
             "/api/v1/projects/{id}/request-rules",
             get(list_request_rules)
                 .post(create_request_rule)
@@ -1021,6 +1025,21 @@ async fn update_project_scope(
     match state
         .db
         .update_project_scope(ProjectId(id), scope, None)
+        .await
+    {
+        Ok(project) => Json(project).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn update_project_request_budget(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(update): Json<RequestBudgetUpdate>,
+) -> Response {
+    match state
+        .db
+        .update_project_request_budget(ProjectId(id), update)
         .await
     {
         Ok(project) => Json(project).into_response(),

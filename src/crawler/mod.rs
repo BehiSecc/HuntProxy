@@ -190,6 +190,7 @@ impl CrawlerService {
                         ..Default::default()
                     },
                     plugin_target_host: None,
+                    request_timeout: None,
                 };
                 match self
                     .reply

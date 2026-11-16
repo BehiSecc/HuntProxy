@@ -584,6 +584,8 @@ pub struct ReplySendContext {
     pub lineage: ExchangeLineage,
     /// Plugin operations revalidate their final URL after project rewrite rules.
     pub plugin_target_host: Option<String>,
+    /// Shortens the request's total timeout; Reply's own is the ceiling.
+    pub request_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -637,6 +639,7 @@ impl ReplySendContext {
                 ..Default::default()
             },
             plugin_target_host: None,
+            request_timeout: None,
         }
     }
 
@@ -650,9 +653,18 @@ impl ReplySendContext {
                 ..Default::default()
             },
             plugin_target_host: None,
+            request_timeout: None,
         }
     }
+
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
 }
+
+/// The total timeout of a Reply send unless its context shortens it.
+const REPLY_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A send that failed, with the exchange saved for the failed attempt.
 #[derive(Debug)]
@@ -1094,6 +1106,11 @@ impl ReplyService {
             Some(slots) => slots,
             None => self.request_limiter.acquire(&project, 1).await?,
         };
+        let total_timeout = context
+            .request_timeout
+            .map_or(REPLY_TOTAL_TIMEOUT, |timeout| {
+                timeout.min(REPLY_TOTAL_TIMEOUT)
+            });
         let started = std::time::Instant::now();
         let out = self
             .transport
@@ -1120,8 +1137,8 @@ impl ReplyService {
                         ProtocolPreference::H1 => ProtocolMode::Http1,
                         ProtocolPreference::H2 => ProtocolMode::Http2,
                     },
-                    connect_timeout: Duration::from_secs(10),
-                    total_timeout: Duration::from_secs(60),
+                    connect_timeout: Duration::from_secs(10).min(total_timeout),
+                    total_timeout,
                     max_body_bytes: project.limits.max_body_bytes,
                     preserve_identity_headers: true,
                     upstream_proxy,
