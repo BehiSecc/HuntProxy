@@ -203,22 +203,15 @@ impl Db {
         }
         let query_urls = unique.clone();
         self.with_conn(move |conn| {
-            let placeholders = (0..query_urls.len())
-                .map(|index| format!("?{}", index + 2))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT scheme || '://' || authority || path ||
-                        CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END
-                   FROM exchanges
-                  WHERE project_id=?1 AND
-                        (scheme || '://' || authority || path ||
-                         CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END)
-                        IN ({placeholders})"
-            );
-            let mut values = Vec::with_capacity(query_urls.len() + 1);
+            let authorities = query_urls
+                .iter()
+                .filter_map(|url| url_authority(url))
+                .collect::<HashSet<_>>();
+            let mut values = Vec::with_capacity(1 + authorities.len() + query_urls.len());
             values.push(Value::Integer(project_id.get()));
+            values.extend(authorities.iter().map(|a| Value::Text((*a).to_owned())));
             values.extend(query_urls.iter().cloned().map(Value::Text));
+            let sql = uncaptured_urls_sql(authorities.len(), query_urls.len());
             let mut statement = conn.prepare(&sql).map_err(storage_error)?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(values), |row| {
@@ -899,6 +892,36 @@ fn raw_summary(
     })
 }
 
+/// The text between `://` and the path or query of `url`: the only stored
+/// `authority` whose `scheme://authority/path?query` can equal `url`.
+fn url_authority(url: &str) -> Option<&str> {
+    let rest = &url[url.find("://")? + 3..];
+    Some(&rest[..rest.find(['/', '?']).unwrap_or(rest.len())])
+}
+
+/// Saved URLs among `?{authorities+2}..` hosts that equal one of the URLs
+/// after them. Matching the authorities first lets SQLite use
+/// `idx_exchanges_authority` instead of rebuilding every saved URL.
+fn uncaptured_urls_sql(authorities: usize, urls: usize) -> String {
+    let placeholders = |from: usize, count: usize| {
+        (from..from + count)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "SELECT scheme || '://' || authority || path ||
+                CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END
+           FROM exchanges
+          WHERE project_id=?1 AND authority IN ({}) AND
+                (scheme || '://' || authority || path ||
+                 CASE WHEN query IS NULL OR query='' THEN '' ELSE '?' || query END)
+                IN ({})",
+        placeholders(2, authorities),
+        placeholders(2 + authorities, urls)
+    )
+}
+
 pub fn insert_exchange_conn(
     conn: &rusqlite::Connection,
     ex: NewExchange,
@@ -1383,6 +1406,79 @@ fn storage_error(error: rusqlite::Error) -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn uncaptured_urls_are_found_through_the_authority_index() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "crawl".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        for (authority, path, query) in [
+            ("example.com", "/app.js", None),
+            ("example.com", "/", Some("q=1")),
+            ("cdn.example.com:8443", "/lib.css", None),
+        ] {
+            db.insert_exchange(NewExchange {
+                authority: authority.into(),
+                host: authority.split(':').next().unwrap().into(),
+                method: "GET".into(),
+                path: path.into(),
+                query: query.map(str::to_owned),
+                ..spool_exchange(project.id)
+            })
+            .await
+            .unwrap();
+        }
+        let urls = [
+            "https://example.com/app.js",
+            "https://example.com/?q=1",
+            "https://example.com/?q=2",
+            "https://cdn.example.com:8443/lib.css",
+            "https://cdn.example.com/lib.css",
+            "https://other.test/app.js",
+            "not a url",
+        ];
+        let left = db
+            .filter_uncaptured_urls(project.id, urls.iter().map(|url| url.to_string()).collect())
+            .await
+            .unwrap();
+        assert_eq!(
+            left,
+            [
+                "https://example.com/?q=2",
+                "https://cdn.example.com/lib.css",
+                "https://other.test/app.js",
+                "not a url",
+            ]
+        );
+
+        assert_eq!(url_authority("https://a.test:1/x?y"), Some("a.test:1"));
+        assert_eq!(url_authority("https://a.test?y"), Some("a.test"));
+        assert_eq!(url_authority("https://a.test"), Some("a.test"));
+        assert_eq!(url_authority("a.test/x"), None);
+        let plan = db
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {}", uncaptured_urls_sql(2, 3)))
+                    .map_err(storage_error)?;
+                let rows = statement
+                    .query_map(params![1, "a", "b", "x", "y", "z"], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .map_err(storage_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(storage_error)?;
+                Ok(rows.join("\n"))
+            })
+            .await
+            .unwrap();
+        assert!(plan.contains("idx_exchanges_authority"), "{plan}");
+    }
 
     #[test]
     fn mixed_evidence_representations_round_trip() {
