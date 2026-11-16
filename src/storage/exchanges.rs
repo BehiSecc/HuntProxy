@@ -4,7 +4,10 @@ use crate::domain::*;
 use crate::history::{filter_to_sql, FilterNode};
 use crate::policy::{present_headers, PresentationOptions};
 use crate::storage::annotations::load_labels_conn;
-use crate::storage::bodies::{store_body_conn, store_body_file_conn, StoredBody};
+use crate::storage::bodies::{
+    hash_body_file, prepare_body, store_body_conn, store_body_file_conn, store_prepared_body_conn,
+    StoredBody,
+};
 use crate::storage::projects::{now_rfc3339, parse_time};
 use crate::storage::Db;
 use rusqlite::params;
@@ -527,8 +530,31 @@ impl Db {
 
     pub async fn insert_exchange(&self, ex: NewExchange) -> DomainResult<ExchangeId> {
         self.with_conn(move |conn| {
+            // Hash and compress the bodies before taking the write lock.
+            let request = ex
+                .request_body
+                .as_deref()
+                .map(|body| prepare_body(conn, body));
+            let response = ex
+                .response_body
+                .as_deref()
+                .map(|body| prepare_body(conn, body));
             let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
-            let exchange_id = insert_exchange_conn(&tx, ex)?;
+            let request_body = ex
+                .request_body
+                .as_deref()
+                .zip(request)
+                .map(|(body, prepared)| store_prepared_body_conn(&tx, body, prepared, None))
+                .transpose()?;
+            let response_body = ex
+                .response_body
+                .as_deref()
+                .zip(response)
+                .map(|(body, prepared)| {
+                    store_prepared_body_conn(&tx, body, prepared, ex.mime.as_deref())
+                })
+                .transpose()?;
+            let exchange_id = insert_exchange_record_conn(&tx, ex, request_body, response_body)?;
             tx.commit().map_err(storage_error)?;
             Ok(exchange_id)
         })
@@ -548,14 +574,21 @@ impl Db {
             ));
         }
         self.with_conn(move |conn| {
-            let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
-            let request_body = request_spool
+            // Read and hash the spools before taking the write lock.
+            let request = request_spool
                 .as_deref()
-                .map(|path| store_body_file_conn(&tx, path, None))
+                .map(|path| hash_body_file(path).map(|hashed| (path, hashed)))
                 .transpose()?;
-            let response_body = response_spool
+            let response = response_spool
                 .as_deref()
-                .map(|path| store_body_file_conn(&tx, path, ex.mime.as_deref()))
+                .map(|path| hash_body_file(path).map(|hashed| (path, hashed)))
+                .transpose()?;
+            let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
+            let request_body = request
+                .map(|(path, hashed)| store_body_file_conn(&tx, path, hashed, None))
+                .transpose()?;
+            let response_body = response
+                .map(|(path, hashed)| store_body_file_conn(&tx, path, hashed, ex.mime.as_deref()))
                 .transpose()?;
             let exchange_id = insert_exchange_record_conn(&tx, ex, request_body, response_body)?;
             tx.commit().map_err(storage_error)?;
