@@ -486,39 +486,40 @@ impl Db {
     ) -> DomainResult<(Vec<FuzzCaseResult>, Option<u64>)> {
         let limit = limit.clamp(1, 500) as usize;
         self.with_conn(move |conn| {
-            let grouping = load_grouping_cases(conn, project_id, job_id)?;
-            let all_matching_indexes = grouping
+            // Group membership comes from the metadata-only grouping rows; only
+            // the page itself loads full case rows with their payloads.
+            let mut matching = load_grouping_cases(conn, project_id, job_id)?
                 .into_iter()
                 .filter(|row| group_id(&grouping_signature(row)) == wanted_group_id)
-                .map(|row| row.case_index)
-                .collect::<std::collections::BTreeSet<_>>();
-            if all_matching_indexes.is_empty() {
+                .map(|row| (row.case_index, row.id))
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
                 return Err(DomainError::not_found("fuzz response group"));
             }
-            let matching_indexes = all_matching_indexes
+            matching.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+            let page = matching
                 .into_iter()
-                .filter(|index| before_case_index.is_none_or(|before| *index < before))
-                .collect::<std::collections::BTreeSet<_>>();
+                .filter(|(index, _)| before_case_index.is_none_or(|before| *index < before))
+                .take(limit + 1)
+                .collect::<Vec<_>>();
+            let has_more = page.len() > limit;
             let mut stmt = conn
                 .prepare(
                     "SELECT fc.id, fc.job_id, fj.project_id, fc.case_index, fc.state, fc.payloads_json,
                             fc.exchange_id, fc.status_code, fc.response_length, fc.duration_ms, fc.error,
                             fc.body_hash, fc.created_at, fc.started_at, fc.finished_at
                      FROM fuzz_cases fc JOIN fuzz_jobs fj ON fj.id=fc.job_id
-                     WHERE fc.job_id=?1 AND fj.project_id=?2 ORDER BY fc.case_index DESC",
+                     WHERE fc.id=?1 AND fc.job_id=?2 AND fj.project_id=?3",
                 )
                 .map_err(storage_error)?;
-            let all = stmt
-                .query_map(params![job_id.get(), project_id.get()], map_fuzz_case)
-                .map_err(storage_error)?
+            let cases = page
+                .iter()
+                .take(limit)
+                .map(|(_, case_id)| {
+                    stmt.query_row(params![case_id, job_id.get(), project_id.get()], map_fuzz_case)
+                })
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(storage_error)?;
-            let mut cases = all
-                .into_iter()
-                .filter(|case| matching_indexes.contains(&case.case_index))
-                .collect::<Vec<_>>();
-            let has_more = cases.len() > limit;
-            cases.truncate(limit);
             let next = has_more.then(|| cases.last().expect("group page is non-empty").case_index);
             Ok((cases, next))
         })
@@ -987,6 +988,87 @@ mod counter_tests {
                 None,
                 None,
             )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn group_case_pages_return_only_members_newest_first() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz".into(),
+                target_url: "https://example.test".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap()
+            .id;
+        let job = db
+            .create_fuzz_job(
+                project,
+                None,
+                FuzzStrategy::Sniper,
+                "{}".into(),
+                10,
+                "{}".into(),
+            )
+            .await
+            .unwrap()
+            .id;
+        for index in 0..10 {
+            let case = db
+                .create_fuzz_case(project, job, index, vec![])
+                .await
+                .unwrap()
+                .id;
+            let hash = if index % 2 == 0 { "even" } else { "odd" };
+            db.finish_fuzz_case(
+                project,
+                job,
+                case,
+                FuzzCaseState::Completed,
+                None,
+                Some(200),
+                Some(10),
+                Some(1),
+                None,
+                Some(hash.into()),
+            )
+            .await
+            .unwrap();
+        }
+        let groups = db.list_fuzz_response_groups(project, job).await.unwrap();
+        let even = groups
+            .iter()
+            .find(|group| group.body_hash.as_deref() == Some("even"))
+            .unwrap()
+            .group_id
+            .clone();
+
+        let mut before = None;
+        let mut seen = Vec::new();
+        loop {
+            let (cases, next) = db
+                .list_fuzz_cases_in_group(project, job, even.clone(), 2, before)
+                .await
+                .unwrap();
+            assert!(cases
+                .iter()
+                .all(|case| case.body_hash.as_deref() == Some("even")));
+            seen.extend(cases.iter().map(|case| case.case_index));
+            match next {
+                Some(next) => {
+                    assert_eq!(Some(&next), seen.last());
+                    before = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen, vec![8, 6, 4, 2, 0]);
+        let missing = db
+            .list_fuzz_cases_in_group(project, job, "0000000000000000".into(), 2, None)
             .await
             .unwrap_err();
         assert_eq!(missing.code(), ErrorCode::NotFound);
