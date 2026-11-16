@@ -5,8 +5,8 @@ use crate::history::{filter_to_sql, FilterNode};
 use crate::policy::{present_headers, PresentationOptions};
 use crate::storage::annotations::load_labels_conn;
 use crate::storage::bodies::{
-    hash_body_file, prepare_body, store_body_conn, store_body_file_conn, store_prepared_body_conn,
-    StoredBody,
+    prepare_body, prepare_body_file, store_body_conn, store_body_file_conn,
+    store_prepared_body_conn, StoredBody,
 };
 use crate::storage::headers::{insert_headers_conn, load_headers_conn};
 use crate::storage::projects::{now_rfc3339, parse_time};
@@ -568,14 +568,14 @@ impl Db {
             ));
         }
         self.with_conn(move |conn| {
-            // Read and hash the spools before taking the write lock.
+            // Hash and compress the spools before taking the write lock.
             let request = request_spool
                 .as_deref()
-                .map(|path| hash_body_file(path).map(|hashed| (path, hashed)))
+                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
                 .transpose()?;
             let response = response_spool
                 .as_deref()
-                .map(|path| hash_body_file(path).map(|hashed| (path, hashed)))
+                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
                 .transpose()?;
             let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             let request_body = request

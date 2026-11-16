@@ -90,4 +90,13 @@ BEGIN
        AND ordinal = OLD.ordinal;
 END;
 
+-- Bodies captured through a spool were stored uncompressed. A background pass
+-- compresses them once, resuming from cursor (the last body id it handled).
+CREATE TABLE storage_maintenance (
+    task TEXT PRIMARY KEY,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    finished_at TEXT
+);
+INSERT INTO storage_maintenance (task) VALUES ('compress_raw_bodies');
+
 PRAGMA cache_size = -2000;
