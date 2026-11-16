@@ -2530,6 +2530,61 @@ async function pointerTarget(page, locator, point, label, scroll = true) {
   return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
 }
 
+// What lies under a viewport point, followed through open shadow roots and
+// into frames, briefly described. A click at a point has no actionability
+// check, so this is how its caller learns whether it hit what was meant.
+// Found before the click, which may navigate or remove the element.
+async function elementAtPoint(page, point) {
+  let frame = page.mainFrame();
+  let { x, y } = point;
+  for (let depth = 0; depth < 4; depth += 1) {
+    const handle = await frame.evaluateHandle(([x, y]) => {
+      let node = document.elementFromPoint(x, y);
+      while (node?.shadowRoot) {
+        const inner = node.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === node) break;
+        node = inner;
+      }
+      return node;
+    }, [x, y]);
+    const element = handle.asElement();
+    if (!element) {
+      await handle.dispose();
+      return null;
+    }
+    try {
+      const found = await element.evaluate((node) => {
+        const text = (node.innerText || node.getAttribute("aria-label") || node.getAttribute("placeholder")
+          || node.getAttribute("alt") || node.getAttribute("title") || "").replace(/\s+/g, " ").trim();
+        const box = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return {
+          described: {
+            tag: node.localName,
+            id: node.id ? node.id.slice(0, 64) : undefined,
+            role: node.getAttribute("role")?.slice(0, 32) || undefined,
+            text: text ? text.slice(0, 80) : undefined,
+          },
+          // Where the frame's own viewport starts, inside border and padding.
+          left: box.left + node.clientLeft + parseFloat(style.paddingLeft),
+          top: box.top + node.clientTop + parseFloat(style.paddingTop),
+        };
+      });
+      const child = /^i?frame$/.test(found.described.tag) ? await element.contentFrame() : null;
+      if (!child) {
+        return frame === page.mainFrame() ? found.described
+          : { ...found.described, frame: publicLocation(frame.url()) || frame.name().slice(0, 64) || null };
+      }
+      frame = child;
+      x -= found.left;
+      y -= found.top;
+    } finally {
+      await handle.dispose();
+    }
+  }
+  return null;
+}
+
 // Holds modifier keys around pointer input given as a point; Playwright only
 // takes them as an option for input aimed at a locator.
 async function holdingModifiers(page, modifiers, run) {
@@ -2563,13 +2618,19 @@ async function performPointer(page, action) {
       if (Boolean(action.locator) === Boolean(point)) {
         throw rpcError(-32602, "pointer click requires either a locator or x and y");
       }
-      // An element gets Playwright's actionability checks; a point is clicked as it is.
+      // An element gets Playwright's actionability checks; a point is clicked
+      // as it is, and the result names what it landed on.
       if (action.locator) {
         await locatorFor(page, action.locator).click({ button, clickCount: count, modifiers, timeout: 30_000 });
-      } else {
-        await holdingModifiers(page, modifiers, () => page.mouse.click(point.x, point.y, { button, clickCount: count }));
+        return { message: "pointer clicked", data: { url: page.url() } };
       }
-      return { message: "pointer clicked", data: { url: page.url() } };
+      {
+        // A page busy navigating has nothing to describe; the click still goes.
+        const hit = await elementAtPoint(page, point).catch(() => null);
+        await holdingModifiers(page, modifiers, () => page.mouse.click(point.x, point.y, { button, clickCount: count }));
+        const named = hit ? ` ${hit.tag}${hit.id ? `#${hit.id}` : ""}${hit.frame ? " in a frame" : ""}` : "";
+        return { message: `pointer clicked${named}`, data: { url: page.url(), hit } };
+      }
     case "hover":
       if (Boolean(action.locator) === Boolean(point)) {
         throw rpcError(-32602, "pointer hover requires either a locator or x and y");
@@ -2682,6 +2743,21 @@ function actionError(error, action) {
   return rpcError(-32000, `${message.split("\nCall log:")[0].trimEnd()}\nSet nth on the locator to pick one of them: 0 is the first, -1 the last.`);
 }
 
+const FRAME_WAIT_MS = 5_000;
+
+// A frame that is still being added, or has not yet loaded the document its
+// URL names, matches nothing for a moment. An action naming such a frame waits
+// up to FRAME_WAIT_MS for it before chooseFrame reports what is there.
+async function awaitNamedFrames(page, action) {
+  const selectors = [action.locator?.frame, action.to_locator?.frame, action.type === "evaluate" ? action.frame : null]
+    .filter((selector) => typeof selector === "string" && selector);
+  const missing = () => selectors.some((selector) => !childFrames(page)
+    .some((frame) => frame.name() === selector || frame.url().includes(selector)));
+  for (const deadline = Date.now() + FRAME_WAIT_MS; missing() && Date.now() < deadline && !page.isClosed();) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 async function executeAction(session, action = {}) {
   let result;
   try {
@@ -2701,6 +2777,7 @@ async function performAction(session, action) {
   // Restore it before page actions so Chromium runs animation frames and
   // Playwright can complete its actionability checks.
   if (PAGE_ACTIONS.has(action.type)) await page.bringToFront();
+  await awaitNamedFrames(page, action);
   switch (action.type) {
     case "navigate": {
       const response = await navigateWithProxyCheck(page, () => page.goto(action.url, {

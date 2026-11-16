@@ -929,7 +929,11 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
 
     // A point: one trusted click exactly where it was aimed.
     let clicked = run(pointer("click", 120.0, 90.0)).await;
-    assert_eq!(clicked.message, "pointer clicked");
+    assert_eq!(clicked.message, "pointer clicked div#pad");
+    assert_eq!(
+        clicked.data.unwrap()["hit"],
+        json!({"tag": "div", "id": "pad"})
+    );
     let events = heard().await;
     assert_eq!(
         events

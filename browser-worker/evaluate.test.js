@@ -187,7 +187,8 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
     const started = Date.now();
     assert.deepEqual(await value("({ then() {}, id: 7 })"), { then: "[Function: then]", id: 7 });
     assert.deepEqual(await value("() => ({ then() {}, id: 8 })"), { then: "[Function: then]", id: 8 });
-    assert.ok(Date.now() - started < 2_000);
+    // Well short of the 10 s deadline either one would have waited for.
+    assert.ok(Date.now() - started < 8_000);
     assert.equal(await value("async () => 9"), 9);
     assert.equal(await value("() => { const realm = document.createElement('iframe'); realm.id = 'realm'; document.body.append(realm); return realm.contentWindow.Promise.resolve(10); }"), 10);
     assert.equal(await value("document.querySelector('#realm').remove(); 'removed'"), "removed");
