@@ -75,6 +75,10 @@ pub struct RawHttp2StreamResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_error: Option<String>,
+    /// The response as saved with `exchange_id`, for callers in this process
+    /// that would otherwise read it straight back.
+    #[serde(skip)]
+    pub(crate) saved_response: Option<super::SavedResponse>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -270,6 +274,10 @@ impl ReplyService {
                 complete: response.complete,
                 truncated: response.truncated,
                 transport_error: stream_transport_error,
+                saved_response: exchange_id.map(|_| super::SavedResponse {
+                    headers: response.headers,
+                    body: response.body.into(),
+                }),
             });
         }
         Ok(RawHttp2Result {

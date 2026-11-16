@@ -627,6 +627,16 @@ pub struct ReplySendResult {
     /// The requested identity selector; contains no credential values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<ReplyIdentity>,
+    /// The response headers and body as saved with `exchange_id`, for callers
+    /// in this process that would otherwise read them straight back.
+    #[serde(skip)]
+    pub(crate) saved_response: Option<SavedResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SavedResponse {
+    pub headers: Vec<HeaderEntry>,
+    pub body: bytes::Bytes,
 }
 
 impl ReplySendContext {
@@ -1330,12 +1340,16 @@ impl ReplyService {
 
         let _ = follow_redirects; // redirects: post-MVP partial — off by default in callers
 
-        // Fuzz jobs group and diff responses themselves; a per-case diff would
-        // only add two exchange reads to every case.
+        // Fuzz jobs group and diff responses themselves, and extensions never
+        // read the diff; for them it would only add two exchange reads per send.
         let fuzz_send = context.source == ExchangeSource::Fuzzer;
+        let skip_diff = matches!(
+            context.source,
+            ExchangeSource::Fuzzer | ExchangeSource::Plugin
+        );
         let mut diff = None;
         if let (Some(parent_id), Some(exchange_id), false) =
-            (base_exchange_id, exchange_id, fuzz_send)
+            (base_exchange_id, exchange_id, skip_diff)
         {
             if let Ok(parent) = self
                 .db
@@ -1404,6 +1418,10 @@ impl ReplyService {
             duration_ms,
             status_code,
             identity: draft.identity.clone(),
+            saved_response: exchange_id.map(|_| SavedResponse {
+                headers: resp_headers,
+                body: out.body,
+            }),
         })
     }
 }
@@ -1472,6 +1490,92 @@ mod tests {
         fn provenance(&self) -> TransportProvenance {
             TransportProvenance::GenericUnprofiled
         }
+    }
+
+    #[tokio::test]
+    async fn sends_hand_over_what_they_saved_and_extensions_skip_the_diff() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "handover".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let service = ReplyService {
+            db: db.clone(),
+            transport: Arc::new(CannedTransport),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        };
+        let draft = ReplyDraft {
+            method: Some("GET".into()),
+            url: Some("https://example.com/a".into()),
+            ..Default::default()
+        };
+        let send = |base: Option<ExchangeId>, source: ExchangeSource| {
+            service.send_with_context(
+                project.id,
+                base,
+                &draft,
+                ProtocolPreference::Auto,
+                0,
+                ReplySendContext {
+                    source,
+                    lineage: ExchangeLineage {
+                        parent_exchange_id: base,
+                        ..Default::default()
+                    },
+                    plugin_target_host: None,
+                    request_timeout: None,
+                },
+            )
+        };
+        let pairs = |headers: &[HeaderEntry]| {
+            headers
+                .iter()
+                .map(|header| (header.name.clone(), header.value.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let base = send(None, ExchangeSource::Reply).await.unwrap();
+        let base_id = base.exchange_id.unwrap();
+        let saved = base.saved_response.unwrap();
+        let stored_body = db
+            .load_raw_body(project.id, base_id, MessageSide::Response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.body.as_ref(), stored_body.as_slice());
+        let stored_headers = db
+            .load_raw_headers(project.id, base_id, MessageSide::Response)
+            .await
+            .unwrap();
+        assert_eq!(pairs(&saved.headers), pairs(&stored_headers));
+
+        let reply = send(Some(base_id), ExchangeSource::Reply).await.unwrap();
+        assert!(reply.diff.is_some());
+        let extension = send(Some(base_id), ExchangeSource::Plugin).await.unwrap();
+        assert!(extension.diff.is_none());
+        assert!(extension.saved_response.is_some());
+
+        // Nothing saved, nothing handed over.
+        db.update_project_scope(
+            project.id,
+            ScopePolicy {
+                host_patterns: vec!["other.test".into()],
+                ..project.scope.clone()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let ephemeral = send(None, ExchangeSource::Plugin).await.unwrap();
+        assert!(ephemeral.exchange_id.is_none());
+        assert!(ephemeral.saved_response.is_none());
     }
 
     #[tokio::test]
