@@ -140,6 +140,7 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
       <div id="chip" draggable="true">chip</div><div id="bin"></div>
       <div id="form"><input id="search" aria-label="Search">
         <input class="otp" maxlength="1" aria-label="Digit 1"><input class="otp" maxlength="1"><input class="otp" maxlength="1"><input class="otp" maxlength="1">
+        <input id="mail" type="email" value="a@b.c">
         <div id="editor" contenteditable="true" role="textbox" aria-label="Notes" style="min-width:200px;min-height:20px;border:1px solid #999"></div>
         <ul id="commands" hidden><li>Heading</li></ul>
         <button class="row">Delete</button><button class="row">Delete</button><button class="row">Delete</button></div>
@@ -232,6 +233,18 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
       await assert.rejects(executeAction(session, { type: "pointer", op: "drag", locator: { css: "#pad" }, to_locator: destination }));
     }
     assert.deepEqual(await heard(), []);
+    // A point is a place in the viewport: scrolling an element end into view
+    // would move what lies under it, so a drag with a point never scrolls.
+    const scrolled = await read("scrollY");
+    for (const ends of [
+      { x: 100, y: 120, to_locator: { css: "iframe[name=help]" } },
+      { locator: { css: "iframe[name=help]" }, to_x: 100, to_y: 120 },
+    ]) {
+      await assert.rejects(executeAction(session, { type: "pointer", op: "drag", ...ends }),
+        /element is out of view; a drag that uses x and y does not scroll/);
+    }
+    assert.equal(await read("scrollY"), scrolled);
+    assert.deepEqual(await heard(), []);
   });
 
   await t.test("types keystrokes into a locator or whatever has focus", async () => {
@@ -242,6 +255,13 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     assert.deepEqual(keys.filter((entry) => entry.kind === "search-keydown").map((entry) => entry.key), ["s", "h", "o", "e", "s", " "]);
     assert.equal(keys.filter((entry) => entry.kind === "search-input").length, 7);
     assert.equal(keys.every((entry) => entry.trusted), true);
+    // Typing into a field that holds text adds to its end, as a person would,
+    // in inputs without a selection API too.
+    await run({ type: "type", text: " red", locator: { role: "textbox", name: "Search" } });
+    assert.equal(await read("document.querySelector('#search').value"), "shoes é red");
+    await run({ type: "type", text: "z", locator: { css: "#mail" } });
+    assert.equal(await read("document.querySelector('#mail').value"), "a@b.cz");
+    await heard();
     // One character per box: focus moves on as the page reacts to each key.
     await run({ type: "pointer", op: "click", locator: { role: "textbox", name: "Digit 1" } });
     await run({ type: "type", text: "4821" });
@@ -251,6 +271,8 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     assert.equal(await read("document.querySelector('#commands').hidden"), false);
     await run({ type: "type", text: "a\nb" });
     assert.match(await read("document.querySelector('#editor').innerText"), /^\/a\n+b$/);
+    await run({ type: "type", text: "c", locator: { role: "textbox", name: "Notes" } });
+    assert.match(await read("document.querySelector('#editor').innerText"), /^\/a\n+bc$/);
     const typed = await run({ type: "type", text: "!", snapshot: true });
     assert.match(typed.data.snapshot.content, /textbox "Notes"/);
     await invalid({ type: "type" }, /type requires text of 1\.\.4096 bytes/);

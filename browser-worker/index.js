@@ -2206,7 +2206,16 @@ const EVALUATE_INTERRUPTED = /navigated or closed|context was destroyed|cannot f
 // else becomes JSON data that stops at a depth and size limit.
 async function describeEvaluationResult(value, call, maxChars) {
   if (call && typeof value === "function") value = value();
-  value = await value;
+  // Only a promise is waited for, from any frame's realm. An object that just
+  // has a then method is a value to show, as the console shows it; awaiting
+  // it would wait for a call that may never come.
+  let promise = false;
+  try {
+    promise = Object.prototype.toString.call(value) === "[object Promise]";
+  } catch {
+    // A cross-origin object: described below as unreadable.
+  }
+  if (promise) value = await value;
   const MAX_DEPTH = 8;
   const MAX_NESTED_NODE_CHARS = 400;
   let remaining = maxChars;
@@ -2568,14 +2577,26 @@ async function performPointer(page, action) {
     case "drag": {
       // Both ends are found before the button goes down: a destination that
       // failed afterwards would release over the source, which clicks it.
-      let from = await pointerTarget(page, action.locator, point, "pointer drag");
-      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination");
-      if (action.locator) {
+      // A point is a place in the viewport, so scrolling would change what
+      // lies under it: with a point at either end nothing is scrolled, and an
+      // element end has to be in view already.
+      const scroll = !point && !destination;
+      let from = await pointerTarget(page, action.locator, point, "pointer drag", scroll);
+      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination", scroll);
+      if (scroll) {
         // Bringing the destination into view may have moved the source.
         from = await pointerTarget(page, action.locator, point, "pointer drag", false);
+      }
+      if (action.locator || action.to_locator) {
         const view = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
-        if (from.x < 0 || from.y < 0 || from.x > view.width || from.y > view.height) {
+        const outside = ({ x, y }) => x < 0 || y < 0 || x > view.width || y > view.height;
+        if (scroll && outside(from)) {
           throw rpcError(-32000, "pointer drag source and destination are not in view together");
+        }
+        for (const [end, place, element] of [["source", from, action.locator], ["destination", to, action.to_locator]]) {
+          if (!scroll && element && outside(place)) {
+            throw rpcError(-32000, `pointer drag ${end} element is out of view; a drag that uses x and y does not scroll, so scroll it into view first or aim both ends at elements`);
+          }
         }
       }
       return holdingModifiers(page, modifiers, async () => {
@@ -2603,7 +2624,31 @@ async function performType(page, action) {
   if (typeof text !== "string" || !text || Buffer.byteLength(text) > MAX_TYPE_BYTES) {
     throw rpcError(-32602, `type requires text of 1..${MAX_TYPE_BYTES} bytes`);
   }
-  if (action.locator) await locatorFor(page, action.locator).focus({ timeout: 30_000 });
+  if (action.locator) {
+    const element = locatorFor(page, action.locator);
+    await element.focus({ timeout: 30_000 });
+    // Focusing leaves the caret at the start of what a field holds; a person
+    // clicking in to add text puts it at the end, and so does this.
+    const placed = await element.evaluate((node) => {
+      if (node.isContentEditable) {
+        const range = node.ownerDocument.createRange();
+        range.selectNodeContents(node);
+        range.collapse(false);
+        const selection = node.ownerDocument.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return true;
+      }
+      if (typeof node.value !== "string" || typeof node.setSelectionRange !== "function") return true;
+      try {
+        node.setSelectionRange(node.value.length, node.value.length);
+        return true;
+      } catch {
+        return false; // email, number and similar inputs have no selection API
+      }
+    }, undefined, { timeout: 30_000 });
+    if (!placed) await page.keyboard.press("End");
+  }
   // One character at a time, so a page whose key handlers are slow is given
   // up on at a deadline instead of being typed at until the worker is killed.
   const characters = [...text];
