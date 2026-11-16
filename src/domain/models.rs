@@ -70,6 +70,10 @@ pub struct ProjectLimits {
 /// (2 × 1024³ bytes), not 2 decimal GB.
 pub const DEFAULT_PROJECT_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The most requests a project may have in flight at once. Transport pools
+/// keep this many idle connections per host so a full budget reuses them.
+pub const MAX_CONCURRENT_REQUESTS: u32 = 256;
+
 impl Default for ProjectLimits {
     fn default() -> Self {
         Self {
