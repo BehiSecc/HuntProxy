@@ -437,11 +437,22 @@ fn record_plugin_execution(
     job: &PluginJob,
     execution: &PluginExecutionSummary,
 ) -> DomainResult<()> {
+    // The summary grows with every operation, so build and measure it, and
+    // measure the one it replaces, outside the write lock that status and
+    // result reads wait for.
     let value = execution.value();
+    let new_bytes = crate::mcp::budget::json_len(&value);
+    let Some(old_bytes) = job
+        .view
+        .read()
+        .result
+        .as_ref()
+        .map(|result| crate::mcp::budget::json_len(&result["execution"]))
+    else {
+        return Ok(());
+    };
     let mut view = job.view.write();
     if let Some(result) = view.result.as_ref() {
-        let old_bytes = serde_json::to_vec(&result["execution"]).map_or(0, |bytes| bytes.len());
-        let new_bytes = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
         let result_bytes = view
             .result_bytes
             .saturating_sub(old_bytes)
@@ -470,8 +481,13 @@ fn record_plugin_execution(
             view.result_bytes = bounded_bytes;
             return Ok(());
         }
-        view.result.as_mut().expect("stored result")["execution"] = value;
+        let replaced = std::mem::replace(
+            &mut view.result.as_mut().expect("stored result")["execution"],
+            value,
+        );
         view.result_bytes = result_bytes;
+        drop(view);
+        drop(replaced);
     }
     Ok(())
 }
@@ -2085,7 +2101,15 @@ impl PluginService {
             .await?;
         save_plugin_partial_result(&job, partial_result)?;
         let job_id = job.view.read().id;
+        // One label per evidence exchange, up to the operation cap: stop as
+        // soon as the job is cancelled rather than finishing the pass.
         for exchange_id in &execution_evidence_exchange_ids {
+            if job.cancel.is_cancelled() {
+                return Err(DomainError::new(
+                    ErrorCode::Cancelled,
+                    "plugin job cancelled",
+                ));
+            }
             self.annotate_plugin_job_exchange(project_id, *exchange_id, job_id)
                 .await?;
         }
@@ -3153,7 +3177,7 @@ impl PluginService {
                     },
                     ..Default::default()
                 };
-                let response = tokio::select! {
+                let mut response = tokio::select! {
                     _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
                     response = self.reply.send_with_context(project_id, request.base_exchange_id, &draft, request.protocol, 0, context) => response?,
                 };
@@ -3171,19 +3195,24 @@ impl PluginService {
                         &operation_id,
                     )
                     .await?;
-                    let raw_response_headers = self
-                        .db
-                        .load_raw_headers(project_id, exchange_id, MessageSide::Response)
-                        .await?;
+                    // Reply hands over what it just saved; reading it back is
+                    // only a fallback.
+                    let (raw_response_headers, saved_body) = match response.saved_response.take() {
+                        Some(saved) => (saved.headers, Some(saved.body.to_vec())),
+                        None => (
+                            self.db
+                                .load_raw_headers(project_id, exchange_id, MessageSide::Response)
+                                .await?,
+                            self.db
+                                .load_raw_body(project_id, exchange_id, MessageSide::Response)
+                                .await?,
+                        ),
+                    };
                     response_headers = raw_response_headers
                         .iter()
                         .map(|header| json!({"name": header.name, "value_base64": base64::engine::general_purpose::STANDARD.encode(&header.value)}))
                         .collect();
-                    if let Some(body) = self
-                        .db
-                        .load_raw_body(project_id, exchange_id, MessageSide::Response)
-                        .await?
-                    {
+                    if let Some(body) = saved_body {
                         let policy = request.observe.as_ref();
                         if let Some(policy) = policy {
                             validate_observation_policy(policy)?;
@@ -3261,7 +3290,7 @@ impl PluginService {
                         })?,
                     _ => unreachable!(),
                 };
-                let response = tokio::select! {
+                let mut response = tokio::select! {
                     _ = cancel.cancelled() => return Err(DomainError::new(ErrorCode::Cancelled, "plugin job cancelled")),
                     response = self.reply.send_raw_http1_with_context(
                         project_id,
@@ -3287,13 +3316,14 @@ impl PluginService {
                     )
                     .await?;
                 }
-                let transcript = match response.exchange_id {
-                    Some(exchange_id) => {
+                let transcript = match (response.exchange_id, response.saved_transcript.take()) {
+                    (Some(_), Some(saved)) => Some(saved.to_vec()),
+                    (Some(exchange_id), None) => {
                         self.db
                             .load_raw_body(project_id, exchange_id, MessageSide::Response)
                             .await?
                     }
-                    None => None,
+                    (None, _) => None,
                 };
                 let raw = plugin_raw_observation(&response, transcript)?;
                 let mut observation = json!({"id":request.id,"raw":raw});
@@ -3399,13 +3429,14 @@ impl PluginService {
                             ) => response,
                         };
                         let observation = match result {
-                            Ok(response) => {
+                            Ok(mut response) => {
                                 if let Some(exchange_id) = response.exchange_id {
                                     service.annotate_plugin_exchange(project_id, exchange_id, &plugin_id, &plugin_name, &operation_id).await?;
                                 }
-                                let transcript = match response.exchange_id {
-                                    Some(exchange_id) => service.db.load_raw_body(project_id, exchange_id, MessageSide::Response).await?,
-                                    None => None,
+                                let transcript = match (response.exchange_id, response.saved_transcript.take()) {
+                                    (Some(_), Some(saved)) => Some(saved.to_vec()),
+                                    (Some(exchange_id), None) => service.db.load_raw_body(project_id, exchange_id, MessageSide::Response).await?,
+                                    (None, _) => None,
                                 };
                                 let mut observation = json!({"id":member_id,"raw":plugin_raw_observation(&response, transcript)?});
                                 if let Some(error) = raw_response_error(&response) {
@@ -3449,7 +3480,7 @@ impl PluginService {
                     ) => response?,
                 };
                 let mut streams = Vec::with_capacity(response.streams.len());
-                for stream in response.streams {
+                for mut stream in response.streams {
                     let mut response_headers = Vec::new();
                     let mut response_body_base64 = None;
                     let mut response_body_hash = None;
@@ -3463,19 +3494,26 @@ impl PluginService {
                             &format!("{}:{}", operation_id, stream.id),
                         )
                         .await?;
-                        let raw_headers = self
-                            .db
-                            .load_raw_headers(project_id, exchange_id, MessageSide::Response)
-                            .await?;
+                        let (raw_headers, saved_body) = match stream.saved_response.take() {
+                            Some(saved) => (saved.headers, Some(saved.body.to_vec())),
+                            None => (
+                                self.db
+                                    .load_raw_headers(
+                                        project_id,
+                                        exchange_id,
+                                        MessageSide::Response,
+                                    )
+                                    .await?,
+                                self.db
+                                    .load_raw_body(project_id, exchange_id, MessageSide::Response)
+                                    .await?,
+                            ),
+                        };
                         response_headers = raw_headers
                             .iter()
                             .map(|header| json!({"name": header.name, "value_base64": base64::engine::general_purpose::STANDARD.encode(&header.value)}))
                             .collect();
-                        if let Some(body) = self
-                            .db
-                            .load_raw_body(project_id, exchange_id, MessageSide::Response)
-                            .await?
-                        {
+                        if let Some(body) = saved_body {
                             let presented = plugin_response_body(
                                 &raw_headers,
                                 body,
@@ -7196,6 +7234,34 @@ mod tests {
     }
 
     #[test]
+    fn recording_execution_keeps_the_result_size_exact_as_evidence_grows() {
+        let job = test_job(PluginJobState::Running);
+        let mut execution = PluginExecutionSummary {
+            planned_operations: 60,
+            ..Default::default()
+        };
+        save_plugin_partial_result(
+            &job,
+            json!({"plan_result": {"steps": 60}, "execution": execution.value(), "analysis": null}),
+        )
+        .unwrap();
+        for index in 0..60 {
+            execution.record(&json!({"id": index, "raw": {"exchange_id": 1_000 + index}}));
+            record_plugin_execution(&job, &execution).unwrap();
+            let view = job.view.read();
+            let result = view.result.as_ref().unwrap();
+            assert_eq!(view.result_bytes, serde_json::to_vec(result).unwrap().len());
+        }
+        let view = job.view.read();
+        let execution = &view.result.as_ref().unwrap()["execution"];
+        assert_eq!(execution["observed_operations"], 60);
+        assert_eq!(
+            execution["evidence_exchange_ids"].as_array().unwrap().len(),
+            60
+        );
+    }
+
+    #[test]
     fn composite_compaction_preserves_operation_counts_and_evidence() {
         let observation = json!({"id":"group","members":[
             {"id":"one","raw":{"exchange_id":41,"response_complete":true,"response_transcript_base64":"a".repeat(2000)}},
@@ -9455,6 +9521,7 @@ mod tests {
             transport_error: None,
             responses: vec![],
             response_base64: None,
+            saved_transcript: None,
         };
         let value = plugin_raw_observation(&response, Some(b"ok".to_vec())).unwrap();
         assert_eq!(value["response_transcript_base64"], "b2s=");
@@ -9474,6 +9541,7 @@ mod tests {
             transport_error: Some("connection closed unexpectedly".into()),
             responses: vec![],
             response_base64: None,
+            saved_transcript: None,
         };
         let value = plugin_raw_observation(&response, Some(b"ok".to_vec())).unwrap();
         assert_eq!(value["exchange_id"], 9);

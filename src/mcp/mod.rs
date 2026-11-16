@@ -4,7 +4,9 @@ pub(crate) mod budget;
 mod exchange_view;
 mod fuzz_view;
 mod history_view;
+mod job_view;
 mod view;
+mod websocket_view;
 
 use crate::app::AppState;
 use crate::browser::BrowserAction;
@@ -563,7 +565,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators. Returns the queued job at once; fuzz_manage get with wait_ms returns as soon as it ends.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Pages fit the output budget: continue cases and group_cases with before_case_index=next_before_case_index, and groups (largest first) with offset=next_offset.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0,"description":"groups: next_offset from the previous page."},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"get: wait up to this long for the job to end instead of polling; returns as soon as it does."}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
+        {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, read one message's whole payload, or inject a text/binary message into an active connection. messages lists the oldest first with the first 2 KB of each payload (payload_cut=true when there is more); pages fit the output budget, so continue with after_id=next_after_id while it is present. message reads one payload by message_id; continue at next_offset while truncated.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","message","send"]},"connection_id":{"type":"integer","description":"Required for messages and send."},"after_id":{"type":"integer","description":"messages: list messages with a larger id; pass next_after_id."},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":250,"description":"Most connections or messages to list; a messages page may hold fewer to fit the output budget."},"message_id":{"type":"integer","description":"Required for message."},"offset":{"type":"integer","minimum":0,"default":0,"description":"message: payload byte to start at; pass next_offset."},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384,"description":"message: most payload bytes to read; a page may hold fewer to fit the output budget."},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"description":"send: how payload is written (default text). message: how the page is written; by default text for UTF-8 payloads, base64 otherwise."},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. console, page_error and dialog events carry the first 1000 characters of their text. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. Prefer accessibility snapshots: scope large pages with locator or page with offset, and add snapshot:true to an interaction instead of a separate snapshot call. A locator's nth picks one of several matches and its frame acts inside an iframe; pages list names each page's frames. Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
@@ -1311,7 +1313,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 };
                 let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(25) as usize;
-                Ok(state.plugins.results(id, view, offset, limit)?)
+                job_view::findings_page(state.plugins.results(id, view, offset, limit)?)
             } else {
                 let job = if name == "job_cancel" {
                     state.plugins.cancel(id)?
@@ -2325,14 +2327,29 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .get("connection_id")
                         .and_then(Value::as_i64)
                         .ok_or_else(|| DomainError::invalid("connection_id required"))?;
-                    Ok(json!({
-                        "messages": state.db.list_websocket_messages(
+                    let limit = limit.clamp(1, 1000);
+                    let messages = state
+                        .db
+                        .list_websocket_messages(
                             project_id,
                             connection_id,
                             args.get("after_id").and_then(Value::as_i64),
                             limit,
-                        ).await?
-                    }))
+                            websocket_view::PREVIEW_BYTES,
+                        )
+                        .await?;
+                    websocket_view::messages_page(messages, limit as usize)
+                }
+                "message" => {
+                    let message_id = args
+                        .get("message_id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| DomainError::invalid("message_id required"))?;
+                    let message = state
+                        .db
+                        .load_websocket_message(project_id, message_id)
+                        .await?;
+                    websocket_view::message_page(&message, &args)
                 }
                 "send" => {
                     let connection_id = args
@@ -2367,7 +2384,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!({"ok": true}))
                 }
                 _ => Err(DomainError::invalid(
-                    "action must be list, messages, or send",
+                    "action must be list, messages, message, or send",
                 )),
             }
         }

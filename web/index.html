@@ -1991,7 +1991,7 @@ test
       const atEnd = !wrap || wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 8;
       $('websocketMessages').innerHTML = placeholder || !messages.length
         ? `<tr><td colspan="4" class="muted">${escapeHtml(placeholder || 'No messages yet.')}</td></tr>`
-        : messages.map(message => `<tr><td>${message.id}</td><td>${escapeHtml(message.direction)}</td><td>${escapeHtml(message.opcode)}</td><td class="mono" title="${escapeHtml(message.payload)}">${escapeHtml(message.payload.slice(0, 100))}${message.truncated ? ' …' : ''}</td></tr>`).join('');
+        : messages.map(message => `<tr><td>${message.id}</td><td>${escapeHtml(message.direction)}</td><td>${escapeHtml(message.opcode)}</td><td class="mono" title="${escapeHtml(message.payload + (message.payload_cut ? '…' : ''))}">${escapeHtml(message.payload.slice(0, 100))}${message.truncated ? ' …' : ''}</td></tr>`).join('');
       if (wrap && atEnd) wrap.scrollTop = wrap.scrollHeight;
     }
     // Messages are listed oldest first, so page forward with after_id: a reset

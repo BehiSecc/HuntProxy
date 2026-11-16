@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-const MESSAGE_PRESENTATION_BYTES: usize = 256 * 1024;
+/// Payload bytes the HTTP API lists per message.
+pub const MESSAGE_PRESENTATION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WebSocketConnection {
@@ -38,8 +39,26 @@ pub struct WebSocketMessageRecord {
     pub payload_length: u64,
     pub truncated: bool,
     pub created_at: String,
+    /// How `payload` is written: `text` when the listed bytes are UTF-8.
     pub encoding: String,
     pub payload: String,
+    /// The stored payload is longer than the listed `payload`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub payload_cut: bool,
+}
+
+/// One captured message with its whole stored payload.
+#[derive(Debug, Clone)]
+pub struct StoredWebSocketMessage {
+    pub id: i64,
+    pub connection_id: i64,
+    pub direction: String,
+    pub opcode: String,
+    /// Length on the wire; longer than `payload` when capture truncated it.
+    pub payload_length: u64,
+    pub truncated: bool,
+    pub created_at: String,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -184,7 +203,7 @@ impl Db {
         let opcode = opcode.to_string();
         let created_at = now_rfc3339();
         self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction().map_err(storage_error)?;
+            let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             tx.execute(
                 "INSERT INTO websocket_messages
                  (project_id, connection_id, direction, opcode, payload, payload_length, truncated, created_at)
@@ -237,7 +256,9 @@ impl Db {
         connection_id: i64,
         after_id: Option<i64>,
         limit: u32,
+        preview_bytes: usize,
     ) -> DomainResult<Vec<WebSocketMessageRecord>> {
+        let preview_bytes = i64::try_from(preview_bytes).unwrap_or(i64::MAX);
         self.with_conn(move |conn| {
             let exists: bool = conn
                 .query_row(
@@ -249,10 +270,14 @@ impl Db {
             if !exists {
                 return Err(DomainError::not_found("WebSocket connection"));
             }
+            // Only the listed prefix is copied out of SQLite, not payloads
+            // of up to the capture limit each.
             let mut statement = conn
                 .prepare(
-                    "SELECT id, project_id, connection_id, direction, opcode, payload,
-                            payload_length, truncated, created_at
+                    "SELECT id, project_id, connection_id, direction, opcode,
+                            substr(CAST(payload AS BLOB), 1, ?5),
+                            payload_length, truncated, created_at,
+                            length(CAST(payload AS BLOB)) > ?5
                      FROM websocket_messages
                      WHERE project_id=?1 AND connection_id=?2 AND id>?3
                      ORDER BY id LIMIT ?4",
@@ -260,11 +285,48 @@ impl Db {
                 .map_err(storage_error)?;
             let rows = statement
                 .query_map(
-                    params![project_id.get(), connection_id, after_id.unwrap_or(0), limit.min(1000)],
+                    params![
+                        project_id.get(),
+                        connection_id,
+                        after_id.unwrap_or(0),
+                        limit.min(1000),
+                        preview_bytes
+                    ],
                     message_row,
                 )
                 .map_err(storage_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(storage_error)
+        })
+        .await
+    }
+
+    pub async fn load_websocket_message(
+        &self,
+        project_id: ProjectId,
+        message_id: i64,
+    ) -> DomainResult<StoredWebSocketMessage> {
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT id, connection_id, direction, opcode, CAST(payload AS BLOB),
+                        payload_length, truncated, created_at
+                 FROM websocket_messages WHERE project_id=?1 AND id=?2",
+                params![project_id.get(), message_id],
+                |row| {
+                    Ok(StoredWebSocketMessage {
+                        id: row.get(0)?,
+                        connection_id: row.get(1)?,
+                        direction: row.get(2)?,
+                        opcode: row.get(3)?,
+                        payload: row.get(4)?,
+                        payload_length: row.get::<_, i64>(5)?.max(0) as u64,
+                        truncated: row.get::<_, i64>(6)? != 0,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| DomainError::not_found("WebSocket message"))
         })
         .await
     }
@@ -305,23 +367,10 @@ fn connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WebSocketConnecti
 }
 
 fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WebSocketMessageRecord> {
-    let payload: Vec<u8> = row.get(5)?;
-    let (encoding, presented) = match std::str::from_utf8(&payload) {
-        Ok(text) => ("text", text.to_string()),
-        Err(_) => (
-            "base64",
-            base64::engine::general_purpose::STANDARD.encode(&payload),
-        ),
-    };
-    let payload = if presented.len() > MESSAGE_PRESENTATION_BYTES {
-        let mut end = MESSAGE_PRESENTATION_BYTES;
-        while !presented.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &presented[..end])
-    } else {
-        presented
-    };
+    // `substr` of an empty payload is NULL.
+    let prefix: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
+    let payload_cut: bool = row.get(9)?;
+    let (encoding, payload) = present_prefix(&prefix, payload_cut);
     Ok(WebSocketMessageRecord {
         id: row.get(0)?,
         project_id: ProjectId(row.get(1)?),
@@ -333,7 +382,28 @@ fn message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WebSocketMessageReco
         created_at: row.get(8)?,
         encoding: encoding.into(),
         payload,
+        payload_cut,
     })
+}
+
+/// `prefix` as text when it is UTF-8, else as base64. A cut prefix may end
+/// inside a character; that character is left out rather than turning the
+/// whole preview into base64.
+fn present_prefix(prefix: &[u8], cut: bool) -> (&'static str, String) {
+    let text = match std::str::from_utf8(prefix) {
+        Ok(text) => Some(text),
+        Err(error) if cut && error.error_len().is_none() => {
+            std::str::from_utf8(&prefix[..error.valid_up_to()]).ok()
+        }
+        Err(_) => None,
+    };
+    match text {
+        Some(text) => ("text", text.to_owned()),
+        None => (
+            "base64",
+            base64::engine::general_purpose::STANDARD.encode(prefix),
+        ),
+    }
 }
 
 fn storage_error(error: rusqlite::Error) -> DomainError {
@@ -341,3 +411,24 @@ fn storage_error(error: rusqlite::Error) -> DomainError {
 }
 
 pub type SharedWebSocketService = Arc<WebSocketService>;
+
+#[cfg(test)]
+mod tests {
+    use super::present_prefix;
+
+    #[test]
+    fn a_cut_preview_stays_text_when_it_ends_inside_a_character() {
+        let payload = "aé".as_bytes();
+        assert_eq!(present_prefix(&payload[..2], true), ("text", "a".into()));
+        assert_eq!(present_prefix(payload, false), ("text", "aé".into()));
+        // An incomplete character is only expected where the cut is.
+        assert_eq!(
+            present_prefix(&payload[..2], false),
+            ("base64", "YcM=".into())
+        );
+        assert_eq!(
+            present_prefix(&[0xff, b'a'], true),
+            ("base64", "/2E=".into())
+        );
+    }
+}

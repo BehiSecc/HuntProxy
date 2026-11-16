@@ -22,7 +22,7 @@ pub(crate) const MAX_INLINE_BODY_BYTES: u64 = 16_384;
 pub(crate) const MAX_BATCH_IDS: usize = 20;
 /// Share a batch body keeps before trailing exchanges move to `not_returned`.
 const MIN_SHARED_BODY_BYTES: usize = 256;
-const DEFAULT_PAGE_BYTES: u64 = 16_384;
+pub(super) const DEFAULT_PAGE_BYTES: u64 = 16_384;
 pub(crate) const MAX_PAGE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_CONTEXT_BYTES: u64 = 160;
 pub(crate) const MAX_CONTEXT_BYTES: u64 = 2_000;
@@ -47,7 +47,7 @@ fn present<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
     args.get(key).filter(|value| !value.is_null())
 }
 
-fn optional_u64(args: &Value, key: &str) -> DomainResult<Option<u64>> {
+pub(super) fn optional_u64(args: &Value, key: &str) -> DomainResult<Option<u64>> {
     present(args, key)
         .map(|value| {
             value.as_u64().ok_or_else(|| {
@@ -67,7 +67,7 @@ fn optional_bool(args: &Value, key: &str) -> DomainResult<Option<bool>> {
         .transpose()
 }
 
-fn to_usize(value: u64) -> usize {
+pub(super) fn to_usize(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
@@ -544,7 +544,27 @@ pub(crate) async fn exchange_body(state: &AppState, args: &Value) -> DomainResul
 /// The largest page of `body[offset..offset + max_bytes]` whose result fits
 /// the output budget, with an exact `next_offset`.
 fn read_page(body: &PreparedBody, offset: usize, max_bytes: usize, base64: bool) -> Value {
-    let data = body.data.as_slice();
+    read_bytes_page(&body.data, offset, max_bytes, base64, |page| {
+        if body.decoded {
+            page["decoded"] = json!(true);
+            page["content_encoding"] = json!(body.content_encoding);
+        }
+        if body.raw_total != body.data.len() {
+            page["raw_total"] = json!(body.raw_total);
+        }
+    })
+}
+
+/// The largest page of `data[offset..offset + max_bytes]` whose result,
+/// including the fields `annotate` adds, fits the output budget, with an
+/// exact `next_offset`.
+pub(super) fn read_bytes_page(
+    data: &[u8],
+    offset: usize,
+    max_bytes: usize,
+    base64: bool,
+    annotate: impl Fn(&mut Value),
+) -> Value {
     let total = data.len();
     let start = offset.min(total);
     let mut end = start.saturating_add(max_bytes).min(total);
@@ -566,13 +586,7 @@ fn read_page(body: &PreparedBody, offset: usize, max_bytes: usize, base64: bool)
         if base64 {
             page["encoding"] = json!("base64");
         }
-        if body.decoded {
-            page["decoded"] = json!(true);
-            page["content_encoding"] = json!(body.content_encoding);
-        }
-        if body.raw_total != total {
-            page["raw_total"] = json!(body.raw_total);
-        }
+        annotate(&mut page);
         page
     };
     let encode = |end: usize| -> String {

@@ -2048,6 +2048,7 @@ async fn list_websocket_messages(
             wid,
             query.after_id,
             query.limit.unwrap_or(250),
+            crate::websocket::MESSAGE_PRESENTATION_BYTES,
         )
         .await
     {

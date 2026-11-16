@@ -165,6 +165,10 @@ pub struct RawReplyResult {
     /// Full wire response when capture scope excludes this exchange.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_base64: Option<String>,
+    /// The transcript as saved with `exchange_id`, for callers in this
+    /// process that would otherwise read it straight back.
+    #[serde(skip)]
+    pub(crate) saved_transcript: Option<bytes::Bytes>,
 }
 
 impl ReplyService {
@@ -389,6 +393,7 @@ impl ReplyService {
                 use base64::Engine;
                 base64::engine::general_purpose::STANDARD.encode(&raw_response)
             }),
+            saved_transcript: exchange_id.map(|_| raw_response.into()),
         })
     }
 }

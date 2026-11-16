@@ -361,8 +361,9 @@ impl Db {
             ));
         }
         self.with_conn(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
+            // Immediate: the first statement reads the quota, and a deferred
+            // transaction that reads first cannot wait for the write lock.
+            let tx = crate::storage::write_transaction(conn)
                 .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
             for (exchange, started) in prepared {
                 let id = crate::storage::insert_exchange_conn(&tx, exchange)?;
