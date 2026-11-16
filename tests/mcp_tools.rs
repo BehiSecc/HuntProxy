@@ -129,6 +129,37 @@ async fn history_search_pages_with_the_returned_next_cursor() {
 }
 
 #[tokio::test]
+async fn projects_set_limits_changes_only_the_request_budget() {
+    let (_directory, state, project_id) = test_state().await;
+    let set = call_tool(
+        state.clone(),
+        "projects",
+        json!({"action":"set_limits","project_id":project_id.get(),"requests_per_second":12.5}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        set,
+        json!({"project_id":project_id.get(),"requests_per_second":12.5,"max_concurrent_requests":32})
+    );
+    for args in [
+        json!({"action":"set_limits","project_id":project_id.get()}),
+        json!({"action":"set_limits","project_id":project_id.get(),"requests_per_second":"fast"}),
+        json!({"action":"set_limits","project_id":project_id.get(),"max_concurrent_requests":-1}),
+        json!({"action":"set_limits","project_id":project_id.get(),"max_concurrent_requests":1.5}),
+        json!({"action":"set_limits","project_id":project_id.get(),"requests_per_second":1000.5}),
+    ] {
+        let error = call_tool(state.clone(), "projects", args.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{args}");
+    }
+    let project = state.db.get_project(project_id).await.unwrap();
+    assert_eq!(project.limits.requests_per_second, 12.5);
+    assert_eq!(project.limits.max_concurrent_requests, 32);
+}
+
+#[tokio::test]
 async fn request_drafts_with_unknown_fields_are_rejected_not_dropped() {
     let (_directory, state, project_id) = test_state().await;
     let project = project_id.get();

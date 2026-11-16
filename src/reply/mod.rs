@@ -584,6 +584,8 @@ pub struct ReplySendContext {
     pub lineage: ExchangeLineage,
     /// Plugin operations revalidate their final URL after project rewrite rules.
     pub plugin_target_host: Option<String>,
+    /// Shortens the request's total timeout; Reply's own is the ceiling.
+    pub request_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -637,6 +639,7 @@ impl ReplySendContext {
                 ..Default::default()
             },
             plugin_target_host: None,
+            request_timeout: None,
         }
     }
 
@@ -650,6 +653,31 @@ impl ReplySendContext {
                 ..Default::default()
             },
             plugin_target_host: None,
+            request_timeout: None,
+        }
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+}
+
+/// The total timeout of a Reply send unless its context shortens it.
+const REPLY_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A send that failed, with the exchange saved for the failed attempt.
+#[derive(Debug)]
+pub(crate) struct FailedSend {
+    pub error: DomainError,
+    pub exchange_id: Option<ExchangeId>,
+}
+
+impl From<DomainError> for FailedSend {
+    fn from(error: DomainError) -> Self {
+        Self {
+            error,
+            exchange_id: None,
         }
     }
 }
@@ -786,7 +814,8 @@ impl ReplyService {
     }
 
     /// Send with slots the caller already took from the project's budget, so
-    /// it can stop waiting for them when its job is cancelled.
+    /// it can stop waiting for them when its job is cancelled. A failure
+    /// names the exchange saved for the failed attempt, if any.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_with_context_and_pinned_identity(
         &self,
@@ -797,8 +826,8 @@ impl ReplyService {
         context: ReplySendContext,
         identity: Option<&crate::cookies::StoredCookieProfile>,
         slots: RequestSlots,
-    ) -> DomainResult<ReplySendResult> {
-        self.send_with_context_and_proxy(
+    ) -> Result<ReplySendResult, FailedSend> {
+        self.send_recording_failure(
             project_id,
             base_exchange_id,
             draft,
@@ -852,17 +881,47 @@ impl ReplyService {
         expected_origin: Option<&str>,
         slots: Option<RequestSlots>,
     ) -> DomainResult<ReplySendResult> {
+        self.send_recording_failure(
+            project_id,
+            base_exchange_id,
+            draft,
+            protocol,
+            follow_redirects,
+            context,
+            upstream_proxy_override,
+            pinned_identity,
+            expected_origin,
+            slots,
+        )
+        .await
+        .map_err(|failed| failed.error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_recording_failure(
+        &self,
+        project_id: ProjectId,
+        base_exchange_id: Option<ExchangeId>,
+        draft: &ReplyDraft,
+        protocol: ProtocolPreference,
+        follow_redirects: u32,
+        context: ReplySendContext,
+        upstream_proxy_override: Option<&str>,
+        pinned_identity: Option<&crate::cookies::StoredCookieProfile>,
+        expected_origin: Option<&str>,
+        slots: Option<RequestSlots>,
+    ) -> Result<ReplySendResult, FailedSend> {
         let project = self.db.get_project(project_id).await?;
         let named_identity = match pinned_identity {
             Some(_) if !matches!(draft.identity, Some(ReplyIdentity::Named { .. })) => {
-                return Err(DomainError::invalid(
+                return Err(FailedSend::from(DomainError::invalid(
                     "pinned identity requires named selection",
-                ));
+                )));
             }
             Some(identity) if identity.project_id != project_id => {
-                return Err(DomainError::invalid(
+                return Err(FailedSend::from(DomainError::invalid(
                     "named identity belongs to another project",
-                ));
+                )));
             }
             Some(identity) => Some(identity.clone()),
             None => self.resolve_named_identity(project_id, draft).await?,
@@ -886,30 +945,30 @@ impl ReplyService {
             let url = url::Url::parse(&mat.url)
                 .map_err(|_| DomainError::invalid("invalid request URL"))?;
             if !url.username().is_empty() || url.password().is_some() {
-                return Err(DomainError::invalid(
+                return Err(FailedSend::from(DomainError::invalid(
                     "named or anonymous identity cannot be combined with URL credentials",
-                ));
+                )));
             }
         }
         if expected_origin.is_some_and(|origin| origins_differ(origin, &mat.url)) {
-            return Err(DomainError::scope_denied(
+            return Err(FailedSend::from(DomainError::scope_denied(
                 "request URL changed origin after applying request rules",
-            ));
+            )));
         }
         if let Some(target_host) = context.plugin_target_host.as_deref() {
             if !url_is_in_scope(&mat.url, &project.scope)? {
-                return Err(DomainError::scope_denied(
+                return Err(FailedSend::from(DomainError::scope_denied(
                     "plugin operation is outside project scope after URL rewrite rules",
-                ));
+                )));
             }
             if project.scope.host_patterns.is_empty() {
                 let rewritten_host = url::Url::parse(&mat.url)
                     .ok()
                     .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
                 if rewritten_host.as_deref() != Some(target_host) {
-                    return Err(DomainError::scope_denied(
+                    return Err(FailedSend::from(DomainError::scope_denied(
                         "plugin URL rewrite changed the project target host",
-                    ));
+                    )));
                 }
             }
         }
@@ -1047,13 +1106,23 @@ impl ReplyService {
             Some(slots) => slots,
             None => self.request_limiter.acquire(&project, 1).await?,
         };
+        let total_timeout = context
+            .request_timeout
+            .map_or(REPLY_TOTAL_TIMEOUT, |timeout| {
+                timeout.min(REPLY_TOTAL_TIMEOUT)
+            });
         let started = std::time::Instant::now();
         let out = self
             .transport
             .send(
                 &dial,
                 OutboundRequest {
-                    identity: TransportIdentity::for_reply(project_id, &wire_headers),
+                    identity: match (context.source, context.lineage.fuzz_job_id) {
+                        (ExchangeSource::Fuzzer, Some(job_id)) => {
+                            TransportIdentity::for_fuzz_job(project_id, job_id)
+                        }
+                        _ => TransportIdentity::for_reply(project_id, &wire_headers),
+                    },
                     method,
                     url: wire_url,
                     headers: wire_headers,
@@ -1068,8 +1137,8 @@ impl ReplyService {
                         ProtocolPreference::H1 => ProtocolMode::Http1,
                         ProtocolPreference::H2 => ProtocolMode::Http2,
                     },
-                    connect_timeout: Duration::from_secs(10),
-                    total_timeout: Duration::from_secs(60),
+                    connect_timeout: Duration::from_secs(10).min(total_timeout),
+                    total_timeout,
                     max_body_bytes: project.limits.max_body_bytes,
                     preserve_identity_headers: true,
                     upstream_proxy,
@@ -1126,7 +1195,7 @@ impl ReplyService {
                 } else {
                     Ok(None)
                 };
-                match insert {
+                let exchange_id = match insert {
                     Ok(Some(exchange_id)) => {
                         let _ = self
                             .db
@@ -1136,13 +1205,15 @@ impl ReplyService {
                                 applied_rules.clone(),
                             )
                             .await;
+                        Some(exchange_id)
                     }
-                    Ok(None) => {}
+                    Ok(None) => None,
                     Err(storage_error) => {
                         tracing::warn!(%storage_error, "failed to preserve failed Reply exchange");
+                        None
                     }
-                }
-                return Err(error);
+                };
+                return Err(FailedSend { error, exchange_id });
             }
         };
         if let Some(route) = &rotation {
@@ -1250,13 +1321,22 @@ impl ReplyService {
         if let Some(exchange_id) = exchange_id {
             self.db
                 .record_exchange_request_rules(project_id, exchange_id, applied_rules.clone())
-                .await?;
+                .await
+                .map_err(|error| FailedSend {
+                    error,
+                    exchange_id: Some(exchange_id),
+                })?;
         }
 
         let _ = follow_redirects; // redirects: post-MVP partial — off by default in callers
 
+        // Fuzz jobs group and diff responses themselves; a per-case diff would
+        // only add two exchange reads to every case.
+        let fuzz_send = context.source == ExchangeSource::Fuzzer;
         let mut diff = None;
-        if let (Some(parent_id), Some(exchange_id)) = (base_exchange_id, exchange_id) {
+        if let (Some(parent_id), Some(exchange_id), false) =
+            (base_exchange_id, exchange_id, fuzz_send)
+        {
             if let Ok(parent) = self
                 .db
                 .get_exchange_detail(project_id, parent_id, PresentationOptions::default())
@@ -1293,7 +1373,8 @@ impl ReplyService {
             }
         }
 
-        if let Some(exchange_id) = exchange_id {
+        // A fuzz job is audited once when it starts, not once per case.
+        if let Some(exchange_id) = exchange_id.filter(|_| !fuzz_send) {
             let mut audit = serde_json::json!({ "parent": base_exchange_id.map(|i| i.get()) });
             if let Some(identity) = &draft.identity {
                 audit["identity"] = serde_json::to_value(identity)
@@ -1303,16 +1384,8 @@ impl ReplyService {
                 .db
                 .audit(
                     Some(project_id),
-                    if context.source == ExchangeSource::Fuzzer {
-                        "fuzz_send"
-                    } else {
-                        "reply_send"
-                    },
-                    Some(if context.source == ExchangeSource::Fuzzer {
-                        "fuzzer"
-                    } else {
-                        "reply"
-                    }),
+                    "reply_send",
+                    Some("reply"),
                     Some("exchange"),
                     Some(&exchange_id.to_string()),
                     audit,

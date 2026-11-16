@@ -70,6 +70,57 @@ pub struct ProjectLimits {
 /// (2 × 1024³ bytes), not 2 decimal GB.
 pub const DEFAULT_PROJECT_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The most requests a project may have in flight at once. Transport pools
+/// keep this many idle connections per host so a full budget reuses them.
+pub const MAX_CONCURRENT_REQUESTS: u32 = 256;
+/// Bounds of a project's request rate. The floor is the rate a project with an
+/// unusable stored rate falls back to.
+pub const MIN_REQUESTS_PER_SECOND: f64 = 0.1;
+pub const MAX_REQUESTS_PER_SECOND: f64 = 1_000.0;
+
+/// A change to the request budget that Reply, the Fuzzer, the crawler and
+/// plugins share. Fields left out keep their value.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestBudgetUpdate {
+    #[serde(default)]
+    pub requests_per_second: Option<f64>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
+}
+
+impl RequestBudgetUpdate {
+    pub fn apply(self, limits: &mut ProjectLimits) -> super::DomainResult<()> {
+        if self.requests_per_second.is_none() && self.max_concurrent_requests.is_none() {
+            return Err(super::DomainError::invalid(
+                "set requests_per_second, max_concurrent_requests, or both",
+            ));
+        }
+        if self.requests_per_second.is_some_and(|rate| {
+            !(MIN_REQUESTS_PER_SECOND..=MAX_REQUESTS_PER_SECOND).contains(&rate)
+        }) {
+            return Err(super::DomainError::invalid(format!(
+                "requests_per_second must be between {MIN_REQUESTS_PER_SECOND} and {MAX_REQUESTS_PER_SECOND}"
+            )));
+        }
+        if self
+            .max_concurrent_requests
+            .is_some_and(|concurrency| !(1..=MAX_CONCURRENT_REQUESTS).contains(&concurrency))
+        {
+            return Err(super::DomainError::invalid(format!(
+                "max_concurrent_requests must be between 1 and {MAX_CONCURRENT_REQUESTS}"
+            )));
+        }
+        if let Some(rate) = self.requests_per_second {
+            limits.requests_per_second = rate;
+        }
+        if let Some(concurrency) = self.max_concurrent_requests {
+            limits.max_concurrent_requests = concurrency;
+        }
+        Ok(())
+    }
+}
+
 impl Default for ProjectLimits {
     fn default() -> Self {
         Self {
@@ -93,6 +144,52 @@ mod project_limit_tests {
     fn default_capture_quota_is_exactly_two_gibibytes() {
         assert_eq!(DEFAULT_PROJECT_DISK_BYTES, 2_147_483_648);
         assert_eq!(ProjectLimits::default().max_disk_bytes, 2_147_483_648);
+    }
+
+    #[test]
+    fn request_budget_updates_change_only_given_fields_within_bounds() {
+        let mut limits = ProjectLimits::default();
+        RequestBudgetUpdate {
+            requests_per_second: Some(5.0),
+            max_concurrent_requests: None,
+        }
+        .apply(&mut limits)
+        .unwrap();
+        assert_eq!(limits.requests_per_second, 5.0);
+        assert_eq!(limits.max_concurrent_requests, 32);
+        RequestBudgetUpdate {
+            requests_per_second: None,
+            max_concurrent_requests: Some(MAX_CONCURRENT_REQUESTS),
+        }
+        .apply(&mut limits)
+        .unwrap();
+        assert_eq!(limits.max_concurrent_requests, 256);
+        assert_eq!(limits.requests_per_second, 5.0);
+
+        for (rate, concurrency) in [
+            (Some(0.0), None),
+            (Some(f64::NAN), None),
+            (Some(f64::INFINITY), None),
+            (Some(1_000.5), None),
+            (None, Some(0)),
+            (None, Some(257)),
+            (Some(20.0), Some(257)),
+            (None, None),
+        ] {
+            let before = limits.clone();
+            let error = RequestBudgetUpdate {
+                requests_per_second: rate,
+                max_concurrent_requests: concurrency,
+            }
+            .apply(&mut limits)
+            .unwrap_err();
+            assert_eq!(error.code(), crate::domain::ErrorCode::InvalidArgument);
+            assert_eq!(limits.requests_per_second, before.requests_per_second);
+            assert_eq!(
+                limits.max_concurrent_requests,
+                before.max_concurrent_requests
+            );
+        }
     }
 }
 

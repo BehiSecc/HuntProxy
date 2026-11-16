@@ -1793,6 +1793,44 @@ async fn optional_capture_scope_can_be_updated_through_http_api() {
 }
 
 #[tokio::test]
+async fn request_budget_can_be_updated_through_http_api() {
+    let (_directory, state, project_id) = test_state().await;
+    let app = huntproxy::api::router(state.clone());
+    let post = |body: serde_json::Value| {
+        Request::post(format!("/api/v1/projects/{}/limits", project_id.get()))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(post(serde_json::json!({"max_concurrent_requests": 8})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let project = json_response(response).await;
+    assert_eq!(project["limits"]["max_concurrent_requests"], 8);
+    assert_eq!(project["limits"]["requests_per_second"], 50.0);
+
+    for body in [
+        serde_json::json!({"requests_per_second": 0}),
+        serde_json::json!({"max_concurrent_requests": 257}),
+        serde_json::json!({}),
+    ] {
+        let response = app.clone().oneshot(post(body.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let response = app
+        .oneshot(post(serde_json::json!({"max_fuzz_cases": 1})))
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+    let stored = state.db.get_project(project_id).await.unwrap();
+    assert_eq!(stored.limits.max_concurrent_requests, 8);
+    assert_eq!(stored.limits.max_fuzz_cases, 100_000);
+}
+
+#[tokio::test]
 async fn managed_cookies_are_configured_without_exposing_values() {
     let (_directory, state, project_id) = test_state().await;
     let app = huntproxy::api::router(state.clone());

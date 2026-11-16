@@ -295,6 +295,41 @@ impl Db {
         self.get_project(id).await
     }
 
+    /// Changes the request budget the project's sends share. Requests that
+    /// start afterwards use it; a running fuzz job keeps the one it started with.
+    pub async fn update_project_request_budget(
+        &self,
+        id: ProjectId,
+        update: RequestBudgetUpdate,
+    ) -> DomainResult<Project> {
+        let ts = now_rfc3339();
+        self.with_conn(move |conn| {
+            let tx = write_transaction(conn).map_err(storage_error)?;
+            let (scope_json, limits_json): (String, String) = tx
+                .query_row(
+                    "SELECT scope_json, limits_json FROM projects WHERE id=?1",
+                    params![id.get()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => DomainError::not_found("project"),
+                    other => storage_error(other),
+                })?;
+            let (_, mut limits) = decode_project_settings(id.get(), &scope_json, &limits_json)?;
+            update.apply(&mut limits)?;
+            let limits_json = serde_json::to_string(&limits)
+                .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+            tx.execute(
+                "UPDATE projects SET limits_json=?1, updated_at=?2 WHERE id=?3",
+                params![limits_json, ts, id.get()],
+            )
+            .map_err(storage_error)?;
+            tx.commit().map_err(storage_error)
+        })
+        .await?;
+        self.get_project(id).await
+    }
+
     pub async fn rename_project(&self, id: ProjectId, name: String) -> DomainResult<Project> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -429,6 +464,49 @@ mod tests {
             let error = db.list_projects().await.unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn request_budget_updates_persist_and_keep_other_limits() {
+        let (db, id) = project_with_settings("{}", r#"{"max_fuzz_cases":7}"#).await;
+        let project = db
+            .update_project_request_budget(
+                id,
+                RequestBudgetUpdate {
+                    requests_per_second: Some(5.0),
+                    max_concurrent_requests: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(project.limits.requests_per_second, 5.0);
+        assert_eq!(project.limits.max_concurrent_requests, 4);
+        assert_eq!(project.limits.max_fuzz_cases, 7);
+        assert_eq!(
+            db.get_project(id).await.unwrap().limits.requests_per_second,
+            5.0
+        );
+
+        let error = db
+            .update_project_request_budget(
+                id,
+                RequestBudgetUpdate {
+                    requests_per_second: Some(1.0),
+                    max_concurrent_requests: Some(0),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            db.get_project(id).await.unwrap().limits.requests_per_second,
+            5.0
+        );
+        let missing = db
+            .update_project_request_budget(ProjectId(id.get() + 1), RequestBudgetUpdate::default())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), ErrorCode::NotFound);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 
 pub(crate) mod budget;
 mod exchange_view;
+mod fuzz_view;
 mod history_view;
 mod view;
 
@@ -468,7 +469,8 @@ fn fuzz_template_schema() -> Value {
                 "default": [],
                 "items": {"type": "string", "enum": ["raw", "hex_encode", "hex_decode", "base64_encode", "base64_decode", "base64_url_encode", "base64_url_decode", "url_encode", "url_decode", "html_encode", "html_decode", "gzip_decode", "gunzip", "brotli_decode", "br_decode"]}
             },
-            "strategy": {"type": "string", "enum": ["sniper", "battering_ram", "pitchfork", "cluster_bomb"], "default": "sniper"}
+            "strategy": {"type": "string", "enum": ["sniper", "battering_ram", "pitchfork", "cluster_bomb"], "default": "sniper"},
+            "request_timeout_ms": {"type": "integer", "minimum": 100, "maximum": 60000, "description": "Fail a case that takes longer than this instead of waiting the default 60 seconds."}
         },
         "required": ["insertion_points"],
         "anyOf": [{"required":["wordlists"]},{"required":["wordlist_files"]},{"required":["payload_generators"]}],
@@ -534,7 +536,7 @@ fn browser_input_tool_def() -> Value {
 
 pub(crate) fn tool_defs() -> Value {
     json!([
-        {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations. set_upstream_proxy persists live routing; proxy null inherits config.toml, direct selects direct traffic, and a URL selects that proxy. Existing connections reconnect naturally.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope","set_upstream_proxy"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults; set_upstream_proxy needs project_id and an explicit proxy URL, direct, or null."},"project_id":{"type":"integer","description":"Optional for list; required for usage, set_scope and set_upstream_proxy."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}},"proxy":{"type":["string","null"],"description":"For set_upstream_proxy: http://, socks5:// or socks5h:// URL, direct to route directly, or null to inherit config.toml."}},"required":["action"],"additionalProperties":false}},
+        {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations. set_upstream_proxy persists live routing; proxy null inherits config.toml, direct selects direct traffic, and a URL selects that proxy. Existing connections reconnect naturally. set_limits changes the request rate and concurrency that Reply, fuzz jobs, the crawler and extensions share; running fuzz jobs keep the limits they started with.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope","set_upstream_proxy","set_limits"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults; set_upstream_proxy needs project_id and an explicit proxy URL, direct, or null; set_limits needs project_id and requests_per_second, max_concurrent_requests, or both."},"project_id":{"type":"integer","description":"Optional for list; required for usage, set_scope, set_upstream_proxy and set_limits."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}},"requests_per_second":{"type":"number","minimum":0.1,"maximum":1000,"description":"For set_limits: the most requests started per second (default 50)."},"max_concurrent_requests":{"type":"integer","minimum":1,"maximum":256,"description":"For set_limits: the most requests in flight at once (default 32)."},"proxy":{"type":["string","null"],"description":"For set_upstream_proxy: http://, socks5:// or socks5h:// URL, direct to route directly, or null to inherit config.toml."}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List compact installed-extension summaries and any rejected packages. Use extension_describe for schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and requested/effective limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
         {"name":"extension_preview","description":"Run the real extension planner without creating a job or sending requests. Returns stage-scoped request, candidate, runtime, and mode estimates plus a bounded planning_summary with selection/exclusion details when supplied by the plugin.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer"},"input":{"type":"object","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
@@ -559,8 +561,8 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
         {"name":"reply_send","description":"Send a semantic HTTP request and return status, a decoded 4 KiB response preview and the saved exchange_id; read more of the response with exchange_body. With base_exchange_id, diff gives the base status, length and whether the body is identical. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
-        {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
-        {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Continue case pages with next_before_case_index.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0}},"required":["project_id","action"],"additionalProperties":false}},
+        {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators. Returns the queued job at once; fuzz_manage get with wait_ms returns as soon as it ends.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
+        {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Pages fit the output budget: continue cases and group_cases with before_case_index=next_before_case_index, and groups (largest first) with offset=next_offset.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0,"description":"groups: next_offset from the previous page."},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"get: wait up to this long for the job to end instead of polling; returns as soon as it does."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, or inject a text/binary message into an active connection.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","send"]},"connection_id":{"type":"integer"},"after_id":{"type":"integer"},"limit":{"type":"integer","minimum":1,"maximum":1000},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"default":"text"},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
@@ -1396,6 +1398,41 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             .await?
                     ))
                 }
+                "set_limits" => {
+                    let project_id = require_project_id(&args)?;
+                    let update = RequestBudgetUpdate {
+                        requests_per_second: args
+                            .get("requests_per_second")
+                            .map(|value| {
+                                value.as_f64().ok_or_else(|| {
+                                    DomainError::invalid("requests_per_second must be a number")
+                                })
+                            })
+                            .transpose()?,
+                        max_concurrent_requests: args
+                            .get("max_concurrent_requests")
+                            .map(|value| {
+                                value
+                                    .as_u64()
+                                    .and_then(|value| u32::try_from(value).ok())
+                                    .ok_or_else(|| {
+                                        DomainError::invalid(
+                                            "max_concurrent_requests must be a positive integer",
+                                        )
+                                    })
+                            })
+                            .transpose()?,
+                    };
+                    let project = state
+                        .db
+                        .update_project_request_budget(project_id, update)
+                        .await?;
+                    Ok(json!({
+                        "project_id": project.id.get(),
+                        "requests_per_second": project.limits.requests_per_second,
+                        "max_concurrent_requests": project.limits.max_concurrent_requests,
+                    }))
+                }
                 "usage" => {
                     let project_id = require_project_id(&args)?;
                     Ok(json!(state.db.project_usage(project_id).await?))
@@ -2178,7 +2215,17 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .get("job_id")
                         .and_then(|v| v.as_i64())
                         .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    Ok(json!(state.fuzzer.get(project_id, FuzzJobId(jid)).await?))
+                    let wait = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+                    Ok(json!(
+                        state
+                            .fuzzer
+                            .wait(
+                                project_id,
+                                FuzzJobId(jid),
+                                std::time::Duration::from_millis(wait),
+                            )
+                            .await?
+                    ))
                 }
                 "cases" => {
                     let jid = args
@@ -2197,17 +2244,18 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .fuzzer
                         .list_cases(project_id, FuzzJobId(jid), limit, before)
                         .await?;
-                    Ok(json!({ "cases": cases, "next_before_case_index": next }))
+                    fuzz_view::case_page(cases, next.is_some())
                 }
                 "groups" => {
                     let jid = args
                         .get("job_id")
                         .and_then(Value::as_i64)
                         .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    Ok(json!({
-                        "groups": state.fuzzer
-                            .list_response_groups(project_id, FuzzJobId(jid)).await?
-                    }))
+                    let groups = state
+                        .fuzzer
+                        .list_response_groups(project_id, FuzzJobId(jid))
+                        .await?;
+                    fuzz_view::group_page(groups, &args)
                 }
                 "group_cases" => {
                     let jid = args
@@ -2233,7 +2281,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             args.get("before_case_index").and_then(Value::as_u64),
                         )
                         .await?;
-                    Ok(json!({ "cases": cases, "next_before_case_index": next }))
+                    fuzz_view::case_page(cases, next.is_some())
                 }
                 "diff" => {
                     let jid = args

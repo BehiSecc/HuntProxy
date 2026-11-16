@@ -10,8 +10,8 @@ pub(crate) mod test_tls;
 pub(crate) mod tls;
 
 use crate::domain::{
-    CaptureSession, DomainError, DomainResult, ErrorCode, ProjectId, TransportProvenance,
-    ValidatedDial,
+    CaptureSession, DomainError, DomainResult, ErrorCode, FuzzJobId, ProjectId,
+    TransportProvenance, ValidatedDial,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -53,6 +53,12 @@ pub enum TransportIdentity {
         project_id: ProjectId,
         credential_digest: [u8; 32],
     },
+    /// Every case of one fuzz job. Cases often vary a credential header, and
+    /// a pool per credential value would open a new connection per case.
+    FuzzJob {
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+    },
 }
 
 impl TransportIdentity {
@@ -87,6 +93,10 @@ impl TransportIdentity {
             project_id,
             credential_digest: digest.finalize().into(),
         }
+    }
+
+    pub fn for_fuzz_job(project_id: ProjectId, job_id: FuzzJobId) -> Self {
+        Self::FuzzJob { project_id, job_id }
     }
 }
 
@@ -253,7 +263,10 @@ impl Resolve for ApprovedResolver {
 
 const CLIENT_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_CACHED_CLIENTS: usize = 64;
-const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 8;
+/// HTTP/1.1 carries one request per connection, so a client running a full
+/// project budget against one host needs that many idle connections to reuse
+/// them. Fewer forces a new TCP and TLS handshake for most requests.
+const MAX_IDLE_CONNECTIONS_PER_HOST: usize = crate::domain::MAX_CONCURRENT_REQUESTS as usize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ClientKey {
@@ -980,6 +993,63 @@ mod tests {
             [(1, 255), (3, 219), (5, 255), (7, 219), (9, 255)]
         );
         assert_eq!(transport.clients.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_http1_requests_reuse_every_idle_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0; 1024];
+                    loop {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        while let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            buffer.drain(..end + 4);
+                            // Hold the request so every request in a wave overlaps.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                            if socket.write_all(response).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let transport = WreqTransport::new();
+        let mut dial = cache_dial(&address.to_string(), 1);
+        dial.port = address.port();
+        dial.scheme = "http".into();
+        let wave = || {
+            futures::future::join_all((0..24).map(|index| {
+                let mut request = cache_request();
+                request.url = format!("http://cache.test:{}/{index}", address.port());
+                request.protocol = ProtocolMode::Http1;
+                transport.send(&dial, request)
+            }))
+        };
+        for response in wave().await {
+            assert_eq!(response.unwrap().status, StatusCode::OK);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for response in wave().await {
+            assert_eq!(response.unwrap().status, StatusCode::OK);
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 24);
     }
 
     #[test]

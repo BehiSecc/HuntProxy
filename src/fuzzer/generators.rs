@@ -400,6 +400,7 @@ mod tests {
             ],
             transforms: vec![],
             strategy: crate::domain::FuzzStrategy::Sniper,
+            request_timeout_ms: None,
         };
         let error = expand_generators(&mut template, 5).unwrap_err();
         assert_eq!(error.code(), ErrorCode::CombinationLimit);

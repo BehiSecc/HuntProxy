@@ -330,7 +330,7 @@ fn route_row(route: SitemapRoute) -> Value {
     Value::Object(row)
 }
 
-fn offset_arg(args: &Value) -> usize {
+pub(super) fn offset_arg(args: &Value) -> usize {
     args.get("offset")
         .and_then(Value::as_u64)
         .map_or(0, |offset| usize::try_from(offset).unwrap_or(usize::MAX))
@@ -339,7 +339,7 @@ fn offset_arg(args: &Value) -> usize {
 /// Adds `rows[offset..]` to `envelope` under `key`, cut to `limit` rows and to
 /// the output budget. When rows remain, `total` and `next_offset` say how many
 /// and where the next page starts.
-fn offset_page(
+pub(super) fn offset_page(
     mut envelope: Map<String, Value>,
     key: &str,
     rows: Vec<Value>,

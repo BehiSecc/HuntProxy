@@ -107,7 +107,15 @@ pub struct FuzzTemplate {
     pub transforms: Vec<crate::codec::Transform>,
     #[serde(default = "default_fuzz_strategy")]
     pub strategy: FuzzStrategy,
+    /// How long each case may take, so a slow endpoint fails its case instead
+    /// of holding a request slot for Reply's full 60 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
 }
+
+/// Bounds of a fuzz job's per-case timeout. The ceiling is Reply's own timeout.
+pub const MIN_FUZZ_REQUEST_TIMEOUT_MS: u64 = 100;
+pub const MAX_FUZZ_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
 fn default_fuzz_strategy() -> FuzzStrategy {
     FuzzStrategy::Sniper
@@ -249,11 +257,17 @@ impl Iterator for CaseIterator {
     }
 }
 
+/// The longest `wait` accepts, so one call never outlasts an MCP client's patience.
+pub const MAX_FUZZ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct FuzzerService {
     pub db: Arc<Db>,
     pub reply: Arc<ReplyService>,
     pub placeholder_key: PlaceholderKey,
     pub cancel_flags: Arc<dashmap::DashMap<i64, CancellationToken>>,
+    /// One receiver per running job. Its sender is dropped once the worker has
+    /// saved the job's final state, which wakes every `wait`.
+    finished: Arc<dashmap::DashMap<i64, tokio::sync::watch::Receiver<()>>>,
 }
 
 impl FuzzerService {
@@ -263,6 +277,7 @@ impl FuzzerService {
             reply,
             placeholder_key,
             cancel_flags: Arc::new(dashmap::DashMap::new()),
+            finished: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -337,12 +352,36 @@ impl FuzzerService {
                 .to_string(),
             )
             .await?;
+        // One audit event per job; cases are not audited one by one.
+        let mut audit = serde_json::json!({
+            "parent": template.base_exchange_id.map(ExchangeId::get),
+            "strategy": template.strategy,
+            "estimated_cases": estimated,
+        });
+        if let Some(identity) = &template.draft.identity {
+            audit["identity"] = serde_json::to_value(identity)
+                .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?;
+        }
+        let _ = self
+            .db
+            .audit(
+                Some(project_id),
+                "fuzz_start",
+                Some("fuzzer"),
+                Some("fuzz_job"),
+                Some(&job.id.get().to_string()),
+                audit,
+            )
+            .await;
 
         let cancel = CancellationToken::new();
         self.cancel_flags.insert(job.id.get(), cancel.clone());
+        let (finished_sender, finished_receiver) = tokio::sync::watch::channel(());
+        self.finished.insert(job.id.get(), finished_receiver);
         let db = self.db.clone();
         let reply = self.reply.clone();
         let cancel_flags = self.cancel_flags.clone();
+        let finished = self.finished.clone();
         let job_id = job.id;
         let max_concurrency = project.limits.max_concurrent_requests.max(1) as usize;
         tokio::spawn(async move {
@@ -369,9 +408,33 @@ impl FuzzerService {
                     .await;
             }
             cancel_flags.remove(&job_id.get());
+            finished.remove(&job_id.get());
+            drop(finished_sender);
         });
 
         Ok(job)
+    }
+
+    /// The job, once it has ended or `wait` has passed, whichever is first.
+    pub async fn wait(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+        wait: std::time::Duration,
+    ) -> DomainResult<FuzzJob> {
+        let job = self.db.get_fuzz_job(project_id, job_id).await?;
+        if wait.is_zero() || fuzz_job_has_ended(job.state) {
+            return Ok(job);
+        }
+        let finished = self
+            .finished
+            .get(&job_id.get())
+            .map(|entry| entry.value().clone());
+        if let Some(mut finished) = finished {
+            // `changed` fails as soon as the worker drops the sender.
+            let _ = tokio::time::timeout(wait.min(MAX_FUZZ_WAIT), finished.changed()).await;
+        }
+        self.db.get_fuzz_job(project_id, job_id).await
     }
 
     pub async fn cancel_for_project(
@@ -380,10 +443,7 @@ impl FuzzerService {
         job_id: FuzzJobId,
     ) -> DomainResult<()> {
         let job = self.db.get_fuzz_job(project_id, job_id).await?;
-        if matches!(
-            job.state,
-            FuzzJobState::Completed | FuzzJobState::Failed | FuzzJobState::Interrupted
-        ) {
+        if fuzz_job_has_ended(job.state) {
             return Err(DomainError::conflict("fuzz job is already terminal"));
         }
         let token = self
@@ -690,6 +750,13 @@ impl FuzzerService {
             (Err(error), _) | (_, Err(error)) => (None, Some(error.to_string())),
         }
     }
+}
+
+fn fuzz_job_has_ended(state: FuzzJobState) -> bool {
+    matches!(
+        state,
+        FuzzJobState::Completed | FuzzJobState::Failed | FuzzJobState::Interrupted
+    )
 }
 
 fn annotate_group_with_baseline(
@@ -1025,8 +1092,6 @@ async fn execute_case(
                 .await;
         }
     };
-    db.mark_fuzz_case_running(project_id, job_id, persisted.id)
-        .await?;
     let slots = tokio::select! {
         _ = cancel.cancelled() => None,
         slots = limiter.acquire(1) => Some(slots?),
@@ -1069,89 +1134,51 @@ async fn execute_case(
             template.base_exchange_id,
             &prepared.draft,
             ProtocolPreference::Auto,
-            ReplySendContext::fuzzer(template.base_exchange_id, job_id, persisted.id),
+            ReplySendContext::fuzzer(template.base_exchange_id, job_id, persisted.id)
+                .with_request_timeout(
+                    template
+                        .request_timeout_ms
+                        .map(std::time::Duration::from_millis),
+                ),
             identity.as_deref(),
             slots,
         )
         .await;
     match result {
+        // The send result carries what the saved exchange holds, so the case
+        // is finished without reading the exchange back.
         Ok(result) => {
-            let Some(exchange_id) = result.exchange_id else {
-                return db
-                    .finish_fuzz_case(
-                        project_id,
-                        job_id,
-                        persisted.id,
-                        FuzzCaseState::Completed,
-                        None,
-                        Some(result.status_code),
-                        Some(result.response_length),
-                        Some(result.duration_ms),
-                        None,
-                        Some(result.response_body_hash),
-                    )
-                    .await;
-            };
-            let detail = db
-                .get_exchange_detail(
-                    project_id,
-                    exchange_id,
-                    crate::policy::PresentationOptions::default(),
-                )
-                .await;
-            match detail {
-                Ok(detail) => {
-                    db.finish_fuzz_case(
-                        project_id,
-                        job_id,
-                        persisted.id,
-                        FuzzCaseState::Completed,
-                        Some(exchange_id),
-                        detail.summary.status_code,
-                        detail.summary.response_length,
-                        detail.summary.duration_ms,
-                        None,
-                        detail.response_body_hash,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    db.finish_fuzz_case(
-                        project_id,
-                        job_id,
-                        persisted.id,
-                        FuzzCaseState::Failed,
-                        Some(exchange_id),
-                        None,
-                        None,
-                        None,
-                        Some(format!("request sent but result loading failed: {error}")),
-                        None,
-                    )
-                    .await
-                }
-            }
+            db.finish_fuzz_case(
+                project_id,
+                job_id,
+                persisted.id,
+                FuzzCaseState::Completed,
+                result.exchange_id,
+                Some(result.status_code),
+                Some(result.response_length),
+                Some(result.duration_ms),
+                None,
+                Some(result.response_body_hash),
+            )
+            .await
         }
-        Err(error) => {
-            let exchange_id = db
-                .find_fuzz_case_exchange(project_id, job_id, persisted.id)
-                .await?;
-            let fatal = error.code() == ErrorCode::DiskQuotaExceeded;
+        Err(failed) => {
+            let fatal = failed.error.code() == ErrorCode::DiskQuotaExceeded;
             db.finish_fuzz_case(
                 project_id,
                 job_id,
                 persisted.id,
                 FuzzCaseState::Failed,
-                exchange_id,
+                failed.exchange_id,
                 None,
                 None,
                 None,
-                Some(error.to_string()),
+                Some(failed.error.to_string()),
                 None,
             )
             .await?;
             if fatal {
-                Err(error)
+                Err(failed.error)
             } else {
                 Ok(())
             }
@@ -1394,6 +1421,13 @@ fn validate_template(template: &FuzzTemplate) -> DomainResult<()> {
     if template.wordlists.iter().any(Vec::is_empty) {
         return Err(DomainError::invalid("wordlists must not be empty"));
     }
+    if template.request_timeout_ms.is_some_and(|timeout| {
+        !(MIN_FUZZ_REQUEST_TIMEOUT_MS..=MAX_FUZZ_REQUEST_TIMEOUT_MS).contains(&timeout)
+    }) {
+        return Err(DomainError::invalid(format!(
+            "request_timeout_ms must be between {MIN_FUZZ_REQUEST_TIMEOUT_MS} and {MAX_FUZZ_REQUEST_TIMEOUT_MS}"
+        )));
+    }
     Ok(())
 }
 
@@ -1514,6 +1548,412 @@ mod tests {
         }
     }
 
+    /// Records the transport identity and timeouts of every request.
+    #[derive(Default)]
+    struct RecordingTransport {
+        identities: parking_lot::Mutex<Vec<crate::transport::TransportIdentity>>,
+        timeouts: parking_lot::Mutex<Vec<(Duration, Duration)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for RecordingTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            self.timeouts
+                .lock()
+                .push((request.connect_timeout, request.total_timeout));
+            self.identities.lock().push(request.identity);
+            Ok(OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                body: Bytes::from_static(b"ok"),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test_recording".into(),
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test_recording"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    #[tokio::test]
+    async fn cases_varying_credentials_share_one_transport_identity() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz identity".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/".into()),
+                header_overrides: vec![HeaderPatch {
+                    name: "Authorization".into(),
+                    value: b"Bearer \xc2\xa7token\xc2\xa7".to_vec(),
+                }],
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "token".into(),
+                location: "header:Authorization".into(),
+            }],
+            wordlists: vec![vec!["one".into(), "two".into(), "three".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
+        };
+        let job = db
+            .create_fuzz_job(
+                project.id,
+                None,
+                template.strategy,
+                serde_json::to_string(&template).unwrap(),
+                3,
+                "{}".into(),
+            )
+            .await
+            .unwrap();
+        let transport = Arc::new(RecordingTransport::default());
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: transport.clone(),
+            placeholder_key: PlaceholderKey::from_bytes(vec![8; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+
+        run_job(
+            db.clone(),
+            reply,
+            project.id,
+            job.id,
+            template,
+            1,
+            test_limiter(1, 1_000.0),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let identities = transport.identities.lock().clone();
+        assert_eq!(identities.len(), 3);
+        assert!(identities.iter().all(|identity| *identity
+            == crate::transport::TransportIdentity::for_fuzz_job(project.id, job.id)));
+    }
+
+    #[tokio::test]
+    async fn a_job_is_audited_once_and_cases_keep_their_send_results() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let mut project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz audit".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        // The in-memory test database is shared-cache, where concurrent
+        // writers fail instead of waiting.
+        project.limits.max_concurrent_requests = 1;
+        project.limits.requests_per_second = 1_000.0;
+        db.update_project_scope(project.id, project.scope.clone(), Some(project.limits))
+            .await
+            .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(RecordingTransport::default()),
+            placeholder_key: PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service =
+            FuzzerService::new(db.clone(), reply, PlaceholderKey::from_bytes(vec![10; 32]));
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/?q=§q§".into()),
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "q".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![vec!["a".into(), "b".into(), "c".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
+        };
+        let job = service.start(project.id, template, false).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while service.has_active_jobs() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fuzz job did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished = db.get_fuzz_job(project.id, job.id).await.unwrap();
+        assert_eq!(finished.state, FuzzJobState::Completed);
+        assert_eq!(finished.completed_cases, 3);
+
+        let audits = db
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare("SELECT event_type, target_id FROM audit_events ORDER BY id")
+                    .unwrap();
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            audits,
+            vec![("fuzz_start".into(), job.id.get().to_string())]
+        );
+
+        let (cases, _) = db
+            .list_fuzz_cases(project.id, job.id, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(cases.len(), 3);
+        for case in cases {
+            assert_eq!(case.state, FuzzCaseState::Completed);
+            assert_eq!(case.status_code, Some(200));
+            assert_eq!(case.response_length, Some(2));
+            assert_eq!(
+                case.body_hash.as_deref(),
+                Some(crate::storage::sha256_hex(b"ok").as_str())
+            );
+            assert!(case.started_at.is_some() && case.finished_at.is_some());
+            let detail = db
+                .get_exchange_detail(
+                    project.id,
+                    case.exchange_id.unwrap(),
+                    PresentationOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(detail.summary.source, ExchangeSource::Fuzzer);
+            assert_eq!(detail.lineage.fuzz_job_id, Some(job.id));
+            assert_eq!(detail.lineage.fuzz_case_id, Some(case.id));
+            assert_eq!(detail.response_body_hash, case.body_hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_timeout_bounds_each_case_and_is_validated() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let mut project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz timeout".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        project.limits.max_concurrent_requests = 1;
+        project.limits.requests_per_second = 1_000.0;
+        db.update_project_scope(project.id, project.scope.clone(), Some(project.limits))
+            .await
+            .unwrap();
+        let transport = Arc::new(RecordingTransport::default());
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: transport.clone(),
+            placeholder_key: PlaceholderKey::from_bytes(vec![13; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service =
+            FuzzerService::new(db.clone(), reply, PlaceholderKey::from_bytes(vec![14; 32]));
+        let template = |timeout| FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/?q=§q§".into()),
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "q".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![vec!["a".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: timeout,
+        };
+        for timeout in [Some(99), Some(60_001)] {
+            let error = service
+                .start(project.id, template(timeout), false)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
+        for timeout in [Some(250), Some(60_000), None] {
+            let job = service
+                .start(project.id, template(timeout), false)
+                .await
+                .unwrap();
+            let ended = service
+                .wait(project.id, job.id, Duration::from_secs(10))
+                .await
+                .unwrap();
+            assert_eq!(ended.state, FuzzJobState::Completed);
+        }
+        assert_eq!(
+            *transport.timeouts.lock(),
+            vec![
+                (Duration::from_millis(250), Duration::from_millis(250)),
+                (Duration::from_secs(10), Duration::from_secs(60)),
+                (Duration::from_secs(10), Duration::from_secs(60)),
+            ]
+        );
+    }
+
+    /// Answers every request after a delay.
+    struct SlowTransport(Duration);
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for SlowTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            _request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            tokio::time::sleep(self.0).await;
+            Ok(OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                body: Bytes::from_static(b"ok"),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test_slow".into(),
+                duration: self.0,
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test_slow"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_returns_when_the_job_ends_not_when_the_wait_does() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let mut project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz wait".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        project.limits.max_concurrent_requests = 1;
+        project.limits.requests_per_second = 1_000.0;
+        db.update_project_scope(project.id, project.scope.clone(), Some(project.limits))
+            .await
+            .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(SlowTransport(Duration::from_millis(150))),
+            placeholder_key: PlaceholderKey::from_bytes(vec![11; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service =
+            FuzzerService::new(db.clone(), reply, PlaceholderKey::from_bytes(vec![12; 32]));
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/?q=§q§".into()),
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "q".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![vec!["a".into(), "b".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
+        };
+        let job = service.start(project.id, template, false).await.unwrap();
+
+        let immediate = service
+            .wait(project.id, job.id, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!fuzz_job_has_ended(immediate.state));
+
+        let started = std::time::Instant::now();
+        let ended = service
+            .wait(project.id, job.id, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert_eq!(ended.state, FuzzJobState::Completed);
+        assert_eq!(ended.completed_cases, 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // An ended job returns at once, and another project's job is not found.
+        let again = std::time::Instant::now();
+        service
+            .wait(project.id, job.id, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert!(again.elapsed() < Duration::from_secs(1));
+        let other = service
+            .wait(
+                ProjectId(project.id.get() + 1),
+                job.id,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(other.code(), ErrorCode::NotFound);
+    }
+
     #[test]
     fn strategy_counts_are_correct() {
         assert_eq!(estimate_combinations(FuzzStrategy::Sniper, 2, &[3, 4]), 7);
@@ -1557,6 +1997,7 @@ mod tests {
             payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
         };
         let cases = CaseIterator::new(
             template.strategy,
@@ -1681,6 +2122,7 @@ mod tests {
             payload_generators: vec![],
             transforms: vec![Transform::HexEncode],
             strategy: FuzzStrategy::Pitchfork,
+            request_timeout_ms: None,
         };
         let case = CaseIterator::new(
             template.strategy,
@@ -1734,6 +2176,7 @@ mod tests {
             payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
         };
 
         load_wordlist_files(&mut template).await.unwrap();
@@ -1759,6 +2202,7 @@ mod tests {
             payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
         };
         let case = CaseIterator::new(
             template.strategy,
@@ -1825,6 +2269,7 @@ mod tests {
             payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
         };
         let job = db
             .create_fuzz_job(
@@ -1925,6 +2370,7 @@ mod tests {
             payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
         };
         let job = db
             .create_fuzz_job(
@@ -2005,6 +2451,7 @@ mod tests {
             payload_generators: vec![],
             transforms: vec![],
             strategy: FuzzStrategy::Sniper,
+            request_timeout_ms: None,
         };
         let job = db
             .create_fuzz_job(
