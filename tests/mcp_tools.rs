@@ -295,3 +295,109 @@ async fn cookie_changes_report_audit_failures() {
             .unwrap_err();
     assert_eq!(error.code(), ErrorCode::StorageError);
 }
+
+#[tokio::test]
+async fn websocket_messages_page_within_the_budget_and_long_payloads_read_whole() {
+    let (_directory, state, project_id) = test_state().await;
+    let connection = state
+        .db
+        .create_websocket_connection(project_id, None, "wss://example.com/live".into(), None)
+        .await
+        .unwrap();
+    let long = |index: usize| format!("{index:04}{}", "x".repeat(30_000)).into_bytes();
+    let mut ids = Vec::new();
+    for index in 0..40 {
+        let payload = match index {
+            0 => Vec::new(),
+            1 => vec![0xff, 0x00],
+            _ => long(index),
+        };
+        let opcode = if index == 1 { "binary" } else { "text" };
+        let id = state
+            .db
+            .insert_websocket_message(
+                project_id,
+                connection.id,
+                "to_client",
+                opcode,
+                &payload,
+                u64::MAX,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let mut seen = Vec::new();
+    let mut after_id: Option<i64> = None;
+    loop {
+        let mut args = json!({"action":"messages","project_id":project_id.get(),"connection_id":connection.id});
+        if let Some(after_id) = after_id {
+            args["after_id"] = json!(after_id);
+        }
+        let page = call_tool(state.clone(), "websocket_manage", args)
+            .await
+            .unwrap();
+        assert!(page.to_string().len() <= 24_000);
+        for message in page["messages"].as_array().unwrap() {
+            seen.push(message["id"].as_i64().unwrap());
+            if message["payload_length"] == 30_004 {
+                assert_eq!(message["payload_cut"], true);
+                assert_eq!(message["payload"].as_str().unwrap().len(), 2_048);
+            } else {
+                assert!(message.get("payload_cut").is_none());
+            }
+        }
+        match page.get("next_after_id") {
+            Some(next) => after_id = next.as_i64(),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ids);
+
+    let mut read = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = call_tool(
+            state.clone(),
+            "websocket_manage",
+            json!({"action":"message","project_id":project_id.get(),"message_id":ids[5],"offset":offset}),
+        )
+        .await
+        .unwrap();
+        assert!(page.to_string().len() <= 24_000);
+        assert_eq!(page["connection_id"], connection.id);
+        read.extend_from_slice(page["preview"].as_str().unwrap().as_bytes());
+        match page.get("next_offset") {
+            Some(next) => offset = next.as_u64().unwrap(),
+            None => break,
+        }
+    }
+    assert_eq!(read, long(5));
+
+    let binary = call_tool(
+        state.clone(),
+        "websocket_manage",
+        json!({"action":"message","project_id":project_id.get(),"message_id":ids[1]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(binary["encoding"], "base64");
+    assert_eq!(binary["preview"], "/wA=");
+
+    for (args, code) in [
+        (
+            json!({"action":"message","project_id":project_id.get()}),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            json!({"action":"message","project_id":project_id.get(),"message_id":999_999}),
+            ErrorCode::NotFound,
+        ),
+    ] {
+        let error = call_tool(state.clone(), "websocket_manage", args)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), code);
+    }
+}

@@ -2354,13 +2354,26 @@ mod tests {
 
         let messages = state
             .db
-            .list_websocket_messages(project.id, connection.id, None, 20)
+            .list_websocket_messages(project.id, connection.id, None, 20, 3)
             .await
             .unwrap();
         assert!(messages.len() >= 4);
         assert!(messages
             .iter()
             .any(|message| message.direction == "injected_to_server"));
+        // Listing reads only a prefix of each payload; loading reads it all.
+        let hello = messages
+            .iter()
+            .find(|message| message.payload_length == 5)
+            .unwrap();
+        assert_eq!((hello.payload.as_str(), hello.payload_cut), ("hel", true));
+        let stored = state
+            .db
+            .load_websocket_message(project.id, hello.id)
+            .await
+            .unwrap();
+        assert_eq!(stored.payload, b"hello");
+        assert_eq!(stored.connection_id, connection.id);
         let handshake_id = ExchangeId(connection.handshake_exchange_id.unwrap());
         let request_headers = state
             .db
