@@ -152,3 +152,51 @@ test("the worker lists JavaScript files after a cursor and waits for events in s
     (error) => error.code === -32001);
   await call("session.stop", { session_id: 1 });
 });
+
+test("a slow call holds up only its own session, and abort ends a session at once", {
+  skip: available ? false : "Playwright and Chromium are required for the browser regression",
+  timeout: 120_000,
+}, async (t) => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end("<!doctype html><title>Lane</title>");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); }));
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  const call = startWorker(t);
+  for (const session_id of [1, 2]) {
+    await call("session.start", { session_id, engine: "chromium", persistent: false, url });
+  }
+  const evaluate = (session_id, expression, timeout_ms = 10_000) =>
+    call("session.action", { session_id, action: { type: "evaluate", expression, timeout_ms } })
+      .then((reply) => reply.data.content);
+
+  const started = Date.now();
+  const slow = evaluate(1, "await new Promise((resolve) => setTimeout(resolve, 3000)); window.step = 'slow'");
+  // Sent after the slow call: one session's calls keep their order.
+  const next = evaluate(1, "window.step");
+  assert.equal(await evaluate(2, "1 + 1"), "2");
+  await call("hello", {});
+  assert.ok(Date.now() - started < 2_000, `session 2 waited ${Date.now() - started} ms for session 1`);
+  assert.equal(await slow, "slow");
+  assert.equal(await next, "slow");
+
+  // A call that never ends goes with its session, and nothing else does.
+  const stuck = evaluate(1, "await new Promise(() => {})", 30_000);
+  stuck.catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const aborting = Date.now();
+  assert.deepEqual(await call("session.abort", { session_id: 1 }), { aborted: true });
+  assert.ok(Date.now() - aborting < 6_000);
+  await assert.rejects(stuck);
+  await assert.rejects(evaluate(1, "1"), (error) => error.code === -32001);
+  assert.equal(await evaluate(2, "2 + 2"), "4");
+
+  // A session given up on while it launches is closed once it has.
+  const launching = call("session.start", { session_id: 3, engine: "chromium", persistent: false });
+  assert.deepEqual(await call("session.abort", { session_id: 3 }), { aborted: false });
+  await assert.rejects(launching, /aborted while it launched/);
+  await assert.rejects(evaluate(3, "1"), (error) => error.code === -32001);
+  await call("session.stop", { session_id: 2 });
+});

@@ -511,7 +511,7 @@ fn browser_input_tool_def() -> Value {
     // Flat and compact for the same Codex reasons as browser_action_schema.
     json!({
         "name": "browser_input",
-        "description": "Mouse and keyboard input on the selected page that browser_action click, fill and press cannot express. click presses a mouse button (count 2 is a double-click, button right a context-menu click) with optional held modifiers; hover moves the pointer; drag presses at the start, moves in steps and releases at the destination, which mouse-driven and native HTML drag and drop both follow; type sends text as real keystrokes to locator, or to whatever has focus when locator is omitted (fill replaces a value at once; type suits editors, autocomplete and one-character boxes). Aim click, hover and drag at a locator or at x and y: CSS pixels in the selected page's viewport, as getBoundingClientRect() reports in its top document, so a point reaches a canvas or anything a locator cannot name. An element is clicked with Playwright's checks; a point is clicked as it is. For single keys and chords use browser_action press.",
+        "description": "Mouse and keyboard input on the selected page that browser_action click, fill and press cannot express. click presses a mouse button (count 2 is a double-click, button right a context-menu click) with optional held modifiers; hover moves the pointer; drag presses at the start, moves in steps and releases at the destination, which mouse-driven and native HTML drag and drop both follow; a drag between elements scrolls them into view, but with x and y at either end nothing scrolls and an element end must already be in view; type sends text as real keystrokes after the text locator holds, or to whatever has focus when locator is omitted (fill replaces a value at once; type suits editors, autocomplete and one-character boxes). Aim click, hover and drag at a locator or at x and y: CSS pixels in the selected page's viewport, as getBoundingClientRect() reports in its top document, so a point reaches a canvas or anything a locator cannot name. An element is clicked with Playwright's checks; a point is clicked as it is, and the result names the element it hit, in whatever frame. For single keys and chords use browser_action press.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3457,6 +3457,9 @@ mod tests {
             "hover moves the pointer",
             "native HTML drag and drop",
             "real keystrokes",
+            "after the text locator holds",
+            "nothing scrolls",
+            "names the element it hit",
             "whatever has focus",
             "getBoundingClientRect()",
             "browser_action press",

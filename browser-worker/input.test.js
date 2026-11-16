@@ -140,6 +140,7 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
       <div id="chip" draggable="true">chip</div><div id="bin"></div>
       <div id="form"><input id="search" aria-label="Search">
         <input class="otp" maxlength="1" aria-label="Digit 1"><input class="otp" maxlength="1"><input class="otp" maxlength="1"><input class="otp" maxlength="1">
+        <input id="mail" type="email" value="a@b.c">
         <div id="editor" contenteditable="true" role="textbox" aria-label="Notes" style="min-width:200px;min-height:20px;border:1px solid #999"></div>
         <ul id="commands" hidden><li>Heading</li></ul>
         <button class="row">Delete</button><button class="row">Delete</button><button class="row">Delete</button></div>
@@ -178,12 +179,15 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
 
   await t.test("clicks at a point with any button, count and modifiers", async () => {
     assert.deepEqual(await run({ type: "pointer", op: "click", x: 100, y: 120 }),
-      { message: "pointer clicked", data: { url: `${base}/` } });
+      { message: "pointer clicked div#pad", data: { url: `${base}/`, hit: { tag: "div", id: "pad" } } });
     assert.deepEqual(await heard(), [
       { kind: "mousedown", x: 100, y: 120, button: 0, detail: 1, trusted: true, keys: "" },
       { kind: "mouseup", x: 100, y: 120, button: 0, detail: 1, trusted: true, keys: "" },
       { kind: "click", x: 100, y: 120, button: 0, detail: 1, trusted: true, keys: "" },
     ]);
+    assert.deepEqual((await run({ type: "pointer", op: "click", x: 580, y: 430 })).data.hit,
+      { tag: "div", id: "chip", text: "chip" });
+    await heard();
     await run({ type: "pointer", op: "click", x: 150.5, y: 200, button: "right" });
     assert.deepEqual((await heard()).map((entry) => [entry.kind, entry.button]), [["mousedown", 2], ["contextmenu", 2], ["mouseup", 2]]);
     await run({ type: "pointer", op: "click", x: 60, y: 80, count: 2 });
@@ -232,6 +236,18 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
       await assert.rejects(executeAction(session, { type: "pointer", op: "drag", locator: { css: "#pad" }, to_locator: destination }));
     }
     assert.deepEqual(await heard(), []);
+    // A point is a place in the viewport: scrolling an element end into view
+    // would move what lies under it, so a drag with a point never scrolls.
+    const scrolled = await read("scrollY");
+    for (const ends of [
+      { x: 100, y: 120, to_locator: { css: "iframe[name=help]" } },
+      { locator: { css: "iframe[name=help]" }, to_x: 100, to_y: 120 },
+    ]) {
+      await assert.rejects(executeAction(session, { type: "pointer", op: "drag", ...ends }),
+        /element is out of view; a drag that uses x and y does not scroll/);
+    }
+    assert.equal(await read("scrollY"), scrolled);
+    assert.deepEqual(await heard(), []);
   });
 
   await t.test("types keystrokes into a locator or whatever has focus", async () => {
@@ -242,6 +258,13 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     assert.deepEqual(keys.filter((entry) => entry.kind === "search-keydown").map((entry) => entry.key), ["s", "h", "o", "e", "s", " "]);
     assert.equal(keys.filter((entry) => entry.kind === "search-input").length, 7);
     assert.equal(keys.every((entry) => entry.trusted), true);
+    // Typing into a field that holds text adds to its end, as a person would,
+    // in inputs without a selection API too.
+    await run({ type: "type", text: " red", locator: { role: "textbox", name: "Search" } });
+    assert.equal(await read("document.querySelector('#search').value"), "shoes é red");
+    await run({ type: "type", text: "z", locator: { css: "#mail" } });
+    assert.equal(await read("document.querySelector('#mail').value"), "a@b.cz");
+    await heard();
     // One character per box: focus moves on as the page reacts to each key.
     await run({ type: "pointer", op: "click", locator: { role: "textbox", name: "Digit 1" } });
     await run({ type: "type", text: "4821" });
@@ -251,6 +274,8 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     assert.equal(await read("document.querySelector('#commands').hidden"), false);
     await run({ type: "type", text: "a\nb" });
     assert.match(await read("document.querySelector('#editor').innerText"), /^\/a\n+b$/);
+    await run({ type: "type", text: "c", locator: { role: "textbox", name: "Notes" } });
+    assert.match(await read("document.querySelector('#editor').innerText"), /^\/a\n+bc$/);
     const typed = await run({ type: "type", text: "!", snapshot: true });
     assert.match(typed.data.snapshot.content, /textbox "Notes"/);
     await invalid({ type: "type" }, /type requires text of 1\.\.4096 bytes/);
@@ -293,8 +318,29 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     // A point is in the page's viewport, whatever frame is under it.
     await run({ type: "scroll", locator: { css: "#pay", frame: "help" } });
     const box = await page.frameLocator("iframe[name=help]").locator("#pay").boundingBox();
-    await run({ type: "pointer", op: "click", x: box.x + 5, y: box.y + 5 });
+    const clicked = await run({ type: "pointer", op: "click", x: box.x + 5, y: box.y + 5 });
+    assert.equal(clicked.message, "pointer clicked button#pay in a frame");
+    assert.deepEqual(clicked.data.hit, { tag: "button", id: "pay", text: "Pay", frame: `http://127.0.0.1:${framesPort}/help` });
     assert.equal(await read("document.querySelector('#paid').textContent", "help"), "paid 4111");
+    const field = await page.frameLocator("iframe[name=pay]").locator("#card-number").boundingBox();
+    assert.deepEqual((await run({ type: "pointer", op: "click", x: field.x + 5, y: field.y + 5 })).data.hit,
+      { tag: "input", id: "card-number", frame: `http://localhost:${framesPort}/pay` });
+    // A frame named before it is added, or before its document has loaded, is waited for.
+    await read(`setTimeout(() => {
+      const named = document.createElement("iframe");
+      named.name = "late";
+      named.srcdoc = "<button id=late onclick=\\"this.textContent = 'pressed'\\">Late</button>";
+      const located = document.createElement("iframe");
+      located.src = "http://localhost:${framesPort}/help?late=1";
+      named.style.cssText = "left: 40px; top: 900px";
+      located.style.cssText = "left: 440px; top: 900px";
+      for (const frame of [named, located]) { frame.className = "late"; document.body.append(frame); }
+    }, 400); 0`);
+    await run({ type: "click", locator: { css: "#late", frame: "late" } });
+    assert.equal(await read("document.querySelector('#late').textContent", "late"), "pressed");
+    await run({ type: "fill", locator: { css: "#card-number", frame: "late=1" }, value: "5" });
+    assert.equal(await read("document.querySelector('#card-number').value", "late=1"), "5");
+    await read("document.querySelectorAll('iframe.late').forEach((frame) => frame.remove()); 0");
     await invalid({ type: "click", locator: { css: "#pay", frame: "checkout" } },
       /^frame matches no frame of the selected page; frames: .*name=help.*name=pay/);
     await invalid({ type: "click", locator: { css: "#pay", frame: `:${framesPort}/` } }, /^frame matches 2 frames/);

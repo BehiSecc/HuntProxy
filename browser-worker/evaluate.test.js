@@ -182,6 +182,16 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
     assert.match(crossLocation, /^\[Unreadable: /);
     assert.deepEqual(await value("({ a: { b: { c: { d: { e: { f: { g: { h: { i: 1 } } } } } } } } })"),
       { a: { b: { c: { d: { e: { f: { g: { h: "[Object]" } } } } } } } });
+    // An object with a then method is shown, not waited for; a promise a
+    // function source returns still is, from another frame's realm too.
+    const started = Date.now();
+    assert.deepEqual(await value("({ then() {}, id: 7 })"), { then: "[Function: then]", id: 7 });
+    assert.deepEqual(await value("() => ({ then() {}, id: 8 })"), { then: "[Function: then]", id: 8 });
+    // Well short of the 10 s deadline either one would have waited for.
+    assert.ok(Date.now() - started < 8_000);
+    assert.equal(await value("async () => 9"), 9);
+    assert.equal(await value("() => { const realm = document.createElement('iframe'); realm.id = 'realm'; document.body.append(realm); return realm.contentWindow.Promise.resolve(10); }"), 10);
+    assert.equal(await value("document.querySelector('#realm').remove(); 'removed'"), "removed");
     assert.equal(await value("({ ['__proto__']: 1, toString: 2 })['__proto__']"), 1);
     assert.deepEqual(await value("JSON.parse('{\"__proto__\": {\"polluted\": true}, \"kept\": 1}')"), JSON.parse("{\"__proto__\": {\"polluted\": true}, \"kept\": 1}"));
   });

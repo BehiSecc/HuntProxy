@@ -18,6 +18,9 @@ import { fileURLToPath } from "node:url";
 
 const PROTOCOL = 1;
 const sessions = new Map();
+// Sessions the daemon gave up on before they had launched. The daemon never
+// reuses a session id, so an id whose start had already failed stays harmless.
+const abortedStarts = new Set();
 const ownedChromeChildren = new Set();
 let shuttingDown = false;
 const MAX_SESSION_EVENTS = 256;
@@ -2206,7 +2209,16 @@ const EVALUATE_INTERRUPTED = /navigated or closed|context was destroyed|cannot f
 // else becomes JSON data that stops at a depth and size limit.
 async function describeEvaluationResult(value, call, maxChars) {
   if (call && typeof value === "function") value = value();
-  value = await value;
+  // Only a promise is waited for, from any frame's realm. An object that just
+  // has a then method is a value to show, as the console shows it; awaiting
+  // it would wait for a call that may never come.
+  let promise = false;
+  try {
+    promise = Object.prototype.toString.call(value) === "[object Promise]";
+  } catch {
+    // A cross-origin object: described below as unreadable.
+  }
+  if (promise) value = await value;
   const MAX_DEPTH = 8;
   const MAX_NESTED_NODE_CHARS = 400;
   let remaining = maxChars;
@@ -2518,6 +2530,61 @@ async function pointerTarget(page, locator, point, label, scroll = true) {
   return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
 }
 
+// What lies under a viewport point, followed through open shadow roots and
+// into frames, briefly described. A click at a point has no actionability
+// check, so this is how its caller learns whether it hit what was meant.
+// Found before the click, which may navigate or remove the element.
+async function elementAtPoint(page, point) {
+  let frame = page.mainFrame();
+  let { x, y } = point;
+  for (let depth = 0; depth < 4; depth += 1) {
+    const handle = await frame.evaluateHandle(([x, y]) => {
+      let node = document.elementFromPoint(x, y);
+      while (node?.shadowRoot) {
+        const inner = node.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === node) break;
+        node = inner;
+      }
+      return node;
+    }, [x, y]);
+    const element = handle.asElement();
+    if (!element) {
+      await handle.dispose();
+      return null;
+    }
+    try {
+      const found = await element.evaluate((node) => {
+        const text = (node.innerText || node.getAttribute("aria-label") || node.getAttribute("placeholder")
+          || node.getAttribute("alt") || node.getAttribute("title") || "").replace(/\s+/g, " ").trim();
+        const box = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return {
+          described: {
+            tag: node.localName,
+            id: node.id ? node.id.slice(0, 64) : undefined,
+            role: node.getAttribute("role")?.slice(0, 32) || undefined,
+            text: text ? text.slice(0, 80) : undefined,
+          },
+          // Where the frame's own viewport starts, inside border and padding.
+          left: box.left + node.clientLeft + parseFloat(style.paddingLeft),
+          top: box.top + node.clientTop + parseFloat(style.paddingTop),
+        };
+      });
+      const child = /^i?frame$/.test(found.described.tag) ? await element.contentFrame() : null;
+      if (!child) {
+        return frame === page.mainFrame() ? found.described
+          : { ...found.described, frame: publicLocation(frame.url()) || frame.name().slice(0, 64) || null };
+      }
+      frame = child;
+      x -= found.left;
+      y -= found.top;
+    } finally {
+      await handle.dispose();
+    }
+  }
+  return null;
+}
+
 // Holds modifier keys around pointer input given as a point; Playwright only
 // takes them as an option for input aimed at a locator.
 async function holdingModifiers(page, modifiers, run) {
@@ -2551,13 +2618,19 @@ async function performPointer(page, action) {
       if (Boolean(action.locator) === Boolean(point)) {
         throw rpcError(-32602, "pointer click requires either a locator or x and y");
       }
-      // An element gets Playwright's actionability checks; a point is clicked as it is.
+      // An element gets Playwright's actionability checks; a point is clicked
+      // as it is, and the result names what it landed on.
       if (action.locator) {
         await locatorFor(page, action.locator).click({ button, clickCount: count, modifiers, timeout: 30_000 });
-      } else {
-        await holdingModifiers(page, modifiers, () => page.mouse.click(point.x, point.y, { button, clickCount: count }));
+        return { message: "pointer clicked", data: { url: page.url() } };
       }
-      return { message: "pointer clicked", data: { url: page.url() } };
+      {
+        // A page busy navigating has nothing to describe; the click still goes.
+        const hit = await elementAtPoint(page, point).catch(() => null);
+        await holdingModifiers(page, modifiers, () => page.mouse.click(point.x, point.y, { button, clickCount: count }));
+        const named = hit ? ` ${hit.tag}${hit.id ? `#${hit.id}` : ""}${hit.frame ? " in a frame" : ""}` : "";
+        return { message: `pointer clicked${named}`, data: { url: page.url(), hit } };
+      }
     case "hover":
       if (Boolean(action.locator) === Boolean(point)) {
         throw rpcError(-32602, "pointer hover requires either a locator or x and y");
@@ -2568,14 +2641,26 @@ async function performPointer(page, action) {
     case "drag": {
       // Both ends are found before the button goes down: a destination that
       // failed afterwards would release over the source, which clicks it.
-      let from = await pointerTarget(page, action.locator, point, "pointer drag");
-      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination");
-      if (action.locator) {
+      // A point is a place in the viewport, so scrolling would change what
+      // lies under it: with a point at either end nothing is scrolled, and an
+      // element end has to be in view already.
+      const scroll = !point && !destination;
+      let from = await pointerTarget(page, action.locator, point, "pointer drag", scroll);
+      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination", scroll);
+      if (scroll) {
         // Bringing the destination into view may have moved the source.
         from = await pointerTarget(page, action.locator, point, "pointer drag", false);
+      }
+      if (action.locator || action.to_locator) {
         const view = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
-        if (from.x < 0 || from.y < 0 || from.x > view.width || from.y > view.height) {
+        const outside = ({ x, y }) => x < 0 || y < 0 || x > view.width || y > view.height;
+        if (scroll && outside(from)) {
           throw rpcError(-32000, "pointer drag source and destination are not in view together");
+        }
+        for (const [end, place, element] of [["source", from, action.locator], ["destination", to, action.to_locator]]) {
+          if (!scroll && element && outside(place)) {
+            throw rpcError(-32000, `pointer drag ${end} element is out of view; a drag that uses x and y does not scroll, so scroll it into view first or aim both ends at elements`);
+          }
         }
       }
       return holdingModifiers(page, modifiers, async () => {
@@ -2603,7 +2688,31 @@ async function performType(page, action) {
   if (typeof text !== "string" || !text || Buffer.byteLength(text) > MAX_TYPE_BYTES) {
     throw rpcError(-32602, `type requires text of 1..${MAX_TYPE_BYTES} bytes`);
   }
-  if (action.locator) await locatorFor(page, action.locator).focus({ timeout: 30_000 });
+  if (action.locator) {
+    const element = locatorFor(page, action.locator);
+    await element.focus({ timeout: 30_000 });
+    // Focusing leaves the caret at the start of what a field holds; a person
+    // clicking in to add text puts it at the end, and so does this.
+    const placed = await element.evaluate((node) => {
+      if (node.isContentEditable) {
+        const range = node.ownerDocument.createRange();
+        range.selectNodeContents(node);
+        range.collapse(false);
+        const selection = node.ownerDocument.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return true;
+      }
+      if (typeof node.value !== "string" || typeof node.setSelectionRange !== "function") return true;
+      try {
+        node.setSelectionRange(node.value.length, node.value.length);
+        return true;
+      } catch {
+        return false; // email, number and similar inputs have no selection API
+      }
+    }, undefined, { timeout: 30_000 });
+    if (!placed) await page.keyboard.press("End");
+  }
   // One character at a time, so a page whose key handlers are slow is given
   // up on at a deadline instead of being typed at until the worker is killed.
   const characters = [...text];
@@ -2634,6 +2743,21 @@ function actionError(error, action) {
   return rpcError(-32000, `${message.split("\nCall log:")[0].trimEnd()}\nSet nth on the locator to pick one of them: 0 is the first, -1 the last.`);
 }
 
+const FRAME_WAIT_MS = 5_000;
+
+// A frame that is still being added, or has not yet loaded the document its
+// URL names, matches nothing for a moment. An action naming such a frame waits
+// up to FRAME_WAIT_MS for it before chooseFrame reports what is there.
+async function awaitNamedFrames(page, action) {
+  const selectors = [action.locator?.frame, action.to_locator?.frame, action.type === "evaluate" ? action.frame : null]
+    .filter((selector) => typeof selector === "string" && selector);
+  const missing = () => selectors.some((selector) => !childFrames(page)
+    .some((frame) => frame.name() === selector || frame.url().includes(selector)));
+  for (const deadline = Date.now() + FRAME_WAIT_MS; missing() && Date.now() < deadline && !page.isClosed();) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 async function executeAction(session, action = {}) {
   let result;
   try {
@@ -2653,6 +2777,7 @@ async function performAction(session, action) {
   // Restore it before page actions so Chromium runs animation frames and
   // Playwright can complete its actionability checks.
   if (PAGE_ACTIONS.has(action.type)) await page.bringToFront();
+  await awaitNamedFrames(page, action);
   switch (action.type) {
     case "navigate": {
       const response = await navigateWithProxyCheck(page, () => page.goto(action.url, {
@@ -2766,6 +2891,8 @@ async function handle(req) {
           throw rpcError(-32602, "session_id must be a positive integer");
         }
         if (sessions.has(sessionId)) throw rpcError(-32602, "session_id is already active");
+        // Given up on while it waited behind other starts: never launch it.
+        if (abortedStarts.delete(sessionId)) throw rpcError(-32000, "browser session was aborted while it launched");
         const engine = params.engine || "chromium";
         if (engine !== "chromium") {
           throw rpcError(-32602, "engine must be chromium");
@@ -2806,6 +2933,10 @@ async function handle(req) {
           throw error;
         }
         sessions.set(sessionId, session);
+        if (abortedStarts.delete(sessionId)) {
+          await closeSession(sessionId);
+          throw rpcError(-32000, "browser session was aborted while it launched");
+        }
         try {
           await initializeSessionTracking(session);
           await restoreProjectState(session, params.restore_state);
@@ -2836,6 +2967,29 @@ async function handle(req) {
           await closeSession(sessionId);
           throw error;
         }
+      }
+      case "session.abort": {
+        // The daemon gave up on a call of this session that may still be
+        // running: close the session at once, whatever it is doing.
+        const sessionId = Number(params.session_id);
+        if (!Number.isSafeInteger(sessionId) || sessionId <= 0) {
+          throw rpcError(-32602, "session_id must be a positive integer");
+        }
+        const session = sessions.get(sessionId);
+        if (!session) {
+          abortedStarts.add(sessionId); // Closed by session.start once it has launched.
+          return respond(id, { aborted: false });
+        }
+        sessions.delete(sessionId);
+        const closed = await Promise.race([
+          closeRuntime(session).then(() => true, () => false),
+          new Promise((resolve) => { const timer = setTimeout(() => resolve(false), 5_000); timer.unref(); }),
+        ]);
+        logMeta("session.abort", { session_id: sessionId, closed });
+        // A browser left running could keep its profile locked: the daemon
+        // then replaces this worker, which stops every browser it started.
+        if (!closed) throw rpcError(-32000, "aborted browser session did not close");
+        return respond(id, { aborted: true });
       }
       case "session.status": {
         const sessionId = Number(params.session_id);
@@ -3148,7 +3302,19 @@ async function closeSession(sessionId) {
   logMeta("session.stop", { session_id: sessionId });
 }
 
-let queue = Promise.resolve();
+// A session's requests run in order and different sessions' side by side, so
+// a slow call holds up only its own session. Starts take turns, since each
+// checks that no other session holds its profile before it launches. hello
+// and session.abort are answered at once: abort is how the daemon ends a
+// session whose call is still running.
+const lanes = new Map();
+function laneOf(request) {
+  const method = request?.method;
+  if (method === "hello" || method === "session.abort") return null;
+  if (method === "session.start") return "start";
+  const sessionId = Number(request?.params?.session_id);
+  return Number.isSafeInteger(sessionId) ? `session ${sessionId}` : "worker";
+}
 const readline = createInterface({ input: process.stdin });
 readline.on("line", (line) => {
   if (!line.trim()) return;
@@ -3159,7 +3325,14 @@ readline.on("line", (line) => {
     respond(null, null, rpcError(-32700, "parse error"));
     return;
   }
-  queue = queue.then(() => handle(request)).catch(() => undefined);
+  const lane = laneOf(request);
+  if (lane === null) {
+    void handle(request);
+    return;
+  }
+  const tail = (lanes.get(lane) ?? Promise.resolve()).then(() => handle(request)).catch(() => undefined);
+  lanes.set(lane, tail);
+  void tail.then(() => { if (lanes.get(lane) === tail) lanes.delete(lane); });
 });
 async function shutdown(exitCode) {
   if (shuttingDown) return;
