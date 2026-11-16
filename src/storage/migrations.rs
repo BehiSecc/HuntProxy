@@ -69,7 +69,34 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "017_capture_token_lookup",
         include_str!("../../migrations/017_capture_token_lookup.sql"),
     ),
+    (
+        "018_compact_storage",
+        include_str!("../../migrations/018_compact_storage.sql"),
+    ),
 ];
+
+/// Turns a current database back into its schema-17 shape, keeping its header
+/// rows, for tests that build databases from older releases.
+#[cfg(test)]
+pub(crate) const UNDO_018: &str = "
+    CREATE TABLE message_headers_17 (
+        project_id INTEGER NOT NULL,
+        exchange_id INTEGER NOT NULL,
+        side TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        value BLOB NOT NULL,
+        PRIMARY KEY (project_id, exchange_id, side, ordinal),
+        FOREIGN KEY (project_id, exchange_id) REFERENCES exchanges(project_id, exchange_id) ON DELETE CASCADE
+    );
+    INSERT INTO message_headers_17 SELECT * FROM message_headers;
+    DROP VIEW message_headers;
+    DROP TABLE message_header_rows;
+    DROP TABLE header_names;
+    DROP TABLE header_values;
+    ALTER TABLE message_headers_17 RENAME TO message_headers;
+    PRAGMA user_version=17;
+";
 
 pub fn schema_version(conn: &Connection) -> DomainResult<i32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
@@ -141,6 +168,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    type HeaderRow = (i64, i64, String, i64, String, Vec<u8>, String);
+
+    fn header_rows(conn: &Connection) -> Vec<HeaderRow> {
+        let mut statement = conn
+            .prepare(
+                "SELECT project_id, exchange_id, side, ordinal, name, CAST(value AS BLOB), typeof(value)
+                   FROM message_headers ORDER BY project_id, exchange_id, side, ordinal",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn headers_move_to_shared_names_and_values_without_changing_any_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, "NORMAL", 5000).unwrap();
+        for (index, (_, sql)) in MIGRATIONS.iter().take(17).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", index as i32 + 1)
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO projects (name,created_at,updated_at,scope_json,limits_json) VALUES ('p','t','t','{}','{}')",
+            [],
+        )
+        .unwrap();
+        for exchange in 1..=3 {
+            conn.execute(
+                "INSERT INTO exchanges (project_id, exchange_id, source, started_at, method, scheme, authority,
+                     host, port, path, completion, capture_quality, header_representation, body_representation)
+                 VALUES (1, ?1, 'proxy', 't', 'GET', 'https', 'a.test', 'a.test', 443, '/', 'complete',
+                     'semantic', 'semantic', 'semantic')",
+                [exchange],
+            )
+            .unwrap();
+        }
+        // Repeated values, a name in two spellings, a value stored once as
+        // text and once as a blob, and an empty value.
+        conn.execute_batch(
+            "INSERT INTO message_headers VALUES
+                (1, 1, 'request', 0, 'Cookie', X'7369643D31'),
+                (1, 1, 'request', 1, 'User-Agent', 'UA'),
+                (1, 1, 'response', 0, 'Set-Cookie', X'78'),
+                (1, 2, 'request', 0, 'Cookie', X'7369643D31'),
+                (1, 2, 'request', 1, 'user-agent', X'5541'),
+                (1, 3, 'response', 0, 'X-Empty', X'');",
+        )
+        .unwrap();
+        let before = header_rows(&conn);
+
+        migrate(&conn).unwrap();
+        assert_eq!(header_rows(&conn), before);
+        assert_eq!(count(&conn, "message_header_rows"), 6);
+        assert_eq!(count(&conn, "header_names"), 5);
+        assert_eq!(count(&conn, "header_values"), 5);
+
+        // Writes through the view share the stored name and value.
+        conn.execute(
+            "INSERT INTO message_headers VALUES (1, 3, 'request', 0, 'Cookie', X'7369643D31')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "header_names"), 5);
+        assert_eq!(count(&conn, "header_values"), 5);
+        assert!(conn
+            .execute(
+                "INSERT INTO message_headers VALUES (1, 3, 'other', 0, 'A', X'00')",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "DELETE FROM message_headers WHERE exchange_id=1 AND side='response'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "message_header_rows"), 6);
+        // Deleting an exchange still removes its headers.
+        conn.execute("DELETE FROM exchanges WHERE exchange_id=2", [])
+            .unwrap();
+        assert_eq!(count(&conn, "message_header_rows"), 4);
     }
 
     #[test]

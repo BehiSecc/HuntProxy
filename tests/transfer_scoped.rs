@@ -229,7 +229,13 @@ fn legacy_prune(path: &Path, project_id: ProjectId, mode: SecretMode) {
              UPDATE exchanges SET capture_session_id=NULL,reply_tab_id=NULL,fuzz_job_id=NULL,fuzz_case_id=NULL;",
         ).unwrap();
     }
-    conn.execute_batch("VACUUM;").unwrap();
+    // Header names and values are shared; keep only those the project uses.
+    conn.execute_batch(
+        "DELETE FROM header_values WHERE id NOT IN (SELECT value_id FROM message_header_rows);
+         DELETE FROM header_names WHERE id NOT IN (SELECT name_id FROM message_header_rows);
+         VACUUM;",
+    )
+    .unwrap();
 }
 
 fn rows(conn: &Connection, table: &str) -> Vec<Vec<Value>> {
