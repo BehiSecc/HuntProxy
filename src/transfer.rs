@@ -427,7 +427,7 @@ fn import_snapshot(
                 "bundle must contain exactly one project",
             ));
         }
-        let tx = crate::storage::write_transaction(&conn).map_err(storage_error)?;
+        let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
         tx.execute(
             "INSERT INTO projects (name,target_url,created_at,updated_at,scope_json,limits_json,default_browser_profile,noise_policy)
              SELECT COALESCE(?1,name),target_url,created_at,updated_at,scope_json,limits_json,default_browser_profile,noise_policy FROM hp_archive.projects WHERE id=?2",
