@@ -1514,6 +1514,113 @@ mod tests {
         }
     }
 
+    /// Records the transport identity of every request.
+    #[derive(Default)]
+    struct RecordingTransport {
+        identities: parking_lot::Mutex<Vec<crate::transport::TransportIdentity>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for RecordingTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            self.identities.lock().push(request.identity);
+            Ok(OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                body: Bytes::from_static(b"ok"),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test_recording".into(),
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test_recording"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    #[tokio::test]
+    async fn cases_varying_credentials_share_one_transport_identity() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz identity".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/".into()),
+                header_overrides: vec![HeaderPatch {
+                    name: "Authorization".into(),
+                    value: b"Bearer \xc2\xa7token\xc2\xa7".to_vec(),
+                }],
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "token".into(),
+                location: "header:Authorization".into(),
+            }],
+            wordlists: vec![vec!["one".into(), "two".into(), "three".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+        };
+        let job = db
+            .create_fuzz_job(
+                project.id,
+                None,
+                template.strategy,
+                serde_json::to_string(&template).unwrap(),
+                3,
+                "{}".into(),
+            )
+            .await
+            .unwrap();
+        let transport = Arc::new(RecordingTransport::default());
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: transport.clone(),
+            placeholder_key: PlaceholderKey::from_bytes(vec![8; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+
+        run_job(
+            db.clone(),
+            reply,
+            project.id,
+            job.id,
+            template,
+            1,
+            test_limiter(1, 1_000.0),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let identities = transport.identities.lock().clone();
+        assert_eq!(identities.len(), 3);
+        assert!(identities.iter().all(|identity| *identity
+            == crate::transport::TransportIdentity::for_fuzz_job(project.id, job.id)));
+    }
+
     #[test]
     fn strategy_counts_are_correct() {
         assert_eq!(estimate_combinations(FuzzStrategy::Sniper, 2, &[3, 4]), 7);

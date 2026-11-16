@@ -10,8 +10,8 @@ pub(crate) mod test_tls;
 pub(crate) mod tls;
 
 use crate::domain::{
-    CaptureSession, DomainError, DomainResult, ErrorCode, ProjectId, TransportProvenance,
-    ValidatedDial,
+    CaptureSession, DomainError, DomainResult, ErrorCode, FuzzJobId, ProjectId,
+    TransportProvenance, ValidatedDial,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -53,6 +53,12 @@ pub enum TransportIdentity {
         project_id: ProjectId,
         credential_digest: [u8; 32],
     },
+    /// Every case of one fuzz job. Cases often vary a credential header, and
+    /// a pool per credential value would open a new connection per case.
+    FuzzJob {
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+    },
 }
 
 impl TransportIdentity {
@@ -87,6 +93,10 @@ impl TransportIdentity {
             project_id,
             credential_digest: digest.finalize().into(),
         }
+    }
+
+    pub fn for_fuzz_job(project_id: ProjectId, job_id: FuzzJobId) -> Self {
+        Self::FuzzJob { project_id, job_id }
     }
 }
 

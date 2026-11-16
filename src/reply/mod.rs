@@ -1053,7 +1053,12 @@ impl ReplyService {
             .send(
                 &dial,
                 OutboundRequest {
-                    identity: TransportIdentity::for_reply(project_id, &wire_headers),
+                    identity: match (context.source, context.lineage.fuzz_job_id) {
+                        (ExchangeSource::Fuzzer, Some(job_id)) => {
+                            TransportIdentity::for_fuzz_job(project_id, job_id)
+                        }
+                        _ => TransportIdentity::for_reply(project_id, &wire_headers),
+                    },
                     method,
                     url: wire_url,
                     headers: wire_headers,
