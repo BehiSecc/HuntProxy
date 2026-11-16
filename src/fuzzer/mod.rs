@@ -337,6 +337,27 @@ impl FuzzerService {
                 .to_string(),
             )
             .await?;
+        // One audit event per job; cases are not audited one by one.
+        let mut audit = serde_json::json!({
+            "parent": template.base_exchange_id.map(ExchangeId::get),
+            "strategy": template.strategy,
+            "estimated_cases": estimated,
+        });
+        if let Some(identity) = &template.draft.identity {
+            audit["identity"] = serde_json::to_value(identity)
+                .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?;
+        }
+        let _ = self
+            .db
+            .audit(
+                Some(project_id),
+                "fuzz_start",
+                Some("fuzzer"),
+                Some("fuzz_job"),
+                Some(&job.id.get().to_string()),
+                audit,
+            )
+            .await;
 
         let cancel = CancellationToken::new();
         self.cancel_flags.insert(job.id.get(), cancel.clone());
@@ -1025,8 +1046,6 @@ async fn execute_case(
                 .await;
         }
     };
-    db.mark_fuzz_case_running(project_id, job_id, persisted.id)
-        .await?;
     let slots = tokio::select! {
         _ = cancel.cancelled() => None,
         slots = limiter.acquire(1) => Some(slots?),
@@ -1075,83 +1094,40 @@ async fn execute_case(
         )
         .await;
     match result {
+        // The send result carries what the saved exchange holds, so the case
+        // is finished without reading the exchange back.
         Ok(result) => {
-            let Some(exchange_id) = result.exchange_id else {
-                return db
-                    .finish_fuzz_case(
-                        project_id,
-                        job_id,
-                        persisted.id,
-                        FuzzCaseState::Completed,
-                        None,
-                        Some(result.status_code),
-                        Some(result.response_length),
-                        Some(result.duration_ms),
-                        None,
-                        Some(result.response_body_hash),
-                    )
-                    .await;
-            };
-            let detail = db
-                .get_exchange_detail(
-                    project_id,
-                    exchange_id,
-                    crate::policy::PresentationOptions::default(),
-                )
-                .await;
-            match detail {
-                Ok(detail) => {
-                    db.finish_fuzz_case(
-                        project_id,
-                        job_id,
-                        persisted.id,
-                        FuzzCaseState::Completed,
-                        Some(exchange_id),
-                        detail.summary.status_code,
-                        detail.summary.response_length,
-                        detail.summary.duration_ms,
-                        None,
-                        detail.response_body_hash,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    db.finish_fuzz_case(
-                        project_id,
-                        job_id,
-                        persisted.id,
-                        FuzzCaseState::Failed,
-                        Some(exchange_id),
-                        None,
-                        None,
-                        None,
-                        Some(format!("request sent but result loading failed: {error}")),
-                        None,
-                    )
-                    .await
-                }
-            }
+            db.finish_fuzz_case(
+                project_id,
+                job_id,
+                persisted.id,
+                FuzzCaseState::Completed,
+                result.exchange_id,
+                Some(result.status_code),
+                Some(result.response_length),
+                Some(result.duration_ms),
+                None,
+                Some(result.response_body_hash),
+            )
+            .await
         }
-        Err(error) => {
-            let exchange_id = db
-                .find_fuzz_case_exchange(project_id, job_id, persisted.id)
-                .await?;
-            let fatal = error.code() == ErrorCode::DiskQuotaExceeded;
+        Err(failed) => {
+            let fatal = failed.error.code() == ErrorCode::DiskQuotaExceeded;
             db.finish_fuzz_case(
                 project_id,
                 job_id,
                 persisted.id,
                 FuzzCaseState::Failed,
-                exchange_id,
+                failed.exchange_id,
                 None,
                 None,
                 None,
-                Some(error.to_string()),
+                Some(failed.error.to_string()),
                 None,
             )
             .await?;
             if fatal {
-                Err(error)
+                Err(failed.error)
             } else {
                 Ok(())
             }
@@ -1619,6 +1595,113 @@ mod tests {
         assert_eq!(identities.len(), 3);
         assert!(identities.iter().all(|identity| *identity
             == crate::transport::TransportIdentity::for_fuzz_job(project.id, job.id)));
+    }
+
+    #[tokio::test]
+    async fn a_job_is_audited_once_and_cases_keep_their_send_results() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let mut project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz audit".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        // The in-memory test database is shared-cache, where concurrent
+        // writers fail instead of waiting.
+        project.limits.max_concurrent_requests = 1;
+        project.limits.requests_per_second = 1_000.0;
+        db.update_project_scope(project.id, project.scope.clone(), Some(project.limits))
+            .await
+            .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(RecordingTransport::default()),
+            placeholder_key: PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service =
+            FuzzerService::new(db.clone(), reply, PlaceholderKey::from_bytes(vec![10; 32]));
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/?q=§q§".into()),
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "q".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![vec!["a".into(), "b".into(), "c".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+        };
+        let job = service.start(project.id, template, false).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while service.has_active_jobs() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fuzz job did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished = db.get_fuzz_job(project.id, job.id).await.unwrap();
+        assert_eq!(finished.state, FuzzJobState::Completed);
+        assert_eq!(finished.completed_cases, 3);
+
+        let audits = db
+            .with_conn(|conn| {
+                let mut statement = conn
+                    .prepare("SELECT event_type, target_id FROM audit_events ORDER BY id")
+                    .unwrap();
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            audits,
+            vec![("fuzz_start".into(), job.id.get().to_string())]
+        );
+
+        let (cases, _) = db
+            .list_fuzz_cases(project.id, job.id, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(cases.len(), 3);
+        for case in cases {
+            assert_eq!(case.state, FuzzCaseState::Completed);
+            assert_eq!(case.status_code, Some(200));
+            assert_eq!(case.response_length, Some(2));
+            assert_eq!(
+                case.body_hash.as_deref(),
+                Some(crate::storage::sha256_hex(b"ok").as_str())
+            );
+            assert!(case.started_at.is_some() && case.finished_at.is_some());
+            let detail = db
+                .get_exchange_detail(
+                    project.id,
+                    case.exchange_id.unwrap(),
+                    PresentationOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(detail.summary.source, ExchangeSource::Fuzzer);
+            assert_eq!(detail.lineage.fuzz_job_id, Some(job.id));
+            assert_eq!(detail.lineage.fuzz_case_id, Some(case.id));
+            assert_eq!(detail.response_body_hash, case.body_hash);
+        }
     }
 
     #[test]

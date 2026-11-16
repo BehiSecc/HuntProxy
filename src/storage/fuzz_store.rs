@@ -160,6 +160,8 @@ impl Db {
         .await
     }
 
+    /// Saves a case as running: it is created only when the worker is about
+    /// to send it, so no separate write marks it started.
     pub async fn create_fuzz_case(
         &self,
         project_id: ProjectId,
@@ -191,8 +193,8 @@ impl Db {
             }
             conn.execute(
                 "INSERT INTO fuzz_cases
-                 (job_id, case_index, state, payloads_json, payload_summary, created_at)
-                 VALUES (?1,?2,'queued',?3,?4,?5)",
+                 (job_id, case_index, state, payloads_json, payload_summary, created_at, started_at)
+                 VALUES (?1,?2,'running',?3,?4,?5,?5)",
                 params![
                     job_id.get(),
                     case_index as i64,
@@ -207,7 +209,7 @@ impl Db {
                 job_id,
                 project_id,
                 case_index,
-                state: FuzzCaseState::Queued,
+                state: FuzzCaseState::Running,
                 payloads,
                 exchange_id: None,
                 status_code: None,
@@ -216,33 +218,9 @@ impl Db {
                 error: None,
                 body_hash: None,
                 created_at: parse_time(&ts),
-                started_at: None,
+                started_at: Some(parse_time(&ts)),
                 finished_at: None,
             })
-        })
-        .await
-    }
-
-    pub async fn mark_fuzz_case_running(
-        &self,
-        project_id: ProjectId,
-        job_id: FuzzJobId,
-        case_id: i64,
-    ) -> DomainResult<()> {
-        let ts = now_rfc3339();
-        self.with_conn(move |conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE fuzz_cases SET state='running', started_at=?1
-                     WHERE id=?2 AND job_id=?3
-                       AND EXISTS(SELECT 1 FROM fuzz_jobs WHERE id=?3 AND project_id=?4)",
-                    params![ts, case_id, job_id.get(), project_id.get()],
-                )
-                .map_err(storage_error)?;
-            if changed == 0 {
-                return Err(DomainError::not_found("fuzz case"));
-            }
-            Ok(())
         })
         .await
     }
@@ -271,20 +249,10 @@ impl Db {
         }
         let ts = now_rfc3339();
         let state_s = fuzz_case_state_str(state);
+        // The exchange already carries the fuzzer source and case lineage from
+        // when Reply saved it, so only the case and the job counters change.
         self.with_conn(move |conn| {
             let tx = write_transaction(conn).map_err(storage_error)?;
-            if let Some(exchange_id) = exchange_id {
-                let changed = tx
-                    .execute(
-                        "UPDATE exchanges SET source='fuzzer', fuzz_job_id=?1, fuzz_case_id=?2
-                         WHERE project_id=?3 AND exchange_id=?4",
-                        params![job_id.get(), case_id, project_id.get(), exchange_id.get()],
-                    )
-                    .map_err(storage_error)?;
-                if changed == 0 {
-                    return Err(DomainError::not_found("fuzz exchange"));
-                }
-            }
             let previous_state: String = tx
                 .query_row(
                     "SELECT state FROM fuzz_cases WHERE id=?1 AND job_id=?2",
@@ -323,26 +291,6 @@ impl Db {
             update_fuzz_counts(&tx, project_id, job_id, &previous_state, state_s, &ts)?;
             tx.commit().map_err(storage_error)?;
             Ok(())
-        })
-        .await
-    }
-
-    pub async fn find_fuzz_case_exchange(
-        &self,
-        project_id: ProjectId,
-        job_id: FuzzJobId,
-        case_id: i64,
-    ) -> DomainResult<Option<ExchangeId>> {
-        self.with_conn(move |conn| {
-            conn.query_row(
-                "SELECT exchange_id FROM exchanges
-                 WHERE project_id=?1 AND fuzz_job_id=?2 AND fuzz_case_id=?3
-                 ORDER BY exchange_id DESC LIMIT 1",
-                params![project_id.get(), job_id.get(), case_id],
-                |row| row.get::<_, i64>(0).map(ExchangeId),
-            )
-            .optional()
-            .map_err(storage_error)
         })
         .await
     }
