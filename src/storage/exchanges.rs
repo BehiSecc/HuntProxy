@@ -1980,6 +1980,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_body_search_reads_through_content_encoding() {
+        use std::io::Write;
+        let gzip = |text: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(text).unwrap();
+            encoder.finish().unwrap()
+        };
+        let brotli = |text: &[u8]| {
+            let mut output = Vec::new();
+            let mut writer = brotli::CompressorWriter::new(&mut output, 4096, 5, 22);
+            writer.write_all(text).unwrap();
+            drop(writer);
+            output
+        };
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "encoded search".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let insert = |path: &str, encodings: &[&str], body: Vec<u8>| {
+            let mut exchange = spool_exchange(project.id);
+            exchange.path = path.into();
+            exchange.response_headers = encodings
+                .iter()
+                .enumerate()
+                .map(|(ordinal, encoding)| HeaderEntry {
+                    name: if ordinal == 0 {
+                        "Content-Encoding".into()
+                    } else {
+                        "content-encoding".into()
+                    },
+                    value: encoding.as_bytes().to_vec(),
+                    ordinal: ordinal as u32,
+                })
+                .collect();
+            exchange.response_body = Some(body);
+            let db = db.clone();
+            async move { db.insert_exchange(exchange).await.unwrap() }
+        };
+        let gzipped = insert("/gzip", &["gzip"], gzip(b"<p>Secret-In-Gzip</p>")).await;
+        let brotlied = insert("/br", &["br"], brotli(b"{\"k\":\"secret-in-br\"}")).await;
+        // gzip applied first, then br, in two headers.
+        let chained = insert("/chain", &["gzip", "br"], brotli(&gzip(b"chained-secret"))).await;
+        // Claims gzip but is not: searched as stored instead of failing the query.
+        let mislabelled = insert("/plain", &["gzip"], b"needle-plain".to_vec()).await;
+        let unencoded = insert("/raw", &[], b"needle-raw".to_vec()).await;
+
+        for (query, expected) in [
+            ("response:~secret-in-gzip", vec![gzipped]),
+            ("response:~secret-in-br", vec![brotlied]),
+            ("response:~chained-secret", vec![chained]),
+            ("response:~needle-plain", vec![mislabelled]),
+            ("response:~needle-raw", vec![unencoded]),
+            ("request:~secret-in-gzip", vec![]),
+        ] {
+            let filter = crate::history::parse_text_query(query).unwrap();
+            let (items, _) = db
+                .list_history_filtered(project.id, Some(filter), 20, None, None)
+                .await
+                .unwrap();
+            let ids = items
+                .into_iter()
+                .map(|item| item.exchange_id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{query}");
+        }
+    }
+
+    #[tokio::test]
     async fn inserts_file_backed_bodies_without_loading_them_into_exchange() {
         let db = Db::open_in_memory().await.unwrap();
         let project = db

@@ -312,28 +312,59 @@ pub fn configure_connection(
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))
 }
 
+/// Whether a stored body contains `needle` (already lowercase), looking through
+/// its HTTP Content-Encoding. A body that does not decode, such as a truncated
+/// capture, an unknown encoding or one past the decoded size limit, is searched
+/// as stored, as it was before encodings were decoded.
+fn body_text_contains(stored: &[u8], content_encoding: Option<&str>, needle: &str) -> bool {
+    let contains = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .to_lowercase()
+            .contains(needle)
+    };
+    match content_encoding.filter(|encoding| !encoding.trim().is_empty()) {
+        None => contains(stored),
+        Some(encoding) => match crate::codec::decode_content_encodings(
+            stored,
+            encoding,
+            crate::codec::MAX_DECODED_BODY_OUTPUT,
+        ) {
+            Ok(decoded) => contains(&decoded),
+            Err(error) => {
+                tracing::debug!(%error, encoding, "body search reads the body as stored");
+                contains(stored)
+            }
+        },
+    }
+}
+
 fn configure(conn: &Connection, synchronous: &str, busy_timeout_ms: u64) -> rusqlite::Result<()> {
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))?;
     conn.pragma_update(None, "synchronous", synchronous)?;
     conn.pragma_update(None, "trusted_schema", false)?;
+    // (codec, content, needle, content_encoding): the last argument is the
+    // message's Content-Encoding, or NULL.
     conn.create_scalar_function(
         "huntproxy_body_contains",
-        3,
+        4,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |context| {
             let codec = context.get::<String>(0)?;
             let content = context.get::<Vec<u8>>(1)?;
             let needle = context.get::<String>(2)?.to_lowercase();
-            let decoded =
+            let content_encoding = context.get::<Option<String>>(3)?;
+            let stored =
                 crate::storage::bodies::decode_body(&codec, &content).map_err(|error| {
                     rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(
                         error.to_string(),
                     )))
                 })?;
-            Ok(String::from_utf8_lossy(&decoded)
-                .to_lowercase()
-                .contains(&needle))
+            Ok(body_text_contains(
+                &stored,
+                content_encoding.as_deref(),
+                &needle,
+            ))
         },
     )?;
     // DEFENSIVE mode
@@ -420,7 +451,7 @@ mod tests {
                     };
                     let contains = conn
                         .query_row(
-                            "SELECT huntproxy_body_contains('raw', CAST('Hello' AS BLOB), 'hell')",
+                            "SELECT huntproxy_body_contains('raw', CAST('Hello' AS BLOB), 'hell', NULL)",
                             [],
                             |row| row.get::<_, bool>(0),
                         )

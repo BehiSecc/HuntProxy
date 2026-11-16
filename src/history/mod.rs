@@ -479,6 +479,17 @@ fn compile_body_term(
         (String::new(), "response_body_id", 1)
     };
     // Each distinct name and value is matched once, then rows are checked by id.
+    // Bodies are searched through the same side's Content-Encoding, in header order.
+    let content_encoding = format!(
+        "(SELECT group_concat(CAST(ev.value AS TEXT), ', ' ORDER BY ce.ordinal) \
+            FROM message_header_rows ce \
+            JOIN header_values ev ON ev.id=ce.value_id \
+           WHERE ce.project_id=exchanges.project_id \
+             AND ce.exchange_id=exchanges.exchange_id \
+             AND ce.side={side_code} \
+             AND ce.name_id IN (SELECT id FROM header_names \
+                                WHERE lower(name)='content-encoding'))"
+    );
     Ok(format!(
         "({target}EXISTS (SELECT 1 FROM message_header_rows mh \
                      WHERE mh.project_id=exchanges.project_id \
@@ -490,7 +501,8 @@ fn compile_body_term(
                                                WHERE CAST(value AS TEXT) LIKE ?{like_index} ESCAPE '\\'))) \
           OR EXISTS (SELECT 1 FROM bodies b \
                      WHERE b.id=exchanges.{body_column} \
-                       AND huntproxy_body_contains(b.codec, b.content, ?{body_index})))"
+                       AND huntproxy_body_contains(b.codec, b.content, ?{body_index}, \
+                                                   {content_encoding})))"
     ))
 }
 
