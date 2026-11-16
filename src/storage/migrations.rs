@@ -94,6 +94,7 @@ pub(crate) const UNDO_018: &str = "
     DROP TABLE message_header_rows;
     DROP TABLE header_names;
     DROP TABLE header_values;
+    DROP TABLE storage_maintenance;
     ALTER TABLE message_headers_17 RENAME TO message_headers;
     PRAGMA user_version=17;
 ";
@@ -270,6 +271,14 @@ mod tests {
         conn.execute("DELETE FROM exchanges WHERE exchange_id=2", [])
             .unwrap();
         assert_eq!(count(&conn, "message_header_rows"), 4);
+        let cleared: i64 = conn
+            .query_row(
+                "SELECT finished_at IS NULL FROM storage_maintenance WHERE task='compress_raw_bodies'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared, 1);
     }
 
     #[test]

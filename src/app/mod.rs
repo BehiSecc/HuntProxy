@@ -241,6 +241,27 @@ pub async fn run_daemon(mut config: Config) -> DomainResult<()> {
     );
     drop(startup_lock);
 
+    // Bodies stored uncompressed by earlier versions are compressed once, in
+    // the background. A stopped pass resumes on the next start.
+    {
+        let db = state.db.clone();
+        let token = shutdown.clone();
+        tokio::spawn(async move {
+            match db.compress_stored_bodies(&token).await {
+                Ok(Some(done)) if done.compressed > 0 => tracing::info!(
+                    bodies = done.compressed,
+                    saved_mib = done.saved_bytes >> 20,
+                    "compressed stored bodies"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    "compressing stored bodies stopped; it resumes on the next start"
+                ),
+            }
+        });
+    }
+
     let server_error = tokio::select! {
         _ = shutdown.cancelled() => None,
         _ = tokio::signal::ctrl_c() => {
