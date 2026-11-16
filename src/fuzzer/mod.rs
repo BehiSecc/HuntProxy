@@ -249,11 +249,17 @@ impl Iterator for CaseIterator {
     }
 }
 
+/// The longest `wait` accepts, so one call never outlasts an MCP client's patience.
+pub const MAX_FUZZ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct FuzzerService {
     pub db: Arc<Db>,
     pub reply: Arc<ReplyService>,
     pub placeholder_key: PlaceholderKey,
     pub cancel_flags: Arc<dashmap::DashMap<i64, CancellationToken>>,
+    /// One receiver per running job. Its sender is dropped once the worker has
+    /// saved the job's final state, which wakes every `wait`.
+    finished: Arc<dashmap::DashMap<i64, tokio::sync::watch::Receiver<()>>>,
 }
 
 impl FuzzerService {
@@ -263,6 +269,7 @@ impl FuzzerService {
             reply,
             placeholder_key,
             cancel_flags: Arc::new(dashmap::DashMap::new()),
+            finished: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -361,9 +368,12 @@ impl FuzzerService {
 
         let cancel = CancellationToken::new();
         self.cancel_flags.insert(job.id.get(), cancel.clone());
+        let (finished_sender, finished_receiver) = tokio::sync::watch::channel(());
+        self.finished.insert(job.id.get(), finished_receiver);
         let db = self.db.clone();
         let reply = self.reply.clone();
         let cancel_flags = self.cancel_flags.clone();
+        let finished = self.finished.clone();
         let job_id = job.id;
         let max_concurrency = project.limits.max_concurrent_requests.max(1) as usize;
         tokio::spawn(async move {
@@ -390,9 +400,33 @@ impl FuzzerService {
                     .await;
             }
             cancel_flags.remove(&job_id.get());
+            finished.remove(&job_id.get());
+            drop(finished_sender);
         });
 
         Ok(job)
+    }
+
+    /// The job, once it has ended or `wait` has passed, whichever is first.
+    pub async fn wait(
+        &self,
+        project_id: ProjectId,
+        job_id: FuzzJobId,
+        wait: std::time::Duration,
+    ) -> DomainResult<FuzzJob> {
+        let job = self.db.get_fuzz_job(project_id, job_id).await?;
+        if wait.is_zero() || fuzz_job_has_ended(job.state) {
+            return Ok(job);
+        }
+        let finished = self
+            .finished
+            .get(&job_id.get())
+            .map(|entry| entry.value().clone());
+        if let Some(mut finished) = finished {
+            // `changed` fails as soon as the worker drops the sender.
+            let _ = tokio::time::timeout(wait.min(MAX_FUZZ_WAIT), finished.changed()).await;
+        }
+        self.db.get_fuzz_job(project_id, job_id).await
     }
 
     pub async fn cancel_for_project(
@@ -401,10 +435,7 @@ impl FuzzerService {
         job_id: FuzzJobId,
     ) -> DomainResult<()> {
         let job = self.db.get_fuzz_job(project_id, job_id).await?;
-        if matches!(
-            job.state,
-            FuzzJobState::Completed | FuzzJobState::Failed | FuzzJobState::Interrupted
-        ) {
+        if fuzz_job_has_ended(job.state) {
             return Err(DomainError::conflict("fuzz job is already terminal"));
         }
         let token = self
@@ -711,6 +742,13 @@ impl FuzzerService {
             (Err(error), _) | (_, Err(error)) => (None, Some(error.to_string())),
         }
     }
+}
+
+fn fuzz_job_has_ended(state: FuzzJobState) -> bool {
+    matches!(
+        state,
+        FuzzJobState::Completed | FuzzJobState::Failed | FuzzJobState::Interrupted
+    )
 }
 
 fn annotate_group_with_baseline(
@@ -1702,6 +1740,119 @@ mod tests {
             assert_eq!(detail.lineage.fuzz_case_id, Some(case.id));
             assert_eq!(detail.response_body_hash, case.body_hash);
         }
+    }
+
+    /// Answers every request after a delay.
+    struct SlowTransport(Duration);
+
+    #[async_trait::async_trait]
+    impl SemanticTransport for SlowTransport {
+        async fn send(
+            &self,
+            _dial: &ValidatedDial,
+            _request: OutboundRequest,
+        ) -> DomainResult<OutboundResponse> {
+            tokio::time::sleep(self.0).await;
+            Ok(OutboundResponse {
+                status: http::StatusCode::OK,
+                headers: vec![("content-type".into(), b"text/plain".to_vec())],
+                body: Bytes::from_static(b"ok"),
+                body_truncated: false,
+                protocol: "HTTP/1.1".into(),
+                transport_provenance: TransportProvenance::GenericUnprofiled,
+                transport_profile: "test_slow".into(),
+                duration: self.0,
+            })
+        }
+
+        fn profile_name(&self) -> &str {
+            "test_slow"
+        }
+
+        fn provenance(&self) -> TransportProvenance {
+            TransportProvenance::GenericUnprofiled
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_returns_when_the_job_ends_not_when_the_wait_does() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let mut project = db
+            .create_project(CreateProjectRequest {
+                name: "fuzz wait".into(),
+                target_url: "http://127.0.0.1:9/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        project.limits.max_concurrent_requests = 1;
+        project.limits.requests_per_second = 1_000.0;
+        db.update_project_scope(project.id, project.scope.clone(), Some(project.limits))
+            .await
+            .unwrap();
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(SlowTransport(Duration::from_millis(150))),
+            placeholder_key: PlaceholderKey::from_bytes(vec![11; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service =
+            FuzzerService::new(db.clone(), reply, PlaceholderKey::from_bytes(vec![12; 32]));
+        let template = FuzzTemplate {
+            base_exchange_id: None,
+            draft: ReplyDraft {
+                url: Some("http://127.0.0.1:9/?q=§q§".into()),
+                ..Default::default()
+            },
+            insertion_points: vec![InsertionPoint {
+                name: "q".into(),
+                location: "url".into(),
+            }],
+            wordlists: vec![vec!["a".into(), "b".into()]],
+            wordlist_files: vec![],
+            payload_generators: vec![],
+            transforms: vec![],
+            strategy: FuzzStrategy::Sniper,
+        };
+        let job = service.start(project.id, template, false).await.unwrap();
+
+        let immediate = service
+            .wait(project.id, job.id, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!fuzz_job_has_ended(immediate.state));
+
+        let started = std::time::Instant::now();
+        let ended = service
+            .wait(project.id, job.id, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert_eq!(ended.state, FuzzJobState::Completed);
+        assert_eq!(ended.completed_cases, 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // An ended job returns at once, and another project's job is not found.
+        let again = std::time::Instant::now();
+        service
+            .wait(project.id, job.id, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert!(again.elapsed() < Duration::from_secs(1));
+        let other = service
+            .wait(
+                ProjectId(project.id.get() + 1),
+                job.id,
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(other.code(), ErrorCode::NotFound);
     }
 
     #[test]
