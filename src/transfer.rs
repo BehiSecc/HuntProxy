@@ -250,7 +250,7 @@ impl Db {
 const SCOPED_TABLES: &[&str] = &[
     "capture_sessions",
     "exchanges",
-    "message_headers",
+    "message_header_rows",
     "annotations",
     "labels",
     "exchange_labels",
@@ -318,6 +318,8 @@ fn copy_project_snapshot(
             ("fuzz_cases", "job_id IN (SELECT id FROM main.fuzz_jobs WHERE project_id=?1)"),
             ("ip_rotation_gateways", "profile_id IN (SELECT id FROM main.ip_rotation_profiles WHERE project_id=?1)"),
             ("bodies", "id IN (SELECT request_body_id FROM main.exchanges WHERE project_id=?1 AND request_body_id IS NOT NULL UNION SELECT response_body_id FROM main.exchanges WHERE project_id=?1 AND response_body_id IS NOT NULL)"),
+            ("header_names", "id IN (SELECT name_id FROM main.message_header_rows WHERE project_id=?1)"),
+            ("header_values", "id IN (SELECT value_id FROM main.message_header_rows WHERE project_id=?1)"),
         ] {
             let sql = format!("INSERT INTO hp_export.{table} SELECT * FROM main.{table} WHERE {predicate}");
             tx.execute(&sql, params![project_id.get()]).map_err(storage_error)?;
@@ -350,12 +352,17 @@ fn sanitize_snapshot(path: &Path, secrets: SecretMode) -> DomainResult<()> {
             .map(|_| "?")
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("DELETE FROM message_headers WHERE lower(name) IN ({names})");
+        let sql = format!(
+            "DELETE FROM message_header_rows WHERE name_id IN
+             (SELECT id FROM header_names WHERE lower(name) IN ({names}))"
+        );
         tx.execute(
             &sql,
             rusqlite::params_from_iter(crate::policy::SENSITIVE_HEADERS.iter()),
         )
         .map_err(storage_error)?;
+        // The removed headers' values, such as cookies and tokens, go too.
+        crate::storage::delete_unused_header_values(&tx).map_err(storage_error)?;
         tx.execute("DELETE FROM project_cookies", [])
             .map_err(storage_error)?;
         tx.execute("DELETE FROM named_cookie_profiles", [])
@@ -1322,6 +1329,16 @@ mod tests {
         )
         .await
         .unwrap();
+        // Header values are shared rows: the removed header's value must not
+        // stay behind in the archive either.
+        let unpacked = directory.path().join("safe-unpacked");
+        unpack_bundle(&bundle, &unpacked);
+        let snapshot = std::fs::read(unpacked.join("project.sqlite3")).unwrap();
+        let secret = b"Bearer secret";
+        assert!(
+            !snapshot.windows(secret.len()).any(|bytes| bytes == secret),
+            "the sanitized archive still holds a removed header value"
+        );
         let imported = db.import_bundle(&config, bundle, None).await.unwrap();
         assert!(!imported.secrets_included);
         assert!(!imported.browser_state_imported);
@@ -1399,6 +1416,7 @@ mod tests {
         let unpacked = directory.path().join("schema14");
         unpack_bundle(&current_bundle, &unpacked);
         let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
+        archive.execute_batch(crate::storage::UNDO_018).unwrap();
         archive
             .execute_batch(
                 "DROP TABLE project_upstream_proxies; DROP INDEX idx_capture_sessions_token_lookup; DROP INDEX idx_capture_sessions_legacy_active; ALTER TABLE capture_sessions DROP COLUMN token_lookup; ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14;",

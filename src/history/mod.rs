@@ -462,7 +462,7 @@ fn compile_body_term(
     let like_index = binds.len();
     binds.push(value);
     let body_index = binds.len();
-    let (target, body_column) = if side == "request" {
+    let (target, body_column, side_code) = if side == "request" {
         (
             format!(
                 "method LIKE ?{like_index} ESCAPE '\\' \
@@ -473,20 +473,36 @@ fn compile_body_term(
                  OR "
             ),
             "request_body_id",
+            0,
         )
     } else {
-        (String::new(), "response_body_id")
+        (String::new(), "response_body_id", 1)
     };
+    // Each distinct name and value is matched once, then rows are checked by id.
+    // Bodies are searched through the same side's Content-Encoding, in header order.
+    let content_encoding = format!(
+        "(SELECT group_concat(CAST(ev.value AS TEXT), ', ' ORDER BY ce.ordinal) \
+            FROM message_header_rows ce \
+            JOIN header_values ev ON ev.id=ce.value_id \
+           WHERE ce.project_id=exchanges.project_id \
+             AND ce.exchange_id=exchanges.exchange_id \
+             AND ce.side={side_code} \
+             AND ce.name_id IN (SELECT id FROM header_names \
+                                WHERE lower(name)='content-encoding'))"
+    );
     Ok(format!(
-        "({target}EXISTS (SELECT 1 FROM message_headers mh \
+        "({target}EXISTS (SELECT 1 FROM message_header_rows mh \
                      WHERE mh.project_id=exchanges.project_id \
                        AND mh.exchange_id=exchanges.exchange_id \
-                       AND mh.side='{side}' \
-                       AND (mh.name LIKE ?{like_index} ESCAPE '\\' \
-                            OR CAST(mh.value AS TEXT) LIKE ?{like_index} ESCAPE '\\')) \
+                       AND mh.side={side_code} \
+                       AND (mh.name_id IN (SELECT id FROM header_names \
+                                           WHERE name LIKE ?{like_index} ESCAPE '\\') \
+                            OR mh.value_id IN (SELECT id FROM header_values \
+                                               WHERE CAST(value AS TEXT) LIKE ?{like_index} ESCAPE '\\'))) \
           OR EXISTS (SELECT 1 FROM bodies b \
                      WHERE b.id=exchanges.{body_column} \
-                       AND huntproxy_body_contains(b.codec, b.content, ?{body_index})))"
+                       AND huntproxy_body_contains(b.codec, b.content, ?{body_index}, \
+                                                   {content_encoding})))"
     ))
 }
 
@@ -1101,7 +1117,7 @@ mod tests {
             assert_eq!(binds, ["%token%", "token"], "{input}");
         }
         let (sql, binds) = filter_to_sql(&parse_text_query("response:~secret").unwrap()).unwrap();
-        assert!(sql.contains("mh.side='response'"));
+        assert!(sql.contains("mh.side=1"));
         assert!(sql.contains("exchanges.response_body_id"));
         assert!(!sql.contains("method LIKE"));
         assert_eq!(binds, ["%secret%", "secret"]);

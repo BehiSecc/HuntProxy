@@ -223,6 +223,8 @@ impl Db {
                 [],
             )
             .map_err(|error| storage_error(error.to_string()))?;
+            crate::storage::delete_unused_header_values(&tx)
+                .map_err(|error| storage_error(error.to_string()))?;
             reconcile_project_usage_conn(&tx, project_id)?;
             tx.commit()
                 .map_err(|error| storage_error(error.to_string()))?;

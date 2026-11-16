@@ -5,9 +5,10 @@ use crate::history::{filter_to_sql, FilterNode};
 use crate::policy::{present_headers, PresentationOptions};
 use crate::storage::annotations::load_labels_conn;
 use crate::storage::bodies::{
-    hash_body_file, prepare_body, store_body_conn, store_body_file_conn, store_prepared_body_conn,
-    StoredBody,
+    prepare_body, prepare_body_file, store_body_conn, store_body_file_conn,
+    store_prepared_body_conn, StoredBody,
 };
+use crate::storage::headers::{insert_headers_conn, load_headers_conn};
 use crate::storage::projects::{now_rfc3339, parse_time};
 use crate::storage::Db;
 use rusqlite::params;
@@ -567,14 +568,14 @@ impl Db {
             ));
         }
         self.with_conn(move |conn| {
-            // Read and hash the spools before taking the write lock.
+            // Hash and compress the spools before taking the write lock.
             let request = request_spool
                 .as_deref()
-                .map(|path| hash_body_file(path).map(|hashed| (path, hashed)))
+                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
                 .transpose()?;
             let response = response_spool
                 .as_deref()
-                .map(|path| hash_body_file(path).map(|hashed| (path, hashed)))
+                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
                 .transpose()?;
             let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             let request_body = request
@@ -1035,34 +1036,20 @@ fn insert_exchange_record_conn(
     )
     .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
 
-    for h in &ex.request_headers {
-        conn.execute(
-            "INSERT INTO message_headers (project_id, exchange_id, side, ordinal, name, value)
-             VALUES (?1,?2,'request',?3,?4,?5)",
-            params![
-                ex.project_id.get(),
-                exchange_id.get(),
-                h.ordinal as i64,
-                h.name,
-                h.value
-            ],
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    }
-    for h in &ex.response_headers {
-        conn.execute(
-            "INSERT INTO message_headers (project_id, exchange_id, side, ordinal, name, value)
-             VALUES (?1,?2,'response',?3,?4,?5)",
-            params![
-                ex.project_id.get(),
-                exchange_id.get(),
-                h.ordinal as i64,
-                h.name,
-                h.value
-            ],
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    }
+    insert_headers_conn(
+        conn,
+        ex.project_id.get(),
+        exchange_id.get(),
+        "request",
+        &ex.request_headers,
+    )?;
+    insert_headers_conn(
+        conn,
+        ex.project_id.get(),
+        exchange_id.get(),
+        "response",
+        &ex.response_headers,
+    )?;
 
     let request_bytes = nonnegative_length(req_len);
     let response_bytes = nonnegative_length(resp_len);
@@ -1227,22 +1214,7 @@ pub(crate) fn load_headers(
     exchange_id: ExchangeId,
     side: &str,
 ) -> DomainResult<Vec<HeaderEntry>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT ordinal, name, value FROM message_headers
-             WHERE project_id=?1 AND exchange_id=?2 AND side=?3 ORDER BY ordinal",
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    let rows = stmt
-        .query_map(params![project_id.get(), exchange_id.get(), side], |row| {
-            Ok(HeaderEntry {
-                ordinal: row.get::<_, i64>(0)? as u32,
-                name: row.get(1)?,
-                value: row.get(2)?,
-            })
-        })
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    collect_rows(rows)
+    load_headers_conn(conn, project_id.get(), exchange_id.get(), side)
 }
 
 fn source_str(s: ExchangeSource) -> &'static str {
@@ -1987,6 +1959,98 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&body_id));
         assert!(ids.contains(&header_id));
+
+        // Header names match too, and only on the side searched.
+        for (query, expected) in [
+            ("request:~x-tes", vec![header_id]),
+            ("response:~that", vec![]),
+            ("response:~X-Test", vec![]),
+        ] {
+            let filter = crate::history::parse_text_query(query).unwrap();
+            let (items, _) = db
+                .list_history_filtered(project.id, Some(filter), 20, None, None)
+                .await
+                .unwrap();
+            let ids = items
+                .into_iter()
+                .map(|item| item.exchange_id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn history_body_search_reads_through_content_encoding() {
+        use std::io::Write;
+        let gzip = |text: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(text).unwrap();
+            encoder.finish().unwrap()
+        };
+        let brotli = |text: &[u8]| {
+            let mut output = Vec::new();
+            let mut writer = brotli::CompressorWriter::new(&mut output, 4096, 5, 22);
+            writer.write_all(text).unwrap();
+            drop(writer);
+            output
+        };
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "encoded search".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let insert = |path: &str, encodings: &[&str], body: Vec<u8>| {
+            let mut exchange = spool_exchange(project.id);
+            exchange.path = path.into();
+            exchange.response_headers = encodings
+                .iter()
+                .enumerate()
+                .map(|(ordinal, encoding)| HeaderEntry {
+                    name: if ordinal == 0 {
+                        "Content-Encoding".into()
+                    } else {
+                        "content-encoding".into()
+                    },
+                    value: encoding.as_bytes().to_vec(),
+                    ordinal: ordinal as u32,
+                })
+                .collect();
+            exchange.response_body = Some(body);
+            let db = db.clone();
+            async move { db.insert_exchange(exchange).await.unwrap() }
+        };
+        let gzipped = insert("/gzip", &["gzip"], gzip(b"<p>Secret-In-Gzip</p>")).await;
+        let brotlied = insert("/br", &["br"], brotli(b"{\"k\":\"secret-in-br\"}")).await;
+        // gzip applied first, then br, in two headers.
+        let chained = insert("/chain", &["gzip", "br"], brotli(&gzip(b"chained-secret"))).await;
+        // Claims gzip but is not: searched as stored instead of failing the query.
+        let mislabelled = insert("/plain", &["gzip"], b"needle-plain".to_vec()).await;
+        let unencoded = insert("/raw", &[], b"needle-raw".to_vec()).await;
+
+        for (query, expected) in [
+            ("response:~secret-in-gzip", vec![gzipped]),
+            ("response:~secret-in-br", vec![brotlied]),
+            ("response:~chained-secret", vec![chained]),
+            ("response:~needle-plain", vec![mislabelled]),
+            ("response:~needle-raw", vec![unencoded]),
+            ("request:~secret-in-gzip", vec![]),
+        ] {
+            let filter = crate::history::parse_text_query(query).unwrap();
+            let (items, _) = db
+                .list_history_filtered(project.id, Some(filter), 20, None, None)
+                .await
+                .unwrap();
+            let ids = items
+                .into_iter()
+                .map(|item| item.exchange_id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{query}");
+        }
     }
 
     #[tokio::test]
