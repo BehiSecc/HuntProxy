@@ -8,6 +8,7 @@ use crate::storage::bodies::{
     hash_body_file, prepare_body, store_body_conn, store_body_file_conn, store_prepared_body_conn,
     StoredBody,
 };
+use crate::storage::headers::{insert_headers_conn, load_headers_conn};
 use crate::storage::projects::{now_rfc3339, parse_time};
 use crate::storage::Db;
 use rusqlite::params;
@@ -1035,34 +1036,20 @@ fn insert_exchange_record_conn(
     )
     .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
 
-    for h in &ex.request_headers {
-        conn.execute(
-            "INSERT INTO message_headers (project_id, exchange_id, side, ordinal, name, value)
-             VALUES (?1,?2,'request',?3,?4,?5)",
-            params![
-                ex.project_id.get(),
-                exchange_id.get(),
-                h.ordinal as i64,
-                h.name,
-                h.value
-            ],
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    }
-    for h in &ex.response_headers {
-        conn.execute(
-            "INSERT INTO message_headers (project_id, exchange_id, side, ordinal, name, value)
-             VALUES (?1,?2,'response',?3,?4,?5)",
-            params![
-                ex.project_id.get(),
-                exchange_id.get(),
-                h.ordinal as i64,
-                h.name,
-                h.value
-            ],
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    }
+    insert_headers_conn(
+        conn,
+        ex.project_id.get(),
+        exchange_id.get(),
+        "request",
+        &ex.request_headers,
+    )?;
+    insert_headers_conn(
+        conn,
+        ex.project_id.get(),
+        exchange_id.get(),
+        "response",
+        &ex.response_headers,
+    )?;
 
     let request_bytes = nonnegative_length(req_len);
     let response_bytes = nonnegative_length(resp_len);
@@ -1227,22 +1214,7 @@ pub(crate) fn load_headers(
     exchange_id: ExchangeId,
     side: &str,
 ) -> DomainResult<Vec<HeaderEntry>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT ordinal, name, value FROM message_headers
-             WHERE project_id=?1 AND exchange_id=?2 AND side=?3 ORDER BY ordinal",
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    let rows = stmt
-        .query_map(params![project_id.get(), exchange_id.get(), side], |row| {
-            Ok(HeaderEntry {
-                ordinal: row.get::<_, i64>(0)? as u32,
-                name: row.get(1)?,
-                value: row.get(2)?,
-            })
-        })
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    collect_rows(rows)
+    load_headers_conn(conn, project_id.get(), exchange_id.get(), side)
 }
 
 fn source_str(s: ExchangeSource) -> &'static str {
@@ -1987,6 +1959,24 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&body_id));
         assert!(ids.contains(&header_id));
+
+        // Header names match too, and only on the side searched.
+        for (query, expected) in [
+            ("request:~x-tes", vec![header_id]),
+            ("response:~that", vec![]),
+            ("response:~X-Test", vec![]),
+        ] {
+            let filter = crate::history::parse_text_query(query).unwrap();
+            let (items, _) = db
+                .list_history_filtered(project.id, Some(filter), 20, None, None)
+                .await
+                .unwrap();
+            let ids = items
+                .into_iter()
+                .map(|item| item.exchange_id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{query}");
+        }
     }
 
     #[tokio::test]

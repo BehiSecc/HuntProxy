@@ -376,6 +376,8 @@ impl Db {
                 [],
             )
             .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            crate::storage::delete_unused_header_values(&tx)
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
             tx.execute(
                 "DELETE FROM search_fts WHERE project_id=?1",
                 params![id.get()],
