@@ -444,7 +444,7 @@ impl Db {
             if matching.is_empty() {
                 return Err(DomainError::not_found("fuzz response group"));
             }
-            matching.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+            matching.sort_unstable_by_key(|left| std::cmp::Reverse(left.0));
             let page = matching
                 .into_iter()
                 .filter(|(index, _)| before_case_index.is_none_or(|before| *index < before))
