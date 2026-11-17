@@ -419,6 +419,85 @@ mod tests {
     }
 
     #[test]
+    fn generator_integer_ranges_are_enforced_without_schema_bounds() {
+        // The MCP schema omits the i64/u64 range bounds; deserialization keeps enforcing them.
+        let template = |generators: serde_json::Value| {
+            serde_json::from_value::<FuzzTemplate>(serde_json::json!({
+                "insertion_points": [{"name": "q", "location": "url"}],
+                "payload_generators": generators,
+            }))
+        };
+        let mut valid = template(serde_json::json!([
+            {"type": "numbers", "from": 3, "to": 1, "step": -1},
+            {"type": "regex_bypass", "input": "a.b", "modes": ["separator"], "byte_from": 65, "byte_to": 66, "include_alphanumeric": true, "max_payloads": 4},
+        ]))
+        .unwrap();
+        expand_generators(&mut valid, 100).unwrap();
+        assert_eq!(
+            valid.wordlists,
+            vec![
+                vec!["3", "2", "1"],
+                vec!["a%41.b", "a%42.b", "a.%41b", "a.%42b"],
+            ]
+        );
+
+        let extremes = template(serde_json::json!([
+            {"type": "numbers", "from": i64::MIN, "to": i64::MAX, "step": i64::MAX},
+            {"type": "regex_bypass", "input": "x", "max_payloads": u64::MAX},
+        ]))
+        .unwrap();
+        assert_eq!(
+            extremes.payload_generators,
+            [
+                PayloadGenerator::Numbers {
+                    from: i64::MIN,
+                    to: i64::MAX,
+                    step: i64::MAX,
+                },
+                PayloadGenerator::RegexBypass {
+                    input: "x".into(),
+                    encoding: RegexBypassEncoding::Url,
+                    modes: default_regex_modes(),
+                    byte_from: 0,
+                    byte_to: 255,
+                    include_alphanumeric: false,
+                    max_payloads: u64::MAX,
+                },
+            ]
+        );
+
+        for generator in [
+            serde_json::json!({"type": "numbers", "from": 9_223_372_036_854_775_808_u64, "to": 1, "step": 1}),
+            serde_json::json!({"type": "numbers", "from": 1, "to": 2, "step": 1.5}),
+            serde_json::json!({"type": "numbers", "from": 1, "to": 2}),
+            serde_json::json!({"type": "regex_bypass", "input": "x", "max_payloads": -1}),
+            serde_json::json!({"type": "regex_bypass", "input": "x", "max_payloads": 18_446_744_073_709_551_615.0_f64 * 2.0}),
+        ] {
+            assert!(
+                template(serde_json::json!([generator])).is_err(),
+                "{generator} should not deserialize"
+            );
+        }
+
+        for (generator, code) in [
+            (
+                serde_json::json!({"type": "numbers", "from": 1, "to": 2, "step": 0}),
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                serde_json::json!({"type": "regex_bypass", "input": "x", "max_payloads": 0}),
+                ErrorCode::CombinationLimit,
+            ),
+        ] {
+            let mut parsed = template(serde_json::json!([generator])).unwrap();
+            assert_eq!(
+                expand_generators(&mut parsed, 100).unwrap_err().code(),
+                code
+            );
+        }
+    }
+
+    #[test]
     fn regex_fixture_matches_recollapse_supported_modes() {
         let output = generate_regex_bypass(
             "a.b",
