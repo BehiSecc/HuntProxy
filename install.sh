@@ -211,7 +211,7 @@ HOME_CANON="$(cd "$HOME" && pwd -P)"
   || die 'data directory is too broad'
 chmod 700 "$DATA_DIR"
 
-info 'Coordinating release preparation and activation'
+info 'Coordinating release preparation and activation (upgrading a large database can take a while; do not interrupt)'
 if ! "$STAGED_BIN" install-release \
   --executable "$INSTALL_DIR/HuntProxy" \
   --data-dir "$DATA_DIR" >"$TEMP_DIR/install-release.log" 2>&1; then
