@@ -226,7 +226,7 @@
 
       <details id="requestLimitsPanel" style="margin-top:.75rem">
         <summary>Request limits</summary>
-        <p class="small muted">Shared by Reply, Fuzzer, the crawler and extensions. Running fuzz jobs keep the limits they started with.</p>
+        <p class="small muted">Shared by Reply, Fuzzer, the crawler and extensions. Changes apply at once, including to running fuzz jobs.</p>
         <div class="row">
           <div><label for="limitRate">Requests per second</label><input id="limitRate" type="number" min="0.1" max="1000" step="any" /></div>
           <div><label for="limitConcurrency">In flight at once</label><input id="limitConcurrency" type="number" min="1" max="256" step="1" /></div>

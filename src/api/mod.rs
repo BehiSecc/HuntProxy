@@ -1042,7 +1042,11 @@ async fn update_project_request_budget(
         .update_project_request_budget(ProjectId(id), update)
         .await
     {
-        Ok(project) => Json(project).into_response(),
+        Ok(project) => {
+            // Running jobs hold the project's budget; apply the limits now.
+            state.reply.request_limiter.budget(&project);
+            Json(project).into_response()
+        }
         Err(error) => error_response(error),
     }
 }
