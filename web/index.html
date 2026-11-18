@@ -849,7 +849,16 @@ test
         $('browserUrl').value = project.target_url || '';
         $('cookieTarget').value = project.target_url || '';
         try { $('ipRotationTarget').value = new URL(project.target_url).origin; } catch (_) { $('ipRotationTarget').value = ''; }
-      } catch (_) {}
+      } catch (e) {
+        // Never leave the previous project's settings for a save to apply to this one.
+        if (isCurrentBrowserContext(browserSelection)) {
+          $('scopeHosts').value = '';
+          $('scopeExcludedHosts').value = '';
+          $('renameProjectName').value = '';
+          renderRequestLimits(null);
+          status('requestLimitsStatus', `Could not load this project: ${e.message}`, 'err');
+        }
+      }
       if (!isCurrentBrowserContext(browserSelection)) return;
       $('cookieValue').value = '';
       $('cookieFile').value = '';
