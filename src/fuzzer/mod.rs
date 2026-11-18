@@ -1208,7 +1208,12 @@ fn prepare_case(
         let Some(raw_value) = case.values.get(index).and_then(Option::as_ref) else {
             // An insertion point this case leaves untouched (Sniper) must not
             // reach the target as a literal `§name§` marker.
-            clear_marker(&mut draft, point);
+            if let Err(error) = clear_marker(&mut draft, point) {
+                return Err(PrepareError {
+                    message: error.to_string(),
+                    payloads,
+                });
+            }
             continue;
         };
         let transformed = match apply_pipeline(&template.transforms, raw_value.as_bytes()) {
@@ -1235,15 +1240,11 @@ fn prepare_case(
 /// Replaces the point's marker with an empty string wherever the point's
 /// location holds it. Insertion points carry no default value, so empty is the
 /// neutral fill for a point a case does not mutate.
-fn clear_marker(draft: &mut ReplyDraft, point: &InsertionPoint) {
+fn clear_marker(draft: &mut ReplyDraft, point: &InsertionPoint) -> DomainResult<()> {
     let marker = format!("§{}§", point.name);
     match point.location.as_str() {
         "body" => {
-            if let Some(body) = draft.body_override.as_mut() {
-                if contains_bytes(body, marker.as_bytes()) {
-                    *body = replace_bytes(body, marker.as_bytes(), b"");
-                }
-            }
+            replace_body_marker(draft, &marker, b"")?;
         }
         "url" => {
             if let Some(url) = draft.url.as_mut() {
@@ -1266,6 +1267,94 @@ fn clear_marker(draft: &mut ReplyDraft, point: &InsertionPoint) {
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// Replaces `marker` with `payload` in whichever draft field holds the body
+/// and returns whether it was there. Raw bytes and text are replaced as
+/// written. In body_json strings and body_params fields the payload becomes
+/// part of that string, so it is escaped or form-encoded with it when the
+/// request is built.
+fn replace_body_marker(draft: &mut ReplyDraft, marker: &str, payload: &[u8]) -> DomainResult<bool> {
+    if let Some(body) = draft.body_override.as_mut() {
+        if !contains_bytes(body, marker.as_bytes()) {
+            return Ok(false);
+        }
+        *body = replace_bytes(body, marker.as_bytes(), payload);
+        return Ok(true);
+    }
+    if let Some(text) = draft.body_text.as_mut() {
+        if !text.contains(marker) {
+            return Ok(false);
+        }
+        match std::str::from_utf8(payload) {
+            Ok(payload) => *text = text.replace(marker, payload),
+            // Text cannot hold the payload: send the body as bytes instead.
+            Err(_) => {
+                draft.body_override =
+                    Some(replace_bytes(text.as_bytes(), marker.as_bytes(), payload));
+                draft.body_text = None;
+            }
+        }
+        return Ok(true);
+    }
+    let in_json = draft
+        .body_json
+        .as_ref()
+        .is_some_and(|value| json_contains(value, marker));
+    let in_params = draft
+        .body_params
+        .iter()
+        .any(|param| param.name.contains(marker) || param.value.contains(marker));
+    if !in_json && !in_params {
+        return Ok(false);
+    }
+    let payload = std::str::from_utf8(payload).map_err(|_| {
+        DomainError::invalid(
+            "a payload for a marker in body_json or body_params must be UTF-8 after transforms; use body_text or body_override for bytes",
+        )
+    })?;
+    if let Some(value) = draft.body_json.as_mut() {
+        json_replace(value, marker, payload);
+    }
+    for param in &mut draft.body_params {
+        param.name = param.name.replace(marker, payload);
+        param.value = param.value.replace(marker, payload);
+    }
+    Ok(true)
+}
+
+fn json_contains(value: &serde_json::Value, marker: &str) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains(marker),
+        serde_json::Value::Array(items) => items.iter().any(|item| json_contains(item, marker)),
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .any(|(key, field)| key.contains(marker) || json_contains(field, marker)),
+        _ => false,
+    }
+}
+
+/// Replaces `marker` in every string and object key of `value`.
+fn json_replace(value: &mut serde_json::Value, marker: &str, payload: &str) {
+    match value {
+        serde_json::Value::String(text) => *text = text.replace(marker, payload),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                json_replace(item, marker, payload);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            *fields = std::mem::take(fields)
+                .into_iter()
+                .map(|(key, mut field)| {
+                    json_replace(&mut field, marker, payload);
+                    (key.replace(marker, payload), field)
+                })
+                .collect();
+        }
+        _ => {}
+    }
 }
 
 fn apply_insertion(
@@ -1277,12 +1366,13 @@ fn apply_insertion(
     match point.location.as_str() {
         "body" => {
             draft.body_cleared = false;
-            draft.body_override = Some(match draft.body_override.take() {
-                Some(body) if contains_bytes(&body, marker.as_bytes()) => {
-                    replace_bytes(&body, marker.as_bytes(), payload)
-                }
-                _ => payload.to_vec(),
-            });
+            if !replace_body_marker(draft, &marker, payload)? {
+                // Without a marker the payload is the whole body.
+                draft.body_text = None;
+                draft.body_json = None;
+                draft.body_params.clear();
+                draft.body_override = Some(payload.to_vec());
+            }
         }
         "url" => {
             let payload = std::str::from_utf8(payload)
@@ -2031,6 +2121,124 @@ mod tests {
             );
             assert!(!all.contains('§'), "literal marker left in {all}");
         }
+    }
+
+    #[test]
+    fn body_markers_are_replaced_in_every_body_field() {
+        let template =
+            |draft: ReplyDraft, names: &[&str], transforms: Vec<Transform>| FuzzTemplate {
+                base_exchange_id: None,
+                draft: ReplyDraft {
+                    method: Some("POST".into()),
+                    url: Some("https://example.test/".into()),
+                    ..draft
+                },
+                insertion_points: names
+                    .iter()
+                    .map(|name| InsertionPoint {
+                        name: (*name).into(),
+                        location: "body".into(),
+                    })
+                    .collect(),
+                wordlists: vec![vec!["c&d=\"<x>\"".into()]],
+                wordlist_files: vec![],
+                payload_generators: vec![],
+                transforms,
+                strategy: FuzzStrategy::Sniper,
+                request_timeout_ms: None,
+            };
+        // The body each case sends, after the draft is normalized for sending.
+        let bodies = |template: &FuzzTemplate| {
+            CaseIterator::new(
+                template.strategy,
+                template.insertion_points.len(),
+                template.wordlists.clone(),
+            )
+            .map(|case| {
+                let prepared = prepare_case(template, &case).map_err(|error| error.message)?;
+                let draft = crate::reply::normalize_reply_draft(prepared.draft)
+                    .map_err(|error| error.to_string())?;
+                Ok(draft.body_override.unwrap_or_default())
+            })
+            .collect::<Result<Vec<_>, String>>()
+        };
+        let text = |value: &str| ReplyDraft {
+            body_text: Some(value.into()),
+            ..Default::default()
+        };
+        let payload = "c&d=\"<x>\"";
+
+        assert_eq!(
+            bodies(&template(text("user=§p§&x=1"), &["p"], vec![])).unwrap(),
+            [format!("user={payload}&x=1").into_bytes()]
+        );
+        let json = ReplyDraft {
+            body_json: Some(serde_json::json!({"user": "§p§", "§p§": [1, "id-§p§"]})),
+            ..Default::default()
+        };
+        let sent = bodies(&template(json, &["p"], vec![])).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&sent[0]).unwrap(),
+            serde_json::json!({"user": payload, payload: [1, format!("id-{payload}")]})
+        );
+        let form = ReplyDraft {
+            body_format: Some(ReplyBodyFormat::FormUrlencoded),
+            body_params: vec![
+                ReplyBodyParam {
+                    name: "user".into(),
+                    value: "§p§".into(),
+                },
+                ReplyBodyParam {
+                    name: "x".into(),
+                    value: "1".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            bodies(&template(form, &["p"], vec![])).unwrap(),
+            [b"user=c%26d%3D%22%3Cx%3E%22&x=1".to_vec()]
+        );
+        let xml = ReplyDraft {
+            body_format: Some(ReplyBodyFormat::Xml),
+            body_text: Some("<a>§p§</a>".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            bodies(&template(xml, &["p"], vec![])).unwrap(),
+            [format!("<a>{payload}</a>").into_bytes()]
+        );
+
+        // Sniper fills one point per case and empties the other's marker.
+        assert_eq!(
+            bodies(&template(text("a=§a§&b=§b§"), &["a", "b"], vec![])).unwrap(),
+            [
+                format!("a={payload}&b=").into_bytes(),
+                format!("a=&b={payload}").into_bytes()
+            ]
+        );
+
+        // A payload that is not UTF-8 after transforms still reaches a text
+        // body as bytes; JSON and form fields cannot hold it.
+        let mut bytes = template(text("v=§p§"), &["p"], vec![Transform::HexDecode]);
+        bytes.wordlists = vec![vec!["ff00".into()]];
+        assert_eq!(bodies(&bytes).unwrap(), [b"v=\xff\x00".to_vec()]);
+        let mut json_bytes = template(
+            ReplyDraft {
+                body_json: Some(serde_json::json!({"v": "§p§"})),
+                ..Default::default()
+            },
+            &["p"],
+            vec![Transform::HexDecode],
+        );
+        json_bytes.wordlists = vec![vec!["ff".into()]];
+        assert!(bodies(&json_bytes).unwrap_err().contains("must be UTF-8"));
+
+        // Without a marker the payload is the whole body, whatever field held it.
+        assert_eq!(
+            bodies(&template(text("no marker"), &["p"], vec![])).unwrap(),
+            [payload.as_bytes().to_vec()]
+        );
     }
 
     #[test]
