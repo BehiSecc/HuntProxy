@@ -34,8 +34,16 @@ impl managed::Manager for SqliteManager {
         let synchronous = self.synchronous.clone();
         let busy_timeout_ms = self.busy_timeout_ms;
         SyncWrapper::new(Runtime::Tokio1, move || {
+            let in_memory = path.contains("mode=memory");
             let conn = Connection::open(path)?;
             configure(&conn, &synchronous, busy_timeout_ms)?;
+            if in_memory {
+                // Test databases share one in-memory cache, where a reader's
+                // table lock makes a concurrent write fail at once with
+                // "database table is locked" instead of waiting. Readers of a
+                // WAL database file never block writers; this keeps tests the same.
+                conn.pragma_update(None, "read_uncommitted", true)?;
+            }
             write_lock(&conn, Some(Duration::from_millis(busy_timeout_ms)));
             Ok(conn)
         })
