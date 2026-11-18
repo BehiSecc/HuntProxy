@@ -400,6 +400,9 @@ fn browser_action_schema() -> Value {
 }
 
 fn fuzz_template_schema() -> Value {
+    // Integer generator fields omit minimum/maximum bounds that only restate i64/u64:
+    // the OpenAI Codex backend answers HTTP 500 when a tool declares i64::MIN or u64::MAX.
+    // Deserializing into PayloadGenerator still rejects out-of-range values.
     json!({
         "type": "object",
         "description": "Use marker §name§ in the selected draft field. Example: draft.url='https://example.test/?q=§q§' with insertion point {name:'q', location:'url'}. In body_json strings and body_params the payload is JSON-escaped or form-encoded with its field; use body_text for raw bytes. A body point without a marker replaces the whole body.",
@@ -441,9 +444,9 @@ fn fuzz_template_schema() -> Value {
                             "type": "object",
                             "properties": {
                                 "type": {"const": "numbers"},
-                                "from": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64},
-                                "to": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64},
-                                "step": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64, "description": "Non-zero; its sign must move from from toward to."}
+                                "from": {"type": "integer"},
+                                "to": {"type": "integer"},
+                                "step": {"type": "integer", "description": "Non-zero; its sign must move from from toward to."}
                             },
                             "required": ["type", "from", "to", "step"],
                             "additionalProperties": false
@@ -458,7 +461,7 @@ fn fuzz_template_schema() -> Value {
                                 "byte_from": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
                                 "byte_to": {"type": "integer", "minimum": 0, "maximum": 255, "default": 255},
                                 "include_alphanumeric": {"type": "boolean", "default": false},
-                                "max_payloads": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615_u64, "default": 2000}
+                                "max_payloads": {"type": "integer", "minimum": 1, "default": 2000}
                             },
                             "required": ["type", "input"],
                             "additionalProperties": false
@@ -3048,6 +3051,73 @@ mod tests {
             schema["properties"]["max_response_bytes"]["maximum"],
             65_536
         );
+    }
+
+    #[test]
+    fn tool_schema_integer_bounds_stay_within_json_safe_range() {
+        // The OpenAI Codex backend returns HTTP 500 for a tool declaring i64::MIN or u64::MAX
+        // as a bound; ±(2^53 - 1) is accepted.
+        const SAFE: i64 = (1 << 53) - 1;
+        fn check(tool: &str, path: &str, value: &Value) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, field) in fields {
+                        let path = format!("{path}/{key}");
+                        if matches!(
+                            key.as_str(),
+                            "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum"
+                        ) && field.is_number()
+                        {
+                            let bound = field.as_i64();
+                            assert!(
+                                bound.is_some_and(|bound| (-SAFE..=SAFE).contains(&bound))
+                                    || field
+                                        .as_f64()
+                                        .is_some_and(|bound| bound.abs() <= SAFE as f64),
+                                "{tool}{path} = {field} exceeds the JSON-safe integer range"
+                            );
+                        }
+                        check(tool, &path, field);
+                    }
+                }
+                Value::Array(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        check(tool, &format!("{path}/{index}"), value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for tool in tool_defs().as_array().unwrap() {
+            check(tool["name"].as_str().unwrap(), "", &tool["inputSchema"]);
+        }
+    }
+
+    #[test]
+    fn fuzz_start_schema_keeps_generator_shapes_without_64_bit_bounds() {
+        let tools = tool_defs();
+        let fuzz_start = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "fuzz_start")
+            .unwrap();
+        let generators = &fuzz_start["inputSchema"]["properties"]["template"]["properties"]
+            ["payload_generators"]["items"]["oneOf"];
+        let numbers = &generators[0];
+        assert_eq!(numbers["properties"]["type"]["const"], "numbers");
+        assert_eq!(numbers["required"], json!(["type", "from", "to", "step"]));
+        for field in ["from", "to", "step"] {
+            assert_eq!(numbers["properties"][field]["type"], "integer");
+        }
+        let regex = &generators[1];
+        assert_eq!(regex["properties"]["type"]["const"], "regex_bypass");
+        assert_eq!(regex["required"], json!(["type", "input"]));
+        let max_payloads = &regex["properties"]["max_payloads"];
+        assert_eq!(max_payloads["minimum"], 1);
+        assert_eq!(max_payloads["default"], 2000);
+        assert!(max_payloads.get("maximum").is_none());
+        assert_eq!(regex["properties"]["byte_to"]["maximum"], 255);
     }
 
     #[test]
