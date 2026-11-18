@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::domain::{DomainError, DomainResult, ErrorCode};
 use crate::storage::migrations;
+use crate::storage::upgrade::{self, UpgradeOptions};
 use deadpool::managed::{self, Metrics, RecycleError, RecycleResult};
 use deadpool::Runtime;
 use deadpool_sync::SyncWrapper;
@@ -145,31 +146,31 @@ pub struct Db {
 
 impl Db {
     pub async fn open(cfg: &Config) -> DomainResult<Self> {
+        Self::open_with(cfg, UpgradeOptions::default()).await
+    }
+
+    /// Opens the database, upgrading an older one as `options` allow.
+    pub async fn open_with(cfg: &Config, options: UpgradeOptions) -> DomainResult<Self> {
         cfg.ensure_layout()?;
         let path = cfg.db_path();
         let sync = cfg.sqlite_synchronous.clone();
         let busy = cfg.busy_timeout_ms;
         let pool = open_pool(path.display().to_string(), sync.clone(), busy)?;
 
-        let migration_backup_dir = cfg.runtime_dir.join("migration-backups");
-        // Migrate on a connection
+        let paths = upgrade::UpgradePaths {
+            database: path.clone(),
+            backups: cfg.runtime_dir.join("migration-backups"),
+            progress: upgrade::upgrade_progress_path(cfg),
+        };
+        // Migrate on one connection before the pool opens any other.
         {
             let conn = pool
                 .get()
                 .await
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-            conn.interact(move |c| {
-                // WAL is database-wide
-                c.pragma_update(None, "journal_mode", "WAL")
-                    .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                let version = migrations::schema_version(c)?;
-                if version > 0 && version < migrations::current_schema_version() {
-                    backup_before_migration(c, &migration_backup_dir, version)?;
-                }
-                migrations::migrate(c)
-            })
-            .await
-            .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))??;
+            conn.interact(move |c| upgrade::run(c, &paths, &options))
+                .await
+                .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))??;
         }
 
         Ok(Self {
@@ -229,40 +230,6 @@ impl Db {
     pub async fn schema_version(&self) -> DomainResult<i32> {
         self.with_conn(migrations::schema_version).await
     }
-}
-
-fn backup_before_migration(
-    source: &Connection,
-    directory: &Path,
-    version: i32,
-) -> DomainResult<()> {
-    crate::config::create_private_dir(directory)?;
-    let path = directory.join(format!("schema-{version}-{}.sqlite3", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut target = Connection::open(&path)?;
-        let backup = rusqlite::backup::Backup::new(source, &mut target)?;
-        backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
-        drop(backup);
-        target.pragma_update(None, "journal_mode", "DELETE")?;
-        drop(target);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::File::open(&path)?.sync_all()?;
-        std::fs::File::open(directory)?.sync_all()?;
-        Ok::<_, anyhow::Error>(())
-    })();
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&path);
-        return Err(DomainError::new(
-            ErrorCode::MigrationError,
-            format!("could not preserve the database before upgrading: {error}"),
-        ));
-    }
-    tracing::info!(path = %path.display(), schema = version, "preserved database before schema upgrade");
-    Ok(())
 }
 
 /// An `IMMEDIATE` transaction, begun once it is this writer's turn for the

@@ -627,11 +627,12 @@ pub(crate) async fn start_daemon_binary(
     std::thread::spawn(move || {
         let _ = finished.send(child.wait());
     });
-    // First startup may provision a private browser runtime. Exit failures
-    // still return immediately instead of waiting for the provisioning limit.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+    // First startup may provision a private browser runtime or upgrade a
+    // large database; the wait lasts while a database upgrade reports
+    // progress. Exit failures still return immediately.
+    let wait = crate::storage::UpgradeWait::new(config);
     let mut exited = false;
-    while tokio::time::Instant::now() < deadline {
+    while !wait.expired() {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(100)) => {},
             _ = &mut completion => {

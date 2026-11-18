@@ -33,8 +33,11 @@ CREATE TABLE message_header_rows (
     FOREIGN KEY (project_id, exchange_id) REFERENCES exchanges(project_id, exchange_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 
-INSERT INTO header_names (name) SELECT DISTINCT name FROM message_headers;
-INSERT INTO header_values (value) SELECT DISTINCT value FROM message_headers;
+-- OR IGNORE interns each value in one pass over the unique index; DISTINCT
+-- first built a temporary copy of every distinct value. Nothing else writes
+-- these tables yet, so the conflict clause cannot replace a row.
+INSERT OR IGNORE INTO header_names (name) SELECT name FROM message_headers;
+INSERT OR IGNORE INTO header_values (value) SELECT value FROM message_headers;
 
 -- A side other than request or response maps to NULL and fails the copy.
 INSERT INTO message_header_rows (project_id, exchange_id, side, ordinal, name_id, value_id)
