@@ -361,7 +361,14 @@ fn configure(conn: &Connection, synchronous: &str, busy_timeout_ms: u64) -> rusq
             let codec = context.get::<String>(0)?;
             let content = context.get::<Vec<u8>>(1)?;
             let needle = context.get::<String>(2)?.to_lowercase();
-            let content_encoding = context.get::<Option<String>>(3)?;
+            // Captured header values are bytes; one that is not UTF-8 must not
+            // fail every body search in its project.
+            let content_encoding = match context.get_raw(3) {
+                rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+                    Some(String::from_utf8_lossy(value).into_owned())
+                }
+                _ => None,
+            };
             let stored =
                 crate::storage::bodies::decode_body(&codec, &content).map_err(|error| {
                     rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(
@@ -476,6 +483,23 @@ mod tests {
             assert_eq!((foreign_keys, busy_timeout, trusted_schema), (1, 5000, 0));
             assert!(contains);
         }
+    }
+
+    #[test]
+    fn body_search_survives_a_content_encoding_that_is_not_utf8() {
+        // History search passes group_concat(CAST(value AS TEXT)), which keeps
+        // a captured header's raw bytes; "g\xffzip" must not fail the query.
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, "NORMAL", 5000).unwrap();
+        let found: bool = conn
+            .query_row(
+                "SELECT huntproxy_body_contains('raw', CAST('a needle here' AS BLOB), 'needle',
+                                                CAST(X'67FF7A6970' AS TEXT))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(found);
     }
 
     #[test]
