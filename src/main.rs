@@ -166,12 +166,45 @@ enum BrowserCdpCmd {
     Disable { project_id: i64, session_id: i64 },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+    if matches!(cli.command, Commands::Serve) {
+        limit_malloc_arenas();
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("error: could not start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = runtime.block_on(run(cli)) {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// How many glibc malloc arenas the daemon may use.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const DAEMON_MALLOC_ARENAS: libc::c_int = 2;
+
+/// Caps glibc's malloc arenas for the daemon. glibc gives threads that contend
+/// for the allocator their own arenas, up to eight per core, and memory freed
+/// in one arena is not reused from another. The daemon's short-lived blocking
+/// threads each left a partly used arena behind, so its memory after a burst
+/// of traffic stayed at more than twice what it was using. Must run before
+/// any other thread exists. An explicit `MALLOC_ARENA_MAX` is left alone.
+fn limit_malloc_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        // SAFETY: mallopt only sets an allocator parameter, and no other
+        // thread has been started yet.
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, DAEMON_MALLOC_ARENAS);
+        }
     }
 }
 
