@@ -4,6 +4,7 @@
 //! requests and responses are stored in History. Upstream traffic still goes
 //! through the semantic transport and its `ValidatedDial` resolver.
 
+mod revocation;
 mod websocket;
 
 use crate::app::AppState;
@@ -27,6 +28,7 @@ use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose,
 };
+use revocation::TunnelRevocations;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -180,6 +182,8 @@ pub async fn serve_proxy_listener(
         .local_addr()
         .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
     let authority = Arc::new(MitmAuthority::load(&state)?);
+    let revocations = Arc::new(TunnelRevocations::default());
+    tokio::spawn(revocations.clone().run(state.clone(), cancel.clone()));
     tracing::info!(%addr, "proxy listening");
 
     loop {
@@ -201,12 +205,16 @@ pub async fn serve_proxy_listener(
                 }
                 let state = state.clone();
                 let authority = authority.clone();
+                let revocations = revocations.clone();
                 let connection_cancel = cancel.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |request| {
                         let state = state.clone();
                         let authority = authority.clone();
-                        async move { handle_outer(state, authority, request, peer).await }
+                        let revocations = revocations.clone();
+                        async move {
+                            handle_outer(state, authority, revocations, request, peer).await
+                        }
                     });
                     let connection = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
@@ -229,10 +237,11 @@ pub async fn serve_proxy_listener(
 async fn handle_outer(
     state: Arc<AppState>,
     authority: Arc<MitmAuthority>,
+    revocations: Arc<TunnelRevocations>,
     request: Request<Incoming>,
     _peer: SocketAddr,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
-    let result = handle_authenticated(state, authority, request).await;
+    let result = handle_authenticated(state, authority, revocations, request).await;
     Ok(match result {
         Ok(response) => response,
         Err(error) => proxy_error_response(error),
@@ -242,6 +251,7 @@ async fn handle_outer(
 async fn handle_authenticated(
     state: Arc<AppState>,
     authority: Arc<MitmAuthority>,
+    revocations: Arc<TunnelRevocations>,
     mut request: Request<Incoming>,
 ) -> DomainResult<Response<ProxyBody>> {
     let auth = request
@@ -258,7 +268,7 @@ async fn handle_authenticated(
     request.headers_mut().remove("proxy-authorization");
 
     if request.method() == Method::CONNECT {
-        handle_connect(state, authority, request, session).await
+        handle_connect(state, authority, revocations, request, session).await
     } else {
         forward_request(state, request, session, None).await
     }
@@ -1068,6 +1078,7 @@ fn spool_io_error(error: std::io::Error) -> DomainError {
 async fn handle_connect(
     state: Arc<AppState>,
     authority: Arc<MitmAuthority>,
+    revocations: Arc<TunnelRevocations>,
     request: Request<Incoming>,
     session: CaptureSession,
 ) -> DomainResult<Response<ProxyBody>> {
@@ -1120,10 +1131,10 @@ async fn handle_connect(
                         }
                     },
                 };
-                serve_connect_io(tls, state, session, "https").await;
+                serve_connect_io(tls, state, session, "https", &revocations).await;
             }
             Some(first) if first.is_ascii_alphabetic() => {
-                serve_connect_io(stream, state, session, "http").await;
+                serve_connect_io(stream, state, session, "http", &revocations).await;
             }
             Some(_) => {
                 tracing::debug!("CONNECT requires TLS or an HTTP request");
@@ -1143,9 +1154,11 @@ async fn serve_connect_io<I>(
     state: Arc<AppState>,
     session: CaptureSession,
     scheme: &'static str,
+    revocations: &Arc<TunnelRevocations>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let watch = revocations.watch(&session);
     let service_state = state.clone();
     let service_session = session.clone();
     let service = service_fn(move |inner| {
@@ -1160,51 +1173,17 @@ async fn serve_connect_io<I>(
         }
     });
     let shutdown = state.shutdown.clone();
-    let revocation = async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if !capture_session_active(&state, &session).await {
-                tracing::debug!(
-                    session_id = session.id.get(),
-                    "closing revoked CONNECT tunnel"
-                );
-                break;
-            }
-        }
-    };
     let builder = AutoServerBuilder::new(TokioExecutor::new());
     let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
     tokio::select! {
         _ = shutdown.cancelled() => {}
-        _ = revocation => {}
+        _ = watch.revoked() => {}
         result = connection => {
             if let Err(error) = result {
                 tracing::debug!(%error, "intercepted CONNECT closed");
             }
         }
     }
-}
-
-async fn capture_session_active(state: &AppState, session: &CaptureSession) -> bool {
-    let project_id = session.project_id.get();
-    let session_id = session.id.get();
-    let now = crate::storage::now_rfc3339();
-    state
-        .db
-        .with_conn(move |connection| {
-            let active: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM capture_sessions
-                     WHERE id=?1 AND project_id=?2 AND status='active'
-                       AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?3)",
-                    rusqlite::params![session_id, project_id, now],
-                    |row| row.get(0),
-                )
-                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
-            Ok(active == 1)
-        })
-        .await
-        .unwrap_or(false)
 }
 
 fn proxy_error_response(error: DomainError) -> Response<ProxyBody> {
@@ -1369,7 +1348,7 @@ mod tests {
     use crate::storage::{CreateCaptureSession, Db};
     use crate::transport::build_default_transport;
 
-    async fn proxy_test_fixture(
+    pub(super) async fn proxy_test_fixture(
         directory: &tempfile::TempDir,
     ) -> (Arc<AppState>, Project, CaptureSession) {
         let mut config = Config::default();
