@@ -2976,3 +2976,71 @@ async fn exchange_body_base64_pages_preserve_exact_request_bytes() {
     .unwrap_err();
     assert_eq!(invalid_side.code(), ErrorCode::InvalidArgument);
 }
+
+#[tokio::test]
+async fn only_project_changes_count_as_browser_activity() {
+    let (_directory, state, project_id) = test_state().await;
+    let other = state
+        .db
+        .create_project(CreateProjectRequest {
+            name: "Other API project".into(),
+            target_url: "https://example.org/".into(),
+            advanced: None,
+        })
+        .await
+        .unwrap();
+    let app = huntproxy::api::router(state.clone());
+    let idle = |project: ProjectId| state.browser.project_idle_for(project);
+    let send = |method: http::Method, path: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let id = project_id.get();
+
+    // Reads, including the browser status and the live event stream the UI
+    // refreshes whenever traffic is captured, never keep a browser open.
+    for path in [
+        format!("/api/v1/projects/{id}"),
+        format!("/api/v1/projects/{id}/history"),
+        format!("/api/v1/projects/{id}/browser-sessions"),
+        format!("/api/v1/projects/{id}/browser-profiles"),
+        format!("/api/v1/projects/{id}/events"),
+    ] {
+        let response = send(http::Method::GET, path.clone()).await;
+        assert!(response.status().is_success(), "{path}");
+        assert_eq!(idle(project_id), std::time::Duration::MAX, "{path}");
+    }
+
+    // A change made in the UI, whatever it is, and browser control count,
+    // even when the request fails.
+    for (method, path) in [
+        (
+            http::Method::DELETE,
+            format!("/api/v1/projects/{id}/findings/999999"),
+        ),
+        (
+            http::Method::POST,
+            format!("/api/v1/projects/{id}/browser-sessions/999999/stop"),
+        ),
+        (
+            http::Method::DELETE,
+            format!("/api/v1/projects/{id}/browser-profiles/missing"),
+        ),
+    ] {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let before = idle(project_id);
+        send(method, path.clone()).await;
+        assert!(idle(project_id) < before, "{path}");
+    }
+    assert_eq!(idle(other.id), std::time::Duration::MAX);
+}

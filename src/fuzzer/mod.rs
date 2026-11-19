@@ -264,7 +264,8 @@ pub struct FuzzerService {
     pub db: Arc<Db>,
     pub reply: Arc<ReplyService>,
     pub placeholder_key: PlaceholderKey,
-    pub cancel_flags: Arc<dashmap::DashMap<i64, CancellationToken>>,
+    /// Each running job's project and cancellation token.
+    pub cancel_flags: Arc<dashmap::DashMap<i64, (ProjectId, CancellationToken)>>,
     /// One receiver per running job. Its sender is dropped once the worker has
     /// saved the job's final state, which wakes every `wait`.
     finished: Arc<dashmap::DashMap<i64, tokio::sync::watch::Receiver<()>>>,
@@ -283,6 +284,12 @@ impl FuzzerService {
 
     pub fn has_active_jobs(&self) -> bool {
         !self.cancel_flags.is_empty()
+    }
+
+    pub fn has_active_jobs_for(&self, project_id: ProjectId) -> bool {
+        self.cancel_flags
+            .iter()
+            .any(|entry| entry.value().0 == project_id)
     }
 
     pub async fn start(
@@ -375,7 +382,8 @@ impl FuzzerService {
             .await;
 
         let cancel = CancellationToken::new();
-        self.cancel_flags.insert(job.id.get(), cancel.clone());
+        self.cancel_flags
+            .insert(job.id.get(), (project_id, cancel.clone()));
         let (finished_sender, finished_receiver) = tokio::sync::watch::channel(());
         self.finished.insert(job.id.get(), finished_receiver);
         let db = self.db.clone();
@@ -449,7 +457,7 @@ impl FuzzerService {
         let token = self
             .cancel_flags
             .get(&job_id.get())
-            .map(|entry| entry.value().clone());
+            .map(|entry| entry.value().1.clone());
         if let Some(token) = token {
             self.db
                 .set_fuzz_job_state(project_id, job_id, FuzzJobState::Cancelling, None)
@@ -1748,6 +1756,27 @@ mod tests {
         assert_eq!(identities.len(), 3);
         assert!(identities.iter().all(|identity| *identity
             == crate::transport::TransportIdentity::for_fuzz_job(project.id, job.id)));
+    }
+
+    #[tokio::test]
+    async fn running_jobs_are_reported_per_project() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(RecordingTransport::default()),
+            placeholder_key: PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service = FuzzerService::new(db, reply, PlaceholderKey::from_bytes(vec![10; 32]));
+        assert!(!service.has_active_jobs_for(ProjectId(1)));
+        service
+            .cancel_flags
+            .insert(7, (ProjectId(1), CancellationToken::new()));
+        assert!(service.has_active_jobs());
+        assert!(service.has_active_jobs_for(ProjectId(1)));
+        assert!(!service.has_active_jobs_for(ProjectId(2)));
     }
 
     #[tokio::test]

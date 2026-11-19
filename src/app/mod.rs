@@ -200,6 +200,27 @@ pub async fn run_daemon(mut config: Config) -> DomainResult<()> {
         }))
     };
 
+    // A project's browsers stop once it has been idle for
+    // `BROWSER_IDLE_TIMEOUT`, unless one of its jobs is still running.
+    let browser_idle_monitor = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(crate::browser::BROWSER_IDLE_CHECK_INTERVAL) => {}
+                }
+                state
+                    .browser
+                    .stop_idle_projects(|project_id| {
+                        state.fuzzer.has_active_jobs_for(project_id)
+                            || state.plugins.has_active_jobs_for(project_id)
+                    })
+                    .await;
+            }
+        })
+    };
+
     // API
     {
         let st = state.clone();
@@ -319,6 +340,7 @@ pub async fn run_daemon(mut config: Config) -> DomainResult<()> {
     if let Some(idle_monitor) = idle_monitor {
         let _ = idle_monitor.await;
     }
+    let _ = browser_idle_monitor.await;
     cleanup_daemon_files(&config);
     match server_error {
         Some(error) => Err(error),

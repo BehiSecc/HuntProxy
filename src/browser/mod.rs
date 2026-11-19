@@ -30,6 +30,13 @@ const EVENT_WAIT_SLICE: Duration = Duration::from_millis(100);
 const DEFAULT_BROWSER_PROXY: &str = "http://127.0.0.1:17891";
 const BROWSER_CDP_PORT: u16 = 9222;
 const BROWSER_CDP_PORT_END: u16 = 9321;
+/// A project's browsers are stopped once it has had no control activity for
+/// this long. Their profiles are saved, so `browser_start` resumes them.
+pub const BROWSER_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How often the daemon looks for idle projects.
+pub const BROWSER_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// The `checkpoint_status` of a session the idle rule stopped.
+const IDLE_STOPPED_STATUS: &str = "idle_stopped";
 
 /// A project worker's last reported sandbox state and reason.
 type SandboxState = (Option<String>, Option<String>);
@@ -1533,6 +1540,11 @@ pub struct BrowserService {
     session_ops: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     workers: Mutex<HashMap<i64, Arc<Mutex<Option<WorkerProcess>>>>>,
     sandbox: std::sync::Mutex<HashMap<i64, SandboxState>>,
+    /// When each project last had control activity: an agent's tool call, a
+    /// change made in the web UI, or a browser start. Proxy traffic and reads
+    /// do not count, so an idle page cannot keep its own browser alive.
+    project_activity: std::sync::Mutex<HashMap<i64, std::time::Instant>>,
+    idle_timeout: Duration,
 }
 
 /// Inspect the installed browser runtime without starting the daemon, launching
@@ -1686,7 +1698,161 @@ impl BrowserService {
             session_ops: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             sandbox: std::sync::Mutex::new(HashMap::new()),
+            project_activity: std::sync::Mutex::new(HashMap::new()),
+            idle_timeout: BROWSER_IDLE_TIMEOUT,
         }
+    }
+
+    /// Records control activity for a project, which keeps its browsers open
+    /// for another idle timeout.
+    pub fn touch_project(&self, project_id: ProjectId) {
+        self.project_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(project_id.get(), std::time::Instant::now());
+    }
+
+    /// How long the project has gone without control activity; `Duration::MAX`
+    /// when it has had none since the daemon started.
+    pub fn project_idle_for(&self, project_id: ProjectId) -> Duration {
+        self.project_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&project_id.get())
+            .map_or(Duration::MAX, std::time::Instant::elapsed)
+    }
+
+    /// Stops the browsers of every project idle for the timeout, unless the
+    /// project is still in use: `has_running_job` says it has a job, or one of
+    /// its browsers is busy, handed off through CDP, or ephemeral (ephemeral
+    /// browsers belong to an operation that stops them). Only in-memory state
+    /// is read until a project is due. Returns how many browsers were stopped.
+    pub async fn stop_idle_projects(&self, has_running_job: impl Fn(ProjectId) -> bool) -> usize {
+        let mut projects = self
+            .runtime_sessions
+            .lock()
+            .await
+            .values()
+            .map(|runtime| runtime.project_id.get())
+            .collect::<Vec<_>>();
+        projects.sort_unstable();
+        projects.dedup();
+        let mut stopped = 0;
+        for project_id in projects.into_iter().map(ProjectId) {
+            if self.project_idle_for(project_id) < self.idle_timeout || has_running_job(project_id)
+            {
+                continue;
+            }
+            match self.stop_project_if_idle(project_id).await {
+                Ok(0) => {}
+                Ok(count) => {
+                    tracing::info!(
+                        project_id = project_id.get(),
+                        browsers = count,
+                        "stopped the browsers of an idle project"
+                    );
+                    stopped += count;
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    project_id = project_id.get(),
+                    "could not stop the browsers of an idle project"
+                ),
+            }
+        }
+        stopped
+    }
+
+    async fn stop_project_if_idle(&self, project_id: ProjectId) -> DomainResult<usize> {
+        // A held lifecycle lock is a start, stop or shutdown in progress: the
+        // project is not idle, or is already being dealt with.
+        let Ok(_shutdown_guard) = self.lifecycle.try_read() else {
+            return Ok(0);
+        };
+        let project_lock = self.project_lifecycle_lock(project_id).await;
+        let Ok(_lifecycle) = project_lock.try_lock() else {
+            return Ok(0);
+        };
+        let session_ids = self
+            .runtime_sessions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, runtime)| (runtime.project_id == project_id).then_some(*id))
+            .collect::<Vec<_>>();
+        // Holding every operation lock keeps new calls from starting while the
+        // project is checked once more and stopped. One that is held is a call
+        // in flight, so the project is in use; never wait for it.
+        let mut operations = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let lock = self
+                .session_operation_lock(BrowserSessionId(session_id))
+                .await;
+            let Ok(guard) = lock.try_lock_owned() else {
+                return Ok(0);
+            };
+            operations.push((BrowserSessionId(session_id), guard));
+        }
+        let in_use = self.runtime_sessions.lock().await.values().any(|runtime| {
+            runtime.project_id == project_id && (runtime.cdp.is_some() || !runtime.persistent)
+        });
+        // A call touches the project before it waits for an operation lock.
+        if in_use || self.project_idle_for(project_id) < self.idle_timeout {
+            return Ok(0);
+        }
+        let total = operations.len();
+        let mut first_error = None;
+        for (session_id, _operation) in operations {
+            if let Err(error) = self
+                .stop_locked(project_id, session_id, IDLE_STOPPED_STATUS)
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.reap_worker(project_id).await;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(total),
+        }
+    }
+
+    /// The error for a session the idle rule stopped, saying what happened and
+    /// how to get the browser back.
+    fn idle_stopped_error(&self, session: &BrowserSession) -> Option<DomainError> {
+        if session.state != BrowserSessionState::Stopped
+            || session.checkpoint_status.as_deref() != Some(IDLE_STOPPED_STATUS)
+        {
+            return None;
+        }
+        let resume = match session.profile.as_deref() {
+            None | Some(DEFAULT_BROWSER_PROFILE) => "call browser_start".to_string(),
+            Some(profile) => format!("call browser_start with profile \"{profile}\""),
+        };
+        Some(DomainError::new(
+            ErrorCode::Unavailable,
+            format!(
+                "browser session {} was stopped after {} without project activity; {resume} to resume its profile",
+                session.id.get(),
+                describe_idle_timeout(self.idle_timeout),
+            ),
+        ))
+    }
+
+    /// The error for a session with no running browser.
+    async fn inactive_session_error(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+    ) -> DomainError {
+        self.db
+            .get_browser_session(project_id, session_id)
+            .await
+            .ok()
+            .and_then(|session| self.idle_stopped_error(&session))
+            .unwrap_or_else(|| {
+                DomainError::new(ErrorCode::Unavailable, "browser session is not active")
+            })
     }
 
     /// Apply paths verified by the release installer without process-wide
@@ -1827,6 +1993,7 @@ impl BrowserService {
         // atomic so a concurrent stop cannot terminate a worker between a new
         // session's launch and its registration, and concurrent starts cannot
         // race the per-project browser limit.
+        self.touch_project(project_id);
         let _shutdown_guard = self.lifecycle.read().await;
         let project_lock = self.project_lifecycle_lock(project_id).await;
         let _lifecycle = project_lock.lock().await;
@@ -2240,6 +2407,8 @@ impl BrowserService {
         if !still_active {
             return Err(self.startup_interrupted(project_id).await);
         }
+        // However long the launch took, a new browser gets a full idle timeout.
+        self.touch_project(project_id);
         schedule_page_title_association(self.db.clone(), &session);
         Ok(session)
     }
@@ -2662,10 +2831,10 @@ impl BrowserService {
             .lock()
             .await
             .get(&session_id.get())
-            .cloned()
-            .ok_or_else(|| {
-                DomainError::new(ErrorCode::Unavailable, "browser session is not active")
-            })?;
+            .cloned();
+        let Some(runtime) = runtime else {
+            return Err(self.inactive_session_error(project_id, session_id).await);
+        };
         if runtime.project_id != project_id {
             return Err(crate::storage::browser_session_not_found(
                 project_id, session_id,
@@ -3030,10 +3199,9 @@ impl BrowserService {
                 | BrowserSessionState::Stopped
                 | BrowserSessionState::Failed
         ) {
-            return Err(DomainError::new(
-                ErrorCode::Unavailable,
-                "browser session is not active",
-            ));
+            return Err(self.idle_stopped_error(&session).unwrap_or_else(|| {
+                DomainError::new(ErrorCode::Unavailable, "browser session is not active")
+            }));
         }
         let runtimes = self.runtime_sessions.lock().await;
         let Some(runtime) = runtimes
@@ -3333,6 +3501,17 @@ impl BrowserService {
     ) -> DomainResult<()> {
         let operation_lock = self.session_operation_lock(session_id).await;
         let _operation_guard = operation_lock.lock().await;
+        self.stop_locked(project_id, session_id, "stopped").await
+    }
+
+    /// Stops a session whose operation lock the caller holds, recording
+    /// `status` as the reason in its checkpoint status.
+    async fn stop_locked(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        status: &str,
+    ) -> DomainResult<()> {
         let mut session = self.db.get_browser_session(project_id, session_id).await?;
         let runtime = self
             .runtime_sessions
@@ -3357,20 +3536,27 @@ impl BrowserService {
             }
             if let Ok(result) = result {
                 if let Some(checkpoint) = result.get("checkpoint") {
-                    if let Err(error) = self
+                    match self
                         .save_checkpoint(
                             project_id,
                             session_id,
                             checkpoint,
-                            "stopped",
+                            status,
                             runtime.profile.as_deref().filter(|_| runtime.persistent),
                         )
                         .await
                     {
-                        persistence_error = Some(error);
+                        // The row is written once more below; keep what was saved.
+                        Ok(saved) => {
+                            session.current_url = saved.url;
+                            session.current_title = saved.title;
+                            session.checkpoint_hash = Some(saved.hash);
+                        }
+                        Err(error) => persistence_error = Some(error),
                     }
                 }
             }
+            session.checkpoint_status = Some(status.into());
         }
         self.runtime_sessions.lock().await.remove(&session_id.get());
         self.release_cdp_reservation(session_id.get());
@@ -4240,7 +4426,12 @@ impl BrowserService {
             .lock()
             .await
             .retain(|(id, _)| *id != project_id.get());
-        self.db.delete_project(project_id).await
+        self.db.delete_project(project_id).await?;
+        self.project_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&project_id.get());
+        Ok(())
     }
 
     async fn save_checkpoint(
@@ -4276,6 +4467,16 @@ impl BrowserService {
             .await?;
         Ok(checkpoint)
     }
+}
+
+/// "30 minutes", or seconds for a timeout shorter than a minute.
+fn describe_idle_timeout(timeout: Duration) -> String {
+    let (count, unit) = match timeout.as_secs() {
+        seconds if seconds >= 60 => (seconds / 60, "minute"),
+        seconds => (seconds, "second"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural}")
 }
 
 fn schedule_page_title_association(db: Arc<Db>, session: &BrowserSession) {
@@ -8338,6 +8539,273 @@ done
         assert!(worker.is_file());
         assert!(previous.is_dir());
         assert!(!removable.exists(), "pruning carries on after a failure");
+    }
+
+    /// A fake worker that starts persistent sessions, records each start
+    /// request in `<script>.starts`, and saves `https://example.test/after-idle`
+    /// as the last page when a session stops.
+    #[cfg(unix)]
+    const IDLE_WORKER: &str = r#"
+n=0
+while IFS= read -r request; do
+  n=$((n + 1))
+  case "$request" in
+    *'"method":"hello"'*) printf '%s\n' '{"id":1,"result":{"protocol":1,"capabilities":["profile_isolation"]}}' ;;
+    *'"method":"session.start"'*)
+      printf '%s\n' "$request" >> "$0.starts"
+      session=$(printf '%s\n' "$request" | sed -n 's/.*"session_id":\([0-9][0-9]*\).*/\1/p')
+      directory=$(printf '%s\n' "$request" | sed -n 's/.*"profile_dir":"\([^"]*\)".*/\1/p')
+      printf '{"id":%s,"result":{"session_id":%s,"requested_profile":"default","active_profile":"default","profile_dir":"%s","persistent":true,"checkpoint":{"url":"https://example.test/start","_private":{}}}}\n' "$n" "$session" "$directory" ;;
+    *'"method":"session.stop"'*) printf '{"id":%s,"result":{"stopped":true,"checkpoint":{"url":"https://example.test/after-idle","_private":{}}}}\n' "$n" ;;
+    *'"method":"session.javascript_files"'*) printf '{"id":%s,"result":{"files":[],"cursor":0}}\n' "$n" ;;
+    *) printf '{"id":%s,"result":{"ok":true}}\n' "$n" ;;
+  esac
+done
+"#;
+
+    /// A browser service on `IDLE_WORKER` whose idle timeout is ten seconds,
+    /// with two projects.
+    #[cfg(unix)]
+    async fn idle_fixture() -> (BrowserService, Arc<Db>, [ProjectId; 2], tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("worker.sh");
+        std::fs::write(&script, IDLE_WORKER).unwrap();
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let mut projects = Vec::new();
+        for name in ["Idle project", "Busy project"] {
+            let project = db
+                .create_project(CreateProjectRequest {
+                    name: name.into(),
+                    target_url: "https://example.test".into(),
+                    advanced: None,
+                })
+                .await
+                .unwrap();
+            projects.push(project.id);
+        }
+        let mut service = BrowserService::new_with_proxy_and_ca(
+            db.clone(),
+            None,
+            None,
+            "http://127.0.0.1:17891".into(),
+            None,
+            directory.path().join("profiles"),
+        );
+        service.node_path = Some(PathBuf::from("/bin/sh"));
+        service.worker_path = Some(script);
+        service.runtime.playwright_core_path = Some(directory.path().to_path_buf());
+        service.runtime.chromium_path = Some(PathBuf::from("/bin/sh"));
+        service.runtime.compatibility_error = None;
+        service.idle_timeout = Duration::from_secs(10);
+        (service, db, [projects[0], projects[1]], directory)
+    }
+
+    /// Makes the project's last activity older than the idle timeout.
+    #[cfg(unix)]
+    fn make_idle(service: &BrowserService, project_id: ProjectId) {
+        let past = std::time::Instant::now()
+            .checked_sub(service.idle_timeout + Duration::from_secs(1))
+            .expect("the monotonic clock reaches back past the idle timeout");
+        service
+            .project_activity
+            .lock()
+            .unwrap()
+            .insert(project_id.get(), past);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idle_project_browser_stops_and_browser_start_resumes_it() {
+        let (mut service, db, [project_id, _], directory) = idle_fixture().await;
+        let started = service
+            .start(project_id, "about:blank".into())
+            .await
+            .unwrap();
+        // Starting is activity: a new browser gets a full timeout.
+        assert_eq!(service.stop_idle_projects(|_| false).await, 0);
+        assert!(service.worker_is_running(project_id).await);
+
+        make_idle(&service, project_id);
+        assert_eq!(service.stop_idle_projects(|_| false).await, 1);
+        assert!(service.runtime_sessions.lock().await.is_empty());
+        assert!(!service.worker_is_running(project_id).await);
+        let stopped = db
+            .get_browser_session(project_id, started.id)
+            .await
+            .unwrap();
+        assert_eq!(stopped.state, BrowserSessionState::Stopped);
+        assert_eq!(stopped.checkpoint_status.as_deref(), Some("idle_stopped"));
+        assert_eq!(
+            stopped.current_url.as_deref(),
+            Some("https://example.test/after-idle")
+        );
+
+        // An agent that comes back is told what happened and what to do.
+        let snapshot: BrowserAction = serde_json::from_value(json!({"type":"snapshot"})).unwrap();
+        let error = service
+            .action(project_id, started.id, snapshot.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "browser session {} was stopped after 10 seconds without project activity; call browser_start to resume its profile",
+                started.id.get()
+            )
+        );
+        service.idle_timeout = BROWSER_IDLE_TIMEOUT;
+        assert_eq!(
+            service
+                .action(project_id, started.id, snapshot)
+                .await
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "browser session {} was stopped after 30 minutes without project activity; call browser_start to resume its profile",
+                started.id.get()
+            )
+        );
+        let mut named = stopped.clone();
+        named.profile = Some("account1".into());
+        assert!(service
+            .idle_stopped_error(&named)
+            .unwrap()
+            .to_string()
+            .ends_with("call browser_start with profile \"account1\" to resume its profile"));
+        assert!(service
+            .enable_cdp(project_id, started.id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("without project activity"));
+        // An explicit stop keeps its plain message.
+        let mut explicit = stopped.clone();
+        explicit.checkpoint_status = Some("stopped".into());
+        assert!(service.idle_stopped_error(&explicit).is_none());
+
+        // The saved profile resumes on the page it was stopped on.
+        let resumed = service
+            .start(project_id, "about:blank".into())
+            .await
+            .unwrap();
+        assert_ne!(resumed.id, started.id);
+        assert_eq!(resumed.checkpoint_status.as_deref(), Some("restored"));
+        let starts = std::fs::read_to_string(directory.path().join("worker.sh.starts")).unwrap();
+        let resume: Value = serde_json::from_str(starts.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(
+            resume["params"]["url"],
+            json!("https://example.test/after-idle")
+        );
+        service.stop(project_id, resumed.id).await.unwrap();
+        let explicit = db
+            .get_browser_session(project_id, resumed.id)
+            .await
+            .unwrap();
+        assert_eq!(explicit.checkpoint_status.as_deref(), Some("stopped"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_project_in_use_keeps_its_browser_and_other_projects_do_not() {
+        let (service, db, [idle, other], _directory) = idle_fixture().await;
+        let first = service.start(idle, "about:blank".into()).await.unwrap();
+        let second = service.start(other, "about:blank".into()).await.unwrap();
+        make_idle(&service, idle);
+        make_idle(&service, other);
+        let attached = |id: BrowserSessionId| {
+            let runtimes = &service.runtime_sessions;
+            async move { runtimes.lock().await.contains_key(&id.get()) }
+        };
+
+        // Activity keeps a project's browsers open.
+        service.touch_project(idle);
+        service.touch_project(other);
+        assert_eq!(service.stop_idle_projects(|_| false).await, 0);
+        make_idle(&service, idle);
+
+        // A call in flight on one of its browsers.
+        let operation = service.session_operation_lock(first.id).await;
+        let guard = operation.lock().await;
+        assert_eq!(service.stop_idle_projects(|_| false).await, 0);
+        drop(guard);
+
+        // A browser handed off to Chrome DevTools.
+        service
+            .runtime_sessions
+            .lock()
+            .await
+            .get_mut(&first.id.get())
+            .unwrap()
+            .cdp = Some(BrowserCdpInfo {
+            port: BROWSER_CDP_PORT,
+            endpoint: "http://127.0.0.1:9222".into(),
+            devtools_url: "devtools".into(),
+            hosted_devtools_url: "hosted-devtools".into(),
+        });
+        assert_eq!(service.stop_idle_projects(|_| false).await, 0);
+        service
+            .runtime_sessions
+            .lock()
+            .await
+            .get_mut(&first.id.get())
+            .unwrap()
+            .cdp = None;
+
+        // A running fuzz or plugin job.
+        assert_eq!(
+            service.stop_idle_projects(|project| project == idle).await,
+            0
+        );
+
+        // An ephemeral browser, which its own operation stops.
+        service.runtime_sessions.lock().await.insert(
+            first.id.get() + 1_000,
+            RuntimeSession {
+                project_id: idle,
+                capture_session_id: CaptureSessionId(1_000),
+                persistent: false,
+                profile: None,
+                cdp: None,
+                javascript_cursor: 0,
+            },
+        );
+        assert_eq!(service.stop_idle_projects(|_| false).await, 0);
+        service
+            .runtime_sessions
+            .lock()
+            .await
+            .remove(&(first.id.get() + 1_000));
+
+        // A start or stop in progress.
+        let lifecycle = service.project_lifecycle_lock(idle).await;
+        let guard = lifecycle.lock().await;
+        assert_eq!(service.stop_idle_projects(|_| false).await, 0);
+        drop(guard);
+        assert!(attached(first.id).await);
+
+        // Another project's activity does not keep this one open, and this
+        // one's idleness does not stop the other.
+        service.touch_project(other);
+        assert_eq!(service.stop_idle_projects(|_| false).await, 1);
+        assert!(!attached(first.id).await);
+        assert!(attached(second.id).await);
+        assert_eq!(
+            db.get_browser_session(other, second.id)
+                .await
+                .unwrap()
+                .state,
+            BrowserSessionState::Ready
+        );
+        service.stop(other, second.id).await.unwrap();
+    }
+
+    #[test]
+    fn idle_timeouts_are_described_in_plain_units() {
+        assert_eq!(describe_idle_timeout(BROWSER_IDLE_TIMEOUT), "30 minutes");
+        assert_eq!(describe_idle_timeout(Duration::from_secs(60)), "1 minute");
+        assert_eq!(describe_idle_timeout(Duration::from_secs(10)), "10 seconds");
+        assert_eq!(describe_idle_timeout(Duration::from_secs(1)), "1 second");
     }
 
     #[cfg(unix)]

@@ -10,6 +10,8 @@ Set environment variables before starting the daemon; existing sessions retain t
 
 Each release keeps its browser worker in `browser-worker-<version>` in the data directory. Preparing a release removes the worker folders of releases older than the previous one; the previous release's folder stays so that rolling back keeps working. Other folders are never touched.
 
+A project's browsers stop after 30 minutes without activity in that project: an agent's tool call for the project, a change made in the web UI, or a browser start. Viewing the web UI and proxy traffic do not count. A browser stays open while a call on it is running, while it is handed off through `browser_cdp`, and while the project has a running Fuzzer or plugin job. Its profile is saved first, so `browser_start` resumes its cookies, storage and last page, and a call on the stopped session says so. This is separate from the daemon's one-hour idle shutdown.
+
 If Chromium's sandbox cannot start, HuntProxy retries without it and reports the fallback in browser status and `HuntProxy doctor`.
 
 HuntProxy authenticates the browser to its own proxy and never offers those credentials to a site. A site's own HTTP authentication challenge is handled as in a plain browser, so a headless navigation to a protected page fails with `net::ERR_INVALID_AUTH_CREDENTIALS`. Put the site's credentials in the URL (`https://user:password@host/`) to sign in.
