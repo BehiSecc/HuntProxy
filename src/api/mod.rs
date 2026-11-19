@@ -43,6 +43,13 @@ pub async fn serve_api_listener(
         .local_addr()
         .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
     tracing::info!(%addr, "api/ui listening");
+    // Streamed responses (events, downloads) are several small writes; see
+    // the proxy listener for why Nagle's algorithm is turned off.
+    let listener = axum::serve::ListenerExt::tap_io(listener, |stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(%error, "could not disable Nagle on an API connection");
+        }
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await

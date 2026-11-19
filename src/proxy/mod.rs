@@ -193,6 +193,12 @@ pub async fn serve_proxy_listener(
                         continue;
                     }
                 };
+                // A response leaves as several small writes (headers, then body
+                // chunks). With Nagle's algorithm each later write waits for the
+                // client's delayed ACK, about 40 ms per response.
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(%error, "could not disable Nagle on a proxy connection");
+                }
                 let state = state.clone();
                 let authority = authority.clone();
                 let connection_cancel = cancel.clone();
