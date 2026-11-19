@@ -244,8 +244,9 @@ fn load_candidates(
     values: impl rusqlite::Params,
 ) -> DomainResult<Vec<SessionCandidate>> {
     let storage = |e: rusqlite::Error| DomainError::new(ErrorCode::StorageError, e.to_string());
+    // Both callers pass a fixed condition, so there are two statements to keep.
     let mut stmt = conn
-        .prepare(&format!(
+        .prepare_cached(&format!(
             "SELECT id, project_id, browser_session_id, browser_action_id, created_at, expires_at,
                     revoked_at, status, is_browser_bound, token_hash, token_salt
              FROM capture_sessions WHERE {condition}"

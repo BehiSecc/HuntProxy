@@ -1033,7 +1033,8 @@ fn insert_exchange_record_conn(
         None => (None, None, None),
     };
 
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "INSERT INTO exchanges (
             project_id, exchange_id, source, started_at, duration_ms, protocol, method, scheme,
             authority, host, port, path, query, status_code, mime, request_length, response_length,
@@ -1115,26 +1116,26 @@ fn insert_exchange_record_conn(
                     .saturating_add(header.value.len() as u64)
             });
     let accounted_bytes = estimated_exchange_bytes(&ex, req_len, resp_len);
-    let changed = conn
-        .execute(
-            "UPDATE project_usage SET
-                exchange_count=exchange_count+1,
-                request_body_bytes=request_body_bytes+?1,
-                response_body_bytes=response_body_bytes+?2,
-                header_bytes=header_bytes+?3,
-                accounted_bytes=accounted_bytes+?4,
-                updated_at=?5
-             WHERE project_id=?6",
-            params![
-                as_i64(request_bytes),
-                as_i64(response_bytes),
-                as_i64(header_bytes),
-                as_i64(accounted_bytes),
-                now_rfc3339(),
-                ex.project_id.get(),
-            ],
-        )
-        .map_err(storage_error)?;
+    let changed = crate::storage::cached_execute(
+        conn,
+        "UPDATE project_usage SET
+            exchange_count=exchange_count+1,
+            request_body_bytes=request_body_bytes+?1,
+            response_body_bytes=response_body_bytes+?2,
+            header_bytes=header_bytes+?3,
+            accounted_bytes=accounted_bytes+?4,
+            updated_at=?5
+         WHERE project_id=?6",
+        params![
+            as_i64(request_bytes),
+            as_i64(response_bytes),
+            as_i64(header_bytes),
+            as_i64(accounted_bytes),
+            now_rfc3339(),
+            ex.project_id.get(),
+        ],
+    )
+    .map_err(storage_error)?;
     if changed != 1 {
         return Err(DomainError::new(
             ErrorCode::StorageError,
@@ -1151,20 +1152,20 @@ fn enforce_project_disk_quota(
     request_length: Option<i64>,
     response_length: Option<i64>,
 ) -> DomainResult<()> {
-    let (limits_json, current_usage): (String, i64) = conn
-        .query_row(
-            "SELECT p.limits_json, u.accounted_bytes
-             FROM projects p JOIN project_usage u ON u.project_id=p.id
-             WHERE p.id=?1",
-            params![ex.project_id.get()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => {
-                crate::storage::lifecycle::missing_usage_or_project(conn, ex.project_id)
-            }
-            other => storage_error(other),
-        })?;
+    let (limits_json, current_usage): (String, i64) = crate::storage::cached_query_row(
+        conn,
+        "SELECT p.limits_json, u.accounted_bytes
+         FROM projects p JOIN project_usage u ON u.project_id=p.id
+         WHERE p.id=?1",
+        params![ex.project_id.get()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => {
+            crate::storage::lifecycle::missing_usage_or_project(conn, ex.project_id)
+        }
+        other => storage_error(other),
+    })?;
     let limits: ProjectLimits = serde_json::from_str(&limits_json).map_err(|error| {
         DomainError::new(
             ErrorCode::StorageError,
@@ -1245,18 +1246,19 @@ fn alloc_exchange_id(
     conn: &rusqlite::Connection,
     project_id: ProjectId,
 ) -> DomainResult<ExchangeId> {
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "UPDATE project_seq SET next_exchange_id = next_exchange_id + 1 WHERE project_id=?1",
         params![project_id.get()],
     )
     .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    let next: i64 = conn
-        .query_row(
-            "SELECT next_exchange_id FROM project_seq WHERE project_id=?1",
-            params![project_id.get()],
-            |r| r.get(0),
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+    let next: i64 = crate::storage::cached_query_row(
+        conn,
+        "SELECT next_exchange_id FROM project_seq WHERE project_id=?1",
+        params![project_id.get()],
+        |r| r.get(0),
+    )
+    .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
     Ok(ExchangeId(next - 1))
 }
 

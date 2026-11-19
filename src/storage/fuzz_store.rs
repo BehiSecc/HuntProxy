@@ -181,17 +181,18 @@ impl Db {
             .collect::<String>();
         let ts = now_rfc3339();
         self.with_conn(move |conn| {
-            let job_exists: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM fuzz_jobs WHERE id=?1 AND project_id=?2)",
-                    params![job_id.get(), project_id.get()],
-                    |row| row.get(0),
-                )
-                .map_err(storage_error)?;
+            let job_exists: bool = crate::storage::cached_query_row(
+                conn,
+                "SELECT EXISTS(SELECT 1 FROM fuzz_jobs WHERE id=?1 AND project_id=?2)",
+                params![job_id.get(), project_id.get()],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
             if !job_exists {
                 return Err(DomainError::not_found("fuzz job"));
             }
-            conn.execute(
+            crate::storage::cached_execute(
+                conn,
                 "INSERT INTO fuzz_cases
                  (job_id, case_index, state, payloads_json, payload_summary, created_at, started_at)
                  VALUES (?1,?2,'running',?3,?4,?5,?5)",
@@ -253,38 +254,38 @@ impl Db {
         // when Reply saved it, so only the case and the job counters change.
         self.with_conn(move |conn| {
             let tx = write_transaction(conn).map_err(storage_error)?;
-            let previous_state: String = tx
-                .query_row(
-                    "SELECT state FROM fuzz_cases WHERE id=?1 AND job_id=?2",
-                    params![case_id, job_id.get()],
-                    |row| row.get(0),
-                )
-                .map_err(|error| match error {
-                    rusqlite::Error::QueryReturnedNoRows => DomainError::not_found("fuzz case"),
-                    other => storage_error(other),
-                })?;
-            let changed = tx
-                .execute(
-                    "UPDATE fuzz_cases
-                     SET state=?1, exchange_id=?2, status_code=?3, response_length=?4,
-                         duration_ms=?5, error=?6, body_hash=?7, finished_at=?8
-                     WHERE id=?9 AND job_id=?10
-                       AND EXISTS(SELECT 1 FROM fuzz_jobs WHERE id=?10 AND project_id=?11)",
-                    params![
-                        state_s,
-                        exchange_id.map(|exchange_id| exchange_id.get()),
-                        status_code.map(i64::from),
-                        response_length,
-                        duration_ms,
-                        error,
-                        body_hash,
-                        ts,
-                        case_id,
-                        job_id.get(),
-                        project_id.get()
-                    ],
-                )
-                .map_err(storage_error)?;
+            let previous_state: String = crate::storage::cached_query_row(
+                &tx,
+                "SELECT state FROM fuzz_cases WHERE id=?1 AND job_id=?2",
+                params![case_id, job_id.get()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => DomainError::not_found("fuzz case"),
+                other => storage_error(other),
+            })?;
+            let changed = crate::storage::cached_execute(
+                &tx,
+                "UPDATE fuzz_cases
+                 SET state=?1, exchange_id=?2, status_code=?3, response_length=?4,
+                     duration_ms=?5, error=?6, body_hash=?7, finished_at=?8
+                 WHERE id=?9 AND job_id=?10
+                   AND EXISTS(SELECT 1 FROM fuzz_jobs WHERE id=?10 AND project_id=?11)",
+                params![
+                    state_s,
+                    exchange_id.map(|exchange_id| exchange_id.get()),
+                    status_code.map(i64::from),
+                    response_length,
+                    duration_ms,
+                    error,
+                    body_hash,
+                    ts,
+                    case_id,
+                    job_id.get(),
+                    project_id.get()
+                ],
+            )
+            .map_err(storage_error)?;
             if changed == 0 {
                 return Err(DomainError::not_found("fuzz case"));
             }

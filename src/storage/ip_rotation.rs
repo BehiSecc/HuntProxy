@@ -220,20 +220,20 @@ impl Db {
         let origin = parsed.origin().ascii_serialization();
         let profile = self
             .with_conn(move |conn| {
-                let profile_id: Option<i64> = conn
-                    .query_row(
-                        "SELECT id FROM ip_rotation_profiles WHERE project_id=?1 AND target_origin=?2 AND enabled=1",
-                        params![project_id.get(), origin],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(storage_error)?;
+                let profile_id: Option<i64> = crate::storage::cached_query_row(
+                    conn,
+                    "SELECT id FROM ip_rotation_profiles WHERE project_id=?1 AND target_origin=?2 AND enabled=1",
+                    params![project_id.get(), origin],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_error)?;
                 let Some(profile_id) = profile_id else {
                     return Ok(None);
                 };
                 let gateways = {
                     let mut statement = conn
-                        .prepare("SELECT region,endpoint FROM ip_rotation_gateways WHERE profile_id=?1 ORDER BY id")
+                        .prepare_cached("SELECT region,endpoint FROM ip_rotation_gateways WHERE profile_id=?1 ORDER BY id")
                         .map_err(storage_error)?;
                     let rows = statement
                         .query_map(params![profile_id], |row| Ok((row.get(0)?, row.get(1)?)))

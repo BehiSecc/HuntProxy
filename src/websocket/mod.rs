@@ -204,7 +204,8 @@ impl Db {
         let created_at = now_rfc3339();
         self.with_conn(move |conn| {
             let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
-            tx.execute(
+            crate::storage::cached_execute(
+                &tx,
                 "INSERT INTO websocket_messages
                  (project_id, connection_id, direction, opcode, payload, payload_length, truncated, created_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -215,7 +216,8 @@ impl Db {
             let id = tx.last_insert_rowid();
             let client_bytes = if direction == "client_to_server" { payload_length } else { 0 };
             let server_bytes = if direction == "server_to_client" { payload_length } else { 0 };
-            tx.execute(
+            crate::storage::cached_execute(
+                &tx,
                 "UPDATE websocket_connections SET message_count=message_count+1,
                  client_bytes=client_bytes+?1, server_bytes=server_bytes+?2
                  WHERE project_id=?3 AND id=?4",

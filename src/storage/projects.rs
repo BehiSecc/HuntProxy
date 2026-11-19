@@ -222,7 +222,8 @@ impl Db {
 
     pub async fn get_project(&self, id: ProjectId) -> DomainResult<Project> {
         self.with_conn(move |conn| {
-            conn.query_row(
+            crate::storage::cached_query_row(
+                conn,
                 "SELECT id, name, target_url, created_at, updated_at, scope_json, limits_json,
                         default_browser_profile, noise_policy FROM projects WHERE id=?1",
                 params![id.get()],

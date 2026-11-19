@@ -111,7 +111,8 @@ fn encode_body(data: &[u8]) -> (String, Vec<u8>) {
 
 /// `(id, stored_length, codec)` of the body stored with this hash.
 fn stored_body_by_hash(conn: &rusqlite::Connection, hash: &str) -> Option<(i64, i64, String)> {
-    conn.query_row(
+    crate::storage::cached_query_row(
+        conn,
         "SELECT id, stored_length, codec FROM bodies WHERE sha256=?1 LIMIT 1",
         params![hash],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -147,7 +148,8 @@ pub fn store_prepared_body_conn(
     }
     let (codec, stored) = encoded.unwrap_or_else(|| encode_body(data));
 
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "INSERT INTO bodies (sha256, original_length, stored_length, codec, mime_class, content)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -374,7 +376,8 @@ pub fn store_body_file_conn(
             ("raw", file, length)
         }
     };
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "INSERT INTO bodies (sha256, original_length, stored_length, codec, mime_class, content)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
