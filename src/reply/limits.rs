@@ -26,13 +26,28 @@ pub struct RequestLimiter {
     projects: dashmap::DashMap<i64, Arc<ProjectBudget>>,
 }
 
+/// A project's budget. It lives as long as the daemon and follows changes to
+/// the project's limits, so a running fuzz job, which holds it, slows down as
+/// soon as the project's rate is lowered.
 #[derive(Debug)]
 pub struct ProjectBudget {
     /// The project's limits as stored, to notice when they change.
-    configured: (u32, u64),
+    configured: parking_lot::Mutex<(u32, u64)>,
+    concurrency: parking_lot::Mutex<Concurrency>,
+    schedule: parking_lot::Mutex<Schedule>,
+}
+
+#[derive(Debug)]
+struct Concurrency {
     max_concurrent_requests: u32,
-    concurrency: Arc<Semaphore>,
-    next_start: parking_lot::Mutex<Instant>,
+    /// Replaced when the limit changes: requests in flight finish on the old
+    /// one, and new requests take slots from the new one.
+    slots: Arc<Semaphore>,
+}
+
+#[derive(Debug)]
+struct Schedule {
+    next_start: Instant,
     interval: Duration,
 }
 
@@ -44,21 +59,15 @@ pub struct RequestSlots {
 }
 
 impl RequestLimiter {
-    /// The project's budget. It is replaced when the project's limits change.
+    /// The project's budget, updated to the project's current limits.
     pub fn budget(&self, project: &Project) -> Arc<ProjectBudget> {
-        if let Some(budget) = self.projects.get(&project.id.get()) {
-            if budget.matches(&project.limits) {
-                return budget.clone();
-            }
-        }
-        let mut budget = self
+        let budget = self
             .projects
             .entry(project.id.get())
-            .or_insert_with(|| ProjectBudget::for_project(project));
-        if !budget.matches(&project.limits) {
-            *budget = ProjectBudget::for_project(project);
-        }
-        budget.clone()
+            .or_insert_with(|| ProjectBudget::for_project(project))
+            .clone();
+        budget.apply(project);
+        budget
     }
 
     /// Wait until `requests` requests may start for the project.
@@ -67,49 +76,87 @@ impl RequestLimiter {
     }
 }
 
+/// The concurrency and start interval a project's limits allow. Limits are
+/// not validated when a project is stored, so an unusable value falls back to
+/// the slowest budget plugin jobs already use: one request at a time, at most
+/// one every ten seconds.
+fn settings(limits: &ProjectLimits) -> (u32, Duration) {
+    let rate = if usable_rate(limits.requests_per_second) {
+        limits.requests_per_second
+    } else {
+        FALLBACK_REQUESTS_PER_SECOND
+    };
+    let interval = (1.0 / rate).min(MAX_START_INTERVAL.as_secs_f64());
+    (
+        limits.max_concurrent_requests.max(1),
+        Duration::from_secs_f64(interval),
+    )
+}
+
+fn configured(limits: &ProjectLimits) -> (u32, u64) {
+    (
+        limits.max_concurrent_requests,
+        limits.requests_per_second.to_bits(),
+    )
+}
+
+fn warn_if_unusable(project: &Project) {
+    let limits = &project.limits;
+    if limits.max_concurrent_requests == 0 || !usable_rate(limits.requests_per_second) {
+        tracing::warn!(
+            project_id = project.id.get(),
+            max_concurrent_requests = limits.max_concurrent_requests,
+            requests_per_second = limits.requests_per_second,
+            "project request limits are not usable; sending one request at a time, at most {FALLBACK_REQUESTS_PER_SECOND} per second"
+        );
+    }
+}
+
 impl ProjectBudget {
-    /// Limits are not validated when a project is stored, so an unusable value
-    /// falls back to the slowest budget plugin jobs already use: one request
-    /// at a time, at most one every ten seconds.
     pub(crate) fn new(limits: &ProjectLimits) -> Self {
-        let rate = if usable_rate(limits.requests_per_second) {
-            limits.requests_per_second
-        } else {
-            FALLBACK_REQUESTS_PER_SECOND
-        };
-        let max_concurrent_requests = limits.max_concurrent_requests.max(1);
-        let interval = (1.0 / rate).min(MAX_START_INTERVAL.as_secs_f64());
+        let (max_concurrent_requests, interval) = settings(limits);
         Self {
-            configured: (
-                limits.max_concurrent_requests,
-                limits.requests_per_second.to_bits(),
-            ),
-            max_concurrent_requests,
-            concurrency: Arc::new(Semaphore::new(max_concurrent_requests as usize)),
-            next_start: parking_lot::Mutex::new(Instant::now()),
-            interval: Duration::from_secs_f64(interval),
+            configured: parking_lot::Mutex::new(configured(limits)),
+            concurrency: parking_lot::Mutex::new(Concurrency {
+                max_concurrent_requests,
+                slots: Arc::new(Semaphore::new(max_concurrent_requests as usize)),
+            }),
+            schedule: parking_lot::Mutex::new(Schedule {
+                next_start: Instant::now(),
+                interval,
+            }),
         }
     }
 
     fn for_project(project: &Project) -> Arc<Self> {
-        let limits = &project.limits;
-        if limits.max_concurrent_requests == 0 || !usable_rate(limits.requests_per_second) {
-            tracing::warn!(
-                project_id = project.id.get(),
-                max_concurrent_requests = limits.max_concurrent_requests,
-                requests_per_second = limits.requests_per_second,
-                "project request limits are not usable; sending one request at a time, at most {FALLBACK_REQUESTS_PER_SECOND} per second"
-            );
-        }
-        Arc::new(Self::new(limits))
+        warn_if_unusable(project);
+        Arc::new(Self::new(&project.limits))
     }
 
-    fn matches(&self, limits: &ProjectLimits) -> bool {
-        self.configured
-            == (
-                limits.max_concurrent_requests,
-                limits.requests_per_second.to_bits(),
-            )
+    /// Switches to the project's limits if they changed. A new rate applies
+    /// to the next start; a new concurrency to requests that have not taken
+    /// a slot yet.
+    fn apply(&self, project: &Project) {
+        let mut current = self.configured.lock();
+        if *current == configured(&project.limits) {
+            return;
+        }
+        *current = configured(&project.limits);
+        warn_if_unusable(project);
+        let (max_concurrent_requests, interval) = settings(&project.limits);
+        {
+            let mut schedule = self.schedule.lock();
+            schedule.interval = interval;
+            // A faster rate does not wait out the slower one's gap.
+            schedule.next_start = schedule.next_start.min(Instant::now() + interval);
+        }
+        let mut concurrency = self.concurrency.lock();
+        if concurrency.max_concurrent_requests != max_concurrent_requests {
+            *concurrency = Concurrency {
+                max_concurrent_requests,
+                slots: Arc::new(Semaphore::new(max_concurrent_requests as usize)),
+            };
+        }
     }
 
     /// Take slots for `requests` requests that start together, then wait for
@@ -120,27 +167,40 @@ impl ProjectBudget {
     /// rather than waiting forever.
     pub async fn acquire(&self, requests: usize) -> DomainResult<RequestSlots> {
         let requests = u32::try_from(requests.max(1)).unwrap_or(u32::MAX);
-        let permit = self
-            .concurrency
-            .clone()
-            .acquire_many_owned(requests.min(self.max_concurrent_requests))
+        let (slots, max_concurrent_requests) = {
+            let concurrency = self.concurrency.lock();
+            (
+                concurrency.slots.clone(),
+                concurrency.max_concurrent_requests,
+            )
+        };
+        let permit = slots
+            .acquire_many_owned(requests.min(max_concurrent_requests))
             .await
             .map_err(|_| DomainError::new(ErrorCode::Unavailable, "request limiter closed"))?;
         loop {
             let wait = {
-                let mut next_start = self.next_start.lock();
+                let mut schedule = self.schedule.lock();
                 let now = Instant::now();
-                if *next_start <= now {
-                    *next_start = now + self.interval.saturating_mul(requests);
+                if schedule.next_start <= now {
+                    schedule.next_start = now + schedule.interval.saturating_mul(requests);
                     break;
                 }
-                *next_start - now
+                schedule.next_start - now
             };
             tokio::time::sleep(wait).await;
         }
         Ok(RequestSlots {
             _permit: Arc::new(permit),
         })
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> (u32, Duration) {
+        (
+            self.concurrency.lock().max_concurrent_requests,
+            self.schedule.lock().interval,
+        )
     }
 }
 
@@ -280,29 +340,62 @@ mod tests {
     }
 
     #[test]
-    fn changed_limits_replace_the_budget_and_projects_do_not_share() {
+    fn a_project_keeps_one_budget_through_limit_changes_and_projects_do_not_share() {
         let limiter = RequestLimiter::default();
         let first = limiter.budget(&project(1, 4, 20.0));
-        assert!(Arc::ptr_eq(&first, &limiter.budget(&project(1, 4, 20.0))));
         assert!(!Arc::ptr_eq(&first, &limiter.budget(&project(2, 4, 20.0))));
-        let changed = limiter.budget(&project(1, 4, 5.0));
-        assert!(!Arc::ptr_eq(&first, &changed));
-        assert!(Arc::ptr_eq(&changed, &limiter.budget(&project(1, 4, 5.0))));
+        let changed = limiter.budget(&project(1, 2, 5.0));
+        assert!(Arc::ptr_eq(&first, &changed));
+        assert_eq!(first.current(), (2, Duration::from_millis(200)));
+    }
+
+    #[tokio::test]
+    async fn a_held_budget_slows_down_when_the_rate_is_lowered() {
+        // A fuzz job takes the budget once and keeps it for every case.
+        let limiter = RequestLimiter::default();
+        let held = limiter.budget(&project(1, 4, 1_000.0));
+        drop(held.acquire(1).await.unwrap());
+        limiter.budget(&project(1, 4, 10.0));
+        let started = Instant::now();
+        for _ in 0..3 {
+            drop(held.acquire(1).await.unwrap());
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(190),
+            "the held budget kept the old rate: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_budget_takes_new_concurrency_for_requests_not_yet_started() {
+        let limiter = RequestLimiter::default();
+        let held = limiter.budget(&project(1, 1, 1_000.0));
+        let in_flight = held.acquire(1).await.unwrap();
+        limiter.budget(&project(1, 2, 1_000.0));
+        let second = tokio::time::timeout(Duration::from_secs(2), held.acquire(1))
+            .await
+            .expect("the raised concurrency did not apply")
+            .unwrap();
+        // The request in flight finishes on the old slots; then two at a time.
+        drop(in_flight);
+        let third = held.acquire(1).await.unwrap();
+        let fourth = tokio::time::timeout(Duration::from_millis(50), held.acquire(1)).await;
+        assert!(fourth.is_err(), "more requests started than the new limit");
+        drop((second, third));
     }
 
     #[test]
     fn unusable_limits_fall_back_to_a_slow_budget() {
         let limiter = RequestLimiter::default();
         let budget = limiter.budget(&project(1, 0, 1.0));
-        assert_eq!(budget.max_concurrent_requests, 1);
-        assert_eq!(budget.interval, Duration::from_secs(1));
+        assert_eq!(budget.current(), (1, Duration::from_secs(1)));
         for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let budget = limiter.budget(&project(1, 2, rate));
-            assert_eq!(budget.max_concurrent_requests, 2, "{rate}");
-            assert_eq!(budget.interval, Duration::from_secs(10), "{rate}");
+            assert_eq!(budget.current(), (2, Duration::from_secs(10)), "{rate}");
         }
         assert_eq!(
-            limiter.budget(&project(1, 2, 1e-12)).interval,
+            limiter.budget(&project(1, 2, 1e-12)).current().1,
             MAX_START_INTERVAL
         );
     }

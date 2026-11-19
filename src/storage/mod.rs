@@ -18,6 +18,7 @@ mod projects;
 mod reply_store;
 mod sessions;
 mod sitemap;
+mod upgrade;
 mod word_sources;
 
 pub use bodies::*;
@@ -29,6 +30,7 @@ pub use migrations::*;
 pub use project_upstream_proxies::*;
 pub use projects::*;
 pub use sessions::*;
+pub use upgrade::{upgrade_progress_path, UpgradeOptions, UpgradeWait, WATCHED_UPGRADE_ENV};
 // side-effect modules register `impl Db` methods
 #[allow(unused_imports)]
 pub use annotations::*;

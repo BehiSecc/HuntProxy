@@ -2708,7 +2708,10 @@ async function performType(page, action) {
         node.setSelectionRange(node.value.length, node.value.length);
         return true;
       } catch {
-        return false; // email, number and similar inputs have no selection API
+        // Email and number inputs have no selection API, so End moves their
+        // caret. On a slider, radio button or date field End changes the
+        // value, so those keep the caret where focus put it.
+        return node.type !== "email" && node.type !== "number";
       }
     }, undefined, { timeout: 30_000 });
     if (!placed) await page.keyboard.press("End");

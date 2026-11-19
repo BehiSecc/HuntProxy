@@ -1,6 +1,6 @@
 [package]
 name = "HuntProxy"
-version = "0.4.0"
+version = "0.4.5"
 edition = "2021"
 rust-version = "1.98"
 description = "A web security workbench built for AI agents and authorized testing"
@@ -52,7 +52,7 @@ webpki-roots = "0.26"
 # bundles) is not held back by deadpool-sqlite's rusqlite pin
 deadpool = { version = "0.13.1", default-features = false, features = ["managed", "rt_tokio_1"] }
 deadpool-sync = "0.2"
-rusqlite = { version = "0.41.1", features = ["bundled", "blob", "backup", "functions", "limits"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "blob", "backup", "functions", "hooks", "limits"] }
 
 # Parsing / codecs
 serde = { version = "1", features = ["derive"] }

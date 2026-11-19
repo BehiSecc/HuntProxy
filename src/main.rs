@@ -222,12 +222,14 @@ async fn run(cli: Cli) -> DomainResult<()> {
             app::run_daemon(cfg).await
         }
         Commands::PrepareUpdate => {
+            // An older installer's time limit runs from the start of this process.
+            let upgrade = huntproxy::storage::UpgradeOptions::for_release_preparation();
             init_logging_stderr("warn");
             let mut cfg = Config::load(cli.data_dir)?;
             app::prepare_release_runtime(&mut cfg).await?;
             ensure_ca(&cfg)?;
             let _ = huntproxy::reply::PlaceholderKey::load_or_create(&cfg.placeholder_key_path())?;
-            let db = huntproxy::storage::Db::open(&cfg).await?;
+            let db = huntproxy::storage::Db::open_with(&cfg, upgrade).await?;
             let schema = db.schema_version().await?;
             println!(
                 "{}",

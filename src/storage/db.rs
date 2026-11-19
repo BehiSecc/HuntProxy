@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::domain::{DomainError, DomainResult, ErrorCode};
 use crate::storage::migrations;
+use crate::storage::upgrade::{self, UpgradeOptions};
 use deadpool::managed::{self, Metrics, RecycleError, RecycleResult};
 use deadpool::Runtime;
 use deadpool_sync::SyncWrapper;
@@ -34,8 +35,16 @@ impl managed::Manager for SqliteManager {
         let synchronous = self.synchronous.clone();
         let busy_timeout_ms = self.busy_timeout_ms;
         SyncWrapper::new(Runtime::Tokio1, move || {
+            let in_memory = path.contains("mode=memory");
             let conn = Connection::open(path)?;
             configure(&conn, &synchronous, busy_timeout_ms)?;
+            if in_memory {
+                // Test databases share one in-memory cache, where a reader's
+                // table lock makes a concurrent write fail at once with
+                // "database table is locked" instead of waiting. Readers of a
+                // WAL database file never block writers; this keeps tests the same.
+                conn.pragma_update(None, "read_uncommitted", true)?;
+            }
             write_lock(&conn, Some(Duration::from_millis(busy_timeout_ms)));
             Ok(conn)
         })
@@ -137,31 +146,31 @@ pub struct Db {
 
 impl Db {
     pub async fn open(cfg: &Config) -> DomainResult<Self> {
+        Self::open_with(cfg, UpgradeOptions::default()).await
+    }
+
+    /// Opens the database, upgrading an older one as `options` allow.
+    pub async fn open_with(cfg: &Config, options: UpgradeOptions) -> DomainResult<Self> {
         cfg.ensure_layout()?;
         let path = cfg.db_path();
         let sync = cfg.sqlite_synchronous.clone();
         let busy = cfg.busy_timeout_ms;
         let pool = open_pool(path.display().to_string(), sync.clone(), busy)?;
 
-        let migration_backup_dir = cfg.runtime_dir.join("migration-backups");
-        // Migrate on a connection
+        let paths = upgrade::UpgradePaths {
+            database: path.clone(),
+            backups: cfg.runtime_dir.join("migration-backups"),
+            progress: upgrade::upgrade_progress_path(cfg),
+        };
+        // Migrate on one connection before the pool opens any other.
         {
             let conn = pool
                 .get()
                 .await
                 .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-            conn.interact(move |c| {
-                // WAL is database-wide
-                c.pragma_update(None, "journal_mode", "WAL")
-                    .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-                let version = migrations::schema_version(c)?;
-                if version > 0 && version < migrations::current_schema_version() {
-                    backup_before_migration(c, &migration_backup_dir, version)?;
-                }
-                migrations::migrate(c)
-            })
-            .await
-            .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))??;
+            conn.interact(move |c| upgrade::run(c, &paths, &options))
+                .await
+                .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))??;
         }
 
         Ok(Self {
@@ -221,40 +230,6 @@ impl Db {
     pub async fn schema_version(&self) -> DomainResult<i32> {
         self.with_conn(migrations::schema_version).await
     }
-}
-
-fn backup_before_migration(
-    source: &Connection,
-    directory: &Path,
-    version: i32,
-) -> DomainResult<()> {
-    crate::config::create_private_dir(directory)?;
-    let path = directory.join(format!("schema-{version}-{}.sqlite3", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut target = Connection::open(&path)?;
-        let backup = rusqlite::backup::Backup::new(source, &mut target)?;
-        backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
-        drop(backup);
-        target.pragma_update(None, "journal_mode", "DELETE")?;
-        drop(target);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::File::open(&path)?.sync_all()?;
-        std::fs::File::open(directory)?.sync_all()?;
-        Ok::<_, anyhow::Error>(())
-    })();
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&path);
-        return Err(DomainError::new(
-            ErrorCode::MigrationError,
-            format!("could not preserve the database before upgrading: {error}"),
-        ));
-    }
-    tracing::info!(path = %path.display(), schema = version, "preserved database before schema upgrade");
-    Ok(())
 }
 
 /// An `IMMEDIATE` transaction, begun once it is this writer's turn for the
@@ -353,7 +328,14 @@ fn configure(conn: &Connection, synchronous: &str, busy_timeout_ms: u64) -> rusq
             let codec = context.get::<String>(0)?;
             let content = context.get::<Vec<u8>>(1)?;
             let needle = context.get::<String>(2)?.to_lowercase();
-            let content_encoding = context.get::<Option<String>>(3)?;
+            // Captured header values are bytes; one that is not UTF-8 must not
+            // fail every body search in its project.
+            let content_encoding = match context.get_raw(3) {
+                rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+                    Some(String::from_utf8_lossy(value).into_owned())
+                }
+                _ => None,
+            };
             let stored =
                 crate::storage::bodies::decode_body(&codec, &content).map_err(|error| {
                     rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(
@@ -468,6 +450,23 @@ mod tests {
             assert_eq!((foreign_keys, busy_timeout, trusted_schema), (1, 5000, 0));
             assert!(contains);
         }
+    }
+
+    #[test]
+    fn body_search_survives_a_content_encoding_that_is_not_utf8() {
+        // History search passes group_concat(CAST(value AS TEXT)), which keeps
+        // a captured header's raw bytes; "g\xffzip" must not fail the query.
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, "NORMAL", 5000).unwrap();
+        let found: bool = conn
+            .query_row(
+                "SELECT huntproxy_body_contains('raw', CAST('a needle here' AS BLOB), 'needle',
+                                                CAST(X'67FF7A6970' AS TEXT))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(found);
     }
 
     #[test]

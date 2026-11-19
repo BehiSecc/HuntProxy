@@ -140,7 +140,7 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
       <div id="chip" draggable="true">chip</div><div id="bin"></div>
       <div id="form"><input id="search" aria-label="Search">
         <input class="otp" maxlength="1" aria-label="Digit 1"><input class="otp" maxlength="1"><input class="otp" maxlength="1"><input class="otp" maxlength="1">
-        <input id="mail" type="email" value="a@b.c">
+        <input id="mail" type="email" value="a@b.c"><input id="volume" type="range" min="0" max="10" value="3">
         <div id="editor" contenteditable="true" role="textbox" aria-label="Notes" style="min-width:200px;min-height:20px;border:1px solid #999"></div>
         <ul id="commands" hidden><li>Heading</li></ul>
         <button class="row">Delete</button><button class="row">Delete</button><button class="row">Delete</button></div>
@@ -264,6 +264,9 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
     assert.equal(await read("document.querySelector('#search').value"), "shoes é red");
     await run({ type: "type", text: "z", locator: { css: "#mail" } });
     assert.equal(await read("document.querySelector('#mail').value"), "a@b.cz");
+    // End would move a slider to its maximum; only text-like inputs get it.
+    await run({ type: "type", text: "z", locator: { css: "#volume" } });
+    assert.equal(await read("document.querySelector('#volume').value"), "3");
     await heard();
     // One character per box: focus moves on as the page reacts to each key.
     await run({ type: "pointer", op: "click", locator: { role: "textbox", name: "Digit 1" } });

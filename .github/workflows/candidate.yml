@@ -141,13 +141,27 @@ jobs:
               output.write(f"{node_dir}\n")
           PY
 
+      # check.sh runs before a browser runtime exists here, so its Chromium
+      # tests skip. Run them again against the runtime just provisioned. Only
+      # these binaries see HUNTPROXY_CHROME_EXECUTABLE: an installation unit
+      # test deletes the file it names.
+      - name: Run live browser tests against the provisioned runtime
+        shell: bash
+        # The job has no overall limit; a hung browser test must not hold it for hours.
+        timeout-minutes: 20
+        run: |
+          set -Eeuo pipefail
+          (cd browser-worker && npm test)
+          cargo test --locked --test browser_profile_isolation -- --ignored --test-threads=1
+
       - name: Fetch verified previous release fixtures
         shell: bash
         run: |
           set -Eeuo pipefail
           for fixture in \
             "0.2.0 2016a21c7ee7a03cccf6f9406a4ecce6231ab3ecea41e1bd354d76881ef8b0a3" \
-            "0.3.0 7d5742db477a92ea935a1385eccbe8ea354a8568dcb04fb30f4652af46c6fe3f"; do
+            "0.3.0 7d5742db477a92ea935a1385eccbe8ea354a8568dcb04fb30f4652af46c6fe3f" \
+            "0.4.0 48736fd1b8f3cea38065dcb167e29389ed18f3efa2dd93d8a014703e95107b18"; do
             read -r version sha256 <<<"$fixture"
             archive="${RUNNER_TEMP}/huntproxy-v${version}-linux-x86_64.tar.gz"
             fixture_dir="${RUNNER_TEMP}/huntproxy-v${version}"
@@ -161,14 +175,14 @@ jobs:
             [[ "$("$fixture_dir/HuntProxy" --version)" == "HuntProxy ${version}" ]]
           done
 
-      - name: Exercise full data and bundle upgrades from v0.2.0 and v0.3.0
+      - name: Exercise full data and bundle upgrades from v0.2.0, v0.3.0 and v0.4.0
         shell: bash
         env:
           HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-upgrade-default
           TMPDIR: ${{ runner.temp }}
         run: |
           set -Eeuo pipefail
-          for version in 0.2.0 0.3.0; do
+          for version in 0.2.0 0.3.0 0.4.0; do
             echo "::group::Upgrade from v${version}"
             HUNTPROXY_PREVIOUS_BINARY="${RUNNER_TEMP}/huntproxy-v${version}/HuntProxy" \
               cargo test --locked --test upgrade_workflows -- --ignored --test-threads=1 --nocapture

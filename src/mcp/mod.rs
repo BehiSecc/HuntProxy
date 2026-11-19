@@ -400,9 +400,12 @@ fn browser_action_schema() -> Value {
 }
 
 fn fuzz_template_schema() -> Value {
+    // Integer generator fields omit minimum/maximum bounds that only restate i64/u64:
+    // the OpenAI Codex backend answers HTTP 500 when a tool declares i64::MIN or u64::MAX.
+    // Deserializing into PayloadGenerator still rejects out-of-range values.
     json!({
         "type": "object",
-        "description": "Use marker §name§ in the selected draft field. Example: draft.url='https://example.test/?q=§q§' with insertion point {name:'q', location:'url'}.",
+        "description": "Use marker §name§ in the selected draft field. Example: draft.url='https://example.test/?q=§q§' with insertion point {name:'q', location:'url'}. In body_json strings and body_params the payload is JSON-escaped or form-encoded with its field; use body_text for raw bytes. A body point without a marker replaces the whole body.",
         "properties": {
             "base_exchange_id": {"type": ["integer", "null"]},
             "draft": reply_draft_schema(),
@@ -441,9 +444,9 @@ fn fuzz_template_schema() -> Value {
                             "type": "object",
                             "properties": {
                                 "type": {"const": "numbers"},
-                                "from": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64},
-                                "to": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64},
-                                "step": {"type": "integer", "minimum": -9223372036854775808_i64, "maximum": 9223372036854775807_i64, "description": "Non-zero; its sign must move from from toward to."}
+                                "from": {"type": "integer"},
+                                "to": {"type": "integer"},
+                                "step": {"type": "integer", "description": "Non-zero; its sign must move from from toward to."}
                             },
                             "required": ["type", "from", "to", "step"],
                             "additionalProperties": false
@@ -458,7 +461,7 @@ fn fuzz_template_schema() -> Value {
                                 "byte_from": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
                                 "byte_to": {"type": "integer", "minimum": 0, "maximum": 255, "default": 255},
                                 "include_alphanumeric": {"type": "boolean", "default": false},
-                                "max_payloads": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615_u64, "default": 2000}
+                                "max_payloads": {"type": "integer", "minimum": 1, "default": 2000}
                             },
                             "required": ["type", "input"],
                             "additionalProperties": false
@@ -538,7 +541,7 @@ fn browser_input_tool_def() -> Value {
 
 pub(crate) fn tool_defs() -> Value {
     json!([
-        {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations. set_upstream_proxy persists live routing; proxy null inherits config.toml, direct selects direct traffic, and a URL selects that proxy. Existing connections reconnect naturally. set_limits changes the request rate and concurrency that Reply, fuzz jobs, the crawler and extensions share; running fuzz jobs keep the limits they started with.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope","set_upstream_proxy","set_limits"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults; set_upstream_proxy needs project_id and an explicit proxy URL, direct, or null; set_limits needs project_id and requests_per_second, max_concurrent_requests, or both."},"project_id":{"type":"integer","description":"Optional for list; required for usage, set_scope, set_upstream_proxy and set_limits."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}},"requests_per_second":{"type":"number","minimum":0.1,"maximum":1000,"description":"For set_limits: the most requests started per second (default 50)."},"max_concurrent_requests":{"type":"integer","minimum":1,"maximum":256,"description":"For set_limits: the most requests in flight at once (default 32)."},"proxy":{"type":["string","null"],"description":"For set_upstream_proxy: http://, socks5:// or socks5h:// URL, direct to route directly, or null to inherit config.toml."}},"required":["action"],"additionalProperties":false}},
+        {"name":"projects","description":"List project summaries or get full details with project_id, create a project, inspect its logical capture quota, or set capture scope. usage returns quota-enforced logical bytes separately from physical database size. Host patterns may be exact or wildcard suffixes such as *.example.com; exclusions take precedence. Scope controls persistence, never request destinations. set_upstream_proxy persists live routing; proxy null inherits config.toml, direct selects direct traffic, and a URL selects that proxy. Existing connections reconnect naturally. set_limits changes the request rate and concurrency that Reply, fuzz jobs, the crawler and extensions share; it applies at once, including to running fuzz jobs.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","usage","set_scope","set_upstream_proxy","set_limits"],"description":"list returns id, name, target_url and updated_at, or full details with project_id; create needs name and target_url; usage and set_scope need project_id; omitted scope resets to defaults; set_upstream_proxy needs project_id and an explicit proxy URL, direct, or null; set_limits needs project_id and requests_per_second, max_concurrent_requests, or both."},"project_id":{"type":"integer","description":"Optional for list; required for usage, set_scope, set_upstream_proxy and set_limits."},"name":{"type":"string","description":"Required for create."},"target_url":{"type":"string","description":"Required for create; absolute HTTP(S) URL."},"scope":{"type":"object","properties":{"schemes":{"type":"array","items":{"type":"string"}},"host_patterns":{"type":"array","description":"Hosts to capture. Supports exact names and wildcard suffixes such as *.example.com. Empty captures all hosts except exclusions.","items":{"type":"string"}},"excluded_host_patterns":{"type":"array","description":"Hosts not to capture. Supports exact names and wildcard suffixes; exclusions override inclusions.","default":[],"items":{"type":"string"}},"ports":{"type":"array","items":{"type":"integer"}},"path_prefixes":{"type":"array","items":{"type":"string"}}}},"requests_per_second":{"type":"number","minimum":0.1,"maximum":1000,"description":"For set_limits: the most requests started per second (default 50)."},"max_concurrent_requests":{"type":"integer","minimum":1,"maximum":256,"description":"For set_limits: the most requests in flight at once (default 32)."},"proxy":{"type":["string","null"],"description":"For set_upstream_proxy: http://, socks5:// or socks5h:// URL, direct to route directly, or null to inherit config.toml."}},"required":["action"],"additionalProperties":false}},
         {"name":"extension_list","description":"List compact installed-extension summaries and any rejected packages. Use extension_describe for schemas, capabilities, and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and requested/effective limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
         {"name":"extension_preview","description":"Run the real extension planner without creating a job or sending requests. Returns stage-scoped request, candidate, runtime, and mode estimates plus a bounded planning_summary with selection/exclusion details when supplied by the plugin.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer"},"input":{"type":"object","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
@@ -563,7 +566,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
         {"name":"reply_send","description":"Send a semantic HTTP request and return status, a decoded 4 KiB response preview and the saved exchange_id; read more of the response with exchange_body. With base_exchange_id, diff gives the base status, length and whether the body is identical. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
-        {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or body_override; use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators. Returns the queued job at once; fuzz_manage get with wait_ms returns as soon as it ends.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
+        {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or the body (body_text, body_override, body_json strings or body_params); use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators. Returns the queued job at once; fuzz_manage get with wait_ms returns as soon as it ends.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Pages fit the output budget: continue cases and group_cases with before_case_index=next_before_case_index, and groups (largest first) with offset=next_offset.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0,"description":"groups: next_offset from the previous page."},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"get: wait up to this long for the job to end instead of polling; returns as soon as it does."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, read one message's whole payload, or inject a text/binary message into an active connection. messages lists the oldest first with the first 2 KB of each payload (payload_cut=true when there is more); pages fit the output budget, so continue with after_id=next_after_id while it is present. message reads one payload by message_id; continue at next_offset while truncated.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","message","send"]},"connection_id":{"type":"integer","description":"Required for messages and send."},"after_id":{"type":"integer","description":"messages: list messages with a larger id; pass next_after_id."},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":250,"description":"Most connections or messages to list; a messages page may hold fewer to fit the output budget."},"message_id":{"type":"integer","description":"Required for message."},"offset":{"type":"integer","minimum":0,"default":0,"description":"message: payload byte to start at; pass next_offset."},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384,"description":"message: most payload bytes to read; a page may hold fewer to fit the output budget."},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"description":"send: how payload is written (default text). message: how the page is written; by default text for UTF-8 payloads, base64 otherwise."},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
@@ -1429,6 +1432,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .db
                         .update_project_request_budget(project_id, update)
                         .await?;
+                    // Running jobs hold the project's budget; apply the limits now.
+                    state.reply.request_limiter.budget(&project);
                     Ok(json!({
                         "project_id": project.id.get(),
                         "requests_per_second": project.limits.requests_per_second,
@@ -1457,7 +1462,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!(state.upstream_proxy_setting(project_id).await?))
                 }
                 _ => Err(DomainError::invalid(
-                    "action must be list|create|usage|set_scope|set_upstream_proxy",
+                    "action must be list|create|usage|set_scope|set_limits|set_upstream_proxy",
                 )),
             }
         }
@@ -3048,6 +3053,73 @@ mod tests {
             schema["properties"]["max_response_bytes"]["maximum"],
             65_536
         );
+    }
+
+    #[test]
+    fn tool_schema_integer_bounds_stay_within_json_safe_range() {
+        // The OpenAI Codex backend returns HTTP 500 for a tool declaring i64::MIN or u64::MAX
+        // as a bound; ±(2^53 - 1) is accepted.
+        const SAFE: i64 = (1 << 53) - 1;
+        fn check(tool: &str, path: &str, value: &Value) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, field) in fields {
+                        let path = format!("{path}/{key}");
+                        if matches!(
+                            key.as_str(),
+                            "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum"
+                        ) && field.is_number()
+                        {
+                            let bound = field.as_i64();
+                            assert!(
+                                bound.is_some_and(|bound| (-SAFE..=SAFE).contains(&bound))
+                                    || field
+                                        .as_f64()
+                                        .is_some_and(|bound| bound.abs() <= SAFE as f64),
+                                "{tool}{path} = {field} exceeds the JSON-safe integer range"
+                            );
+                        }
+                        check(tool, &path, field);
+                    }
+                }
+                Value::Array(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        check(tool, &format!("{path}/{index}"), value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for tool in tool_defs().as_array().unwrap() {
+            check(tool["name"].as_str().unwrap(), "", &tool["inputSchema"]);
+        }
+    }
+
+    #[test]
+    fn fuzz_start_schema_keeps_generator_shapes_without_64_bit_bounds() {
+        let tools = tool_defs();
+        let fuzz_start = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "fuzz_start")
+            .unwrap();
+        let generators = &fuzz_start["inputSchema"]["properties"]["template"]["properties"]
+            ["payload_generators"]["items"]["oneOf"];
+        let numbers = &generators[0];
+        assert_eq!(numbers["properties"]["type"]["const"], "numbers");
+        assert_eq!(numbers["required"], json!(["type", "from", "to", "step"]));
+        for field in ["from", "to", "step"] {
+            assert_eq!(numbers["properties"][field]["type"], "integer");
+        }
+        let regex = &generators[1];
+        assert_eq!(regex["properties"]["type"]["const"], "regex_bypass");
+        assert_eq!(regex["required"], json!(["type", "input"]));
+        let max_payloads = &regex["properties"]["max_payloads"];
+        assert_eq!(max_payloads["minimum"], 1);
+        assert_eq!(max_payloads["default"], 2000);
+        assert!(max_payloads.get("maximum").is_none());
+        assert_eq!(regex["properties"]["byte_to"]["maximum"], 255);
     }
 
     #[test]

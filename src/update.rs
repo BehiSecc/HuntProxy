@@ -622,10 +622,28 @@ async fn prepare_downloaded_release(
         std::ffi::OsStr::new("--data-dir"),
         config.data_dir.as_os_str(),
     ];
-    let output = tokio::time::timeout(Duration::from_secs(900), binary_output(path, &arguments))
-        .await
-        .map_err(|_| update_error("release preparation timed out"))?
-        .map_err(|error| update_error(format!("prepare downloaded release: {error}")))?;
+    // Upgrading a large database can take far longer than 15 minutes; wait
+    // as long as the upgrade reports progress.
+    let wait = crate::storage::UpgradeWait::new(config);
+    let preparation = binary_output_with_env(
+        path,
+        &arguments,
+        &[(crate::storage::WATCHED_UPGRADE_ENV, "1")],
+    );
+    tokio::pin!(preparation);
+    let output = loop {
+        tokio::select! {
+            output = &mut preparation => break output,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if wait.expired() {
+                    return Err(update_error(
+                        "release preparation stopped making progress and timed out",
+                    ));
+                }
+            }
+        }
+    }
+    .map_err(|error| update_error(format!("prepare downloaded release: {error}")))?;
     if !output.status.success() {
         let tail = &output.stderr[output.stderr.len().saturating_sub(4096)..];
         return Err(update_error(format!(
@@ -1120,10 +1138,19 @@ pub(crate) async fn binary_output<S: AsRef<std::ffi::OsStr>>(
     path: &Path,
     args: &[S],
 ) -> std::io::Result<std::process::Output> {
+    binary_output_with_env(path, args, &[]).await
+}
+
+async fn binary_output_with_env<S: AsRef<std::ffi::OsStr>>(
+    path: &Path,
+    args: &[S],
+    envs: &[(&str, &str)],
+) -> std::io::Result<std::process::Output> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         let result = tokio::process::Command::new(path)
             .args(args)
+            .envs(envs.iter().copied())
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output()
