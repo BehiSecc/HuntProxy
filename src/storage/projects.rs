@@ -360,23 +360,22 @@ impl Db {
         self.with_conn(move |conn| {
             let tx = write_transaction(conn)
                 .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            // Bodies are shared by content across projects. The project's
+            // exchanges go with it, so note which bodies they use first.
+            let body_ids =
+                crate::storage::bodies::exchange_body_ids(&tx, "project_id=?1", params![id.get()])
+                    .map_err(|error| {
+                        DomainError::new(ErrorCode::StorageError, error.to_string())
+                    })?;
             let changed = tx
                 .execute("DELETE FROM projects WHERE id=?1", params![id.get()])
                 .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
             if changed == 0 {
                 return Err(DomainError::not_found(format!("project {}", id.get())));
             }
-            // Bodies are content-addressed but currently project-private in
-            // practice. Remove only objects no remaining exchange references.
-            tx.execute(
-                "DELETE FROM bodies WHERE id NOT IN (
-                    SELECT request_body_id FROM exchanges WHERE request_body_id IS NOT NULL
-                    UNION
-                    SELECT response_body_id FROM exchanges WHERE response_body_id IS NOT NULL
-                 )",
-                [],
-            )
-            .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
+            // Remove only those no remaining exchange references.
+            crate::storage::bodies::delete_unreferenced_bodies(&tx, &body_ids)
+                .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
             crate::storage::delete_unused_header_values(&tx)
                 .map_err(|error| DomainError::new(ErrorCode::StorageError, error.to_string()))?;
             tx.execute(

@@ -73,6 +73,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "018_compact_storage",
         include_str!("../../migrations/018_compact_storage.sql"),
     ),
+    (
+        "019_foreign_key_indexes",
+        include_str!("../../migrations/019_foreign_key_indexes.sql"),
+    ),
 ];
 
 /// Turns a current database back into its schema-17 shape, keeping its header
@@ -169,6 +173,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Foreign keys left without an index on their referencing columns, each
+    /// because deleting a project removes one parent row and so scans the
+    /// small referencing table once.
+    const UNINDEXED_FOREIGN_KEYS: &[(&str, &[&str])] = &[
+        ("reply_workspaces", &["project_id"]),
+        ("reply_tabs", &["project_id"]),
+        ("reply_tabs", &["workspace_id"]),
+        ("fuzz_jobs", &["project_id"]),
+        ("browser_sessions", &["project_id"]),
+    ];
+
+    /// Deleting a row that foreign keys point at makes SQLite look for the
+    /// rows that reference it: a scan of the whole referencing table unless an
+    /// index starts with the referencing columns. Deleting many such rows at
+    /// once (a project's bodies, WebSocket connections, browser sessions) then
+    /// takes time proportional to their number times the table.
+    #[test]
+    fn every_foreign_key_has_an_index_on_its_referencing_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, "NORMAL", 5000).unwrap();
+        migrate(&conn).unwrap();
+        let column = |sql: &str, index: usize| -> Vec<String> {
+            let mut statement = conn.prepare(sql).unwrap();
+            let rows = statement.query_map([], |row| row.get(index)).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        let tables = column(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            0,
+        );
+        let mut unindexed = Vec::new();
+        for table in &tables {
+            let mut foreign_keys = std::collections::BTreeMap::<i64, Vec<String>>::new();
+            {
+                let mut statement = conn
+                    .prepare(&format!("PRAGMA foreign_key_list('{table}')"))
+                    .unwrap();
+                let mut rows = statement.query([]).unwrap();
+                while let Some(row) = rows.next().unwrap() {
+                    foreign_keys
+                        .entry(row.get(0).unwrap())
+                        .or_default()
+                        .push(row.get(3).unwrap());
+                }
+            }
+            // The primary key and every index, as their column lists.
+            let mut indexed = vec![{
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT name FROM pragma_table_info('{table}') WHERE pk > 0 ORDER BY pk"
+                    ))
+                    .unwrap();
+                let rows = statement.query_map([], |row| row.get(0)).unwrap();
+                rows.collect::<Result<Vec<String>, _>>().unwrap()
+            }];
+            for index in column(&format!("PRAGMA index_list('{table}')"), 1) {
+                indexed.push(column(&format!("PRAGMA index_info('{index}')"), 2));
+            }
+            for columns in foreign_keys.into_values() {
+                let covered = indexed.iter().any(|index| {
+                    index.len() >= columns.len()
+                        && columns
+                            .iter()
+                            .all(|name| index[..columns.len()].contains(name))
+                });
+                let known = UNINDEXED_FOREIGN_KEYS.iter().any(|(known_table, known)| {
+                    known_table == table
+                        && known
+                            .iter()
+                            .map(|name| name.to_string())
+                            .collect::<Vec<_>>()
+                            == columns
+                });
+                if !covered && !known {
+                    unindexed.push(format!("{table}({})", columns.join(", ")));
+                }
+            }
+        }
+        assert!(
+            unindexed.is_empty(),
+            "foreign keys without an index on their referencing columns: {unindexed:?}"
+        );
     }
 
     type HeaderRow = (i64, i64, String, i64, String, Vec<u8>, String);

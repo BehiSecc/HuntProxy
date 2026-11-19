@@ -411,6 +411,51 @@ pub fn store_body_file_conn(
     })
 }
 
+/// The bodies of the exchanges that `condition` (a WHERE clause over
+/// `exchanges`, with its parameters) selects. Read them before deleting those
+/// exchanges, then pass them to [`delete_unreferenced_bodies`].
+pub(crate) fn exchange_body_ids(
+    conn: &rusqlite::Connection,
+    condition: &str,
+    values: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT request_body_id, response_body_id FROM exchanges WHERE {condition}"
+    ))?;
+    let mut rows = statement.query(values)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        for column in 0..2 {
+            if let Some(id) = row.get::<_, Option<i64>>(column)? {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Deletes those of `ids` that no exchange uses any more and returns how many
+/// went. Bodies are shared by content, so one that another exchange, in this
+/// project or any other, still uses stays. The work is proportional to `ids`,
+/// not to the database: each check is a lookup in the indexes of migration 019.
+pub(crate) fn delete_unreferenced_bodies(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+) -> rusqlite::Result<usize> {
+    let mut delete = conn.prepare(
+        "DELETE FROM bodies WHERE id=?1
+           AND NOT EXISTS (SELECT 1 FROM exchanges WHERE request_body_id=?1)
+           AND NOT EXISTS (SELECT 1 FROM exchanges WHERE response_body_id=?1)",
+    )?;
+    let mut deleted = 0;
+    for id in ids {
+        deleted += delete.execute([id])?;
+    }
+    Ok(deleted)
+}
+
 /// What one pass over stored bodies compressed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BodyCompaction {
