@@ -4,6 +4,7 @@
 //! requests and responses are stored in History. Upstream traffic still goes
 //! through the semantic transport and its `ValidatedDial` resolver.
 
+mod capture;
 mod revocation;
 mod websocket;
 
@@ -16,6 +17,7 @@ use crate::transport::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
+use capture::{BodyCapture, CompleteBody};
 use futures::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -37,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
@@ -362,7 +364,7 @@ async fn forward_request(
         .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("proxy-connection"))
         .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
         .collect::<Vec<_>>();
-    let mut request_spool = spool_request_body(
+    let mut request_body = capture_request_body(
         incoming,
         project.limits.capture_body_bytes,
         &state.config.spool_dir,
@@ -372,18 +374,17 @@ async fn forward_request(
         crate::request_rules::has_applicable_body_rules(&state.db, session.project_id, &url)
             .await?;
     let mut body = if rewrite_body {
-        if request_spool.as_ref().is_some_and(|(_, length)| {
-            *length > crate::request_rules::MAX_REWRITE_BODY_BYTES as u64
-        }) {
+        if request_body
+            .as_ref()
+            .is_some_and(|body| body.len() > crate::request_rules::MAX_REWRITE_BODY_BYTES as u64)
+        {
             return Err(DomainError::new(
                 ErrorCode::BodyTooLarge,
                 "request body exceeds 2 MiB rewrite limit",
             ));
         }
-        match &request_spool {
-            Some((spool, _)) => tokio::fs::read(spool.path())
-                .await
-                .map_err(spool_io_error)?,
+        match &request_body {
+            Some(body) => body.read().await.map_err(spool_io_error)?,
             None => Vec::new(),
         }
     } else {
@@ -404,27 +405,15 @@ async fn forward_request(
     if rotation.is_some() {
         wire_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("host"));
     }
-    if rewrite_body {
-        if let Some((spool, length)) = request_spool.as_mut() {
-            tokio::fs::write(spool.path(), &body)
-                .await
-                .map_err(spool_io_error)?;
-            *length = body.len() as u64;
-        } else if !body.is_empty() {
-            let (spool, mut file) = create_private_spool(&state.config.spool_dir, "request")?;
-            file.write_all(&body).await.map_err(spool_io_error)?;
-            file.flush().await.map_err(spool_io_error)?;
-            file.sync_data().await.map_err(spool_io_error)?;
-            drop(file);
-            request_spool = Some((spool, body.len() as u64));
-        }
+    // A rewritten body is at most the rewrite limit plus what the rules added,
+    // and is already in memory. A request that had a body keeps one, even if
+    // the rules emptied it, so History shows what was sent.
+    if rewrite_body && (request_body.is_some() || !body.is_empty()) {
+        request_body = Some(CompleteBody::Memory(Bytes::from(body)));
     }
-    let request_body = request_spool
+    let outbound_body = request_body
         .as_ref()
-        .map(|(spool, len)| OutboundBody::Spool {
-            path: spool.path().to_path_buf(),
-            len: *len,
-        })
+        .map(CompleteBody::outbound)
         .unwrap_or(OutboundBody::Empty);
     let start = std::time::Instant::now();
     let outbound = state
@@ -436,7 +425,7 @@ async fn forward_request(
                 method: method.clone(),
                 url: wire_url,
                 headers: wire_headers,
-                body: request_body,
+                body: outbound_body,
                 // The intercepted connection's version describes the browser
                 // talking to HuntProxy. Negotiate independently with the origin.
                 protocol: ProtocolMode::Auto,
@@ -459,7 +448,7 @@ async fn forward_request(
                     &target,
                     &method,
                     &headers,
-                    request_spool,
+                    request_body,
                     start.elapsed(),
                     &error,
                     &applied_rules,
@@ -480,7 +469,7 @@ async fn forward_request(
         target,
         method,
         headers,
-        request_spool,
+        request_body,
         outbound,
         project.limits.capture_body_bytes,
         start,
@@ -502,38 +491,33 @@ async fn forward_request(
     Ok(response)
 }
 
-async fn spool_request_body(
+/// Reads the whole request body before it is sent on, since rewrite rules and
+/// History both need all of it. `None` is a request without a body.
+async fn capture_request_body(
     mut body: Incoming,
     max_bytes: u64,
     spool_dir: &Path,
-) -> DomainResult<Option<(SpoolGuard, u64)>> {
-    let (spool, mut file) = create_private_spool(spool_dir, "request")?;
-    let mut length = 0u64;
+) -> DomainResult<Option<CompleteBody>> {
+    let mut capture = BodyCapture::new(spool_dir, "request");
     while let Some(frame) = body.frame().await {
         let frame =
             frame.map_err(|error| DomainError::new(ErrorCode::ProtocolError, error.to_string()))?;
         if let Ok(data) = frame.into_data() {
             let chunk_len = u64::try_from(data.len())
                 .map_err(|_| DomainError::new(ErrorCode::BodyTooLarge, "request body too large"))?;
-            if chunk_len > max_bytes.saturating_sub(length) {
+            if chunk_len > max_bytes.saturating_sub(capture.len()) {
                 return Err(DomainError::new(
                     ErrorCode::BodyTooLarge,
                     format!("request body exceeds project limit of {max_bytes} bytes"),
                 ));
             }
-            file.write_all(&data).await.map_err(spool_io_error)?;
-            length += chunk_len;
+            capture.write(&data).await.map_err(spool_io_error)?;
         }
     }
-    file.flush().await.map_err(spool_io_error)?;
-    file.sync_data().await.map_err(spool_io_error)?;
-    drop(file);
-    if length == 0 {
-        drop(spool);
-        Ok(None)
-    } else {
-        Ok(Some((spool, length)))
+    if capture.len() == 0 {
+        return Ok(None);
     }
+    capture.finish().await.map(Some).map_err(spool_io_error)
 }
 
 fn request_url(parts: &http::request::Parts, forced_scheme: Option<&str>) -> DomainResult<String> {
@@ -569,7 +553,7 @@ async fn record_failed_exchange(
     target: &TargetRef,
     method: &Method,
     headers: &[(String, Vec<u8>)],
-    request_spool: Option<(SpoolGuard, u64)>,
+    request_body: Option<CompleteBody>,
     duration: Duration,
     error: &DomainError,
     applied_rules: &[crate::request_rules::AppliedRequestRule],
@@ -579,12 +563,9 @@ async fn record_failed_exchange(
         return;
     }
     let completion = completion_for_error(error);
-    let request_path = request_spool
-        .as_ref()
-        .map(|(spool, _)| spool.path().to_path_buf());
     let result = state
         .db
-        .insert_exchange_from_spools(
+        .insert_captured_exchange(
             NewExchange {
                 project_id: session.project_id,
                 source: ExchangeSource::Proxy,
@@ -622,7 +603,7 @@ async fn record_failed_exchange(
                 page_title: None,
                 error_message: Some(error.to_string()),
             },
-            request_path,
+            request_body.as_ref().map(CompleteBody::stored),
             None,
         )
         .await;
@@ -740,7 +721,7 @@ fn streaming_response(
     target: TargetRef,
     method: Method,
     request_headers: Vec<(String, Vec<u8>)>,
-    request_spool: Option<(SpoolGuard, u64)>,
+    request_body: Option<CompleteBody>,
     outbound: StreamingOutboundResponse,
     capture_limit: u64,
     started: std::time::Instant,
@@ -748,8 +729,6 @@ fn streaming_response(
     suppress_crawl: bool,
     applied_rules: Vec<crate::request_rules::AppliedRequestRule>,
 ) -> DomainResult<Response<ProxyBody>> {
-    let (response_spool, response_file) =
-        create_private_spool(&state.config.spool_dir, "response")?;
     let status = outbound.status;
     let mut builder = Response::builder().status(outbound.status);
     for (name, value) in &outbound.headers {
@@ -777,9 +756,7 @@ fn streaming_response(
         target,
         method,
         request_headers,
-        request_spool,
-        response_spool,
-        response_file,
+        request_body,
         outbound,
         status,
         capture_limit,
@@ -799,9 +776,7 @@ async fn pump_streaming_response(
     target: TargetRef,
     method: Method,
     request_headers: Vec<(String, Vec<u8>)>,
-    request_spool: Option<(SpoolGuard, u64)>,
-    response_spool: SpoolGuard,
-    mut response_file: tokio::fs::File,
+    request_body: Option<CompleteBody>,
     mut outbound: StreamingOutboundResponse,
     status: StatusCode,
     capture_limit: u64,
@@ -818,11 +793,15 @@ async fn pump_streaming_response(
         .map(|header| String::from_utf8_lossy(&header.value).into_owned());
     let html_response = is_html_content_type(mime.as_deref());
     let crawl_html = session.is_browser_bound && !suppress_crawl && html_response;
-    let mut captured = 0u64;
+    // Nothing is kept of a response that will not be stored: out-of-scope
+    // traffic is only forwarded.
+    let mut response_capture = (capture
+        && !is_chrome_background_request(&session, &target, &method))
+    .then(|| BodyCapture::new(&state.config.spool_dir, "response"));
     let mut truncated = false;
     let mut completion = CompletionState::Complete;
     let mut error_message = None;
-    let mut response_spool_valid = true;
+    let mut response_body_valid = true;
 
     loop {
         let next = tokio::select! {
@@ -844,16 +823,14 @@ async fn pump_streaming_response(
                 break;
             }
         };
-        if response_spool_valid {
-            let room = capture_limit.saturating_sub(captured);
+        if let Some(capture) = response_capture.as_mut().filter(|_| response_body_valid) {
+            let room = capture_limit.saturating_sub(capture.len());
             let write_len = usize::try_from(room.min(chunk.len() as u64)).unwrap_or(chunk.len());
             if write_len > 0 {
-                if let Err(error) = response_file.write_all(&chunk[..write_len]).await {
-                    response_spool_valid = false;
+                if let Err(error) = capture.write(&chunk[..write_len]).await {
+                    response_body_valid = false;
                     completion = CompletionState::Interrupted;
                     error_message = Some(format!("response capture spool write failed: {error}"));
-                } else {
-                    captured += write_len as u64;
                 }
             }
             if write_len < chunk.len() {
@@ -872,27 +849,23 @@ async fn pump_streaming_response(
         return;
     }
 
-    if response_spool_valid {
-        if let Err(error) = response_file.flush().await {
-            response_spool_valid = false;
-            completion = CompletionState::Interrupted;
-            error_message = Some(format!("response capture spool flush failed: {error}"));
-        } else if let Err(error) = response_file.sync_data().await {
-            response_spool_valid = false;
-            completion = CompletionState::Interrupted;
-            error_message = Some(format!("response capture spool sync failed: {error}"));
-        }
-    }
-    drop(response_file);
+    let response_body = match response_capture.filter(|_| response_body_valid) {
+        Some(capture) => match capture.finish().await {
+            Ok(body) => Some(body),
+            Err(error) => {
+                response_body_valid = false;
+                completion = CompletionState::Interrupted;
+                error_message = Some(format!("response capture spool flush failed: {error}"));
+                None
+            }
+        },
+        None => None,
+    };
     if completion == CompletionState::Complete && truncated {
         completion = CompletionState::TruncatedByPolicy;
         error_message = Some("response body truncated by project capture limit".into());
     }
 
-    let request_path = request_spool
-        .as_ref()
-        .map(|(spool, _)| spool.path().to_path_buf());
-    let response_path = response_spool_valid.then(|| response_spool.path().to_path_buf());
     let document_url = format!(
         "{}://{}{}{}",
         target.scheme,
@@ -907,7 +880,7 @@ async fn pump_streaming_response(
     );
     let result = state
         .db
-        .insert_exchange_from_spools(
+        .insert_captured_exchange(
             NewExchange {
                 project_id: session.project_id,
                 source: ExchangeSource::Proxy,
@@ -924,7 +897,7 @@ async fn pump_streaming_response(
                 completion,
                 capture_quality: CaptureQuality::Semantic,
                 header_representation: HeaderRepresentation::Semantic,
-                body_representation: if response_spool_valid {
+                body_representation: if response_body_valid {
                     BodyRepresentation::SemanticEncoded
                 } else {
                     BodyRepresentation::Unavailable
@@ -946,8 +919,8 @@ async fn pump_streaming_response(
                 page_title: None,
                 error_message,
             },
-            request_path,
-            response_path,
+            request_body.as_ref().map(CompleteBody::stored),
+            response_body.as_ref().map(CompleteBody::stored),
         )
         .await;
     match result {
@@ -2178,7 +2151,7 @@ mod tests {
         target: SocketAddr,
         token: &str,
     ) -> tokio::net::TcpStream {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
         stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Bearer {token}\r\n\r\n").as_bytes()).await.unwrap();
         let response = tokio::time::timeout(Duration::from_secs(2), async {
@@ -2480,7 +2453,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rejects_non_http_non_tls_starts_without_dialing_origin() {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let directory = tempfile::tempdir().unwrap();
         let (state, _, session) = proxy_test_fixture(&directory).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2998,6 +2971,143 @@ mod tests {
             std::fs::read_dir(&state.config.spool_dir).unwrap().count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn bodies_past_the_memory_limit_are_spooled_and_stored_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, project, session) = proxy_test_fixture(&directory).await;
+        // Compressible and incompressible parts, in chunks that straddle the
+        // memory limit.
+        let response_chunks = (0..24u32)
+            .map(|index| {
+                let chunk = if index % 2 == 0 {
+                    vec![b'a' + (index % 26) as u8; 40_000]
+                } else {
+                    (0..40_000u32)
+                        .map(|byte| (byte.wrapping_mul(2_654_435_761) >> 13) as u8)
+                        .collect()
+                };
+                Bytes::from(chunk)
+            })
+            .collect::<Vec<_>>();
+        let response_bytes = response_chunks.concat();
+        assert!(response_bytes.len() > capture::MEMORY_BODY_BYTES);
+        let request_bytes = vec![b'r'; capture::MEMORY_BODY_BYTES + 1];
+        let mut request_capture = BodyCapture::new(&state.config.spool_dir, "request");
+        request_capture.write(&request_bytes).await.unwrap();
+        let request_body = request_capture.finish().await.unwrap();
+        assert!(matches!(request_body, CompleteBody::Spool(..)));
+
+        let response = streaming_response(
+            state.clone(),
+            session,
+            TargetRef::from_url("https://example.com/upload").unwrap(),
+            Method::POST,
+            vec![],
+            Some(request_body),
+            StreamingOutboundResponse {
+                status: StatusCode::OK,
+                headers: vec![],
+                body: Box::pin(futures::stream::iter(
+                    response_chunks.into_iter().map(Ok).collect::<Vec<_>>(),
+                )),
+                protocol: "HTTP/2".into(),
+                transport_provenance: TransportProvenance::ProtocolProfileOnly,
+                transport_profile: "test".into(),
+            },
+            10 * 1024 * 1024,
+            std::time::Instant::now(),
+            true,
+            false,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            response_bytes
+        );
+        let detail = wait_for_exchange(&state, project.id).await;
+        assert_eq!(detail.summary.completion, CompletionState::Complete);
+        for (side, expected) in [
+            (MessageSide::Request, &request_bytes),
+            (MessageSide::Response, &response_bytes),
+        ] {
+            let stored = state
+                .db
+                .load_raw_body(project.id, detail.summary.exchange_id, side)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored == *expected, "the stored {side:?} body differs");
+        }
+        // The pump still holds its spools until it finishes its follow-up work.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::fs::read_dir(&state.config.spool_dir).unwrap().count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("spools are removed once the exchange is stored");
+    }
+
+    #[tokio::test]
+    async fn a_response_that_is_not_captured_is_never_buffered_or_spooled() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, project, session) = proxy_test_fixture(&directory).await;
+        let chunk = Bytes::from(vec![b'x'; 100_000]);
+        let (sender, receiver) = mpsc::channel::<DomainResult<Bytes>>(1);
+        let response = streaming_response(
+            state.clone(),
+            session,
+            TargetRef::from_url("https://cdn.example.net/video").unwrap(),
+            Method::GET,
+            vec![],
+            None,
+            StreamingOutboundResponse {
+                status: StatusCode::OK,
+                headers: vec![],
+                body: Box::pin(ReceiverStream::new(receiver)),
+                protocol: "HTTP/2".into(),
+                transport_provenance: TransportProvenance::ProtocolProfileOnly,
+                transport_profile: "test".into(),
+            },
+            10 * 1024 * 1024,
+            std::time::Instant::now(),
+            false,
+            false,
+            vec![],
+        )
+        .unwrap();
+        let mut body = response.into_body();
+        let mut delivered = 0;
+        // More than the memory limit has passed through while the stream is
+        // still open: a capture would have spilled to a spool by now.
+        for _ in 0..4 {
+            sender.send(Ok(chunk.clone())).await.unwrap();
+            delivered += body
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap()
+                .len();
+        }
+        assert!(delivered > capture::MEMORY_BODY_BYTES);
+        assert_eq!(
+            std::fs::read_dir(&state.config.spool_dir).unwrap().count(),
+            0
+        );
+        drop(sender);
+        assert!(body.frame().await.is_none());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (items, _) = state
+            .db
+            .list_history(project.id, 10, None, None)
+            .await
+            .unwrap();
+        assert!(items.is_empty());
     }
 
     #[tokio::test]

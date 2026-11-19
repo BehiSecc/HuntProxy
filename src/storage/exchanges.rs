@@ -6,7 +6,7 @@ use crate::policy::{present_headers, PresentationOptions};
 use crate::storage::annotations::load_labels_conn;
 use crate::storage::bodies::{
     prepare_body, prepare_body_file, store_body_conn, store_body_file_conn,
-    store_prepared_body_conn, StoredBody,
+    store_prepared_body_conn, PreparedBody, PreparedBodyFile, StoredBody,
 };
 use crate::storage::headers::{insert_headers_conn, load_headers_conn};
 use crate::storage::projects::{now_rfc3339, parse_time};
@@ -19,6 +19,42 @@ use time::{Duration, OffsetDateTime};
 
 pub(crate) const EXCHANGE_ACCOUNTING_OVERHEAD: u64 = 512;
 pub(crate) const HEADER_ACCOUNTING_OVERHEAD: u64 = 64;
+
+/// A body captured off the wire, waiting to be stored with its exchange. A
+/// small body is held in memory; one too large for that is in a spool file.
+#[derive(Debug)]
+pub enum CapturedBody {
+    Memory(bytes::Bytes),
+    Spool(PathBuf),
+}
+
+/// A [`CapturedBody`] hashed and, unless it is already stored, encoded.
+enum PreparedCapture<'body> {
+    Memory(&'body [u8], PreparedBody),
+    Spool(&'body std::path::Path, PreparedBodyFile),
+}
+
+impl<'body> PreparedCapture<'body> {
+    fn of(conn: &rusqlite::Connection, body: &'body CapturedBody) -> DomainResult<Self> {
+        Ok(match body {
+            CapturedBody::Memory(data) => Self::Memory(data, prepare_body(conn, data)),
+            CapturedBody::Spool(path) => Self::Spool(path, prepare_body_file(conn, path)?),
+        })
+    }
+
+    fn store(
+        self,
+        conn: &rusqlite::Connection,
+        mime_class: Option<&str>,
+    ) -> DomainResult<StoredBody> {
+        match self {
+            Self::Memory(data, prepared) => {
+                store_prepared_body_conn(conn, data, prepared, mime_class)
+            }
+            Self::Spool(path, prepared) => store_body_file_conn(conn, path, prepared, mime_class),
+        }
+    }
+}
 
 const HISTORY_SELECT: &str =
     "SELECT exchange_id, source, started_at, duration_ms, method, scheme, authority, host, port, path, query,
@@ -561,28 +597,44 @@ impl Db {
         request_spool: Option<PathBuf>,
         response_spool: Option<PathBuf>,
     ) -> DomainResult<ExchangeId> {
+        self.insert_captured_exchange(
+            ex,
+            request_spool.map(CapturedBody::Spool),
+            response_spool.map(CapturedBody::Spool),
+        )
+        .await
+    }
+
+    /// Stores an exchange whose bodies were captured off the wire, each one
+    /// in memory or in a spool file.
+    pub async fn insert_captured_exchange(
+        &self,
+        ex: NewExchange,
+        request_body: Option<CapturedBody>,
+        response_body: Option<CapturedBody>,
+    ) -> DomainResult<ExchangeId> {
         if ex.request_body.is_some() || ex.response_body.is_some() {
             return Err(DomainError::new(
                 ErrorCode::InvalidArgument,
-                "spool-backed exchange must not also contain in-memory bodies",
+                "an exchange with captured bodies must not also contain in-memory bodies",
             ));
         }
         self.with_conn(move |conn| {
-            // Hash and compress the spools before taking the write lock.
-            let request = request_spool
-                .as_deref()
-                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
+            // Hash and compress the bodies before taking the write lock.
+            let request = request_body
+                .as_ref()
+                .map(|body| PreparedCapture::of(conn, body))
                 .transpose()?;
-            let response = response_spool
-                .as_deref()
-                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
+            let response = response_body
+                .as_ref()
+                .map(|body| PreparedCapture::of(conn, body))
                 .transpose()?;
             let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             let request_body = request
-                .map(|(path, hashed)| store_body_file_conn(&tx, path, hashed, None))
+                .map(|prepared| prepared.store(&tx, None))
                 .transpose()?;
             let response_body = response
-                .map(|(path, hashed)| store_body_file_conn(&tx, path, hashed, ex.mime.as_deref()))
+                .map(|prepared| prepared.store(&tx, ex.mime.as_deref()))
                 .transpose()?;
             let exchange_id = insert_exchange_record_conn(&tx, ex, request_body, response_body)?;
             tx.commit().map_err(storage_error)?;
