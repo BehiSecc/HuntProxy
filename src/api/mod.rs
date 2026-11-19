@@ -43,6 +43,13 @@ pub async fn serve_api_listener(
         .local_addr()
         .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
     tracing::info!(%addr, "api/ui listening");
+    // Streamed responses (events, downloads) are several small writes; see
+    // the proxy listener for why Nagle's algorithm is turned off.
+    let listener = axum::serve::ListenerExt::tap_io(listener, |stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(%error, "could not disable Nagle on an API connection");
+        }
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await
@@ -379,7 +386,26 @@ async fn track_control_activity(
     ) {
         state.activity.touch();
     }
+    if let Some(project_id) = project_control_target(request.method(), request.uri().path()) {
+        state.browser.touch_project(project_id);
+    }
     next.run(request).await
+}
+
+/// The project a request acts on, for the browser idle rule. Only changes
+/// count: the UI reloads project data, browser status included, whenever the
+/// proxy captures traffic, so reads would let an idle page keep its own
+/// browser open. Every browser control request is a POST or DELETE.
+fn project_control_target(method: &http::Method, path: &str) -> Option<ProjectId> {
+    if matches!(
+        *method,
+        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+    ) {
+        return None;
+    }
+    let rest = path.strip_prefix("/api/v1/projects/")?;
+    let id = rest.split('/').next()?;
+    id.parse().ok().map(ProjectId)
 }
 
 fn private_router(state: Arc<AppState>) -> Router {

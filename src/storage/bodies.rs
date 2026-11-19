@@ -111,7 +111,8 @@ fn encode_body(data: &[u8]) -> (String, Vec<u8>) {
 
 /// `(id, stored_length, codec)` of the body stored with this hash.
 fn stored_body_by_hash(conn: &rusqlite::Connection, hash: &str) -> Option<(i64, i64, String)> {
-    conn.query_row(
+    crate::storage::cached_query_row(
+        conn,
         "SELECT id, stored_length, codec FROM bodies WHERE sha256=?1 LIMIT 1",
         params![hash],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -147,7 +148,8 @@ pub fn store_prepared_body_conn(
     }
     let (codec, stored) = encoded.unwrap_or_else(|| encode_body(data));
 
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "INSERT INTO bodies (sha256, original_length, stored_length, codec, mime_class, content)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -374,7 +376,8 @@ pub fn store_body_file_conn(
             ("raw", file, length)
         }
     };
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "INSERT INTO bodies (sha256, original_length, stored_length, codec, mime_class, content)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -406,6 +409,51 @@ pub fn store_body_file_conn(
         stored_length: stored_length as i64,
         codec: codec.into(),
     })
+}
+
+/// The bodies of the exchanges that `condition` (a WHERE clause over
+/// `exchanges`, with its parameters) selects. Read them before deleting those
+/// exchanges, then pass them to [`delete_unreferenced_bodies`].
+pub(crate) fn exchange_body_ids(
+    conn: &rusqlite::Connection,
+    condition: &str,
+    values: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT request_body_id, response_body_id FROM exchanges WHERE {condition}"
+    ))?;
+    let mut rows = statement.query(values)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        for column in 0..2 {
+            if let Some(id) = row.get::<_, Option<i64>>(column)? {
+                ids.push(id);
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Deletes those of `ids` that no exchange uses any more and returns how many
+/// went. Bodies are shared by content, so one that another exchange, in this
+/// project or any other, still uses stays. The work is proportional to `ids`,
+/// not to the database: each check is a lookup in the indexes of migration 019.
+pub(crate) fn delete_unreferenced_bodies(
+    conn: &rusqlite::Connection,
+    ids: &[i64],
+) -> rusqlite::Result<usize> {
+    let mut delete = conn.prepare(
+        "DELETE FROM bodies WHERE id=?1
+           AND NOT EXISTS (SELECT 1 FROM exchanges WHERE request_body_id=?1)
+           AND NOT EXISTS (SELECT 1 FROM exchanges WHERE response_body_id=?1)",
+    )?;
+    let mut deleted = 0;
+    for id in ids {
+        deleted += delete.execute([id])?;
+    }
+    Ok(deleted)
 }
 
 /// What one pass over stored bodies compressed.

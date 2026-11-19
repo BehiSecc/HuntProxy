@@ -146,7 +146,8 @@ impl Db {
         project_id: ProjectId,
     ) -> DomainResult<Option<Option<String>>> {
         self.with_conn(move |conn| {
-            conn.query_row(
+            crate::storage::cached_query_row(
+                conn,
                 "SELECT proxy FROM project_upstream_proxies WHERE project_id=?1",
                 params![project_id.get()],
                 |row| row.get(0),

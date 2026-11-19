@@ -313,7 +313,38 @@ fn body_text_contains(stored: &[u8], content_encoding: Option<&str>, needle: &st
     }
 }
 
+/// How many prepared statements a connection keeps for reuse. Storing one
+/// captured exchange and the lookups before it use about twenty.
+const STATEMENT_CACHE_CAPACITY: usize = 64;
+
+/// Runs a query that returns one row through the connection's statement cache.
+/// Use it on paths that run for every request: preparing a statement (parsing
+/// and planning its SQL) costs more than running a small one.
+pub(crate) fn cached_query_row<T, P, F>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    row: F,
+) -> rusqlite::Result<T>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    conn.prepare_cached(sql)?.query_row(params, row)
+}
+
+/// Runs a statement through the connection's statement cache; see
+/// [`cached_query_row`]. Returns the number of rows it changed.
+pub(crate) fn cached_execute<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    conn.prepare_cached(sql)?.execute(params)
+}
+
 fn configure(conn: &Connection, synchronous: &str, busy_timeout_ms: u64) -> rusqlite::Result<()> {
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))?;
     conn.pragma_update(None, "synchronous", synchronous)?;
@@ -450,6 +481,40 @@ mod tests {
             assert_eq!((foreign_keys, busy_timeout, trusted_schema), (1, 5000, 0));
             assert!(contains);
         }
+    }
+
+    #[tokio::test]
+    async fn cached_statements_are_reused_and_survive_a_schema_change() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.with_conn(|conn| {
+            let count = |conn: &Connection| {
+                cached_query_row(conn, "SELECT count(*) FROM cached_fixture", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+            };
+            conn.execute_batch("CREATE TABLE cached_fixture(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            for value in ["a", "b"] {
+                let changed =
+                    cached_execute(conn, "INSERT INTO cached_fixture(v) VALUES (?1)", [value]);
+                assert_eq!(changed.unwrap(), 1);
+            }
+            assert_eq!(count(conn), 2);
+            // A migration or an index added later must not break a statement
+            // that a pooled connection prepared before it.
+            conn.execute_batch(
+                "ALTER TABLE cached_fixture ADD COLUMN extra TEXT;
+                 CREATE INDEX cached_fixture_v ON cached_fixture(v);",
+            )
+            .unwrap();
+            let changed = cached_execute(conn, "INSERT INTO cached_fixture(v) VALUES (?1)", ["c"]);
+            assert_eq!(changed.unwrap(), 1);
+            assert_eq!(count(conn), 3);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

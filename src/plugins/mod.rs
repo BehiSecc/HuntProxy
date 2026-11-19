@@ -1682,12 +1682,11 @@ impl PluginService {
     }
 
     pub fn has_active_jobs(&self) -> bool {
-        self.jobs.iter().any(|job| {
-            matches!(
-                job.view.read().state,
-                PluginJobState::Queued | PluginJobState::Running
-            )
-        })
+        has_active_job(&self.jobs, None)
+    }
+
+    pub fn has_active_jobs_for(&self, project_id: ProjectId) -> bool {
+        has_active_job(&self.jobs, Some(project_id))
     }
 
     fn prune_finished_jobs(&self) {
@@ -5527,6 +5526,15 @@ fn evaluate_race_success(
     }))
 }
 
+/// Whether a job is queued or running, in `project_id` when given.
+fn has_active_job(jobs: &DashMap<Uuid, Arc<PluginJob>>, project_id: Option<ProjectId>) -> bool {
+    jobs.iter().any(|job| {
+        let view = job.view.read();
+        project_id.is_none_or(|project_id| view.project_id == project_id)
+            && matches!(view.state, PluginJobState::Queued | PluginJobState::Running)
+    })
+}
+
 fn prune_finished_jobs(jobs: &DashMap<Uuid, Arc<PluginJob>>) {
     let excess = jobs
         .len()
@@ -7288,6 +7296,21 @@ mod tests {
         let summary = summarize_plugin_result(&json!({"execution":after.value()}));
         assert_eq!(summary["execution"]["evidence_exchange_count"], 2);
         assert!(summary["execution"].get("evidence_exchange_ids").is_none());
+    }
+
+    #[test]
+    fn queued_and_running_jobs_are_reported_per_project() {
+        let jobs = DashMap::new();
+        jobs.insert(Uuid::new_v4(), test_job(PluginJobState::Completed));
+        assert!(!has_active_job(&jobs, None));
+        assert!(!has_active_job(&jobs, Some(ProjectId(1))));
+        for state in [PluginJobState::Queued, PluginJobState::Running] {
+            let jobs = DashMap::new();
+            jobs.insert(Uuid::new_v4(), test_job(state));
+            assert!(has_active_job(&jobs, None));
+            assert!(has_active_job(&jobs, Some(ProjectId(1))));
+            assert!(!has_active_job(&jobs, Some(ProjectId(2))));
+        }
     }
 
     #[test]

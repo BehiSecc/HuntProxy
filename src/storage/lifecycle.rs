@@ -203,6 +203,14 @@ impl Db {
                 params![project_id.get(), cutoff_for_query],
             )
             .map_err(|error| storage_error(error.to_string()))?;
+            // Bodies are shared by content, so note which ones the exchanges
+            // being cleared use, then remove those nothing else references.
+            let body_ids = crate::storage::bodies::exchange_body_ids(
+                &tx,
+                "project_id=?1 AND julianday(started_at) < julianday(?2)",
+                params![project_id.get(), cutoff_for_query],
+            )
+            .map_err(|error| storage_error(error.to_string()))?;
             let deleted = tx
                 .execute(
                     "DELETE FROM exchanges WHERE project_id=?1
@@ -215,14 +223,8 @@ impl Db {
                 [],
             )
             .map_err(|error| storage_error(error.to_string()))?;
-            tx.execute(
-                "DELETE FROM bodies WHERE id NOT IN (
-                    SELECT request_body_id FROM exchanges WHERE request_body_id IS NOT NULL
-                    UNION SELECT response_body_id FROM exchanges WHERE response_body_id IS NOT NULL
-                 )",
-                [],
-            )
-            .map_err(|error| storage_error(error.to_string()))?;
+            crate::storage::bodies::delete_unreferenced_bodies(&tx, &body_ids)
+                .map_err(|error| storage_error(error.to_string()))?;
             crate::storage::delete_unused_header_values(&tx)
                 .map_err(|error| storage_error(error.to_string()))?;
             reconcile_project_usage_conn(&tx, project_id)?;
@@ -845,6 +847,126 @@ mod tests {
             page_title: None,
             error_message: None,
         }
+    }
+
+    fn exchange_with_bodies(project_id: ProjectId, request: &str, response: &str) -> NewExchange {
+        NewExchange {
+            request_body: Some(request.as_bytes().to_vec()),
+            response_body: Some(response.as_bytes().to_vec()),
+            ..exchange(project_id)
+        }
+    }
+
+    async fn stored_bodies(db: &Db) -> Vec<String> {
+        db.with_conn(|conn| {
+            let mut statement = conn
+                .prepare("SELECT codec, content FROM bodies ORDER BY id")
+                .map_err(|error| storage_error(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|error| storage_error(error.to_string()))?;
+            let mut bodies = Vec::new();
+            for row in rows {
+                let (codec, content) = row.map_err(|error| storage_error(error.to_string()))?;
+                let body = crate::storage::bodies::decode_body(&codec, &content)?;
+                bodies.push(String::from_utf8(body).unwrap());
+            }
+            bodies.sort();
+            Ok(bodies)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deleting_a_project_removes_its_bodies_and_keeps_those_another_project_shares() {
+        let db = Db::open_in_memory().await.unwrap();
+        let doomed = db.create_project(project_request("Doomed")).await.unwrap();
+        let kept = db.create_project(project_request("Kept")).await.unwrap();
+        // "shared" is a response in one project and a request in the other.
+        db.insert_exchange(exchange_with_bodies(doomed.id, "doomed request", "shared"))
+            .await
+            .unwrap();
+        db.insert_exchange(exchange_with_bodies(
+            doomed.id,
+            "doomed request",
+            "doomed only",
+        ))
+        .await
+        .unwrap();
+        let kept_exchange = db
+            .insert_exchange(exchange_with_bodies(kept.id, "shared", "kept only"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_bodies(&db).await,
+            ["doomed only", "doomed request", "kept only", "shared"]
+        );
+
+        db.delete_project(doomed.id).await.unwrap();
+
+        assert_eq!(stored_bodies(&db).await, ["kept only", "shared"]);
+        for (side, expected) in [
+            (MessageSide::Request, "shared"),
+            (MessageSide::Response, "kept only"),
+        ] {
+            let body = db
+                .load_raw_body(kept.id, kept_exchange, side)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(body, expected.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_history_removes_only_bodies_that_nothing_newer_uses() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db.create_project(project_request("History")).await.unwrap();
+        let other = db.create_project(project_request("Other")).await.unwrap();
+        let old = db
+            .insert_exchange(exchange_with_bodies(project.id, "old request", "reused"))
+            .await
+            .unwrap();
+        db.insert_exchange(exchange_with_bodies(
+            other.id,
+            "other request",
+            "old request",
+        ))
+        .await
+        .unwrap();
+        // Everything stored so far is older than the cutoff.
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE exchanges SET started_at='2020-01-01T00:00:00Z'
+                 WHERE project_id=?1 AND exchange_id=?2",
+                params![project.id.get(), old.get()],
+            )
+            .map_err(|error| storage_error(error.to_string()))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.insert_exchange(exchange_with_bodies(project.id, "new request", "reused"))
+            .await
+            .unwrap();
+
+        let cleared = db
+            .clear_history_before(project.id, "2021-01-01T00:00:00Z".into())
+            .await
+            .unwrap();
+
+        assert_eq!(cleared.deleted_exchanges, 1);
+        // "old request" is still another project's response, and "reused" is
+        // still this project's newer response.
+        assert_eq!(
+            stored_bodies(&db).await,
+            ["new request", "old request", "other request", "reused"]
+        );
+        db.delete_project(other.id).await.unwrap();
+        assert_eq!(stored_bodies(&db).await, ["new request", "reused"]);
     }
 
     #[tokio::test]

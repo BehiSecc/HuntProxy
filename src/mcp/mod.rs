@@ -1220,6 +1220,10 @@ fn emit_event(state: &AppState, project_id: ProjectId, kind: &str, payload: Valu
 }
 
 pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResult<Value> {
+    // Any call about a project keeps that project's browsers open.
+    if let Some(project_id) = args.get("project_id").and_then(Value::as_i64) {
+        state.browser.touch_project(ProjectId(project_id));
+    }
     match name {
         "extension_list" => Ok(json!({
             "plugin_directory": state.plugins.directory(),

@@ -401,3 +401,37 @@ async fn websocket_messages_page_within_the_budget_and_long_payloads_read_whole(
         assert_eq!(error.code(), code);
     }
 }
+
+#[tokio::test]
+async fn a_tool_call_about_a_project_counts_as_its_browser_activity() {
+    let (_directory, state, project_id) = test_state().await;
+    let idle = |project: ProjectId| state.browser.project_idle_for(project);
+    call_tool(state.clone(), "extension_list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(idle(project_id), std::time::Duration::MAX);
+
+    call_tool(
+        state.clone(),
+        "history_search",
+        json!({"project_id": project_id.get(), "limit": 1}),
+    )
+    .await
+    .unwrap();
+    assert!(idle(project_id) < std::time::Duration::from_secs(60));
+    // A call that fails is still the agent at work.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let before = idle(project_id);
+    call_tool(
+        state.clone(),
+        "browser_action",
+        json!({"project_id": project_id.get(), "session_id": 999_999, "action": {"type": "snapshot"}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(idle(project_id) < before);
+    assert_eq!(
+        idle(ProjectId(project_id.get() + 1)),
+        std::time::Duration::MAX
+    );
+}

@@ -6,7 +6,7 @@ use crate::policy::{present_headers, PresentationOptions};
 use crate::storage::annotations::load_labels_conn;
 use crate::storage::bodies::{
     prepare_body, prepare_body_file, store_body_conn, store_body_file_conn,
-    store_prepared_body_conn, StoredBody,
+    store_prepared_body_conn, PreparedBody, PreparedBodyFile, StoredBody,
 };
 use crate::storage::headers::{insert_headers_conn, load_headers_conn};
 use crate::storage::projects::{now_rfc3339, parse_time};
@@ -19,6 +19,42 @@ use time::{Duration, OffsetDateTime};
 
 pub(crate) const EXCHANGE_ACCOUNTING_OVERHEAD: u64 = 512;
 pub(crate) const HEADER_ACCOUNTING_OVERHEAD: u64 = 64;
+
+/// A body captured off the wire, waiting to be stored with its exchange. A
+/// small body is held in memory; one too large for that is in a spool file.
+#[derive(Debug)]
+pub enum CapturedBody {
+    Memory(bytes::Bytes),
+    Spool(PathBuf),
+}
+
+/// A [`CapturedBody`] hashed and, unless it is already stored, encoded.
+enum PreparedCapture<'body> {
+    Memory(&'body [u8], PreparedBody),
+    Spool(&'body std::path::Path, PreparedBodyFile),
+}
+
+impl<'body> PreparedCapture<'body> {
+    fn of(conn: &rusqlite::Connection, body: &'body CapturedBody) -> DomainResult<Self> {
+        Ok(match body {
+            CapturedBody::Memory(data) => Self::Memory(data, prepare_body(conn, data)),
+            CapturedBody::Spool(path) => Self::Spool(path, prepare_body_file(conn, path)?),
+        })
+    }
+
+    fn store(
+        self,
+        conn: &rusqlite::Connection,
+        mime_class: Option<&str>,
+    ) -> DomainResult<StoredBody> {
+        match self {
+            Self::Memory(data, prepared) => {
+                store_prepared_body_conn(conn, data, prepared, mime_class)
+            }
+            Self::Spool(path, prepared) => store_body_file_conn(conn, path, prepared, mime_class),
+        }
+    }
+}
 
 const HISTORY_SELECT: &str =
     "SELECT exchange_id, source, started_at, duration_ms, method, scheme, authority, host, port, path, query,
@@ -561,28 +597,44 @@ impl Db {
         request_spool: Option<PathBuf>,
         response_spool: Option<PathBuf>,
     ) -> DomainResult<ExchangeId> {
+        self.insert_captured_exchange(
+            ex,
+            request_spool.map(CapturedBody::Spool),
+            response_spool.map(CapturedBody::Spool),
+        )
+        .await
+    }
+
+    /// Stores an exchange whose bodies were captured off the wire, each one
+    /// in memory or in a spool file.
+    pub async fn insert_captured_exchange(
+        &self,
+        ex: NewExchange,
+        request_body: Option<CapturedBody>,
+        response_body: Option<CapturedBody>,
+    ) -> DomainResult<ExchangeId> {
         if ex.request_body.is_some() || ex.response_body.is_some() {
             return Err(DomainError::new(
                 ErrorCode::InvalidArgument,
-                "spool-backed exchange must not also contain in-memory bodies",
+                "an exchange with captured bodies must not also contain in-memory bodies",
             ));
         }
         self.with_conn(move |conn| {
-            // Hash and compress the spools before taking the write lock.
-            let request = request_spool
-                .as_deref()
-                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
+            // Hash and compress the bodies before taking the write lock.
+            let request = request_body
+                .as_ref()
+                .map(|body| PreparedCapture::of(conn, body))
                 .transpose()?;
-            let response = response_spool
-                .as_deref()
-                .map(|path| prepare_body_file(conn, path).map(|prepared| (path, prepared)))
+            let response = response_body
+                .as_ref()
+                .map(|body| PreparedCapture::of(conn, body))
                 .transpose()?;
             let tx = crate::storage::write_transaction(conn).map_err(storage_error)?;
             let request_body = request
-                .map(|(path, hashed)| store_body_file_conn(&tx, path, hashed, None))
+                .map(|prepared| prepared.store(&tx, None))
                 .transpose()?;
             let response_body = response
-                .map(|(path, hashed)| store_body_file_conn(&tx, path, hashed, ex.mime.as_deref()))
+                .map(|prepared| prepared.store(&tx, ex.mime.as_deref()))
                 .transpose()?;
             let exchange_id = insert_exchange_record_conn(&tx, ex, request_body, response_body)?;
             tx.commit().map_err(storage_error)?;
@@ -981,7 +1033,8 @@ fn insert_exchange_record_conn(
         None => (None, None, None),
     };
 
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "INSERT INTO exchanges (
             project_id, exchange_id, source, started_at, duration_ms, protocol, method, scheme,
             authority, host, port, path, query, status_code, mime, request_length, response_length,
@@ -1063,26 +1116,26 @@ fn insert_exchange_record_conn(
                     .saturating_add(header.value.len() as u64)
             });
     let accounted_bytes = estimated_exchange_bytes(&ex, req_len, resp_len);
-    let changed = conn
-        .execute(
-            "UPDATE project_usage SET
-                exchange_count=exchange_count+1,
-                request_body_bytes=request_body_bytes+?1,
-                response_body_bytes=response_body_bytes+?2,
-                header_bytes=header_bytes+?3,
-                accounted_bytes=accounted_bytes+?4,
-                updated_at=?5
-             WHERE project_id=?6",
-            params![
-                as_i64(request_bytes),
-                as_i64(response_bytes),
-                as_i64(header_bytes),
-                as_i64(accounted_bytes),
-                now_rfc3339(),
-                ex.project_id.get(),
-            ],
-        )
-        .map_err(storage_error)?;
+    let changed = crate::storage::cached_execute(
+        conn,
+        "UPDATE project_usage SET
+            exchange_count=exchange_count+1,
+            request_body_bytes=request_body_bytes+?1,
+            response_body_bytes=response_body_bytes+?2,
+            header_bytes=header_bytes+?3,
+            accounted_bytes=accounted_bytes+?4,
+            updated_at=?5
+         WHERE project_id=?6",
+        params![
+            as_i64(request_bytes),
+            as_i64(response_bytes),
+            as_i64(header_bytes),
+            as_i64(accounted_bytes),
+            now_rfc3339(),
+            ex.project_id.get(),
+        ],
+    )
+    .map_err(storage_error)?;
     if changed != 1 {
         return Err(DomainError::new(
             ErrorCode::StorageError,
@@ -1099,20 +1152,20 @@ fn enforce_project_disk_quota(
     request_length: Option<i64>,
     response_length: Option<i64>,
 ) -> DomainResult<()> {
-    let (limits_json, current_usage): (String, i64) = conn
-        .query_row(
-            "SELECT p.limits_json, u.accounted_bytes
-             FROM projects p JOIN project_usage u ON u.project_id=p.id
-             WHERE p.id=?1",
-            params![ex.project_id.get()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => {
-                crate::storage::lifecycle::missing_usage_or_project(conn, ex.project_id)
-            }
-            other => storage_error(other),
-        })?;
+    let (limits_json, current_usage): (String, i64) = crate::storage::cached_query_row(
+        conn,
+        "SELECT p.limits_json, u.accounted_bytes
+         FROM projects p JOIN project_usage u ON u.project_id=p.id
+         WHERE p.id=?1",
+        params![ex.project_id.get()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => {
+            crate::storage::lifecycle::missing_usage_or_project(conn, ex.project_id)
+        }
+        other => storage_error(other),
+    })?;
     let limits: ProjectLimits = serde_json::from_str(&limits_json).map_err(|error| {
         DomainError::new(
             ErrorCode::StorageError,
@@ -1193,18 +1246,19 @@ fn alloc_exchange_id(
     conn: &rusqlite::Connection,
     project_id: ProjectId,
 ) -> DomainResult<ExchangeId> {
-    conn.execute(
+    crate::storage::cached_execute(
+        conn,
         "UPDATE project_seq SET next_exchange_id = next_exchange_id + 1 WHERE project_id=?1",
         params![project_id.get()],
     )
     .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
-    let next: i64 = conn
-        .query_row(
-            "SELECT next_exchange_id FROM project_seq WHERE project_id=?1",
-            params![project_id.get()],
-            |r| r.get(0),
-        )
-        .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
+    let next: i64 = crate::storage::cached_query_row(
+        conn,
+        "SELECT next_exchange_id FROM project_seq WHERE project_id=?1",
+        params![project_id.get()],
+        |r| r.get(0),
+    )
+    .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))?;
     Ok(ExchangeId(next - 1))
 }
 

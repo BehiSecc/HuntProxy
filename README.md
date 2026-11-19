@@ -439,7 +439,7 @@ Yes. Run HuntProxy and your agent on a VPS, connect from your phone with [Tailsc
 <details>
 <summary><strong>Do I need to keep HuntProxy running?</strong></summary>
 
-Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an MCP-started daemon shuts down after one hour without MCP or UI control activity. The next tool call automatically recovers an idle or unexpectedly terminated daemon. After an explicit `huntproxy_stop`, call `huntproxy_restart` on the same connection. Run `HuntProxy serve` when you want the workbench to stay active until explicitly stopped.
+Not necessarily. `HuntProxy mcp` starts the daemon automatically. By default, an MCP-started daemon shuts down after one hour without MCP or UI control activity. While it runs, a project's browsers stop after 30 minutes without activity in that project, unless a call, a CDP handoff, or a Fuzzer or plugin job is still using them; `browser_start` resumes the saved profile. The next tool call automatically recovers an idle or unexpectedly terminated daemon. After an explicit `huntproxy_stop`, call `huntproxy_restart` on the same connection. Run `HuntProxy serve` when you want the workbench to stay active until explicitly stopped.
 
 </details>
 
