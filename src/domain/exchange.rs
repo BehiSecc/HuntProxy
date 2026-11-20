@@ -69,6 +69,8 @@ pub enum TransportProvenance {
     GenericUnprofiled,
     ChromiumWireFidelity,
     SemanticProxy,
+    /// A block request rule answered the request inside HuntProxy; nothing was sent upstream.
+    RequestRuleBlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

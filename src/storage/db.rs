@@ -635,6 +635,7 @@ mod tests {
         config.ensure_layout().unwrap();
         let database = Connection::open(config.db_path()).unwrap();
         migrations::migrate(&database).unwrap();
+        database.execute_batch(migrations::UNDO_020).unwrap();
         database.execute_batch(migrations::UNDO_018).unwrap();
         database.execute_batch("DROP TABLE project_upstream_proxies; DROP INDEX idx_capture_sessions_token_lookup; DROP INDEX idx_capture_sessions_legacy_active; ALTER TABLE capture_sessions DROP COLUMN token_lookup; ALTER TABLE browser_sessions DROP COLUMN profile_name; PRAGMA user_version=14; CREATE TABLE saved_fixture(name TEXT); INSERT INTO saved_fixture VALUES ('Existing project');").unwrap();
         config

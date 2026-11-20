@@ -1711,6 +1711,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_rules_never_stop_repeater_requests() {
+        let db = Arc::new(Db::open_in_memory().await.unwrap());
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "blocks".into(),
+                target_url: "http://127.0.0.1".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        db.create_request_rule(
+            project.id,
+            crate::request_rules::RequestRuleInput {
+                name: "proxy-only block".into(),
+                enabled: true,
+                position: 0,
+                host_pattern: Some("127.0.0.1".into()),
+                target: crate::request_rules::RequestRuleTarget::Url,
+                operation: crate::request_rules::RequestRuleOperation::Block,
+                header_name: None,
+                match_kind: crate::request_rules::RequestRuleMatchKind::Literal,
+                pattern: "/logout".into(),
+                replacement: None,
+                replace_all: true,
+                method: None,
+                response_status: Some(200),
+                response_content_type: None,
+                response_body: None,
+            },
+        )
+        .await
+        .unwrap();
+        let recorded_urls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let service = ReplyService {
+            db,
+            transport: Arc::new(RecordingTransport {
+                headers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                urls: recorded_urls.clone(),
+            }),
+            placeholder_key: PlaceholderKey::from_bytes(vec![1; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        };
+        service
+            .send(
+                project.id,
+                None,
+                None,
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    url: Some("http://127.0.0.1/logout?source=ChromiumAccountReconcilor".into()),
+                    ..Default::default()
+                },
+                ProtocolPreference::H1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_urls.lock().unwrap().as_slice(),
+            ["http://127.0.0.1/logout?source=ChromiumAccountReconcilor"],
+            "an explicitly tested request reaches the origin even when a block rule matches it"
+        );
+    }
+
+    #[tokio::test]
     async fn managed_cookie_replaces_inherited_but_not_explicit_cookie() {
         let db = Arc::new(Db::open_in_memory().await.unwrap());
         let project = db

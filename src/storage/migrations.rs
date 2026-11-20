@@ -83,6 +83,16 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Removes migration 020's request rule columns. Run it before UNDO_018 when a
+/// test rebuilds an older schema from a current database.
+#[cfg(test)]
+pub(crate) const UNDO_020: &str = "
+    ALTER TABLE request_rules DROP COLUMN method;
+    ALTER TABLE request_rules DROP COLUMN response_status;
+    ALTER TABLE request_rules DROP COLUMN response_content_type;
+    ALTER TABLE request_rules DROP COLUMN response_body;
+";
+
 /// Turns a current database back into its schema-17 shape, keeping its header
 /// rows, for tests that build databases from older releases.
 #[cfg(test)]

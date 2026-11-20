@@ -1388,6 +1388,7 @@ fn transport_prov_str(t: TransportProvenance) -> &'static str {
         TransportProvenance::GenericUnprofiled => "generic_unprofiled",
         TransportProvenance::ChromiumWireFidelity => "chromium_wire_fidelity",
         TransportProvenance::SemanticProxy => "semantic_proxy",
+        TransportProvenance::RequestRuleBlock => "request_rule_block",
     }
 }
 pub(crate) fn parse_transport_prov(s: &str) -> TransportProvenance {
@@ -1396,6 +1397,7 @@ pub(crate) fn parse_transport_prov(s: &str) -> TransportProvenance {
         "identity_inconsistent" => TransportProvenance::IdentityInconsistent,
         "generic_unprofiled" => TransportProvenance::GenericUnprofiled,
         "chromium_wire_fidelity" => TransportProvenance::ChromiumWireFidelity,
+        "request_rule_block" => TransportProvenance::RequestRuleBlock,
         _ => TransportProvenance::SemanticProxy,
     }
 }

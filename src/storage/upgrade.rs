@@ -568,6 +568,7 @@ mod tests {
         configure_connection(&conn, "NORMAL", 5000).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         migrations::migrate(&conn).unwrap();
+        conn.execute_batch(migrations::UNDO_020).unwrap();
         conn.execute_batch(migrations::UNDO_018).unwrap();
         conn.execute_batch(
             "INSERT INTO projects (name,created_at,updated_at,scope_json,limits_json)

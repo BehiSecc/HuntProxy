@@ -49,8 +49,39 @@ pub(super) async fn handle(
     let upgrade = hyper::upgrade::on(&mut request);
     let (parts, _body) = request.into_parts();
     let mut http_url = websocket_policy_url(&request_url(&parts, forced_scheme)?)?;
-    let mut applied_rules =
-        crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut http_url).await?;
+    let exempt =
+        super::own_api_block_exemption(&TargetRef::from_url(&http_url)?, state.config.api_listen);
+    let outcome = crate::request_rules::apply_url_rules_with_blocks(
+        &state.db,
+        session.project_id,
+        &mut http_url,
+        parts.method.as_str(),
+        &exempt,
+    )
+    .await?;
+    let mut applied_rules = outcome.applied;
+    if let Some(block) = outcome.block {
+        // A blocked upgrade gets the synthetic response instead of 101 and never dials out.
+        let capture = url_is_in_scope(&http_url, &project.scope)?
+            && !is_own_api_target(&TargetRef::from_url(&http_url)?, state.config.api_listen);
+        let headers = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        return super::blocked_response(
+            &state,
+            &session,
+            &parts.method,
+            parts.version,
+            &http_url,
+            &headers,
+            block,
+            applied_rules,
+            capture,
+        )
+        .await;
+    }
     let target = TargetRef::from_url(&http_url)?;
     let capture = url_is_in_scope(&http_url, &project.scope)?
         && !is_own_api_target(&target, state.config.api_listen);

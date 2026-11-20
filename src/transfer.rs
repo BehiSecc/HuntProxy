@@ -1416,6 +1416,7 @@ mod tests {
         let unpacked = directory.path().join("schema14");
         unpack_bundle(&current_bundle, &unpacked);
         let archive = rusqlite::Connection::open(unpacked.join("project.sqlite3")).unwrap();
+        archive.execute_batch(crate::storage::UNDO_020).unwrap();
         archive.execute_batch(crate::storage::UNDO_018).unwrap();
         archive
             .execute_batch(

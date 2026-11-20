@@ -295,13 +295,43 @@ async fn forward_request(
     let original_url = url.clone();
     let original_target = TargetRef::from_url(&url)?;
     enforce_browser_request_origin(browser_origin.as_deref(), &url, false)?;
-    let mut applied_rules =
-        crate::request_rules::apply_url_rules(&state.db, session.project_id, &mut url).await?;
+    let api_listen = state.config.api_listen;
+    let exempt = own_api_block_exemption(&original_target, api_listen);
+    let outcome = crate::request_rules::apply_url_rules_with_blocks(
+        &state.db,
+        session.project_id,
+        &mut url,
+        parts.method.as_str(),
+        &exempt,
+    )
+    .await?;
+    let mut applied_rules = outcome.applied;
+    if let Some(block) = outcome.block {
+        let capture = url_is_in_scope(&url, &project.scope)?
+            && !is_own_api_target(&TargetRef::from_url(&url)?, api_listen);
+        let headers = parts
+            .headers
+            .iter()
+            .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("proxy-connection"))
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        return blocked_response(
+            &state,
+            &session,
+            &parts.method,
+            parts.version,
+            &url,
+            &headers,
+            block,
+            applied_rules,
+            capture,
+        )
+        .await;
+    }
     enforce_browser_request_origin(browser_origin.as_deref(), &url, true)?;
     let target = TargetRef::from_url(&url)?;
     // Requests to this daemon stay on its listener, independent of project
     // egress settings. A rewrite to or from another target is not internal.
-    let api_listen = state.config.api_listen;
     let api_dial = if is_own_api_target(&original_target, api_listen)
         && is_own_api_target(&target, api_listen)
     {
@@ -489,6 +519,156 @@ async fn forward_request(
         );
     }
     Ok(response)
+}
+
+/// Block rules never apply to HuntProxy's own API or UI, so a broad rule cannot lock the
+/// user out of the daemon. Both the original and the rewritten URL are checked.
+pub(super) fn own_api_block_exemption(
+    original: &TargetRef,
+    api_listen: SocketAddr,
+) -> impl Fn(&str) -> bool + Send + Sync {
+    let original_is_api = is_own_api_target(original, api_listen);
+    move |url: &str| {
+        original_is_api
+            || TargetRef::from_url(url).is_ok_and(|target| is_own_api_target(&target, api_listen))
+    }
+}
+
+/// Answers a request a block rule matched. Nothing is sent upstream (no DNS lookup, IP
+/// rotation, upstream proxy, or body read), and the response never sets cookies. With
+/// `capture`, the exchange is recorded in History with the rule that blocked it.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn blocked_response(
+    state: &AppState,
+    session: &CaptureSession,
+    method: &Method,
+    version: hyper::Version,
+    url: &str,
+    request_headers: &[(String, Vec<u8>)],
+    block: crate::request_rules::RequestRuleBlock,
+    applied_rules: Vec<crate::request_rules::AppliedRequestRule>,
+    capture: bool,
+) -> DomainResult<Response<ProxyBody>> {
+    let status = StatusCode::from_u16(block.status)
+        .map_err(|error| DomainError::invalid(format!("invalid block response status: {error}")))?;
+    let (headers, body) = block.response_parts(method == Method::HEAD);
+    if capture {
+        record_blocked_exchange(
+            state,
+            session,
+            method,
+            version,
+            url,
+            request_headers,
+            status,
+            &headers,
+            &body,
+            applied_rules,
+        )
+        .await;
+    }
+    let mut response = Response::builder().status(status);
+    for (name, value) in &headers {
+        response = response.header(*name, value.as_str());
+    }
+    response
+        .body(full_body(Bytes::from(body)))
+        .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_blocked_exchange(
+    state: &AppState,
+    session: &CaptureSession,
+    method: &Method,
+    version: hyper::Version,
+    url: &str,
+    request_headers: &[(String, Vec<u8>)],
+    status: StatusCode,
+    response_headers: &[(&'static str, String)],
+    body: &[u8],
+    applied_rules: Vec<crate::request_rules::AppliedRequestRule>,
+) {
+    let Ok(target) = TargetRef::from_url(url) else {
+        return;
+    };
+    let response_headers = response_headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.clone().into_bytes()))
+        .collect::<Vec<_>>();
+    let mime = response_headers
+        .iter()
+        .find(|(name, _)| name == "content-type")
+        .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
+    let protocol = match version {
+        hyper::Version::HTTP_2 => "HTTP/2",
+        hyper::Version::HTTP_3 => "HTTP/3",
+        hyper::Version::HTTP_10 => "HTTP/1.0",
+        _ => "HTTP/1.1",
+    };
+    let result = state
+        .db
+        .insert_captured_exchange(
+            NewExchange {
+                project_id: session.project_id,
+                source: ExchangeSource::Proxy,
+                protocol: protocol.into(),
+                method: method.as_str().into(),
+                scheme: target.scheme.clone(),
+                authority: target.authority(),
+                host: target.host.clone(),
+                port: target.port,
+                path: target.path.clone(),
+                query: target.query.clone(),
+                status_code: Some(status.as_u16()),
+                mime,
+                completion: CompletionState::Complete,
+                capture_quality: CaptureQuality::Semantic,
+                header_representation: HeaderRepresentation::Semantic,
+                body_representation: BodyRepresentation::SemanticEncoded,
+                cache_provenance: CacheProvenance::None,
+                transport_provenance: Some(TransportProvenance::RequestRuleBlock),
+                transport_profile: None,
+                request_headers: header_entries(request_headers),
+                response_headers: header_entries(&response_headers),
+                request_body: None,
+                response_body: None,
+                duration_ms: Some(0),
+                lineage: ExchangeLineage {
+                    capture_session_id: Some(session.id),
+                    browser_session_id: session.browser_session_id,
+                    browser_action_id: session.browser_action_id,
+                    ..Default::default()
+                },
+                page_title: None,
+                error_message: None,
+            },
+            None,
+            (!body.is_empty())
+                .then(|| crate::storage::CapturedBody::Memory(Bytes::copy_from_slice(body))),
+        )
+        .await;
+    match result {
+        Ok(exchange_id) => {
+            let _ = state
+                .db
+                .record_exchange_request_rules(session.project_id, exchange_id, applied_rules)
+                .await;
+            let _ = state.events.send(crate::app::AppEvent {
+                project_id: session.project_id.get(),
+                kind: "exchange".into(),
+                payload: serde_json::json!({
+                    "exchange_id": exchange_id.get(),
+                    "source": "proxy",
+                    "completion": CompletionState::Complete,
+                    "blocked": true,
+                }),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not record a request blocked by a request rule")
+        }
+    }
 }
 
 /// Reads the whole request body before it is sent on, since rewrite rules and
@@ -1732,6 +1912,313 @@ mod tests {
         proxy.await.unwrap().unwrap();
         own_server.abort();
         external_server.abort();
+    }
+
+    #[tokio::test]
+    async fn block_rules_answer_locally_record_history_and_spare_the_own_api() {
+        use crate::request_rules::{
+            RequestRuleInput, RequestRuleMatchKind, RequestRuleOperation, RequestRuleTarget,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        async fn send(proxy: SocketAddr, method: &str, url: &str, token: &str) -> String {
+            let mut socket = TcpStream::connect(proxy).await.unwrap();
+            socket.write_all(format!(
+                "{method} {url} HTTP/1.1\r\nHost: {}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n",
+                url::Url::parse(url).unwrap().authority()
+            ).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        }
+        fn block_rule(
+            name: &str,
+            host: &str,
+            pattern: &str,
+            method: Option<&str>,
+            status: Option<u16>,
+            content_type: Option<&str>,
+            body: Option<&str>,
+        ) -> RequestRuleInput {
+            RequestRuleInput {
+                name: name.into(),
+                enabled: true,
+                position: 0,
+                host_pattern: Some(host.into()),
+                target: RequestRuleTarget::Url,
+                operation: RequestRuleOperation::Block,
+                header_name: None,
+                match_kind: RequestRuleMatchKind::Literal,
+                pattern: pattern.into(),
+                replacement: None,
+                replace_all: true,
+                method: method.map(str::to_string),
+                response_status: status,
+                response_content_type: content_type.map(str::to_string),
+                response_body: body.map(str::to_string),
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, project, session) = proxy_test_fixture(&directory).await;
+        let own = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own_addr = own.local_addr().unwrap();
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        Arc::get_mut(&mut state).unwrap().config.api_listen = own_addr;
+        let origin_hits = Arc::new(AtomicU64::new(0));
+        let own_hits = Arc::new(AtomicU64::new(0));
+        for (listener, hits) in [(origin, origin_hits.clone()), (own, own_hits.clone())] {
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin").await;
+                }
+            });
+        }
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let proxy = tokio::spawn(serve_proxy_listener(
+            state.clone(),
+            listener,
+            cancel.clone(),
+        ));
+        let token = session.token_once.as_deref().unwrap();
+        let rules = [
+            block_rule(
+                "dice",
+                "127.0.0.1",
+                "/logout?source=ChromiumAccountReconcilor",
+                Some("GET"),
+                Some(200),
+                Some("text/html; charset=utf-8"),
+                Some(""),
+            ),
+            block_rule(
+                "tracker",
+                "127.0.0.1",
+                "/collect",
+                None,
+                None,
+                None,
+                Some("blocked here"),
+            ),
+            block_rule(
+                "ping",
+                "127.0.0.1",
+                "/ping",
+                None,
+                Some(204),
+                Some("text/html"),
+                None,
+            ),
+            block_rule(
+                "in scope",
+                "example.com",
+                "/signout",
+                None,
+                None,
+                None,
+                Some("nope"),
+            ),
+            block_rule("own api", "localhost", "/api/", None, None, None, None),
+            block_rule(
+                "socket",
+                "127.0.0.1",
+                "/ws",
+                None,
+                None,
+                None,
+                Some("no socket"),
+            ),
+        ];
+        for rule in rules {
+            state
+                .db
+                .create_request_rule(project.id, rule)
+                .await
+                .unwrap();
+        }
+        let origin_base = format!("http://{origin_addr}");
+
+        let dice = send(
+            proxy_addr,
+            "GET",
+            &format!("{origin_base}/logout?source=ChromiumAccountReconcilor"),
+            token,
+        )
+        .await;
+        assert!(dice.starts_with("HTTP/1.1 200"), "{dice}");
+        let lower = dice.to_ascii_lowercase();
+        assert!(
+            lower.contains("cache-control: no-store")
+                && lower.contains("content-type: text/html; charset=utf-8"),
+            "{dice}"
+        );
+        assert!(!lower.contains("set-cookie"), "{dice}");
+        assert!(
+            dice.ends_with("\r\n\r\n"),
+            "an empty configured body is sent empty: {dice}"
+        );
+
+        let tracker = send(
+            proxy_addr,
+            "POST",
+            &format!("{origin_base}/collect?id=1"),
+            token,
+        )
+        .await;
+        assert!(
+            tracker.starts_with("HTTP/1.1 403"),
+            "the status defaults to 403: {tracker}"
+        );
+        assert!(tracker
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain; charset=utf-8"));
+        assert!(tracker.ends_with("blocked here"), "{tracker}");
+        let head = send(proxy_addr, "HEAD", &format!("{origin_base}/collect"), token).await;
+        assert!(
+            head.starts_with("HTTP/1.1 403") && head.ends_with("\r\n\r\n"),
+            "HEAD gets headers only: {head}"
+        );
+
+        let ping = send(proxy_addr, "GET", &format!("{origin_base}/ping"), token).await;
+        assert!(ping.starts_with("HTTP/1.1 204"), "{ping}");
+        assert!(
+            !ping.to_ascii_lowercase().contains("content-type"),
+            "204 carries no entity headers: {ping}"
+        );
+        assert_eq!(
+            origin_hits.load(Ordering::SeqCst),
+            0,
+            "blocked requests never reach the origin"
+        );
+
+        let mut socket = TcpStream::connect(proxy_addr).await.unwrap();
+        socket.write_all(format!(
+            "GET {origin_base}/ws HTTP/1.1\r\nHost: {origin_addr}\r\nProxy-Authorization: Bearer {token}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        ).as_bytes()).await.unwrap();
+        let mut upgrade = vec![0u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut upgrade))
+            .await
+            .unwrap()
+            .unwrap();
+        let upgrade = String::from_utf8_lossy(&upgrade[..read]).into_owned();
+        assert!(
+            upgrade.starts_with("HTTP/1.1 403") && upgrade.contains("no socket"),
+            "a blocked upgrade gets the synthetic response: {upgrade}"
+        );
+        assert_eq!(
+            origin_hits.load(Ordering::SeqCst),
+            0,
+            "a blocked upgrade never dials the origin"
+        );
+
+        let user_logout = send(
+            proxy_addr,
+            "POST",
+            &format!("{origin_base}/logout?source=ChromiumAccountReconcilor"),
+            token,
+        )
+        .await;
+        assert!(
+            user_logout.ends_with("origin"),
+            "the method filter lets other methods through: {user_logout}"
+        );
+        assert_eq!(origin_hits.load(Ordering::SeqCst), 1);
+
+        let own_api = send(
+            proxy_addr,
+            "GET",
+            &format!("http://localhost:{}/api/v1/projects", own_addr.port()),
+            token,
+        )
+        .await;
+        assert!(
+            own_api.ends_with("origin"),
+            "the daemon's own API is never blocked: {own_api}"
+        );
+        assert_eq!(own_hits.load(Ordering::SeqCst), 1);
+
+        // Only example.com is in scope from here on.
+        state
+            .db
+            .update_project_scope(
+                project.id,
+                ScopePolicy {
+                    host_patterns: vec!["example.com".into()],
+                    ..project.scope.clone()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let outside = send(
+            proxy_addr,
+            "GET",
+            &format!("{origin_base}/collect/outside"),
+            token,
+        )
+        .await;
+        assert!(
+            outside.starts_with("HTTP/1.1 403"),
+            "out-of-scope requests are still blocked: {outside}"
+        );
+        let in_scope = send(proxy_addr, "GET", "http://example.com/signout", token).await;
+        assert!(
+            in_scope.starts_with("HTTP/1.1 403") && in_scope.ends_with("nope"),
+            "{in_scope}"
+        );
+        let (items, _) = state
+            .db
+            .list_history(project.id, 20, None, None)
+            .await
+            .unwrap();
+        let recorded = items
+            .iter()
+            .find(|item| item.path == "/signout")
+            .expect("in-scope blocked request is in History");
+        assert_eq!(recorded.status_code, Some(403));
+        assert_eq!(
+            recorded.transport_provenance,
+            Some(TransportProvenance::RequestRuleBlock)
+        );
+        let applied = state
+            .db
+            .list_exchange_request_rules(project.id, recorded.exchange_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied
+                .iter()
+                .map(|rule| rule.name.as_str())
+                .collect::<Vec<_>>(),
+            ["in scope"]
+        );
+        let dice = items
+            .iter()
+            .find(|item| item.path == "/logout" && item.method == "GET")
+            .expect("blocks made while in scope are recorded");
+        assert_eq!(
+            (dice.status_code, dice.transport_provenance),
+            (Some(200), Some(TransportProvenance::RequestRuleBlock))
+        );
+        assert!(
+            !items.iter().any(|item| item.path == "/collect/outside"),
+            "out-of-scope blocks are not recorded"
+        );
+        assert_eq!(
+            origin_hits.load(Ordering::SeqCst),
+            1,
+            "no blocked request reached the origin"
+        );
+
+        cancel.cancel();
+        proxy.await.unwrap().unwrap();
     }
 
     #[tokio::test]
