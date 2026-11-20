@@ -3048,3 +3048,110 @@ async fn only_project_changes_count_as_browser_activity() {
     }
     assert_eq!(idle(other.id), std::time::Duration::MAX);
 }
+
+#[tokio::test]
+async fn block_request_rules_round_trip_through_mcp_preview_and_archives() {
+    let directory = tempfile::Builder::new()
+        .prefix("hp-block-rules-")
+        .tempdir()
+        .unwrap();
+    let config = Config {
+        data_dir: directory.path().to_path_buf(),
+        spool_dir: directory.path().join("spool"),
+        export_dir: directory.path().join("exports"),
+        runtime_dir: directory.path().join("runtime"),
+        plugin_dir: directory.path().join("plugins"),
+        ..Config::default()
+    };
+    let state = bootstrap_state(config).await.unwrap();
+    let project = state
+        .db
+        .create_project(CreateProjectRequest {
+            name: "Google auth".into(),
+            target_url: "https://accounts.google.com/".into(),
+            advanced: None,
+        })
+        .await
+        .unwrap();
+    let rule = huntproxy::mcp::call_tool(
+        state.clone(),
+        "request_rules",
+        serde_json::json!({
+            "project_id": project.id.get(),
+            "action": "add",
+            "rule": {
+                "name": "block-chrome-dice-logout",
+                "host_pattern": "accounts.google.com",
+                "target": "url",
+                "operation": "block",
+                "method": "GET",
+                "match_kind": "regex",
+                "pattern": "(?i)^https://accounts\\.google\\.com(?::443)?/logout\\?(?:.*&)?source=ChromiumAccountReconcilor",
+                "response_status": 200,
+                "response_content_type": "text/html; charset=utf-8",
+                "response_body": ""
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rule["operation"], "block");
+    assert_eq!(rule["method"], "GET");
+    assert_eq!(rule["response_status"], 200);
+
+    let preview = |method: &'static str| {
+        let state = state.clone();
+        async move {
+            huntproxy::mcp::call_tool(
+                state,
+                "request_rules",
+                serde_json::json!({
+                    "project_id": project.id.get(),
+                    "action": "preview",
+                    "method": method,
+                    "url": "https://accounts.google.com/logout?continue=x&source=ChromiumAccountReconcilor"
+                }),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let blocked = preview("GET").await;
+    assert_eq!(blocked["blocked"], true);
+    assert_eq!(blocked["block"]["status"], 200);
+    assert_eq!(blocked["block"]["content_type"], "text/html; charset=utf-8");
+    assert_eq!(blocked["block"]["rule"]["name"], "block-chrome-dice-logout");
+    assert_eq!(preview("POST").await["blocked"], false);
+
+    let invalid = huntproxy::mcp::call_tool(
+        state.clone(),
+        "request_rules",
+        serde_json::json!({
+            "project_id": project.id.get(),
+            "action": "add",
+            "rule": {"name": "everything", "target": "url", "operation": "block"}
+        }),
+    )
+    .await;
+    assert!(
+        invalid.is_err(),
+        "a block rule without host or pattern is rejected"
+    );
+
+    let archive = state.db.export_project(project.id).await.unwrap();
+    let imported = state.db.import_project(archive).await.unwrap();
+    let rules = state.db.list_request_rules(imported.id).await.unwrap();
+    assert_eq!(rules.len(), 1);
+    let copy = &rules[0];
+    assert_eq!(
+        copy.operation,
+        huntproxy::request_rules::RequestRuleOperation::Block
+    );
+    assert_eq!(copy.method.as_deref(), Some("GET"));
+    assert_eq!(copy.response_status, Some(200));
+    assert_eq!(
+        copy.response_content_type.as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(copy.response_body.as_deref(), Some(""));
+}

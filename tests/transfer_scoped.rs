@@ -143,6 +143,8 @@ async fn seed_project(db: &Db, config: &Config, marker: &str) -> ProjectId {
         VALUES ({pid},'{marker} rule','header','replace','literal','2024-01-01','2024-01-01');
         INSERT INTO exchange_request_rules (project_id,exchange_id,rule_id,rule_name)
         VALUES ({pid},{eid},(SELECT id FROM request_rules WHERE project_id={pid}),'{marker} rule');
+        INSERT INTO request_rules (project_id,name,host_pattern,target,operation,match_kind,pattern,method,response_status,response_content_type,response_body,created_at,updated_at)
+        VALUES ({pid},'{marker} block','example.test','url','block','regex','/logout','GET',200,'text/html; charset=utf-8','','2024-01-01','2024-01-01');
         INSERT INTO ip_rotation_profiles (project_id,target_origin,stage_name,created_at,updated_at)
         VALUES ({pid},'https://example.test','{marker}','2024-01-01','2024-01-01');
         INSERT INTO ip_rotation_gateways (profile_id,region,rest_api_id,endpoint)
