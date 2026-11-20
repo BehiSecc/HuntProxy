@@ -34,6 +34,8 @@ Run `scripts/check.sh --quick` for day-to-day formatting, notices, asset validat
 cargo test --locked --test browser_profile_isolation -- --ignored --test-threads=1
 ```
 
+To try a change in a running daemon or another project's image, such as Huntr's, build `cargo build --locked --profile fast` and use `target/fast/HuntProxy`. It has the release optimizations without LTO, so an edit rebuilds in about 20 seconds instead of about 14 minutes. Build anything you publish or ship with `--release`.
+
 Run the ignored upgrade fixture once for each supported previous release, v0.2.0, v0.3.0 and v0.4.0, with `HUNTPROXY_PREVIOUS_BINARY` set to that verified official executable. The Linux x86_64 release archive SHA-256 values are `2016a21c7ee7a03cccf6f9406a4ecce6231ab3ecea41e1bd354d76881ef8b0a3` (v0.2.0), `7d5742db477a92ea935a1385eccbe8ea354a8568dcb04fb30f4652af46c6fe3f` (v0.3.0) and `48736fd1b8f3cea38065dcb167e29389ed18f3efa2dd93d8a014703e95107b18` (v0.4.0).
 
 ```bash

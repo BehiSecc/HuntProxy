@@ -103,10 +103,27 @@ tempfile = "3"
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "cookies"] }
 
+# Line tables keep file:line backtraces; optimized dependencies make tests run
+# faster and halve the debug target's size. HuntProxy itself stays at opt-level 0.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Local test binaries: release optimizations without LTO, so an edit rebuilds in
+# seconds instead of about 14 minutes. Released binaries always use --release.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
 
 [patch.crates-io]
 # Published releases lack the measured Chrome153 TLS signature/trust-anchor support.
