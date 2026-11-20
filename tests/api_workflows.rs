@@ -1378,6 +1378,10 @@ async fn mcp_page_analyzer_fetches_and_captures_same_origin_manifest_bundles() {
                 pattern: format!("http://{address}/static/js/async/page.js"),
                 replacement: Some(format!("http://{address}/rewritten/nested/page.js")),
                 replace_all: true,
+                method: None,
+                response_status: None,
+                response_content_type: None,
+                response_body: None,
             },
         )
         .await

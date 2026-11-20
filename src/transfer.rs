@@ -691,7 +691,7 @@ INSERT INTO javascript_provenance SELECT {new},javascript_url,javascript_host,ja
 INSERT INTO audit_events SELECT id+{audit},{new},event_type,actor,target_type,target_id,metadata_json,created_at FROM hp_archive.audit_events WHERE project_id={old};
 INSERT INTO websocket_connections SELECT id+{websocket_connection},{new},handshake_exchange_id,url,protocol,CASE WHEN state='open' THEN 'interrupted' ELSE state END,opened_at,COALESCE(closed_at,opened_at),message_count,client_bytes,server_bytes,last_error FROM hp_archive.websocket_connections WHERE project_id={old};
 INSERT INTO websocket_messages SELECT id+{websocket_message},{new},connection_id+{websocket_connection},direction,opcode,payload,payload_length,truncated,created_at FROM hp_archive.websocket_messages WHERE project_id={old};
-INSERT INTO request_rules SELECT id+{request_rule},{new},name,enabled,position,host_pattern,target,operation,header_name,match_kind,pattern,replacement,replace_all,revision,created_at,updated_at FROM hp_archive.request_rules WHERE project_id={old};
+INSERT INTO request_rules SELECT id+{request_rule},{new},name,enabled,position,host_pattern,target,operation,header_name,match_kind,pattern,replacement,replace_all,revision,created_at,updated_at,method,response_status,response_content_type,response_body FROM hp_archive.request_rules WHERE project_id={old};
 INSERT INTO exchange_request_rules SELECT {new},exchange_id,CASE WHEN rule_id IS NULL THEN NULL ELSE rule_id+{request_rule} END,rule_name FROM hp_archive.exchange_request_rules WHERE project_id={old};
 -- A cloud gateway may be owned by one profile only: disabling a profile deletes its
 -- gateways remotely, so a copy shared with another project would be deleted under it.

@@ -521,6 +521,10 @@ impl Db {
                         pattern: rule.pattern,
                         replacement: rule.replacement,
                         replace_all: rule.replace_all,
+                        method: rule.method,
+                        response_status: rule.response_status,
+                        response_content_type: rule.response_content_type,
+                        response_body: rule.response_body,
                     },
                 )
                 .await?;

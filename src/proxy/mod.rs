@@ -1688,6 +1688,10 @@ mod tests {
                         pattern: from.clone(),
                         replacement: Some(to),
                         replace_all: true,
+                        method: None,
+                        response_status: None,
+                        response_content_type: None,
+                        response_body: None,
                     },
                 )
                 .await
@@ -2193,6 +2197,10 @@ mod tests {
                     pattern: String::new(),
                     replacement: Some("applied".into()),
                     replace_all: true,
+                    method: None,
+                    response_status: None,
+                    response_content_type: None,
+                    response_body: None,
                 },
             )
             .await

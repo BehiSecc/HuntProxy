@@ -164,6 +164,10 @@ impl Fixture {
                     pattern: String::new(),
                     replacement: Some(value.into()),
                     replace_all: true,
+                    method: None,
+                    response_status: None,
+                    response_content_type: None,
+                    response_body: None,
                 },
             )
             .await
@@ -425,6 +429,10 @@ async fn identity_checks_effective_destination_after_url_rules() {
             pattern: "127.0.0.1".into(),
             replacement: Some("127.0.0.2".into()),
             replace_all: true,
+            method: None,
+            response_status: None,
+            response_content_type: None,
+            response_body: None,
         },
     )
     .await

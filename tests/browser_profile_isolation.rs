@@ -2105,6 +2105,10 @@ async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
                     pattern: format!("http://localhost:{}/api/blocked", h.fixture.port),
                     replacement: Some(format!("http://127.0.0.1:{}/api/mutate", h.fixture.port)),
                     replace_all: true,
+                    method: None,
+                    response_status: None,
+                    response_content_type: None,
+                    response_body: None,
                 },
             )
             .await

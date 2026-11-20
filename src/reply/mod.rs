@@ -1603,6 +1603,10 @@ mod tests {
                 pattern: "https://example.com/".into(),
                 replacement: Some("https://static.example.net/".into()),
                 replace_all: true,
+                method: None,
+                response_status: None,
+                response_content_type: None,
+                response_body: None,
             },
         )
         .await
@@ -1738,6 +1742,10 @@ mod tests {
                 pattern: String::new(),
                 replacement: Some("Bearer managed".into()),
                 replace_all: true,
+                method: None,
+                response_status: None,
+                response_content_type: None,
+                response_body: None,
             },
         )
         .await
@@ -1756,6 +1764,10 @@ mod tests {
                 pattern: String::new(),
                 replacement: Some("managed-secret".into()),
                 replace_all: true,
+                method: None,
+                response_status: None,
+                response_content_type: None,
+                response_body: None,
             },
         )
         .await

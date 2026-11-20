@@ -77,6 +77,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "019_foreign_key_indexes",
         include_str!("../../migrations/019_foreign_key_indexes.sql"),
     ),
+    (
+        "020_request_rule_blocks",
+        include_str!("../../migrations/020_request_rule_blocks.sql"),
+    ),
 ];
 
 /// Turns a current database back into its schema-17 shape, keeping its header

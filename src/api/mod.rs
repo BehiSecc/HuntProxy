@@ -1155,6 +1155,9 @@ async fn delete_request_rule(
 #[derive(Deserialize)]
 struct RequestRulePreviewBody {
     url: String,
+    /// HTTP method for block rules with a method filter; defaults to GET.
+    #[serde(default)]
+    method: Option<String>,
     #[serde(default)]
     headers: Vec<RequestRulePreviewHeader>,
     #[serde(default)]
@@ -1181,6 +1184,7 @@ async fn preview_request_rules(
         &state.db,
         ProjectId(id),
         body.url,
+        body.method,
         headers,
         body.body.into_bytes(),
     )
