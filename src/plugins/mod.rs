@@ -2876,8 +2876,9 @@ impl PluginService {
                 {
                     Ok(profile) => profile,
                     Err(error) => {
-                        cleanup_rotation_gateways(helper, &credentials, &gateways).await;
-                        return Err(error);
+                        let failures =
+                            cleanup_rotation_gateways(helper, &credentials, &gateways).await;
+                        return Err(with_rollback_failures(error, failures));
                     }
                 };
                 Ok(json!({
@@ -4947,8 +4948,8 @@ async fn provision_rotation_gateways(
         }
     }
     if let Some(error) = first_error {
-        cleanup_rotation_gateways(helper, credentials, &gateways).await;
-        return Err(error);
+        let failures = cleanup_rotation_gateways(helper, credentials, &gateways).await;
+        return Err(with_rollback_failures(error, failures));
     }
     gateways.sort_by(|left, right| left.region.cmp(&right.region));
     Ok(gateways)
@@ -4984,32 +4985,69 @@ fn parse_provisioned_gateway(
     })
 }
 
+const ROLLBACK_RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(2)
+};
+
+/// Deletes the gateways of a failed IP rotation setup. These gateways are never stored, so a
+/// failed delete would leave an internet-facing REST API that nothing tracks. Each delete is
+/// retried once (throttling is the usual cause); gateways that still fail are returned.
 async fn cleanup_rotation_gateways(
     helper: &str,
     credentials: &AwsCredentialFile,
     gateways: &[crate::storage::IpRotationGateway],
-) {
+) -> Vec<(crate::storage::IpRotationGateway, DomainError)> {
     let cleanup_cancel = CancellationToken::new();
-    let _ = stream::iter(gateways.iter().cloned())
+    stream::iter(gateways.iter().cloned())
         .map(|gateway| {
             let cleanup_cancel = cleanup_cancel.clone();
             async move {
-                run_aws_control_helper(
-                    helper,
-                    json!({
-                        "action": "delete",
-                        "region": gateway.region,
-                        "rest_api_id": gateway.rest_api_id,
-                    }),
-                    credentials,
-                    &cleanup_cancel,
-                )
-                .await
+                let payload = json!({
+                    "action": "delete",
+                    "region": gateway.region,
+                    "rest_api_id": gateway.rest_api_id,
+                });
+                let mut result =
+                    run_aws_control_helper(helper, payload.clone(), credentials, &cleanup_cancel)
+                        .await;
+                if result.is_err() {
+                    tokio::time::sleep(ROLLBACK_RETRY_DELAY).await;
+                    result =
+                        run_aws_control_helper(helper, payload, credentials, &cleanup_cancel).await;
+                }
+                (gateway, result)
             }
         })
         .buffer_unordered(4)
         .collect::<Vec<_>>()
-        .await;
+        .await
+        .into_iter()
+        .filter_map(|(gateway, result)| result.err().map(|error| (gateway, error)))
+        .collect()
+}
+
+/// Keeps the setup error and names every gateway the rollback could not delete.
+fn with_rollback_failures(
+    error: DomainError,
+    failures: Vec<(crate::storage::IpRotationGateway, DomainError)>,
+) -> DomainError {
+    if failures.is_empty() {
+        return error;
+    }
+    let leftovers = failures
+        .iter()
+        .map(|(gateway, cleanup_error)| {
+            tracing::warn!(region = %gateway.region, rest_api_id = %gateway.rest_api_id, %cleanup_error, "IP rotation rollback could not delete an API Gateway REST API");
+            format!("{} in {} ({cleanup_error})", gateway.rest_api_id, gateway.region)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    DomainError::new(
+        error.code(),
+        format!("{error}; rollback could not delete these API Gateway REST APIs, delete them in AWS: {leftovers}"),
+    )
 }
 
 struct RotationCleanupResult {
@@ -6850,6 +6888,84 @@ fn bounded_javascript_error(mut message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fake AWS helper: us-east-1 deletes fail once, eu-west-1 always fails, others succeed.
+    fn rollback_helper(calls: &std::path::Path) -> String {
+        format!(
+            r#"
+import json, os, sys
+request = json.load(sys.stdin)
+region = request["region"]
+path = {calls:?} + "." + region
+count = int(open(path).read()) if os.path.exists(path) else 0
+open(path, "w").write(str(count + 1))
+if region == "eu-west-1" or (region == "us-east-1" and count == 0):
+    sys.stderr.write("TooManyRequestsException")
+    sys.exit(1)
+print(json.dumps({{"deleted": True}}))
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn ip_rotation_rollback_retries_and_names_gateways_it_could_not_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = directory.path().join("calls");
+        let helper = rollback_helper(&calls);
+        let credentials = AwsCredentialFile {
+            access_key_id: "AKIAROLLBACKTEST".into(),
+            secret_access_key: "rollback-secret".into(),
+            session_token: None,
+        };
+        let gateway = |region: &str| crate::storage::IpRotationGateway {
+            region: region.into(),
+            rest_api_id: format!("api-{region}"),
+            endpoint: format!("https://api-{region}.example"),
+        };
+        let gateways = [
+            gateway("us-east-1"),
+            gateway("eu-west-1"),
+            gateway("ap-south-1"),
+        ];
+        let failures = cleanup_rotation_gateways(&helper, &credentials, &gateways).await;
+        assert_eq!(
+            failures
+                .iter()
+                .map(|(gateway, _)| gateway.region.as_str())
+                .collect::<Vec<_>>(),
+            ["eu-west-1"],
+            "a transient failure is retried and a persistent one is returned"
+        );
+        let attempts = |region: &str| {
+            std::fs::read_to_string(format!("{}.{region}", calls.display())).unwrap()
+        };
+        assert_eq!(attempts("us-east-1"), "2");
+        assert_eq!(attempts("eu-west-1"), "2");
+        assert_eq!(attempts("ap-south-1"), "1");
+
+        let error = with_rollback_failures(
+            DomainError::new(ErrorCode::Unavailable, "provisioning failed in eu-west-1"),
+            failures,
+        );
+        assert_eq!(
+            error.code(),
+            ErrorCode::Unavailable,
+            "the setup error code is kept"
+        );
+        let message = error.to_string();
+        assert!(message.contains("provisioning failed in eu-west-1"));
+        assert!(message.contains("api-eu-west-1 in eu-west-1"));
+        assert!(message.contains("TooManyRequestsException"));
+        assert!(!message.contains("rollback-secret") && !message.contains("AKIAROLLBACKTEST"));
+        let untouched = with_rollback_failures(
+            DomainError::new(ErrorCode::Unavailable, "setup failed"),
+            Vec::new(),
+        );
+        assert_eq!(
+            untouched.to_string(),
+            DomainError::new(ErrorCode::Unavailable, "setup failed").to_string()
+        );
+    }
 
     struct UnusedTransport;
 
