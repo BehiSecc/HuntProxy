@@ -38,10 +38,10 @@ pub async fn serve_api_listener(
     listener: tokio::net::TcpListener,
     cancel: CancellationToken,
 ) -> DomainResult<()> {
-    let app = router(state.clone());
     let addr = listener
         .local_addr()
         .map_err(|e| DomainError::new(ErrorCode::Unavailable, e.to_string()))?;
+    let app = tcp_router(state.clone(), addr);
     tracing::info!(%addr, "api/ui listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel.cancelled().await })
@@ -351,6 +351,79 @@ pub fn router(state: Arc<AppState>) -> Router {
             track_control_activity,
         ))
         .with_state(state)
+}
+
+/// The TCP listener serves the UI and API to local clients only. Any web page a
+/// browser loads can send requests to a loopback port, and DNS rebinding can make
+/// those requests look same-origin. Reject requests whose Host is not this
+/// listener's loopback name or address, and cross-site requests by Origin or
+/// Sec-Fetch-Site. The private Unix socket does not need this guard.
+pub fn tcp_router(state: Arc<AppState>, listen: std::net::SocketAddr) -> Router {
+    router(state).layer(axum::middleware::from_fn_with_state(
+        listen,
+        reject_foreign_browser_requests,
+    ))
+}
+
+async fn reject_foreign_browser_requests(
+    State(listen): State<std::net::SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = request.headers();
+    let host = headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let host_ok = host.is_some_and(|value| is_allowed_authority(value, listen));
+    let origin_ok = match headers.get(http::header::ORIGIN) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.strip_prefix("http://"))
+            .is_some_and(|authority| is_allowed_authority(authority, listen)),
+    };
+    let fetch_site_ok = !headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"));
+    if host_ok && origin_ok && fetch_site_ok {
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        host = host.unwrap_or("-"),
+        "rejected api request with a foreign host or origin"
+    );
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": {
+                "code": "forbidden",
+                "message": "requests must come from a local client using a loopback host"
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Accept `localhost`, a loopback IP, or the exact listen IP. Reject every other
+/// name, so a rebound domain cannot pass. Any port is accepted, because a
+/// container or SSH tunnel can publish the API on a different local port.
+fn is_allowed_authority(authority: &str, listen: std::net::SocketAddr) -> bool {
+    let host = match authority.rsplit_once(':') {
+        Some((host, _)) if !host.ends_with(']') && host.contains(':') => authority,
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip == listen.ip(),
+        Err(_) => false,
+    }
 }
 
 async fn prevent_api_caching(
@@ -2495,5 +2568,105 @@ mod tests {
     fn disk_quota_errors_use_insufficient_storage() {
         let error = DomainError::new(ErrorCode::DiskQuotaExceeded, "project quota exceeded");
         assert_eq!(status_for_error(&error), StatusCode::INSUFFICIENT_STORAGE);
+    }
+}
+
+#[cfg(test)]
+mod foreign_request_guard_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn listen() -> std::net::SocketAddr {
+        "127.0.0.1:17890".parse().unwrap()
+    }
+
+    #[test]
+    fn allows_only_loopback_authorities_on_the_listen_port() {
+        for ok in [
+            "127.0.0.1:17890",
+            "127.0.0.1",
+            "localhost:17890",
+            "LOCALHOST",
+            "[::1]:17890",
+            "::1",
+            "127.0.0.2:17890",
+            "localhost:8080",
+            "127.0.0.1:1",
+        ] {
+            assert!(is_allowed_authority(ok, listen()), "{ok}");
+        }
+        for bad in [
+            "evil.example",
+            "evil.example:17890",
+            "localhost:notaport",
+            "localhost.evil.example:17890",
+            "192.168.1.3:17890",
+            "",
+        ] {
+            assert!(!is_allowed_authority(bad, listen()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn accepts_the_exact_non_loopback_listen_ip() {
+        let lan: std::net::SocketAddr = "10.0.0.5:17890".parse().unwrap();
+        assert!(is_allowed_authority("10.0.0.5:17890", lan));
+        assert!(!is_allowed_authority("10.0.0.6:17890", lan));
+    }
+
+    async fn status(headers: &[(&str, &str)]) -> StatusCode {
+        let app = Router::new()
+            .route("/api/v1/projects", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                listen(),
+                reject_foreign_browser_requests,
+            ));
+        let mut request = axum::http::Request::builder().uri("/api/v1/projects");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn middleware_blocks_rebinding_and_cross_site_requests() {
+        assert_eq!(status(&[("host", "127.0.0.1:17890")]).await, StatusCode::OK);
+        assert_eq!(
+            status(&[
+                ("host", "localhost:17890"),
+                ("origin", "http://localhost:17890"),
+                ("sec-fetch-site", "same-origin"),
+            ])
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(status(&[]).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(&[("host", "rebind.evil.example:17890")]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(&[
+                ("host", "127.0.0.1:17890"),
+                ("origin", "http://evil.example")
+            ])
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(&[("host", "127.0.0.1:17890"), ("origin", "null")]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(&[
+                ("host", "127.0.0.1:17890"),
+                ("sec-fetch-site", "cross-site")
+            ])
+            .await,
+            StatusCode::FORBIDDEN
+        );
     }
 }
