@@ -633,3 +633,164 @@ async fn a_session_id_that_cannot_be_read_never_falls_back_to_the_project_listin
         assert!(!error.to_string().contains("required"), "{tool}: {error}");
     }
 }
+
+/// A server that answers every request with `<method> <body>`.
+async fn echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(|method: axum::http::Method, body: String| async move {
+        format!("{method} {body}")
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (address, server)
+}
+
+async fn project_for(state: &AppState, address: std::net::SocketAddr) -> i64 {
+    state
+        .db
+        .create_project(CreateProjectRequest {
+            name: "Reply".into(),
+            target_url: format!("http://{address}/"),
+            advanced: None,
+        })
+        .await
+        .unwrap()
+        .id
+        .get()
+}
+
+#[tokio::test]
+async fn reply_send_and_reply_tabs_take_request_fields_beside_the_draft() {
+    let (address, server) = echo_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    let url = format!("http://{address}/echo");
+    let send = |args: Value| {
+        let state = state.clone();
+        async move { call_tool(state, "reply_send", args).await }
+    };
+
+    // Everything beside `draft` is read as if it were inside it.
+    let flat = send(json!({
+        "project_id": project, "url": url, "method": "POST", "body_text": "hello",
+        "identity": {"mode": "anonymous"},
+    }))
+    .await
+    .unwrap();
+    assert_eq!(flat["response_preview"]["text"], "POST hello");
+    assert_eq!(flat["identity"], json!({"mode": "anonymous"}));
+    let mixed = send(json!({
+        "project_id": project, "url": url, "body_text": "hello",
+        "draft": {"method": "PUT"},
+    }))
+    .await
+    .unwrap();
+    assert_eq!(mixed["response_preview"]["text"], "PUT hello");
+    // The same value twice is harmless.
+    send(json!({"project_id": project, "method": "GET", "draft": {"url": url, "method": "GET"}}))
+        .await
+        .unwrap();
+
+    // Two different values for one field are an error naming it.
+    let error = send(json!({
+        "project_id": project, "method": "GET", "draft": {"url": url, "method": "POST"},
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("`method`"), "{error}");
+    assert!(error.to_string().contains("different values"), "{error}");
+
+    // `headers` and `body` are not request fields; the error points to the right ones.
+    let error = send(json!({"project_id": project, "draft": {"url": url}, "headers": {"X": "1"}}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("header_overrides"), "{error}");
+
+    // A client that fills every property with null still sends a plain request.
+    let nulls = send(json!({
+        "project_id": project, "draft": null, "tab_id": null, "base_exchange_id": null,
+        "protocol": null, "upstream_proxy": null, "identity": null, "url": url,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(nulls["response_preview"]["text"], "GET ");
+    let nested_nulls = send(json!({
+        "project_id": project,
+        "draft": {"url": url, "method": null, "header_overrides": null, "body_text": null,
+                  "body_params": null, "identity": null},
+    }))
+    .await
+    .unwrap();
+    assert_eq!(nested_nulls["response_preview"]["text"], "GET ");
+
+    // Tabs store the lifted fields in their draft.
+    let tab = call_tool(
+        state.clone(),
+        "reply_tabs",
+        json!({"project_id": project, "action": "create", "name": "flat",
+               "url": url, "identity": {"mode": "anonymous"}, "draft": {"method": "POST"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(tab["draft"]["url"], url);
+    assert_eq!(tab["draft"]["method"], "POST");
+    assert_eq!(tab["draft"]["identity"], json!({"mode": "anonymous"}));
+    server.abort();
+}
+
+#[tokio::test]
+async fn reply_send_accepts_http_version_aliases_and_lenient_body_rules() {
+    let (address, server) = echo_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    let url = format!("http://{address}/echo");
+    let send = |draft: Value, protocol: Value| {
+        let state = state.clone();
+        let args = json!({"project_id": project, "draft": draft, "protocol": protocol});
+        async move { call_tool(state, "reply_send", args).await }
+    };
+
+    for protocol in ["h1", "http1", "HTTP/1.1", "http/1.1", "auto"] {
+        let sent = send(json!({"url": url}), json!(protocol)).await.unwrap();
+        assert_eq!(sent["status_code"], 200, "{protocol}");
+    }
+    let error = send(json!({"url": url}), json!("h3")).await.unwrap_err();
+    assert!(error.to_string().contains("auto, h1 or h2"), "{error}");
+
+    // body_cleared wins over a format without a body and over an empty body.
+    for extra in [
+        json!({"body_cleared": true, "body_format": "json"}),
+        json!({"body_cleared": true, "body_text": ""}),
+        json!({"body_cleared": true, "body_format": "raw", "body_text": ""}),
+    ] {
+        let mut draft = json!({"url": url, "method": "POST"});
+        draft
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let sent = send(draft, Value::Null).await.unwrap();
+        assert_eq!(sent["response_preview"]["text"], "POST ", "{extra}");
+    }
+    let error = send(
+        json!({"url": url, "body_cleared": true, "body_text": "x"}),
+        Value::Null,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("body_cleared"), "{error}");
+
+    // A GET has nothing to format, so a body_format is dropped; a POST still needs a body.
+    let sent = send(json!({"url": url, "body_format": "raw"}), Value::Null)
+        .await
+        .unwrap();
+    assert_eq!(sent["response_preview"]["text"], "GET ");
+    let error = send(
+        json!({"url": url, "method": "POST", "body_format": "raw"}),
+        Value::Null,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("explicit body"), "{error}");
+    server.abort();
+}

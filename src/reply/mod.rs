@@ -186,11 +186,14 @@ pub async fn materialize_request(
     draft: &ReplyDraft,
     key: &PlaceholderKey,
 ) -> DomainResult<MaterializedRequest> {
-    let has_explicit_body = draft.body_override.is_some()
-        || draft.body_text.is_some()
-        || draft.body_json.is_some()
-        || !draft.body_params.is_empty();
-    let normalized = normalize_reply_draft(draft.clone())?;
+    let has_explicit_body = !draft.body_cleared
+        && (draft.body_override.is_some()
+            || draft.body_text.is_some()
+            || draft.body_json.is_some()
+            || !draft.body_params.is_empty());
+    let normalized = normalize_reply_draft(
+        without_idle_body_format(db, project_id, base_exchange_id, draft).await?,
+    )?;
     let draft = &normalized;
     let mut method = draft.method.clone().unwrap_or_else(|| "GET".into());
     let mut url = draft
@@ -354,6 +357,52 @@ pub async fn materialize_request(
     })
 }
 
+/// A `body_format` with no body to format is ignored on a GET or HEAD request
+/// that has no base body to carry, instead of failing for lack of a body.
+async fn without_idle_body_format(
+    db: &Db,
+    project_id: ProjectId,
+    base_exchange_id: Option<ExchangeId>,
+    draft: &ReplyDraft,
+) -> DomainResult<ReplyDraft> {
+    let mut draft = draft.clone();
+    // A form with nothing in it is already an empty form body.
+    let idle = draft
+        .body_format
+        .is_some_and(|format| format != ReplyBodyFormat::FormUrlencoded)
+        && draft.body_override.is_none()
+        && draft.body_text.is_none()
+        && draft.body_json.is_none()
+        && draft.body_params.is_empty();
+    if !idle {
+        return Ok(draft);
+    }
+    let (method, base_has_body) = match base_exchange_id {
+        None => (draft.method.clone(), false),
+        Some(base_id) => {
+            let method = match &draft.method {
+                Some(method) => Some(method.clone()),
+                None => Some(
+                    db.get_exchange_detail(project_id, base_id, PresentationOptions::default())
+                        .await?
+                        .summary
+                        .method,
+                ),
+            };
+            let body = db
+                .load_raw_body(project_id, base_id, MessageSide::Request)
+                .await?;
+            (method, body.is_some_and(|body| !body.is_empty()))
+        }
+    };
+    let method = method.unwrap_or_else(|| "GET".into());
+    if !base_has_body && (method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD"))
+    {
+        draft.body_format = None;
+    }
+    Ok(draft)
+}
+
 fn validate_reply_identity(draft: &ReplyDraft) -> DomainResult<()> {
     if matches!(draft.identity, Some(ReplyIdentity::Named { .. }))
         && draft
@@ -370,6 +419,26 @@ fn validate_reply_identity(draft: &ReplyDraft) -> DomainResult<()> {
 
 pub fn normalize_reply_draft(mut draft: ReplyDraft) -> DomainResult<ReplyDraft> {
     validate_reply_identity(&draft)?;
+    if draft.body_cleared {
+        // Clearing the body wins over a format with nothing to format and over
+        // an empty body; only a body with content contradicts it.
+        if draft.body_text.as_deref() == Some("") {
+            draft.body_text = None;
+        }
+        if draft.body_override.as_deref() == Some(&[]) {
+            draft.body_override = None;
+        }
+        if draft.body_override.is_some()
+            || draft.body_text.is_some()
+            || draft.body_json.is_some()
+            || !draft.body_params.is_empty()
+        {
+            return Err(DomainError::invalid(
+                "body_cleared cannot be combined with a body value",
+            ));
+        }
+        draft.body_format = None;
+    }
     let body_sources = usize::from(draft.body_override.is_some())
         + usize::from(draft.body_text.is_some())
         + usize::from(draft.body_json.is_some())
@@ -377,11 +446,6 @@ pub fn normalize_reply_draft(mut draft: ReplyDraft) -> DomainResult<ReplyDraft> 
     if body_sources > 1 {
         return Err(DomainError::invalid(
             "provide only one of body_override, body_text, body_json, or body_params",
-        ));
-    }
-    if draft.body_cleared && (body_sources > 0 || draft.body_format.is_some()) {
-        return Err(DomainError::invalid(
-            "body_cleared cannot be combined with a body value or body_format",
         ));
     }
     let format = draft.body_format;
@@ -2218,6 +2282,231 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn body_cleared_wins_over_a_format_without_a_body_and_over_an_empty_body() {
+        let cleared = ReplyDraft {
+            body_cleared: true,
+            ..Default::default()
+        };
+        for draft in [
+            ReplyDraft {
+                body_format: Some(ReplyBodyFormat::Json),
+                ..cleared.clone()
+            },
+            ReplyDraft {
+                body_text: Some(String::new()),
+                ..cleared.clone()
+            },
+            ReplyDraft {
+                body_override: Some(Vec::new()),
+                ..cleared.clone()
+            },
+            ReplyDraft {
+                body_format: Some(ReplyBodyFormat::Raw),
+                body_text: Some(String::new()),
+                ..cleared.clone()
+            },
+        ] {
+            let normalized = normalize_reply_draft(draft).unwrap();
+            assert!(normalized.body_cleared);
+            assert!(normalized.body_override.is_none());
+            assert!(normalized.body_text.is_none());
+            assert!(normalized.body_format.is_none());
+            assert!(normalized.header_overrides.is_empty());
+        }
+        // Only a body with content contradicts clearing it.
+        for draft in [
+            ReplyDraft {
+                body_text: Some("x".into()),
+                ..cleared.clone()
+            },
+            ReplyDraft {
+                body_override: Some(vec![1]),
+                ..cleared.clone()
+            },
+            ReplyDraft {
+                body_json: Some(serde_json::json!({})),
+                body_format: Some(ReplyBodyFormat::Json),
+                ..cleared.clone()
+            },
+            ReplyDraft {
+                body_params: vec![ReplyBodyParam {
+                    name: "a".into(),
+                    value: String::new(),
+                }],
+                ..cleared.clone()
+            },
+        ] {
+            let error = normalize_reply_draft(draft).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(error.to_string().contains("body_cleared"), "{error}");
+        }
+    }
+
+    fn exchange_with_body(project_id: ProjectId, method: &str, body: Option<&[u8]>) -> NewExchange {
+        NewExchange {
+            project_id,
+            source: ExchangeSource::Proxy,
+            protocol: "HTTP/2".into(),
+            method: method.into(),
+            scheme: "https".into(),
+            authority: "base.test".into(),
+            host: "base.test".into(),
+            port: 443,
+            path: "/rpc".into(),
+            query: None,
+            status_code: Some(200),
+            mime: None,
+            completion: CompletionState::Complete,
+            capture_quality: CaptureQuality::Semantic,
+            header_representation: HeaderRepresentation::Semantic,
+            body_representation: BodyRepresentation::SemanticEncoded,
+            cache_provenance: CacheProvenance::None,
+            transport_provenance: Some(TransportProvenance::ProtocolProfileOnly),
+            transport_profile: Some("test".into()),
+            request_headers: vec![HeaderEntry {
+                name: "Content-Type".into(),
+                value: b"application/json".to_vec(),
+                ordinal: 0,
+            }],
+            response_headers: vec![],
+            request_body: body.map(<[u8]>::to_vec),
+            response_body: None,
+            duration_ms: Some(1),
+            lineage: ExchangeLineage::default(),
+            page_title: None,
+            error_message: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn body_cleared_with_an_empty_body_sends_like_body_cleared_alone() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "cleared".into(),
+                target_url: "https://base.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let base = db
+            .insert_exchange(exchange_with_body(project.id, "POST", Some(b"{\"a\":1}")))
+            .await
+            .unwrap();
+        let key = PlaceholderKey::from_bytes(vec![1; 32]);
+        let mut seen = Vec::new();
+        for (text, format) in [
+            (None, None),
+            (Some(String::new()), None),
+            (None, Some(ReplyBodyFormat::Json)),
+        ] {
+            let request = materialize_request(
+                &db,
+                project.id,
+                Some(base),
+                &ReplyDraft {
+                    method: Some("GET".into()),
+                    body_cleared: true,
+                    body_text: text,
+                    body_format: format,
+                    ..Default::default()
+                },
+                &key,
+            )
+            .await
+            .unwrap();
+            assert!(request.body.is_none());
+            seen.push(request.headers);
+        }
+        assert!(seen.iter().all(|headers| headers == &seen[0]));
+        assert!(!seen[0]
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type")));
+    }
+
+    #[tokio::test]
+    async fn a_body_format_without_a_body_is_ignored_on_a_get_with_no_base_body() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "idle format".into(),
+                target_url: "https://base.test/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        let key = PlaceholderKey::from_bytes(vec![1; 32]);
+        let draft = |method: Option<&str>, format| ReplyDraft {
+            method: method.map(Into::into),
+            url: Some("https://base.test/rpc".into()),
+            body_format: Some(format),
+            ..Default::default()
+        };
+
+        for method in [None, Some("GET"), Some("head")] {
+            for format in [
+                ReplyBodyFormat::Raw,
+                ReplyBodyFormat::Json,
+                ReplyBodyFormat::Xml,
+                ReplyBodyFormat::Multipart,
+            ] {
+                let request =
+                    materialize_request(&db, project.id, None, &draft(method, format), &key)
+                        .await
+                        .unwrap();
+                assert!(request.body.is_none(), "{method:?} {format:?}");
+                assert!(!request
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("content-type")));
+            }
+        }
+
+        // Anything that can carry a body still needs one.
+        for method in ["POST", "PUT"] {
+            let error = materialize_request(
+                &db,
+                project.id,
+                None,
+                &draft(Some(method), ReplyBodyFormat::Raw),
+                &key,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("explicit body"), "{error}");
+        }
+
+        // A base GET without a body counts as none; a base body does not.
+        let empty_base = db
+            .insert_exchange(exchange_with_body(project.id, "GET", None))
+            .await
+            .unwrap();
+        materialize_request(
+            &db,
+            project.id,
+            Some(empty_base),
+            &draft(None, ReplyBodyFormat::Json),
+            &key,
+        )
+        .await
+        .unwrap();
+        let body_base = db
+            .insert_exchange(exchange_with_body(project.id, "GET", Some(b"{}")))
+            .await
+            .unwrap();
+        let error = materialize_request(
+            &db,
+            project.id,
+            Some(body_base),
+            &draft(None, ReplyBodyFormat::Json),
+            &key,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("explicit body"), "{error}");
     }
 
     #[tokio::test]

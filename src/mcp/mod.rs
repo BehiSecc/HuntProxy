@@ -972,6 +972,84 @@ async fn handle_rpc(
     }
 }
 
+/// Request fields an agent may put beside `draft` instead of inside it.
+const LIFTED_DRAFT_FIELDS: [&str; 12] = [
+    "method",
+    "url",
+    "identity",
+    "header_overrides",
+    "header_tombstones",
+    "inheritance",
+    "body_override",
+    "body_text",
+    "body_json",
+    "body_format",
+    "body_params",
+    "body_cleared",
+];
+
+/// The request `draft` of a tool call: the `draft` argument plus any request
+/// field given at the top level, which moves into it unless `draft` already
+/// sets that field. A field set in both places must agree.
+fn request_draft_value(args: &Value) -> DomainResult<Option<Value>> {
+    for (field, hint) in [
+        (
+            "headers",
+            "put `header_overrides`: [{\"name\", \"value\"}] under `draft`",
+        ),
+        (
+            "body",
+            "put `body_text`, `body_json`, or `body_params` under `draft`",
+        ),
+    ] {
+        if arguments::present(args, field).is_some() {
+            return Err(DomainError::invalid(format!(
+                "`{field}` is not a request field; {hint}"
+            )));
+        }
+    }
+    let mut draft = arguments::present(args, "draft").cloned();
+    if let Some(Value::Object(fields)) = &mut draft {
+        // A client that sends every property sends null for the unused ones.
+        fields.retain(|_, value| !value.is_null());
+    }
+    for field in LIFTED_DRAFT_FIELDS {
+        let Some(value) = arguments::present(args, field) else {
+            continue;
+        };
+        let Value::Object(fields) = draft.get_or_insert_with(|| json!({})) else {
+            return Err(DomainError::invalid("draft must be an object"));
+        };
+        match fields.get(field) {
+            None => {
+                fields.insert(field.into(), value.clone());
+            }
+            Some(existing) if existing == value => {}
+            Some(_) => {
+                return Err(DomainError::invalid(format!(
+                    "`{field}` is set both at the top level and in `draft` with different values; keep it under `draft`"
+                )))
+            }
+        }
+    }
+    Ok(draft)
+}
+
+/// The protocol preference, accepting the usual spellings of HTTP/1.1 and HTTP/2.
+fn parse_protocol(value: Option<&str>) -> DomainResult<ProtocolPreference> {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("auto") => Ok(ProtocolPreference::Auto),
+        Some("h1" | "http1" | "http/1" | "http1.1" | "http/1.1") => Ok(ProtocolPreference::H1),
+        Some("h2" | "http2" | "http/2") => Ok(ProtocolPreference::H2),
+        Some(_) => Err(DomainError::invalid(
+            "protocol must be auto, h1 or h2 (http/1.1 and http/2 also work)",
+        )),
+    }
+}
+
 /// Parses a request-supplied `draft`, rejecting unknown keys so fields such as
 /// `headers` or `body` are never silently dropped from the sent request.
 fn parse_request_draft(draft: Option<&Value>) -> DomainResult<ReplyDraft> {
@@ -1977,11 +2055,6 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "reply_tabs" => {
             let project_id = require_project_id(&args)?;
-            if args.get("identity").is_some() {
-                return Err(DomainError::invalid(
-                    "put request field `identity` under `draft`",
-                ));
-            }
             let action = args
                 .get("action")
                 .and_then(|v| v.as_str())
@@ -1995,7 +2068,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .unwrap_or("tab")
                         .to_string();
                     let base = arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
-                    let draft = parse_request_draft(args.get("draft"))?;
+                    let draft = parse_request_draft(request_draft_value(&args)?.as_ref())?;
                     Ok(json!(
                         state
                             .db
@@ -2016,33 +2089,10 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "reply_send" => {
             let project_id = require_project_id(&args)?;
-            for field in [
-                "identity",
-                "url",
-                "method",
-                "headers",
-                "header_overrides",
-                "body",
-                "body_text",
-                "body_json",
-                "body_params",
-                "body_format",
-            ] {
-                if args.get(field).is_some() {
-                    return Err(DomainError::invalid(format!(
-                        "put request field `{field}` under `draft`"
-                    )));
-                }
-            }
-            let draft = parse_request_draft(args.get("draft"))?;
+            let draft = parse_request_draft(request_draft_value(&args)?.as_ref())?;
             let base_exchange_id =
                 arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
-            let protocol = match args.get("protocol").and_then(Value::as_str) {
-                Some("h1") => ProtocolPreference::H1,
-                Some("h2") => ProtocolPreference::H2,
-                Some("auto") | None => ProtocolPreference::Auto,
-                Some(_) => return Err(DomainError::invalid("protocol must be auto|h1|h2")),
-            };
+            let protocol = parse_protocol(args.get("protocol").and_then(Value::as_str))?;
             let result = state
                 .reply
                 .send_with_proxy(
@@ -4152,5 +4202,76 @@ mod tests {
         let draft = parse_request_draft(Some(&json!({"url": "https://example.test/"}))).unwrap();
         assert_eq!(draft.url.as_deref(), Some("https://example.test/"));
         assert!(parse_request_draft(None).unwrap().url.is_none());
+    }
+
+    #[test]
+    fn top_level_request_fields_move_into_the_draft() {
+        let args = json!({
+            "project_id": 1,
+            "url": "https://a.test/",
+            "identity": {"mode": "anonymous"},
+            "body_text": null,
+            "draft": {"method": "POST", "header_overrides": null}
+        });
+        assert_eq!(
+            request_draft_value(&args).unwrap(),
+            Some(json!({
+                "method": "POST",
+                "url": "https://a.test/",
+                "identity": {"mode": "anonymous"}
+            }))
+        );
+        // Without a draft the lifted fields make one; with nothing to lift there is none.
+        assert_eq!(
+            request_draft_value(&json!({"project_id": 1, "method": "HEAD"})).unwrap(),
+            Some(json!({"method": "HEAD"}))
+        );
+        for args in [json!({"project_id": 1}), json!({"draft": null})] {
+            assert_eq!(request_draft_value(&args).unwrap(), None);
+        }
+        // The same value in both places is fine; different values are a conflict.
+        let same = json!({"url": "https://a.test/", "draft": {"url": "https://a.test/"}});
+        assert_eq!(
+            request_draft_value(&same).unwrap(),
+            Some(json!({"url": "https://a.test/"}))
+        );
+        let conflict = json!({"url": "https://a.test/", "draft": {"url": "https://b.test/"}});
+        let error = request_draft_value(&conflict).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("`url`"), "{error}");
+        assert!(error.to_string().contains("different values"), "{error}");
+        // A draft that is not an object cannot take fields.
+        assert!(request_draft_value(&json!({"url": "https://a.test/", "draft": "x"})).is_err());
+        // headers and body are not request fields; the error says where they go.
+        let error = request_draft_value(&json!({"headers": {"X": "1"}})).unwrap_err();
+        assert!(error.to_string().contains("header_overrides"), "{error}");
+        let error = request_draft_value(&json!({"body": "x"})).unwrap_err();
+        assert!(error.to_string().contains("body_text"), "{error}");
+        // Every lifted field is one a draft accepts.
+        for field in LIFTED_DRAFT_FIELDS {
+            validate_reply_draft_request(&json!({ field: null })).unwrap();
+        }
+    }
+
+    #[test]
+    fn protocol_accepts_the_usual_spellings_of_http_versions() {
+        for (value, expected) in [
+            (None, ProtocolPreference::Auto),
+            (Some("auto"), ProtocolPreference::Auto),
+            (Some("h1"), ProtocolPreference::H1),
+            (Some("HTTP/1.1"), ProtocolPreference::H1),
+            (Some("http1.1"), ProtocolPreference::H1),
+            (Some("http/1"), ProtocolPreference::H1),
+            (Some("HTTP1"), ProtocolPreference::H1),
+            (Some("h2"), ProtocolPreference::H2),
+            (Some("http2"), ProtocolPreference::H2),
+            (Some("HTTP/2"), ProtocolPreference::H2),
+            (Some(" H2 "), ProtocolPreference::H2),
+        ] {
+            assert_eq!(parse_protocol(value).unwrap(), expected, "{value:?}");
+        }
+        let error = parse_protocol(Some("h3")).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("auto, h1 or h2"), "{error}");
     }
 }
