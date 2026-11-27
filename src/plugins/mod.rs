@@ -9745,6 +9745,7 @@ print(json.dumps({{"deleted": True}}))
             response_complete: true,
             transport_error: None,
             responses: vec![],
+            line_endings_normalized: false,
             response_base64: None,
             saved_transcript: None,
         };
@@ -9765,6 +9766,7 @@ print(json.dumps({{"deleted": True}}))
             response_complete: true,
             transport_error: Some("connection closed unexpectedly".into()),
             responses: vec![],
+            line_endings_normalized: false,
             response_base64: None,
             saved_transcript: None,
         };

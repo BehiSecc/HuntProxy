@@ -1049,6 +1049,8 @@ async fn reply_send_raw_injects_managed_cookies_into_bare_lf_requests() {
     .await
     .unwrap();
     assert_eq!(sent["status_code"], 200);
+    // The result says the header bytes were changed beyond the Cookie header.
+    assert_eq!(sent["line_endings_normalized"], true, "{sent}");
     let received = String::from_utf8(server.await.unwrap()).unwrap();
     assert_eq!(
         received,
