@@ -402,8 +402,9 @@ impl Drop for BodySearchScope {
 }
 
 /// `huntproxy_search_open(started_at)`: true until the search budget has
-/// passed, then false for every remaining row, so the query finishes at once
-/// with the rows it already matched. Rows at the first row's time are always
+/// passed, then false for every remaining row. The query still walks the
+/// rest of the started_at index, but searches no body past the stop, and it
+/// returns exactly the rows it matched before. Rows at the first row's time are always
 /// searched, so a continuation from the stopped row's time gets further.
 /// Outside a [`BodySearchScope`] it is true.
 fn search_open(started_at: &str) -> bool {

@@ -466,6 +466,37 @@ mod tests {
         }
     }
 
+    /// `value` after a JSON.parse / JSON.stringify round trip.
+    fn as_javascript_client_sends(value: &Value) -> Value {
+        match value {
+            Value::Number(number) => {
+                serde_json::from_str(&number.as_f64().unwrap().to_string()).unwrap()
+            }
+            Value::Array(items) => items.iter().map(as_javascript_client_sends).collect(),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn a_stopped_search_cursor_survives_a_javascript_client() {
+        let next = json!([
+            "2026-11-24T06:30:00Z",
+            crate::storage::STOPPED_SEARCH_CURSOR_ID
+        ]);
+        let sent = as_javascript_client_sends(&next);
+        assert_eq!(sent, next);
+        assert_eq!(
+            parse_history_cursor(Some(&sent)).unwrap(),
+            (
+                Some("2026-11-24T06:30:00Z".into()),
+                Some(crate::storage::STOPPED_SEARCH_CURSOR_ID)
+            )
+        );
+        // The former i64::MAX sentinel came back as an unusable 2^63.
+        let old = as_javascript_client_sends(&json!(["t", i64::MAX]));
+        assert!(parse_history_cursor(Some(&old)).is_err());
+    }
+
     #[tokio::test]
     async fn a_stopped_body_search_says_so_and_continues_with_next() {
         let directory = tempfile::tempdir().unwrap();
@@ -540,12 +571,17 @@ mod tests {
                 assert_eq!(page["partial"], true);
                 assert_eq!(page["note"], PARTIAL_NOTE);
                 let back_to = page["searched_back_to"].as_str().unwrap();
-                assert_eq!(page["next"], json!([back_to, i64::MAX]));
+                assert_eq!(
+                    page["next"],
+                    json!([back_to, crate::storage::STOPPED_SEARCH_CURSOR_ID])
+                );
                 // A stopped search is not an empty result to explain.
                 assert!(page.get("no_match_terms").is_none() && page.get("hint").is_none());
             }
             match page.get("next") {
-                Some(next) => args["cursor"] = next.clone(),
+                // Sent back as a JavaScript client would: its numbers are
+                // doubles, printed without a fraction when whole.
+                Some(next) => args["cursor"] = as_javascript_client_sends(next),
                 None => break,
             }
         }

@@ -109,6 +109,20 @@ pub fn uses_body_search(node: &FilterNode) -> bool {
     }
 }
 
+/// Whether every exchange `node` can match has an `exchange_id` the filter
+/// names (`exchange_id:5`, `exchange_id:5 response:~x`), so the primary key
+/// bounds the search.
+pub fn pins_exchange_id(node: &FilterNode) -> bool {
+    match node {
+        FilterNode::And { and } => and.iter().any(pins_exchange_id),
+        FilterNode::Or { or } => !or.is_empty() && or.iter().all(pins_exchange_id),
+        FilterNode::Not { .. } => false,
+        FilterNode::Term { field, op, .. } => {
+            field == "exchange_id" && matches!(op.as_str(), "eq" | "in")
+        }
+    }
+}
+
 fn is_body_field(field: &str) -> bool {
     matches!(field, "request" | "response")
 }
@@ -1145,6 +1159,23 @@ mod tests {
         assert!(uses_body_search(
             &parse_text_query("response:~needle").unwrap()
         ));
+    }
+
+    #[test]
+    fn exchange_id_equality_pins_a_filter() {
+        for (input, pinned) in [
+            ("exchange_id:123 response:~x", true),
+            ("response:~x exchange_id:123", true),
+            ("exchange_id:1 OR exchange_id:2", true),
+            ("(exchange_id:1 OR exchange_id:2) request:~tok", true),
+            ("exchange_id:1 OR response:~x", false),
+            ("NOT exchange_id:1 response:~x", false),
+            ("exchange_id>5 response:~x", false),
+            ("method:PUT response:~tok", false),
+        ] {
+            let filter = parse_text_query(input).unwrap();
+            assert_eq!(pins_exchange_id(&filter), pinned, "{input}");
+        }
     }
 
     #[test]
