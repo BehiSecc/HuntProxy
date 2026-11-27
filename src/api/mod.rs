@@ -406,6 +406,8 @@ pub fn ui_link(listen: std::net::SocketAddr, token: Option<&str>) -> String {
 }
 
 const SIGN_IN_PARAM: &str = "token";
+/// Marks the one automatic retry of the sign-in required page.
+const SIGN_IN_RETRY_PARAM: &str = "signin";
 const SESSION_MAX_AGE_SECONDS: u32 = 30 * 24 * 60 * 60;
 
 #[derive(Clone)]
@@ -500,7 +502,7 @@ async fn guard_tcp_requests(
                 return sign_in_response(&access, request.uri().query().unwrap_or(""));
             }
             tracing::warn!(?peer, "rejected a ui sign-in link with a wrong token");
-            return unauthorized_response(headers);
+            return unauthorized_response(&request);
         }
     }
     if access.has_valid_bearer(headers) {
@@ -514,7 +516,7 @@ async fn guard_tcp_requests(
     }
     if !peer.is_some_and(|ip| ip.is_loopback()) {
         tracing::warn!(?peer, "rejected an unauthenticated api request");
-        return unauthorized_response(headers);
+        return unauthorized_response(&request);
     }
     if is_local_browser_request(request.method(), headers) {
         return next.run(request).await;
@@ -628,14 +630,35 @@ code { padding: .1rem .3rem; border-radius: 4px; background: #e4e7ec; }
 </html>
 "#;
 
-fn unauthorized_response(headers: &http::HeaderMap) -> Response {
-    let wants_html = headers
+fn unauthorized_response(request: &axum::extract::Request) -> Response {
+    let wants_html = request
+        .headers()
         .get_all(http::header::ACCEPT)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(|accept| accept.contains("text/html"));
     let mut response = if wants_html {
-        (StatusCode::UNAUTHORIZED, Html(SIGN_IN_REQUIRED_PAGE)).into_response()
+        // A sign-in link opened from a web page reaches `/` through a
+        // cross-site redirect, so the browser withholds the Strict session
+        // cookie. Navigate once more from this page: that request is
+        // same-origin and carries the cookie. The marker prevents a loop.
+        let query = request.uri().query();
+        let retry = request.method() == http::Method::GET
+            && request.uri().path() == "/"
+            && query_value(query, SIGN_IN_RETRY_PARAM).is_none()
+            && query_value(query, SIGN_IN_PARAM).is_none();
+        let page = if retry {
+            SIGN_IN_REQUIRED_PAGE.replacen(
+                "<title>",
+                &format!(
+                    "<meta http-equiv=\"refresh\" content=\"0; url=/?{SIGN_IN_RETRY_PARAM}=1\">\n<title>"
+                ),
+                1,
+            )
+        } else {
+            SIGN_IN_REQUIRED_PAGE.to_string()
+        };
+        (StatusCode::UNAUTHORIZED, Html(page)).into_response()
     } else {
         error_response(DomainError::new(
             ErrorCode::Unauthorized,
@@ -3415,5 +3438,52 @@ mod foreign_request_guard_tests {
             response.headers()[http::header::CONTENT_SECURITY_POLICY],
             "frame-ancestors 'none'"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_page_retries_once_so_the_session_cookie_is_sent() {
+        let host = ("host", "10.0.0.5:17890");
+        let html = ("accept", "text/html,*/*;q=0.8");
+        let refresh = "<meta http-equiv=\"refresh\" content=\"0; url=/?signin=1\">";
+
+        // After a cross-site sign-in redirect, the navigation to `/` has no cookie.
+        let response = send(
+            Some(TOKEN),
+            Some(LAN_PEER),
+            "/",
+            &[host, html, ("sec-fetch-site", "cross-site")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = body_text(response).await;
+        assert!(body.contains(refresh), "{body}");
+
+        // The retry without a cookie gets the static page, so there is no loop.
+        // A wrong sign-in token and other paths never retry.
+        for uri in ["/?signin=1", "/?token=wrong", "/api/v1/projects"] {
+            let response = send(Some(TOKEN), Some(LAN_PEER), uri, &[host, html]).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            let body = body_text(response).await;
+            assert!(!body.contains("http-equiv"), "{uri}: {body}");
+            assert!(body.contains("HuntProxy status"), "{uri}");
+        }
+
+        // The retry is same-origin, so the browser sends the cookie.
+        let cookie = session_cookie(TOKEN, 17890);
+        let response = send(
+            Some(TOKEN),
+            Some(LAN_PEER),
+            "/?signin=1",
+            &[
+                host,
+                html,
+                ("cookie", &cookie),
+                ("sec-fetch-site", "same-origin"),
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", "document"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
