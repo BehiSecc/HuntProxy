@@ -502,7 +502,7 @@ fn compile_body_term(
           OR EXISTS (SELECT 1 FROM bodies b \
                      WHERE b.id=exchanges.{body_column} \
                        AND huntproxy_body_contains(b.codec, b.content, ?{body_index}, \
-                                                   {content_encoding})))"
+                                                   {content_encoding}, b.id)))"
     ))
 }
 
