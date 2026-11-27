@@ -1055,3 +1055,97 @@ async fn reply_send_raw_injects_managed_cookies_into_bare_lf_requests() {
         format!("POST /x HTTP/1.1\r\nHost: {address}\r\nCookie: sid=abc\r\nContent-Length: 4\r\n\r\nli\nn")
     );
 }
+
+#[tokio::test]
+async fn cookies_set_from_a_file_takes_its_one_domain_as_the_target() {
+    let (directory, state, project_id) = test_state().await;
+    let project = project_id.get();
+    let file = |name: &str, text: &str| {
+        let path = directory.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        path.display().to_string()
+    };
+    let one = file(
+        "one.json",
+        r#"[{"name":"sid","value":"abc","domain":".app.example.com","path":"/"},
+            {"name":"theme","value":"dark","domain":"app.example.com"}]"#,
+    );
+    let session = file(
+        "session.json",
+        r#"{"cookies":[{"name":"sid","value":"abc","domain":"app.example.com"}],"origins":[]}"#,
+    );
+    let several = file(
+        "several.json",
+        r#"[{"name":"a","value":"1","domain":"b.example.org"},
+            {"name":"b","value":"2","domain":".a.example.com"}]"#,
+    );
+    let nameless = file("nameless.json", r#"[{"name":"a","value":"1"}]"#);
+    let header = file("header.txt", "sid=abc\n");
+
+    // The file's one domain becomes https://<domain>, for named and project cookies.
+    let named = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "file_path": one,
+               "profile_name": "alice", "target_url": null, "cookie": null}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(named["profile"]["host"], "app.example.com");
+    assert_eq!(named["profile"]["target_url"], "https://app.example.com/");
+    let project_wide = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "file_path": session}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        project_wide["profile"]["target_url"],
+        "https://app.example.com/"
+    );
+
+    // An explicit target_url still wins.
+    let explicit = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "file_path": one,
+               "profile_name": "bob", "target_url": "https://www.example.com/"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        explicit["profile"]["target_url"],
+        "https://www.example.com/"
+    );
+
+    // Several domains are listed; none, or a raw Cookie header, cannot be derived.
+    for (path, expected) in [
+        (&several, "several domains (a.example.com, b.example.org)"),
+        (&nameless, "carry no domain"),
+        (&header, "raw Cookie header"),
+    ] {
+        let error = call_tool(
+            state.clone(),
+            "cookies",
+            json!({"project_id": project, "action": "set", "file_path": path}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error.to_string().starts_with("target_url required"),
+            "{error}"
+        );
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    // An inline cookie never names its site.
+    let error = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "cookie": "sid=abc"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "target_url required");
+}

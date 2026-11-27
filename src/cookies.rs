@@ -271,6 +271,64 @@ pub fn normalize_cookie_input(target_url: &str, input: &str) -> DomainResult<Str
     Ok(parse_cookie_input(target_url, input, false)?.cookie_header)
 }
 
+/// The cookies and storage origins of JSON cookie input: a cookie array or a
+/// session object. `None` when the input is a raw Cookie header.
+fn parse_json_cookie_input(
+    input: &str,
+) -> DomainResult<Option<(Vec<ExportedCookie>, Vec<StorageOrigin>)>> {
+    let detection_value = input.strip_prefix('\u{feff}').unwrap_or(input).trim();
+    if !detection_value.starts_with('[') && !detection_value.starts_with('{') {
+        return Ok(None);
+    }
+    // Serde errors can quote the offending value, so report fixed messages.
+    if detection_value.starts_with('{') {
+        let object: SessionObjectInput = serde_json::from_str(detection_value).map_err(|_| {
+            DomainError::invalid(
+                "invalid JSON session object; expected {\"cookies\": [...], \"origins\": [...]}",
+            )
+        })?;
+        let origins = normalize_storage_origins(object.origins)?;
+        if object.cookies.is_empty() && origins.is_empty() {
+            return Err(DomainError::invalid(
+                "JSON session object needs a non-empty cookies array or origins array",
+            ));
+        }
+        Ok(Some((object.cookies, origins)))
+    } else {
+        let cookies: Vec<ExportedCookie> = serde_json::from_str(detection_value)
+            .map_err(|_| DomainError::invalid("invalid JSON cookie array"))?;
+        if cookies.is_empty() {
+            return Err(DomainError::invalid("JSON cookie array cannot be empty"));
+        }
+        Ok(Some((cookies, Vec::new())))
+    }
+}
+
+/// The target URL a cookie file implies: `https://` and the one domain its JSON
+/// cookies carry, ignoring a leading dot. A raw Cookie header names no site,
+/// and several domains leave the choice to the caller.
+pub fn target_url_from_cookie_input(input: &str) -> DomainResult<String> {
+    let Some((cookies, _)) = parse_json_cookie_input(input)? else {
+        return Err(DomainError::invalid(
+            "target_url required: a raw Cookie header does not say which site it belongs to",
+        ));
+    };
+    let mut domains = BTreeSet::new();
+    for domain in cookies.iter().filter_map(|cookie| cookie.domain.as_deref()) {
+        domains.insert(normalize_exported_domain(domain)?);
+    }
+    match domains.len() {
+        0 => Err(DomainError::invalid(
+            "target_url required: the cookies in the file carry no domain",
+        )),
+        1 => Ok(format!("https://{}", domains.first().expect("one domain"))),
+        _ => Err(DomainError::invalid(format!(
+            "target_url required: the cookies in the file cover several domains ({}); pass target_url for the one to use",
+            domains.into_iter().collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
 fn parse_cookie_input(
     target_url: &str,
     input: &str,
@@ -283,36 +341,13 @@ fn parse_cookie_input(
         ));
     }
 
-    let detection_value = input.strip_prefix('\u{feff}').unwrap_or(input).trim();
-    if !detection_value.starts_with('[') && !detection_value.starts_with('{') {
+    let Some((cookies, origins)) = parse_json_cookie_input(input)? else {
         parse_cookie_header(input)?;
         return Ok(NormalizedCookieInput {
             cookie_header: input.to_string(),
             managed_cookies: None,
             origins: Vec::new(),
         });
-    }
-    // Serde errors can quote the offending value, so report fixed messages.
-    let (cookies, origins) = if detection_value.starts_with('{') {
-        let object: SessionObjectInput = serde_json::from_str(detection_value).map_err(|_| {
-            DomainError::invalid(
-                "invalid JSON session object; expected {\"cookies\": [...], \"origins\": [...]}",
-            )
-        })?;
-        let origins = normalize_storage_origins(object.origins)?;
-        if object.cookies.is_empty() && origins.is_empty() {
-            return Err(DomainError::invalid(
-                "JSON session object needs a non-empty cookies array or origins array",
-            ));
-        }
-        (object.cookies, origins)
-    } else {
-        let cookies: Vec<ExportedCookie> = serde_json::from_str(detection_value)
-            .map_err(|_| DomainError::invalid("invalid JSON cookie array"))?;
-        if cookies.is_empty() {
-            return Err(DomainError::invalid("JSON cookie array cannot be empty"));
-        }
-        (cookies, Vec::new())
     };
 
     let target = parse_cookie_target(target_url)?;
@@ -1252,6 +1287,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(object.cookie_header, array.cookie_header);
+    }
+
+    #[test]
+    fn a_cookie_file_with_one_domain_names_its_target_url() {
+        let cookie = |domain: &str| format!(r#"{{"name":"sid","value":"a","domain":"{domain}"}}"#);
+        // A leading dot, letter case and repeated domains do not make several.
+        for input in [
+            format!("[{}]", cookie(".Example.com")),
+            format!("[{},{}]", cookie("example.com"), cookie(".example.com")),
+            format!(
+                r#"{{"cookies":[{}],"origins":[{{"origin":"https://other.test"}}]}}"#,
+                cookie("EXAMPLE.com")
+            ),
+            format!("\u{feff}  [{}]\n", cookie("example.com")),
+            // Cookies without a domain follow the target and do not count.
+            format!(r#"[{},{{"name":"x","value":"y"}}]"#, cookie("example.com")),
+        ] {
+            assert_eq!(
+                target_url_from_cookie_input(&input).unwrap(),
+                "https://example.com",
+                "{input}"
+            );
+        }
+
+        // Several domains are listed, sorted, so the caller can choose.
+        let error = target_url_from_cookie_input(&format!(
+            "[{},{},{}]",
+            cookie("b.example.org"),
+            cookie(".a.example.com"),
+            cookie("a.example.com")
+        ))
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error
+                .to_string()
+                .contains("several domains (a.example.com, b.example.org)"),
+            "{error}"
+        );
+
+        // Nothing to derive it from: no domain, or a raw Cookie header.
+        for (input, message) in [
+            (r#"[{"name":"sid","value":"a"}]"#, "carry no domain"),
+            (
+                r#"{"cookies":[],"origins":[{"origin":"https://a.example"}]}"#,
+                "carry no domain",
+            ),
+            ("sid=a; theme=dark", "raw Cookie header"),
+        ] {
+            let error = target_url_from_cookie_input(input).unwrap_err();
+            assert!(
+                error.to_string().starts_with("target_url required"),
+                "{error}"
+            );
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        // Malformed JSON reports what set would report.
+        assert_eq!(
+            target_url_from_cookie_input("[{").unwrap_err().to_string(),
+            "invalid JSON cookie array"
+        );
+
+        // The derived URL is one the cookies validate against.
+        let input = format!("[{}]", cookie(".example.com"));
+        let target = target_url_from_cookie_input(&input).unwrap();
+        let profile = validate_named_cookie_profile(&target, input).unwrap();
+        assert_eq!(profile.host, "example.com");
+        assert_eq!(profile.names, ["sid"]);
     }
 
     #[test]
