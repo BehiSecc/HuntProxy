@@ -567,6 +567,18 @@ impl BrowserAction {
 
     /// Shared settings this action was given but does not use.
     fn unused_options(&self) -> Vec<&'static str> {
+        // Nothing waits for a dom snapshot of the whole page.
+        if let Self::Snapshot {
+            format,
+            locator: None,
+            timeout_ms: Some(_),
+            ..
+        } = self
+        {
+            if format == "dom" {
+                return vec!["timeout_ms"];
+            }
+        }
         let Some(options) = self.options() else {
             return Vec::new();
         };
@@ -575,7 +587,22 @@ impl BrowserAction {
             Self::Navigate { .. } | Self::Back { .. } | Self::Forward { .. }
         );
         let waits_after = !matches!(self, Self::Wait { .. } | Self::Pointer { .. });
+        // Keys sent to whatever has focus, a fixed pause and a point wait for nothing.
+        let waits_for_nothing = match self {
+            Self::Press { locator, .. } | Self::Type { locator, .. } => locator.is_none(),
+            Self::Wait { for_what, .. } => for_what == "timeout",
+            Self::Pointer {
+                locator,
+                to_locator,
+                ..
+            } => locator.is_none() && to_locator.is_none(),
+            _ => false,
+        };
         [
+            (
+                "timeout_ms",
+                options.timeout_ms.is_some() && waits_for_nothing,
+            ),
             ("wait_ms", options.wait_ms.is_some() && !waits_after),
             (
                 "max_bytes",
@@ -592,12 +619,13 @@ impl BrowserAction {
     /// absent one, and an option this action does not take is named in the
     /// returned list instead of failing the call or vanishing: `op` naming the
     /// action's own type and `snapshot` on a snapshot action are accepted as
-    /// they are.
+    /// they are. So is any option at its schema default, which some clients
+    /// fill in for every property; each action's own default is the same.
     pub fn from_agent_input(value: Value) -> DomainResult<(Self, Vec<String>)> {
         let Value::Object(mut fields) = value else {
             return Err(DomainError::invalid("action must be an object"));
         };
-        fields.retain(|_, value| !value.is_null());
+        fields.retain(|name, value| !value.is_null() && !is_schema_default(name, value));
         let action: Self = serde_json::from_value(Value::Object(fields.clone()))
             .map_err(|error| DomainError::invalid(error.to_string()))?;
         // Every field the action read is serialized back, so what is missing
@@ -658,6 +686,20 @@ fn default_pages_op() -> String {
 
 /// The most option names an action result lists as ignored.
 const MAX_IGNORED_OPTIONS: usize = 16;
+
+/// Whether `value` is the default the browser_action schema declares for the
+/// `name` option. Every action that reads one of these options has the same
+/// default, so leaving it out changes nothing.
+fn is_schema_default(name: &str, value: &Value) -> bool {
+    let default = match name {
+        "offset" | "after_sequence" | "wait_ms" | "delta_x" | "delta_y" => json!(0),
+        "limit" => json!(default_browser_event_limit()),
+        "max_response_bytes" => json!(default_browser_request_response_bytes()),
+        "snapshot" | "via_chooser" | "full_page" | "follow_redirects" => json!(false),
+        _ => return false,
+    };
+    *value == default
+}
 
 fn default_pointer_button() -> String {
     "left".into()
@@ -1144,8 +1186,14 @@ fn concurrency_limit_message(
     } else {
         format!(", held by {}", holders.join(", "))
     };
+    // Ephemeral sessions belong to a running HuntProxy tool, which stops them.
+    let ephemeral_note = if ephemeral > 0 {
+        "; ephemeral sessions end on their own when the tool using them finishes"
+    } else {
+        ""
+    };
     format!(
-        "project browser concurrency limit reached: {used} of {limit} browser slots in use{held}; browser_manage op=stop with a session_id frees one"
+        "project browser concurrency limit reached: {used} of {limit} browser slots in use{held}; browser_manage op=stop with a persistent session's session_id frees one{ephemeral_note}"
     )
 }
 
@@ -6116,6 +6164,84 @@ mod tests {
     }
 
     #[test]
+    fn agent_actions_accept_schema_defaults_and_name_timeouts_nothing_waits_for() {
+        let ignored = |value: Value| BrowserAction::from_agent_input(value).unwrap().1;
+        // A client that fills in every schema default.
+        let defaults = json!({
+            "offset": 0, "limit": 50, "after_sequence": 0, "delta_x": 0, "delta_y": 0,
+            "full_page": false, "via_chooser": false, "follow_redirects": false,
+            "max_response_bytes": 4096, "wait_ms": 0, "snapshot": false,
+        });
+        let mut click = defaults.clone();
+        click["type"] = json!("click");
+        click["locator"] = json!({"css": "#save"});
+        assert!(ignored(click).is_empty());
+        let mut wait = defaults.clone();
+        wait["type"] = json!("wait");
+        wait["for_what"] = json!("selector");
+        wait["value"] = json!("#x");
+        assert!(ignored(wait).is_empty());
+        // A value other than the default is still named.
+        assert_eq!(
+            ignored(json!({"type":"click","locator":{"css":"a"},"limit":10,"full_page":true})),
+            ["full_page", "limit"]
+        );
+        // The defaults an action reads are the same with or without them.
+        let (events, _) = BrowserAction::from_agent_input(
+            json!({"type":"events","limit":50,"after_sequence":0,"wait_ms":0}),
+        )
+        .unwrap();
+        assert!(matches!(
+            events,
+            BrowserAction::Events {
+                limit: 50,
+                after_sequence: 0,
+                wait_ms: 0,
+                ..
+            }
+        ));
+
+        for (value, expected) in [
+            (
+                json!({"type":"press","key":"Enter","timeout_ms":5000}),
+                vec!["timeout_ms"],
+            ),
+            (
+                json!({"type":"type","text":"a","timeout_ms":5000}),
+                vec!["timeout_ms"],
+            ),
+            (
+                json!({"type":"wait","for_what":"timeout","value":"100","timeout_ms":5000}),
+                vec!["timeout_ms"],
+            ),
+            (
+                json!({"type":"pointer","op":"click","x":1,"y":2,"timeout_ms":5000}),
+                vec!["timeout_ms"],
+            ),
+            (
+                json!({"type":"snapshot","format":"dom","timeout_ms":5000}),
+                vec!["timeout_ms"],
+            ),
+            // Where something is waited for, it applies.
+            (
+                json!({"type":"press","key":"Enter","locator":{"css":"input"},"timeout_ms":5000}),
+                vec![],
+            ),
+            (
+                json!({"type":"pointer","op":"drag","x":1,"y":2,"to_locator":{"css":"#bin"},"timeout_ms":5000}),
+                vec![],
+            ),
+            (json!({"type":"snapshot","timeout_ms":5000}), vec![]),
+            (
+                json!({"type":"snapshot","format":"dom","locator":{"css":"main"},"timeout_ms":5000}),
+                vec![],
+            ),
+        ] {
+            assert_eq!(ignored(value.clone()), expected, "{value}");
+        }
+    }
+
+    #[test]
     fn interaction_options_are_bounded() {
         for value in [
             json!({"type":"click","locator":{"css":"a"},"timeout_ms":0}),
@@ -6171,10 +6297,13 @@ mod tests {
         );
         assert_eq!(
             message,
-            "project browser concurrency limit reached: 3 of 3 browser slots in use, held by session 4 (profile default), session 7 (profile admin), 1 ephemeral session; browser_manage op=stop with a session_id frees one"
+            "project browser concurrency limit reached: 3 of 3 browser slots in use, held by session 4 (profile default), session 7 (profile admin), 1 ephemeral session; browser_manage op=stop with a persistent session's session_id frees one; ephemeral sessions end on their own when the tool using them finishes"
         );
         let message = concurrency_limit_message(2, [(1, None::<&str>), (2, None)].into_iter());
         assert!(message.contains("2 of 2 browser slots in use, held by 2 ephemeral sessions;"));
+        // Without ephemeral sessions there is nothing to say about them.
+        let message = concurrency_limit_message(1, [(5, Some("default"))].into_iter());
+        assert!(message.ends_with("session_id frees one"), "{message}");
     }
 
     #[test]

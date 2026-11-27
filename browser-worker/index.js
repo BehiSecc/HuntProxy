@@ -2508,14 +2508,22 @@ const SNAPSHOT_AFTER_ACTIONS = new Set([
 // Playwright has waited for any navigation the action started to commit, and
 // this waits for its DOM like navigate does. A failure is reported beside the
 // action result, which already happened and must not look failed.
-// `maxBytes` bounds it as the snapshot action's max_bytes does.
-async function snapshotAfterAction(session, maxBytes) {
+// `maxBytes` bounds it as the snapshot action's max_bytes does, and every
+// wait ends by the action's `deadline`.
+async function snapshotAfterAction(session, maxBytes, deadline) {
+  // Playwright reads a timeout of 0 as none at all.
+  const timeout = () => {
+    const left = remainingWithin(deadline, 30_000);
+    if (left < 1) throw new Error(outOfTime("the snapshot"));
+    return left;
+  };
   try {
+    timeout();
     const page = await activePage(session);
     for (let attempt = 1; ; attempt += 1) {
-      await page.waitForLoadState("domcontentloaded", { timeout: 30_000 });
+      await page.waitForLoadState("domcontentloaded", { timeout: timeout() });
       try {
-        const content = await page.locator("body").ariaSnapshot({ timeout: 30_000 });
+        const content = await page.locator("body").ariaSnapshot({ timeout: timeout() });
         return snapshotSlice(content, 0, Math.max(1, Math.min(Number(maxBytes) || MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES)));
       } catch (error) {
         // A navigation can replace the document during the capture; retry once on the new one.
@@ -2766,6 +2774,19 @@ const PAGE_ACTIONS = new Set([
 const LOCATOR_TIMEOUT_MS = 10_000;
 const NAVIGATION_TIMEOUT_MS = 30_000;
 const CALL_LOG_LINES = 4;
+// The daemon gives an action 90 s and then closes the session. One action,
+// with its wait_ms pause and snapshot, ends well before that, leaving time to
+// checkpoint and answer.
+const ACTION_DEADLINE_MS = 75_000;
+
+// How much of `wanted` ms is left before `deadline`.
+function remainingWithin(deadline, wanted, now = Date.now()) {
+  return Math.max(0, Math.min(wanted, deadline - now));
+}
+
+function outOfTime(step) {
+  return `no time was left for ${step}: an action has ${ACTION_DEADLINE_MS} ms in all, so lower timeout_ms or wait_ms`;
+}
 
 // The action's timeout_ms, or `fallback` when it has none.
 function actionTimeout(action, fallback) {
@@ -2785,12 +2806,31 @@ function navigation(action) {
   return { waitUntil, timeout: actionTimeout(action, NAVIGATION_TIMEOUT_MS) };
 }
 
+// Lines of a Playwright call log that say why an element was not acted on.
+const CALL_LOG_REASON = /^element is (?:not |outside)|did not find some options|option being selected|intercepts pointer events$/;
+
+// The call log without its retries: each line once, without the "N ×" count,
+// "retrying" and "waiting Nms" lines. The first lines are kept, and every
+// line that says why.
+function compactCallLog(lines) {
+  const seen = new Set();
+  const kept = [];
+  for (const raw of lines) {
+    const line = raw.replace(/^\d+ × /, "");
+    if (/^retrying |^waiting \d+ms$/.test(line) || seen.has(line)) continue;
+    seen.add(line);
+    kept.push(line);
+  }
+  return kept.filter((line, index) => index < CALL_LOG_LINES || CALL_LOG_REASON.test(line));
+}
+
 // Playwright follows a failed locator action with a call log that repeats
 // every retry. Say what went wrong and what to do about it instead, keeping
-// only the first lines of the log.
+// the log's first lines and the reason it gives.
 function actionError(error, action) {
   // Playwright dims its call log with terminal escapes.
   const message = String(error?.message || "").replace(/\x1b\[[0-9;]*m/g, "");
+  if (typeof error?.message === "string" && error.message !== message) error.message = message;
   const located = action.locator || action.to_locator
     || (action.type === "wait" && ["selector", "text"].includes(action.for_what));
   if (Number.isSafeInteger(error?.code) || !located) return error;
@@ -2820,7 +2860,7 @@ function actionError(error, action) {
   } else if (/Timeout \d+ms exceeded/.test(summary) && !lines.some((line) => line.includes("resolved to"))) {
     text = `no element matched ${target} within ${milliseconds} ms; take a snapshot to see what is on the page`;
   } else if (lines.length) {
-    text = `${summary}\nCall log:\n${lines.slice(0, CALL_LOG_LINES).map((line) => `  - ${line}`).join("\n")}`;
+    text = `${summary}\nCall log:\n${compactCallLog(lines).map((line) => `  - ${line}`).join("\n")}`;
   } else {
     return error;
   }
@@ -2843,6 +2883,7 @@ async function awaitNamedFrames(page, action) {
 }
 
 async function executeAction(session, action = {}) {
+  const deadline = Date.now() + ACTION_DEADLINE_MS;
   let result;
   try {
     result = await performAction(session, action);
@@ -2850,12 +2891,15 @@ async function executeAction(session, action = {}) {
     throw actionError(error, action);
   }
   // A fixed pause for what the action set off, such as a page that renders
-  // after a click, instead of a separate wait action.
+  // after a click, instead of a separate wait action. What the deadline cuts
+  // off is reported as waited_ms.
   if (action.wait_ms > 0 && WAIT_AFTER_ACTIONS.has(action.type)) {
-    await new Promise((resolve) => setTimeout(resolve, action.wait_ms));
+    const pause = remainingWithin(deadline, action.wait_ms);
+    await new Promise((resolve) => setTimeout(resolve, pause));
+    if (pause < action.wait_ms) result.data = { ...result.data, waited_ms: pause };
   }
   if (action.snapshot === true && SNAPSHOT_AFTER_ACTIONS.has(action.type)) {
-    result.data = { ...result.data, snapshot: await snapshotAfterAction(session, action.max_bytes) };
+    result.data = { ...result.data, snapshot: await snapshotAfterAction(session, action.max_bytes, deadline) };
   }
   return result;
 }

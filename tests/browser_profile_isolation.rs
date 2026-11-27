@@ -2621,7 +2621,7 @@ async fn verify_browser_resources(h: &Harness) {
         }
     };
     let expected = format!(
-        "project browser concurrency limit reached: 2 of 2 browser slots in use, held by session {low} (profile {}), session {high} (profile {}); browser_manage op=stop with a session_id frees one",
+        "project browser concurrency limit reached: 2 of 2 browser slots in use, held by session {low} (profile {}), session {high} (profile {}); browser_manage op=stop with a persistent session's session_id frees one",
         profile(low),
         profile(high)
     );

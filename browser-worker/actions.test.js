@@ -23,7 +23,7 @@ function actions() {
     ${between("async function browserRequestInIsolatedWorld", "function proxyErrorMarker")}
     ${between("function proxyErrorMarker", "async function clearCookieIdentities")}
     ({ executeAction, actionError, actionTimeout, evaluationValue, LOCATOR_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS,
-      MAX_SNAPSHOT_BYTES });`, {
+      MAX_SNAPSHOT_BYTES, ACTION_DEADLINE_MS, remainingWithin, snapshotAfterAction });`, {
     Buffer, URL, fs, path, setTimeout, clearTimeout,
     activePage: async (session) => session.page,
     reconcileCurrentOriginStorage: async () => {},
@@ -72,22 +72,56 @@ test("locator failures say what went wrong and what to do, without the repeated 
     "  - waiting for locator('#box')"), { type: "upload", locator: { css: "#box" }, files: [] }),
   /input\[type=file\].*via_chooser:true/s);
 
-  // Anything else keeps its message and the first lines of its log.
+  // Anything else keeps its message, the first lines of its log once each,
+  // and the reason Playwright gives, without its retries.
+  const retried = (wait, reason, action) => Array.from({ length: 30 }, () => [
+    `    2 × waiting for element to be ${wait}`, `      - ${reason}`, `    - retrying ${action} action`,
+    "    - waiting 20ms", "      - waiting 100ms", "      - waiting 500ms",
+  ]).flat();
   const hidden = playwright("locator.fill: Timeout 800ms exceeded.", "  - waiting for locator('#name')",
     "    - locator resolved to <input id=\"name\" hidden/>", "  - fill(\"a\")", "  - attempting fill action",
-    ...Array.from({ length: 30 }, () => "    - element is not visible"));
+    ...retried("visible, enabled and editable", "element is not visible", "fill"));
   assert.equal(message(hidden), "locator.fill: Timeout 800ms exceeded.\nCall log:\n  - waiting for locator('#name')\n"
-    + "  - locator resolved to <input id=\"name\" hidden/>\n  - fill(\"a\")\n  - attempting fill action");
+    + "  - locator resolved to <input id=\"name\" hidden/>\n  - fill(\"a\")\n  - attempting fill action\n"
+    + "  - element is not visible");
+  const disabled = playwright("locator.click: Timeout 800ms exceeded.", "  - waiting for locator('#off')",
+    "    - locator resolved to <button id=\"off\" disabled>Off</button>", "  - attempting click action",
+    ...retried("visible, enabled and stable", "element is not enabled", "click"));
+  assert.equal(message(disabled), "locator.click: Timeout 800ms exceeded.\nCall log:\n  - waiting for locator('#off')\n"
+    + "  - locator resolved to <button id=\"off\" disabled>Off</button>\n  - attempting click action\n"
+    + "  - waiting for element to be visible, enabled and stable\n  - element is not enabled");
+  const missingOption = playwright("locator.selectOption: Timeout 800ms exceeded.", "  - waiting for locator('#pick')",
+    "    - locator resolved to <select id=\"pick\">…</select>", "  - attempting select option action",
+    ...retried("visible and enabled", "did not find some options", "select option"));
+  assert.match(message(missingOption, { type: "select", locator: { css: "#pick" }, value: "zzz" }), /\n {2}- did not find some options$/);
+  assert.doesNotMatch(message(missingOption, { type: "select", locator: { css: "#pick" }, value: "zzz" }), /retrying|waiting \d+ms|×/);
 
   // The strict-mode hint stays.
   assert.match(message(playwright("locator.click: Error: strict mode violation: locator('li') resolved to 3 elements:",
     "  - waiting for locator('li')")), /Set nth on the locator/);
 
-  // Errors of HuntProxy's own, and ones without a locator, are returned as they are.
+  // Errors of HuntProxy's own, and ones without a locator, are returned as
+  // they are, only without the terminal escapes.
   const own = Object.assign(new Error("frame matches no frame"), { code: -32602 });
   assert.equal(actionError(own, click), own);
-  const navigation = playwright("page.goto: Timeout 30000ms exceeded.", "  - navigating to \"https://app.test/\"");
+  const navigation = playwright("page.goto: Timeout 12000ms exceeded.", "  - navigating to \"https://app.test/\"");
   assert.equal(actionError(navigation, { type: "navigate", url: "https://app.test/" }), navigation);
+  assert.equal(navigation.message, "page.goto: Timeout 12000ms exceeded.\nCall log:\n  - navigating to \"https://app.test/\"");
+});
+
+test("an action, its pause and its snapshot end by one deadline the daemon never reaches", async () => {
+  const { remainingWithin, snapshotAfterAction, ACTION_DEADLINE_MS } = actions();
+  // The daemon gives up on a call after 90 s and closes the session.
+  assert.ok(ACTION_DEADLINE_MS <= 80_000);
+  const deadline = 1_000_000 + ACTION_DEADLINE_MS;
+  assert.equal(remainingWithin(deadline, 30_000, 1_000_000), 30_000);
+  assert.equal(remainingWithin(deadline, 30_000, deadline - 12_345), 12_345);
+  assert.equal(remainingWithin(deadline, 30_000, deadline), 0);
+  assert.equal(remainingWithin(deadline, 30_000, deadline + 5), 0);
+  // Out of time, the snapshot is reported as not taken, and nothing waits.
+  const page = { waitForLoadState: () => assert.fail("must not wait") };
+  const snapshot = await snapshotAfterAction({ page }, undefined, Date.now() - 1);
+  assert.match(snapshot.error, /^no time was left for the snapshot: an action has \d+ ms in all, so lower timeout_ms or wait_ms$/);
 });
 
 test("timeouts default per kind of action and stay within 1..30000 ms", () => {
@@ -133,6 +167,7 @@ test("interactions honour timeout_ms, wait_ms, max_bytes and wait_until, and req
       <button id="covered">Covered</button>
       <div id="overlay" class="cdk-overlay-backdrop" style="position:fixed;left:0;top:0;width:100vw;height:100vh"></div>
       <div id="listbox" role="listbox">Pick</div>
+      <button id="off" disabled>Off</button><select id="pick"><option value="a">A</option></select>
       <ul>${"<li>row of a long list</li>".repeat(200)}</ul>
       <script>
         document.querySelector("#later").addEventListener("click", () => setTimeout(() => {
@@ -182,6 +217,18 @@ test("interactions honour timeout_ms, wait_ms, max_bytes and wait_until, and req
     // The suggested dispatched click reaches the covered element.
     await execute({ type: "evaluate", expression: "document.querySelector('#covered').click()" });
     assert.equal(await page.evaluate(() => window.coveredClicks), 1);
+  });
+
+  await t.test("a found element that cannot be acted on keeps Playwright's reason", async () => {
+    // The overlay of the next subtest would be the reason otherwise.
+    await page.evaluate(() => { document.querySelector("#overlay").style.display = "none"; });
+    const disabled = await failure({ type: "click", locator: { css: "#off" }, timeout_ms: 1_200 });
+    assert.match(disabled.message, /^locator\.click: Timeout 1200ms exceeded\.\nCall log:\n/);
+    assert.match(disabled.message, /\n {2}- element is not enabled$/);
+    assert.doesNotMatch(disabled.message, /retrying|waiting \d+ms|×|\x1b/);
+    const option = await failure({ type: "select", locator: { css: "#pick" }, value: "zzz", timeout_ms: 1_200 });
+    assert.match(option.message, /did not find some options/);
+    await page.evaluate(() => { document.querySelector("#overlay").style.display = ""; });
   });
 
   await t.test("select on a custom listbox says how to choose its option", async () => {
