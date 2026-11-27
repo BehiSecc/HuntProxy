@@ -2242,7 +2242,7 @@ test
       events: ['Value (unused)', '', '{"after_sequence":0,"limit":50,"kinds":[],"wait_ms":0}', 'Read bounded browser events with an optional long-poll wait. Console, page error, and dialog events include the start of their text.'],
       scroll: ['Value (unused)', '', '{"delta_y":640}', 'Scroll by a bounded delta or bring the located element into view.'],
       screenshot: ['Value (unused)', '', '{"full_page":false,"max_bytes":4194304}', 'Capture the page or located element as PNG.'],
-      request: ['Same-origin URL', 'https://app.example.com/api/me', '{"method":"GET","headers":[],"timeout_ms":15000,"max_response_bytes":4096}', 'Send one normal same-origin browser request with redirects disabled.'],
+      request: ['Same-origin URL', 'https://app.example.com/api/me', '{"method":"GET","headers":[],"timeout_ms":15000,"max_response_bytes":4096}', 'Send one normal same-origin browser request. A redirect fails unless "follow_redirects" is true.'],
       back: ['Value (unused)', '', '{}', 'Go back in the active tab.'],
       forward: ['Value (unused)', '', '{}', 'Go forward in the active tab.'],
     };

@@ -166,6 +166,7 @@ test("pointer and keyboard input, locators that pick a match or reach into a fra
   const run = async (action) => JSON.parse(JSON.stringify(await executeAction(session, action)));
   const read = async (expression, frame) => {
     const { data } = await run({ type: "evaluate", expression, frame });
+    if ("value" in data) return data.value;
     return data.type === "string" ? data.content : JSON.parse(data.content);
   };
   const heard = async () => {

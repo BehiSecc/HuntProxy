@@ -2,10 +2,9 @@
 //! [`MAX_OUTPUT_BYTES`] by construction, so `next_after_id` never skips a
 //! message, and one message's whole payload read in slices.
 
+use super::arguments::optional_u64;
 use super::budget::{json_len, rows_that_fit, MAX_OUTPUT_BYTES};
-use super::exchange_view::{
-    optional_u64, read_bytes_page, to_usize, DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES,
-};
+use super::exchange_view::{read_bytes_page, to_usize, DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES};
 use crate::domain::*;
 use crate::websocket::{StoredWebSocketMessage, WebSocketMessageRecord};
 use serde_json::{json, Value};

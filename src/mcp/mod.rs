@@ -1,5 +1,6 @@
 //! Minimal stdio JSON-RPC MCP server. Protocol on stdout; diagnostics on stderr.
 
+mod arguments;
 pub(crate) mod budget;
 mod exchange_view;
 mod fuzz_view;
@@ -366,33 +367,35 @@ fn browser_action_schema() -> Value {
         "type": "object",
         "properties": {
             "type": {"type": "string", "enum": ["navigate", "snapshot", "click", "fill", "select", "upload", "inspect", "pages", "events", "scroll", "screenshot", "request", "press", "wait", "back", "forward", "close"]},
-            "url": {"type": "string", "description":"Required for navigate/request; optional for pages new. request requires the active page origin."},
+            "url": {"type": "string", "description":"Required for navigate/request (page origin only); optional for pages new."},
             "locator": locator_schema(),
-            "value": {"type": "string","description":"Required for fill/select/wait. wait modes: selector=Playwright selector; text=visible text; url=URL pattern; timeout=string 0..60000 ms; load_state=load/domcontentloaded/networkidle (empty: domcontentloaded). Other waits: 30000 ms."},
-            "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Upload requires <=16 absolute readable regular-file paths, <=4096 bytes each. [] clears input; chooser needs a file."},
-            "via_chooser": {"type":"boolean","default":false,"description":"Upload via trusted locator click/file chooser."},
-            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"description":"Upload ms: 1..30000 (default 10000); request: 1000..30000 (default 15000). wait uses for_what/value."},
+            "value": {"type": "string","description":"Required for fill/select/wait. wait: selector, text, url pattern, timeout 0..60000 ms (string), or load_state load/domcontentloaded/networkidle (empty: domcontentloaded), by default for up to 30000 ms."},
+            "files": {"type":"array","maxItems":16,"items":{"type":"string","minLength":1},"description":"Upload requires <=16 absolute readable paths <=4096 bytes; [] clears; chooser needs one."},
+            "via_chooser": {"type":"boolean","default":false,"description":"Upload via the file chooser locator opens."},
+            "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"description":"1..30000 ms; default 10000, or 30000 for navigation/wait/snapshot; request 1000..30000, default 15000."},
             "key": {"type": "string","description":"Required for press: Playwright key (Enter, Control+A)."},
             "for_what": {"type": "string", "enum": ["selector", "text", "url", "timeout", "load_state"],"description":"Required with value for wait."},
-            "format": {"type": "string", "enum": ["accessibility", "dom"],"description":"Snapshot; default accessibility."},
-            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"inspect 1..65536 (default 4096); screenshot 1..8388608 (default 4194304); snapshot default/cap 24000, cut to fit the result."},
-            "offset": {"type":"integer","minimum":0,"default":0,"description":"Snapshot byte offset; continue with next_offset."},
-            "snapshot": {"type":"boolean","default":false,"description":"navigate/click/fill/select/press/wait/back/forward: add data.snapshot of the resulting page."},
-            "op": {"type":"string","enum":["list","select","new","close"],"description":"Required for pages: list omits IDs/url; new permits url only; select/close need page_id/runtime_generation, no url."},
-            "page_id": {"type":"integer","minimum":1,"description":"Positive pages ID; required with runtime_generation for select/close, omitted for list/new."},
-            "runtime_generation": {"type":"integer","minimum":1,"description":"Positive generation from pages/events/context. Required with its page ID for select/close or nonzero event cursor; omit for list/new."},
-            "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"Events cursor: integer >=0, default 0; pass next_sequence; nonzero requires matching runtime_generation."},
+            "format": {"type": "string", "enum": ["accessibility", "dom"]},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608, "description":"inspect 1..65536 (default 4096); screenshot 1..8388608 (default 4194304); snapshot and snapshot:true default/cap 24000."},
+            "offset": {"type":"integer","minimum":0,"default":0,"description":"Snapshot: pass next_offset."},
+            "snapshot": {"type":"boolean","default":false,"description":"Add data.snapshot of the resulting page."},
+            "op": {"type":"string","enum":["list","select","new","close"],"description":"pages: list (default), new (optional url), or select/close (page_id and runtime_generation required)."},
+            "page_id": {"type":"integer","minimum":1,"description":"Positive pages ID; required with runtime_generation for select/close, not list/new."},
+            "runtime_generation": {"type":"integer","minimum":1,"description":"Positive, from pages/events. Required with page ID for select/close or a nonzero event cursor."},
+            "after_sequence": {"type":"integer","minimum":0,"default":0,"description":"Events cursor: integer >=0, default 0 (next_sequence); nonzero needs runtime_generation."},
             "limit": {"type":"integer","minimum":1,"maximum":100,"default":50,"description":"Events limit: 1..100, default 50."},
-            "kinds": {"type":"array","maxItems":11,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message","observer_error"]},"description":"Event filter: <=11 unique kinds, default all. Filtered observer failures remain in observer_errors."},
-            "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"Events wait: 0..30000 ms, default 0."},
-            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Horizontal scroll: -100000..100000, default 0; needs locator or nonzero delta."},
-            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Vertical scroll: -100000..100000, default 0."},
-            "full_page": {"type":"boolean","default":false,"description":"Full screenshot; excludes locator."},
+            "kinds": {"type":"array","maxItems":11,"uniqueItems":true,"items":{"type":"string","enum":["page","popup","navigation","dialog","console","page_error","request","response","request_failed","window_message","observer_error"]}},
+            "wait_ms": {"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"0..30000 ms, default 0: events waits for one; interactions pause after acting."},
+            "delta_x": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Scroll x: -100000..100000, default 0; needs locator or nonzero delta."},
+            "delta_y": {"type":"integer","minimum":-100000,"maximum":100000,"default":0,"description":"Scroll y: -100000..100000, default 0."},
+            "full_page": {"type":"boolean","default":false},
             "method": {"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"],"description":"Required for request."},
-            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"<=64, <=65536 bytes total; default []. Rejects duplicates, browser-managed/Fetch-forbidden transport, identity, origin, host, length, proxy, Sec-*, internal headers."},
-            "body_text": {"type":"string","description":"UTF-8 body, at most 2 MiB; excludes body_base64. GET/HEAD cannot have a body."},
-            "body_base64": {"type":"string","description":"Base64 body, at most 2 MiB decoded; excludes body_text."},
-            "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Response preview bytes: 1..65536, default 4096."}
+            "headers": {"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"value":{"type":"string"}},"required":["name","value"],"additionalProperties":false},"description":"<=64; no duplicates or browser-managed headers."},
+            "body_text": {"type":"string","description":"UTF-8 body <=2 MiB; not with body_base64 or GET/HEAD."},
+            "body_base64": {"type":"string","description":"Base64 body <=2 MiB."},
+            "max_response_bytes": {"type":"integer","minimum":1,"maximum":65536,"default":4096,"description":"Response preview bytes: 1..65536, default 4096."},
+            "follow_redirects": {"type":"boolean","default":false,"description":"request: follow redirects (default: fail on one)."},
+            "wait_until": {"type":"string","enum":["load","domcontentloaded","networkidle"],"description":"navigate/back/forward; default domcontentloaded."}
         },
         "required": ["type"],
         "additionalProperties": false
@@ -509,6 +512,19 @@ fn request_rules_tool_def() -> Value {
     }"#).expect("request rules tool schema is valid JSON")
 }
 
+/// browser_start's browser profile and cookie profile. A cookie profile seeds
+/// the browser profile of the same name, so it also names the profile when
+/// none is given.
+fn browser_start_profiles(args: &Value) -> (&str, Option<&str>) {
+    let cookie_profile = args.get("cookie_profile").and_then(Value::as_str);
+    let profile = args
+        .get("profile")
+        .and_then(Value::as_str)
+        .or(cookie_profile)
+        .unwrap_or("default");
+    (profile, cookie_profile)
+}
+
 fn browser_input_tool_def() -> Value {
     let mut element = locator_schema();
     element["description"] = json!("Element to click, hover, drag from, or type into. One strategy: role/name, text, test_id, css. nth picks one match (0 first, -1 last); frame: iframe name or URL part. Omit to use x and y, or to type into the focused element.");
@@ -535,7 +551,8 @@ fn browser_input_tool_def() -> Value {
                 "count": {"type":"integer","minimum":1,"maximum":3,"default":1,"description":"Clicks, 1..3 (default 1); 2 is a double-click."},
                 "modifiers": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","enum":["Alt","Control","Meta","Shift"]},"description":"Keys held during click, hover or drag; default none."},
                 "text": {"type":"string","minLength":1,"maxLength":4096,"description":"Required for type: 1..4096 bytes; a newline presses Enter."},
-                "snapshot": {"type":"boolean","default":false,"description":"Add data.snapshot of the resulting page."}
+                "snapshot": {"type":"boolean","default":false,"description":"Add data.snapshot of the resulting page."},
+                "timeout_ms": {"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Wait for the locator 1..30000 ms, default 10000."}
             },
             "required": ["project_id", "session_id", "op"],
             "additionalProperties": false
@@ -550,33 +567,33 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"extension_describe","description":"Describe one extension, its actions, input schemas, capabilities, and requested/effective limits.","inputSchema":{"type":"object","properties":{"plugin_id":{"type":"string"}},"required":["plugin_id"],"additionalProperties":false}},
         {"name":"extension_preview","description":"Run the real extension planner without creating a job or sending requests. Returns stage-scoped request, candidate, runtime, and mode estimates plus a bounded planning_summary with selection/exclusion details when supplied by the plugin.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"plugin_id":{"type":"string"},"action":{"type":"string"},"base_exchange_id":{"type":"integer"},"input":{"type":"object","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
         {"name":"extension_run","description":"Start an asynchronous extension job. Call extension_describe first and place action-specific fields inside input, not at the top level. project_id owns the job/evidence; optional base_exchange_id supplies a saved request while cookies and authorization remain host-side. Planning failures report the plugin's bounded validation message.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"HuntProxy project that owns the job and evidence."},"plugin_id":{"type":"string","description":"Installed id from extension_list."},"action":{"type":"string","description":"Action name from extension_describe."},"base_exchange_id":{"type":"integer","description":"Optional saved request inherited host-side without copying secrets into action input."},"input":{"type":"object","description":"Action arguments matching extension_describe.actions[].input_schema. Do not put these fields at the top level.","default":{}}},"required":["project_id","plugin_id","action"],"additionalProperties":false}},
-        {"name":"job_status","description":"Read compact extension job state, phase, request-weighted progress, and recommended_poll_interval_ms. Progress is not requests actually sent; use job_results execution metadata for returned/skipped observations. Honor the returned interval before polling again.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
+        {"name":"job_status","description":"Read compact extension job state, phase, request-weighted progress, and recommended_poll_interval_ms. Progress is not requests actually sent; use job_results execution metadata for returned/skipped observations. Honor the returned interval before polling again, or pass wait_ms to wait for the job to end.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"Wait up to this long for the job to end instead of polling; returns as soon as it does."}},"required":["job_id"],"additionalProperties":false}},
         {"name":"job_cancel","description":"Cancel an active extension job.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"}},"required":["job_id"],"additionalProperties":false}},
         {"name":"job_resume_analysis","description":"Retry only a failed resumable aggregation stage without replaying network probes, then resume normal status polling. The memory-only checkpoint must be retried before restart; timeout is bounded to 120000 ms.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"job_id":{"type":"string","format":"uuid"},"js_stage_timeout_ms":{"type":"integer","minimum":250,"maximum":120000}},"required":["project_id","job_id"],"additionalProperties":false}},
         {"name":"job_results","description":"Read available extension output, including partial results after failure or cancellation. summary (default) and full preserve host execution counts; returned observations do not establish clean coverage. findings returns a stable page; full returns complete non-finding data plus a paged findings array.","inputSchema":{"type":"object","properties":{"job_id":{"type":"string","format":"uuid"},"view":{"type":"string","enum":["summary","findings","full"],"default":"summary"},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":100,"default":25}},"required":["job_id"],"additionalProperties":false}},
         {"name":"capture_sessions","description":"List proxy capture credentials, create a one-time credential, revoke one, or renew one. create returns the secret once; copy it immediately. revoke and renew require session_id. This does not start Chromium; use browser_start for browser traffic.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","revoke","renew"]},"session_id":{"type":"integer","description":"Required for revoke and renew."}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set requires target_url and exactly one of cookie or file_path; clear requires target_url unless profile_name is supplied. Set accepts a raw Cookie header, a browser-export JSON cookie array, or a session object {\"cookies\":[...],\"origins\":[{\"origin\":\"https://app.example\",\"localStorage\":[{\"name\",\"value\"}],\"sessionStorage\":[{\"name\",\"value\"}]}]} (Playwright storageState plus optional per-origin sessionStorage; cookies may be empty). Origins must be exact http(s) origins without a path, and storage requires profile_name (project cookies have no browser to seed). Input up to 4 MiB. list reports only an origin_count, never keys or values. Project cookies apply to HTTP tools and ephemeral sessions. Persistent browser jars change only with an explicit browser_start(cookie_profile=...). profile_name stores a reusable named cookie identity for extensions or browser_start(cookie_profile=...) without changing an already running browser.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Optional reusable identity name. Pass the same name as browser_start.cookie_profile to seed a persistent Chromium profile."},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array or session object."},{"type":"object","description":"Session object: cookies plus per-origin localStorage/sessionStorage. Requires profile_name when origins are present.","properties":{"cookies":{"type":"array","items":{"type":"object"}},"origins":{"type":"array","items":{"type":"object","properties":{"origin":{"type":"string"},"localStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}},"sessionStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}}},"required":["origin"]}}}},{"type":"array","description":"Browser-export or Playwright cookie array.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"path":{"type":"string"},"httpOnly":{"type":"boolean"},"secure":{"type":"boolean"},"sameSite":{"type":"string"},"session":{"type":"boolean"},"expirationDate":{"type":"number"},"expires":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file (up to 4 MiB) containing a raw Cookie header, JSON cookie array, or session object with cookies and origins."}},"required":["project_id","action"]}},
+        {"name":"cookies","description":"Set, list, or clear project cookies without exposing their values. Set requires target_url and exactly one of cookie or file_path; with file_path, target_url may be omitted when the JSON cookies carry exactly one domain (https://<domain> is used); clear requires target_url unless profile_name is supplied. Set accepts a raw Cookie header, a browser-export JSON cookie array, or a session object {\"cookies\":[...],\"origins\":[{\"origin\":\"https://app.example\",\"localStorage\":[{\"name\",\"value\"}],\"sessionStorage\":[{\"name\",\"value\"}]}]} (Playwright storageState plus optional per-origin sessionStorage; cookies may be empty). Origins must be exact http(s) origins without a path, and storage requires profile_name (project cookies have no browser to seed). Input up to 4 MiB. list reports only an origin_count, never keys or values. Project cookies apply to HTTP tools and ephemeral sessions. Persistent browser jars change only with an explicit browser_start(cookie_profile=...). profile_name stores a reusable named cookie identity for extensions or browser_start(cookie_profile=...) without changing an already running browser.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["set","list","clear"]},"target_url":{"type":"string"},"profile_name":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Optional reusable identity name. Pass the same name as browser_start.cookie_profile to seed a persistent Chromium profile."},"cookie":{"oneOf":[{"type":"string","description":"Raw Cookie header or a string containing a JSON cookie array or session object."},{"type":"object","description":"Session object: cookies plus per-origin localStorage/sessionStorage. Requires profile_name when origins are present.","properties":{"cookies":{"type":"array","items":{"type":"object"}},"origins":{"type":"array","items":{"type":"object","properties":{"origin":{"type":"string"},"localStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}},"sessionStorage":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"}},"required":["name","value"]}}},"required":["origin"]}}}},{"type":"array","description":"Browser-export or Playwright cookie array.","items":{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"domain":{"type":"string"},"hostOnly":{"type":"boolean"},"path":{"type":"string"},"httpOnly":{"type":"boolean"},"secure":{"type":"boolean"},"sameSite":{"type":"string"},"session":{"type":"boolean"},"expirationDate":{"type":"number"},"expires":{"type":"number"}},"required":["name","value"]}}]},"file_path":{"type":"string","description":"Local UTF-8 file (up to 4 MiB) containing a raw Cookie header, JSON cookie array, or session object with cookies and origins."}},"required":["project_id","action"]}},
         request_rules_tool_def(),
         {"name":"overview","description":"Summarize one project's saved activity: total exchanges and counts by source, captured replies sent, findings, distinct hosts, and last exchange time.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"history_search","description":format!("Search saved project history, newest first, across all hosts and MIME types; active browser responses appear once captured. {} Pages fit the output budget; pass next as cursor to continue. When an AND query matches nothing, no_match_terms lists its terms that match nothing alone. Rows omit bodies; read exchanges with exchange_get.", view::EXCHANGE_ROW_NOTE),"inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 text, not Unix seconds. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, query, url (scheme://authority/path?query), method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request, response. request:~text searches the request line, headers and decoded body; response:~text searches response headers and decoded body; both are slow on broad queries, so add host, method, time or size terms. Bare words search host, path, mime, title and error. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50},"cursor":{"description":"next from the previous page.","oneOf":[{"type":"array","items":{"type":["string","integer"]},"minItems":2,"maxItems":2},{"type":"string"},{"type":"null"}]}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"history_search","description":format!("Search saved project history, newest first, across all hosts and MIME types; active browser responses appear once captured. {} Pages fit the output budget; pass next as cursor to continue. When a query matches nothing, no_match_terms lists its terms that match nothing alone. A request:/response: search stops after 10 s with partial:true; pass next to continue it. Rows omit bodies; read exchanges with exchange_get.", view::EXCHANGE_ROW_NOTE),"inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"q":{"type":"string","description":format!("{HISTORY_QUERY_SYNTAX}. Comparisons: >, >=, <, <=, !=. time compares stored UTC RFC 3339 text, not Unix seconds. duration is milliseconds; request_size and response_size are body bytes. Fields: exchange_id, host, authority, path, query, url (scheme://authority/path?query), method, protocol, status, mime, source, label, request_size, response_size, duration, title, page_title, display_title, parent, browser_session, capture_session, reply_tab, fuzz_job, request_hash, response_hash, time, error, request, response. request:~text searches the request line, headers and decoded body; response:~text searches response headers and decoded body; both are slow on broad queries, so add host, method, time or size terms. Bare words search host, path, mime, title and error. Adjacent terms are AND; NOT binds before AND, then OR."),"examples":["host:example.com method:GET status>=400","time>2026-10-12T00:00:00Z","duration>=1000 response_size>1024","(request:~\"monthly report\" OR request:~summary) method:PUT"]},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50},"urls":{"type":"string","enum":["full","short"],"default":"full","description":"short cuts query strings over 80 characters; exchange_get returns the full URL."},"cursor":{"description":"next from the previous page.","oneOf":[{"type":"array","items":{"type":["string","integer"]},"minItems":2,"maxItems":2},{"type":"string"},{"type":"null"}]}},"required":["project_id"],"additionalProperties":false}},
         {"name":"sitemap","description":"Discover saved routes. Omit host for a lightweight list of hosts and route counts. With one exact host, list its routes sorted by path, optionally under path_prefix; routes omit empty lists and exchange_count 1. Pass next_offset as offset to continue.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"host":{"type":"string","description":"Exact hostname, case-insensitive."},"path_prefix":{"type":"string","description":"Slash-boundary path subtree, such as /api. Requires host."},"offset":{"type":"integer","minimum":0}},"required":["project_id"],"additionalProperties":false}},
         {"name":"findings","description":"List findings, mark an exchange as a finding, or remove a finding.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","add","remove"]},"exchange_id":{"type":"integer","description":"Required for add."},"finding_id":{"type":"integer","description":"Required for remove."},"title":{"type":"string","description":"Required for add."},"description":{"type":"string","description":"Required for add."}},"required":["project_id","action"]}},
-        {"name":"exchange_get","description":"Read exchanges in one call: summary, headers as \"name: value\" (secrets redacted, noisy hidden) and bodies inline up to body_bytes per side. A cut body has next_offset; continue, search or save it with exchange_body. exchange_ids reads up to 20; ids that do not fit are in not_returned.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"exchange_ids":{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":exchange_view::MAX_BATCH_IDS,"description":"Instead of exchange_id."},"body_bytes":{"type":"integer","minimum":0,"maximum":exchange_view::MAX_INLINE_BODY_BYTES,"default":4096,"description":"0 omits bodies."}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"exchange_get","description":"Read exchanges in one call: summary, headers as \"name: value\" (secrets redacted, noisy hidden) and bodies inline up to body_bytes per side. A cut body has next_offset; continue, search or save it with exchange_body. exchange_ids reads up to 20; ids that do not fit are in not_returned; headers=compact (low-signal headers hidden, long values cut) or none fits more ids per call.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"exchange_ids":{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":exchange_view::MAX_BATCH_IDS,"description":"Instead of exchange_id."},"body_bytes":{"type":"integer","minimum":0,"maximum":exchange_view::MAX_INLINE_BODY_BYTES,"default":4096,"description":"0 omits bodies."},"headers":{"type":"string","enum":["full","compact","none"],"default":"full","description":"compact hides low-signal headers (hidden_headers names them) and cuts values over 256 characters; none omits headers."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"exchange_compare","description":"Compare the saved request and response of two exchanges. Lists only differences; unchanged names matching parts. Sensitive values stay redacted but are still compared. Cuts are marked (text_diff_truncated, headers_omitted).","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"left_exchange_id":{"type":"integer"},"right_exchange_id":{"type":"integer"},"include_noisy_headers":{"type":"boolean","default":false}},"required":["project_id","left_exchange_id","right_exchange_id"],"additionalProperties":false}},
         {"name":"page_analyzer","description":"Extract sorted, unique endpoints, absolute URLs, emails, and request parameter names from JavaScript or HTML without executing it. Provide exactly one saved exchange_id or absolute URL. The tool analyzes that page and sequentially fetches bounded same-origin JavaScript bundles referenced by script tags or a Modern.js route manifest; URL mode first sends a semantic GET with project cookies. CSS and other non-JavaScript assets are skipped. Extracted values may contain secrets.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer","description":"Saved exchange whose decoded response body and same-origin JavaScript bundles should be analyzed."},"url":{"type":"string","description":"Absolute http/https URL to fetch and analyze, including its same-origin JavaScript bundles."}},"required":["project_id"],"oneOf":[{"required":["exchange_id"]},{"required":["url"]}],"additionalProperties":false}},
         {"name":"copy_as","description":"Convert a saved request to cURL or Python requests. The output includes the original sensitive headers by default so it is immediately runnable; set include_secrets=false to produce a redacted copy.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"format":{"type":"string","enum":["curl","python_requests"]},"include_secrets":{"type":"boolean","default":true}},"required":["project_id","exchange_id","format"],"additionalProperties":false}},
-        {"name":"exchange_body","description":"Read a body beyond what exchange_get inlines. Pages fit the output budget; continue at next_offset while truncated. search finds a literal, ASCII case-insensitive string; match offsets work as offset. save writes the whole body to a private file and returns its path for local tools. Responses are decoded (gzip/br/deflate/zstd) unless raw=true; side=request redacts raw HTTP/1.1 request headers. available=false means no body. utf8 is lossy for non-UTF-8 bytes; encoding=base64 is exact.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"response"},"offset":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384},"raw":{"type":"boolean","default":false},"encoding":{"type":"string","enum":["utf8","base64"],"default":"utf8"},"search":{"type":"string"},"context_bytes":{"type":"integer","minimum":0,"maximum":exchange_view::MAX_CONTEXT_BYTES,"default":160,"description":"Context around each search match."},"save":{"type":"boolean","default":false}},"required":["project_id","exchange_id"],"additionalProperties":false}},
+        {"name":"exchange_body","description":"Read a body beyond what exchange_get inlines. Pages fit the output budget; continue at next_offset while truncated. search finds a literal, ASCII case-insensitive string; match offsets work as offset. save writes the whole body to a private file and returns its path for local tools. Responses are decoded (gzip/br/deflate/zstd) unless raw=true, which also reads a body whose decoding fails; side=request redacts raw HTTP/1.1 request headers. available=false means no body. utf8 is lossy for non-UTF-8 bytes; encoding=base64 is exact.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"response"},"offset":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384},"raw":{"type":"boolean","default":false},"encoding":{"type":"string","enum":["utf8","base64"],"default":"utf8"},"search":{"type":"string"},"context_bytes":{"type":"integer","minimum":0,"maximum":exchange_view::MAX_CONTEXT_BYTES,"default":160,"description":"Context around each search match."},"save":{"type":"boolean","default":false}},"required":["project_id","exchange_id"],"additionalProperties":false}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"request"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a semantic HTTP request and return status, a decoded 4 KiB response preview and the saved exchange_id; read more of the response with exchange_body. With base_exchange_id, diff gives the base status, length and whether the body is identical. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
+        {"name":"reply_send","description":"Send a semantic HTTP request and return status, a decoded 4 KiB response preview and the saved exchange_id; read more of the response with exchange_body. With base_exchange_id, diff gives the base status, length and whether the body is identical. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"},"response_headers":{"type":"boolean","description":"Also return the response headers as \"name: value\" lines, secrets redacted."},"preview_bytes":{"type":"integer","minimum":0,"maximum":16384,"default":4096,"description":"Response preview size in bytes."}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. With use_project_cookies the project Cookie header replaces any in the request, and bare LF line endings in the header block are sent as CRLF. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or the body (body_text, body_override, body_json strings or body_params); use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators. Returns the queued job at once; fuzz_manage get with wait_ms returns as soon as it ends.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Pages fit the output budget: continue cases and group_cases with before_case_index=next_before_case_index, and groups (largest first) with offset=next_offset.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0,"description":"groups: next_offset from the previous page."},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"get: wait up to this long for the job to end instead of polling; returns as soon as it does."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, read one message's whole payload, or inject a text/binary message into an active connection. messages lists the oldest first with the first 2 KB of each payload (payload_cut=true when there is more); pages fit the output budget, so continue with after_id=next_after_id while it is present. message reads one payload by message_id; continue at next_offset while truncated.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","message","send"]},"connection_id":{"type":"integer","description":"Required for messages and send."},"after_id":{"type":"integer","description":"messages: list messages with a larger id; pass next_after_id."},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":250,"description":"Most connections or messages to list; a messages page may hold fewer to fit the output budget."},"message_id":{"type":"integer","description":"Required for message."},"offset":{"type":"integer","minimum":0,"default":0,"description":"message: payload byte to start at; pass next_offset."},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384,"description":"message: most payload bytes to read; a page may hold fewer to fit the output budget."},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"description":"send: how payload is written (default text). message: how the page is written; by default text for UTF-8 payloads, base64 otherwise."},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
-        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. console, page_error and dialog events carry the first 1000 characters of their text. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. Prefer accessibility snapshots: scope large pages with locator or page with offset, and add snapshot:true to an interaction instead of a separate snapshot call. A locator's nth picks one of several matches and its frame acts inside an iframe; pages list names each page's frames. Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
-        {"name":"browser_evaluate","description":"Run JavaScript in the selected page of an active browser session and return its result. Use it to read page state and globals, call the application's own functions and APIs with the live session, or reach DOM that locators cannot; do not enable browser_cdp to script the page. expression runs in the page's main world as in the DevTools console: statements and top-level await work, declarations may be repeated between calls, a () => ... function source is called, and console helpers such as getEventListeners() and $$() are available. The page's CSP does not restrict it. frame runs it in one frame of the page instead, including cross-origin frames; browser_action pages lists them. data.content is the result: a string or DOM node (its outerHTML) as text, anything else as JSON; data.type names the JavaScript type, and a thrown exception is returned with type exception. content is cut to fit and then reports truncated with total_bytes, so return only what you need. Requests the page sends are captured in History like other browser traffic. Choose the tab with browser_action pages.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"expression":{"type":"string","minLength":1,"maxLength":65536,"description":"JavaScript, at most 65536 bytes. The value of the last expression is returned, and a promise is awaited."},"frame":{"type":"string","minLength":1,"maxLength":2048,"description":"Frame name, or part of its URL, matching exactly one frame of the selected page. Omit for the page itself."},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Stop waiting after 1..30000 ms, default 10000; a running loop is terminated."}},"required":["project_id","session_id","expression"],"additionalProperties":false}},
+        {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile, which defaults to it. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, op defaults to list; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. console, page_error and dialog events carry the first 1000 characters of their text. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, never retries it, follows redirects only with follow_redirects, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. Prefer accessibility snapshots: scope large pages with locator or page with offset, and add snapshot:true to an interaction instead of a separate snapshot call, and wait_ms instead of a separate timeout wait. Options an action does not use are listed in ignored_options. A locator's nth picks one of several matches and its frame acts inside an iframe; pages list names each page's frames. Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
+        {"name":"browser_evaluate","description":"Run JavaScript in the selected page of an active browser session and return its result. Use it to read page state and globals, call the application's own functions and APIs with the live session, or reach DOM that locators cannot; do not enable browser_cdp to script the page. expression runs in the page's main world as in the DevTools console: statements and top-level await work, declarations may be repeated between calls, a () => ... function source is called, and console helpers such as getEventListeners() and $$() are available. The page's CSP does not restrict it. frame runs it in one frame of the page instead, including cross-origin frames; browser_action pages lists them. data.content is the result: a string or DOM node (its outerHTML) as text, anything else as JSON, except that an object or array that fits is returned as JSON in data.value; data.type names the JavaScript type, and a thrown exception is returned with type exception. content is cut to fit and then reports truncated with total_bytes, so return only what you need. Requests the page sends are captured in History like other browser traffic. Choose the tab with browser_action pages.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"expression":{"type":"string","minLength":1,"maxLength":65536,"description":"JavaScript, at most 65536 bytes. The value of the last expression is returned, and a promise is awaited."},"frame":{"type":"string","minLength":1,"maxLength":2048,"description":"Frame name, or part of its URL, matching exactly one frame of the selected page. Omit for the page itself."},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Stop waiting after 1..30000 ms, default 10000; a running loop is terminated."}},"required":["project_id","session_id","expression"],"additionalProperties":false}},
         browser_input_tool_def(),
         {"name":"browser_cdp","description":"Hand an active persistent Chromium session to a person through loopback Chrome DevTools on an available port from 9222 to 9321, inspect handoff status, or return control to the agent. This is a handoff to a person, not a scripting interface: to run JavaScript in the page yourself, call browser_evaluate, and for mouse or keyboard input browser_input. While enabled, browser_action, browser_evaluate and browser_input are paused for that session. Status accepts an optional session_id; without it, active_sessions lists the project’s handoffs. On a VPS, use ssh_forward_command when returned; otherwise forward the returned cdp_port to the same port on 127.0.0.1 over SSH. Try hosted_devtools_url first, then devtools_url if the browser restricts the hosted frontend’s local-network WebSocket.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for enable and disable; optional for status."},"op":{"type":"string","enum":["enable","status","disable"]}},"required":["project_id","op"],"additionalProperties":false}},
         {"name":"browser_manage","description":"Get status, suspend one browser, suspend all project browsers, or reset one persistent Chromium profile. Status without session_id lists active browser sessions and resources: per-project capacity including ephemeral sessions, verified profile ownership, and cdp_port_in_use, which is true when the CDP port range is exhausted. Reuse these observations until a lifecycle transition or browser error; capacity is not a reservation. Stop operations preserve browser state. reset_profile defaults to default, requires confirm=true, and clears only that profile's browser-derived state.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"session_id":{"type":"integer","description":"Required for stop; optional for status."},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default","description":"Profile to reset when op=reset_profile."},"op":{"type":"string","enum":["status","stop","stop_all","reset_profile"]},"confirm":{"type":"boolean","default":false,"description":"Must be true for reset_profile because browser state is permanently deleted."}},"required":["project_id","op"],"additionalProperties":false}},
@@ -971,6 +988,118 @@ async fn handle_rpc(
     }
 }
 
+/// Request fields an agent may put beside `draft` instead of inside it.
+const LIFTED_DRAFT_FIELDS: [&str; 12] = [
+    "method",
+    "url",
+    "identity",
+    "header_overrides",
+    "header_tombstones",
+    "inheritance",
+    "body_override",
+    "body_text",
+    "body_json",
+    "body_format",
+    "body_params",
+    "body_cleared",
+];
+
+/// The request `draft` of a tool call: the `draft` argument plus any request
+/// field given at the top level, which moves into it unless `draft` already
+/// sets that field. A field set in both places must agree.
+fn request_draft_value(args: &Value) -> DomainResult<Option<Value>> {
+    for (field, hint) in [
+        (
+            "headers",
+            "put `header_overrides`: [{\"name\", \"value\"}] under `draft`",
+        ),
+        (
+            "body",
+            "put `body_text`, `body_json`, or `body_params` under `draft`",
+        ),
+    ] {
+        if arguments::present(args, field).is_some() {
+            return Err(DomainError::invalid(format!(
+                "`{field}` is not a request field; {hint}"
+            )));
+        }
+    }
+    let mut draft = arguments::present(args, "draft").cloned();
+    if let Some(Value::Object(fields)) = &mut draft {
+        // A client that sends every property sends null for the unused ones.
+        fields.retain(|_, value| !value.is_null());
+    }
+    for field in LIFTED_DRAFT_FIELDS {
+        let Some(value) = arguments::present(args, field) else {
+            continue;
+        };
+        let Value::Object(fields) = draft.get_or_insert_with(|| json!({})) else {
+            return Err(DomainError::invalid("draft must be an object"));
+        };
+        match fields.get(field) {
+            None => {
+                fields.insert(field.into(), value.clone());
+            }
+            Some(existing) if existing == value => {}
+            Some(_) => {
+                return Err(DomainError::invalid(format!(
+                    "`{field}` is set both at the top level and in `draft` with different values; keep it under `draft`"
+                )))
+            }
+        }
+    }
+    Ok(draft)
+}
+
+/// The protocol preference, accepting the usual spellings of HTTP/1.1 and HTTP/2.
+fn parse_protocol(value: Option<&str>) -> DomainResult<ProtocolPreference> {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("auto") => Ok(ProtocolPreference::Auto),
+        Some("h1" | "http1" | "http/1" | "http1.1" | "http/1.1") => Ok(ProtocolPreference::H1),
+        Some("h2" | "http2" | "http/2") => Ok(ProtocolPreference::H2),
+        Some(_) => Err(DomainError::invalid(
+            "protocol must be auto, h1 or h2 (http/1.1 and http/2 also work)",
+        )),
+    }
+}
+
+/// The response headers as exchange_get shows them: `name: value` lines with
+/// secrets redacted and noisy headers hidden.
+fn response_header_lines(result: &crate::reply::ReplySendResult) -> Value {
+    let presented = match (&result.saved_response, &result.response) {
+        (Some(saved), _) => {
+            let options = crate::policy::PresentationOptions::default();
+            crate::policy::present_headers(&saved.headers, &options).headers
+        }
+        (None, Some(unsaved)) => unsaved.headers.clone(),
+        (None, None) => Vec::new(),
+    };
+    exchange_view::header_lines(&presented)
+}
+
+/// The options of a raw send, read from the tool arguments. Null counts as
+/// absent and the numbers may be quoted.
+fn raw_http1_options(args: &Value) -> DomainResult<crate::reply::RawHttp1Options> {
+    let mut options = args.as_object().cloned().unwrap_or_default();
+    options.retain(|_, value| !value.is_null());
+    for field in [
+        "pause_at_byte",
+        "pause_ms",
+        "read_timeout_ms",
+        "idle_timeout_ms",
+    ] {
+        match arguments::optional_u64(args, field)? {
+            Some(number) => options.insert(field.into(), json!(number)),
+            None => options.remove(field),
+        };
+    }
+    serde_json::from_value(Value::Object(options))
+        .map_err(|error| DomainError::invalid(format!("raw HTTP/1.1 options: {error}")))
+}
+
 /// Parses a request-supplied `draft`, rejecting unknown keys so fields such as
 /// `headers` or `body` are never silently dropped from the sent request.
 fn parse_request_draft(draft: Option<&Value>) -> DomainResult<ReplyDraft> {
@@ -1080,11 +1209,7 @@ fn tool_call_result(name: &str, result: Value, is_error: bool) -> Value {
 }
 
 fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
-    let id = args
-        .get("project_id")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| DomainError::invalid("project_id required"))?;
-    Ok(ProjectId(id))
+    arguments::required_i64(args, "project_id").map(ProjectId)
 }
 
 async fn fetch_page_analyzer_bundle(
@@ -1225,7 +1350,8 @@ fn emit_event(state: &AppState, project_id: ProjectId, kind: &str, payload: Valu
 
 pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResult<Value> {
     // Any call about a project keeps that project's browsers open.
-    if let Some(project_id) = args.get("project_id").and_then(Value::as_i64) {
+    // A malformed id is reported by the handler; here it only skips the touch.
+    if let Ok(Some(project_id)) = arguments::optional_i64(&args, "project_id") {
         state.browser.touch_project(ProjectId(project_id));
     }
     match name {
@@ -1251,10 +1377,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("action")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("action required"))?;
-            let base_exchange_id = args
-                .get("base_exchange_id")
-                .and_then(Value::as_i64)
-                .map(ExchangeId);
+            let base_exchange_id =
+                arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
             let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
             state
                 .plugins
@@ -1271,11 +1395,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("action")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("action required"))?;
-            let base_exchange_id = args
-                .get("base_exchange_id")
-                .or_else(|| args.get("exchange_id"))
-                .and_then(Value::as_i64)
-                .map(ExchangeId);
+            let base_exchange_id = if arguments::present(&args, "base_exchange_id").is_some() {
+                arguments::optional_i64(&args, "base_exchange_id")?
+            } else {
+                arguments::optional_i64(&args, "exchange_id")?
+            }
+            .map(ExchangeId);
             let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
             Ok(json!(
                 state
@@ -1302,7 +1427,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .plugins
                         .resume_analysis(
                             id,
-                            args.get("js_stage_timeout_ms").and_then(Value::as_u64),
+                            arguments::optional_u64(&args, "js_stage_timeout_ms")?,
                         )
                         .await?
                 ));
@@ -1322,14 +1447,18 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         ))
                     }
                 };
-                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(25) as usize;
+                let offset = arguments::optional_u64(&args, "offset")?.unwrap_or(0) as usize;
+                let limit = arguments::optional_u64(&args, "limit")?.unwrap_or(25) as usize;
                 job_view::findings_page(state.plugins.results(id, view, offset, limit)?)
             } else {
                 let job = if name == "job_cancel" {
                     state.plugins.cancel(id)?
                 } else {
-                    state.plugins.status(id)?
+                    let wait = arguments::optional_u64(&args, "wait_ms")?.unwrap_or(0);
+                    state
+                        .plugins
+                        .wait_status(id, std::time::Duration::from_millis(wait))
+                        .await?
                 };
                 Ok(json!(job))
             }
@@ -1341,7 +1470,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .unwrap_or("list");
             match action {
                 "list" => {
-                    if args.get("project_id").is_some() {
+                    if arguments::present(&args, "project_id").is_some() {
                         Ok(json!(
                             state.project_detail(require_project_id(&args)?).await?
                         ))
@@ -1414,27 +1543,27 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 "set_limits" => {
                     let project_id = require_project_id(&args)?;
                     let update = RequestBudgetUpdate {
-                        requests_per_second: args
-                            .get("requests_per_second")
+                        requests_per_second: arguments::present(&args, "requests_per_second")
                             .map(|value| {
                                 value.as_f64().ok_or_else(|| {
                                     DomainError::invalid("requests_per_second must be a number")
                                 })
                             })
                             .transpose()?,
-                        max_concurrent_requests: args
-                            .get("max_concurrent_requests")
-                            .map(|value| {
-                                value
-                                    .as_u64()
-                                    .and_then(|value| u32::try_from(value).ok())
-                                    .ok_or_else(|| {
-                                        DomainError::invalid(
-                                            "max_concurrent_requests must be a positive integer",
-                                        )
-                                    })
-                            })
-                            .transpose()?,
+                        max_concurrent_requests: arguments::present(
+                            &args,
+                            "max_concurrent_requests",
+                        )
+                        .map(|value| {
+                            arguments::integer(value)
+                                .and_then(|value| u32::try_from(value).ok())
+                                .ok_or_else(|| {
+                                    DomainError::invalid(
+                                        "max_concurrent_requests must be a positive integer",
+                                    )
+                                })
+                        })
+                        .transpose()?,
                     };
                     let project = state
                         .db
@@ -1506,10 +1635,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!(session))
                 }
                 "revoke" => {
-                    let sid = args
-                        .get("session_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("session_id required"))?;
+                    let sid = arguments::required_i64(&args, "session_id")?;
                     state
                         .db
                         .revoke_capture_session(project_id, CaptureSessionId(sid))
@@ -1523,10 +1649,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!({ "ok": true }))
                 }
                 "renew" => {
-                    let sid = args
-                        .get("session_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("session_id required"))?;
+                    let sid = arguments::required_i64(&args, "session_id")?;
                     let session = state
                         .db
                         .renew_capture_session(project_id, CaptureSessionId(sid))
@@ -1553,12 +1676,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "named_profiles": state.db.list_named_cookie_profiles(project_id).await?.into_iter().map(|(name, profile)| json!({"name":name,"profile":profile})).collect::<Vec<_>>()
                 })),
                 "set" => {
-                    let target_url = args
-                        .get("target_url")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| DomainError::invalid("target_url required"))?;
-                    let inline = args.get("cookie");
+                    let target_url = args.get("target_url").and_then(Value::as_str);
+                    let inline = arguments::present(&args, "cookie");
                     let file_path = args.get("file_path").and_then(Value::as_str);
+                    if target_url.is_none() && file_path.is_none() {
+                        return Err(DomainError::invalid("target_url required"));
+                    }
                     let cookie = match (inline, file_path) {
                         (Some(value), None) => crate::cookies::cookie_input_from_json_value(value)?,
                         (None, Some(path)) => {
@@ -1570,6 +1693,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             ))
                         }
                     };
+                    // A cookie file with one domain says which site it is for.
+                    let target_url = match target_url {
+                        Some(target_url) => target_url.to_string(),
+                        None => crate::cookies::target_url_from_cookie_input(&cookie)?,
+                    };
+                    let target_url = target_url.as_str();
                     if let Some(name) = args.get("profile_name").and_then(Value::as_str) {
                         let profile =
                             crate::cookies::validate_named_cookie_profile(target_url, cookie)?;
@@ -1617,19 +1746,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     let rule = if args.get("action").and_then(Value::as_str) == Some("add") {
                         state.db.create_request_rule(project_id, input).await?
                     } else {
-                        let id = args
-                            .get("rule_id")
-                            .and_then(Value::as_i64)
-                            .ok_or_else(|| DomainError::invalid("rule_id required"))?;
+                        let id = arguments::required_i64(&args, "rule_id")?;
                         state.db.update_request_rule(project_id, id, input).await?
                     };
                     Ok(json!(rule))
                 }
                 "remove" => {
-                    let id = args
-                        .get("rule_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("rule_id required"))?;
+                    let id = arguments::required_i64(&args, "rule_id")?;
                     state.db.delete_request_rule(project_id, id).await?;
                     Ok(json!({ "ok": true }))
                 }
@@ -1683,10 +1806,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "findings": state.db.list_findings(project_id).await?
                 })),
                 "add" => {
-                    let exchange_id = args
-                        .get("exchange_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+                    let exchange_id = arguments::required_i64(&args, "exchange_id")?;
                     let title = args
                         .get("title")
                         .and_then(Value::as_str)
@@ -1724,10 +1844,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!(finding))
                 }
                 "remove" => {
-                    let finding_id = args
-                        .get("finding_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("finding_id required"))?;
+                    let finding_id = arguments::required_i64(&args, "finding_id")?;
                     state
                         .db
                         .delete_finding(project_id, FindingId(finding_id))
@@ -1757,14 +1874,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         "exchange_get" => exchange_view::exchange_get(&state, &args).await,
         "exchange_compare" => {
             let project_id = require_project_id(&args)?;
-            let left = args
-                .get("left_exchange_id")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| DomainError::invalid("left_exchange_id required"))?;
-            let right = args
-                .get("right_exchange_id")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| DomainError::invalid("right_exchange_id required"))?;
+            let left = arguments::required_i64(&args, "left_exchange_id")?;
+            let right = arguments::required_i64(&args, "right_exchange_id")?;
             exchange_view::compare_view(
                 &crate::compare::compare_saved_exchanges(
                     &state.db,
@@ -1783,10 +1894,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "page_analyzer" => {
             let project_id = require_project_id(&args)?;
-            let exchange_id = args
-                .get("exchange_id")
-                .and_then(Value::as_i64)
-                .map(ExchangeId);
+            let exchange_id = arguments::optional_i64(&args, "exchange_id")?.map(ExchangeId);
             let url = args.get("url").and_then(Value::as_str);
             match (exchange_id, url) {
                 (Some(exchange_id), None) => {
@@ -1925,11 +2033,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "copy_as" => {
             let project_id = require_project_id(&args)?;
-            let exchange_id = args
-                .get("exchange_id")
-                .and_then(Value::as_i64)
-                .map(ExchangeId)
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let exchange_id = ExchangeId(arguments::required_i64(&args, "exchange_id")?);
             let format: crate::copy_as::CopyAsFormat = serde_json::from_value(
                 args.get("format")
                     .cloned()
@@ -1967,10 +2071,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         "exchange_body" => exchange_view::exchange_body(&state, &args).await,
         "secret_reveal" => {
             let project_id = require_project_id(&args)?;
-            let eid = args
-                .get("exchange_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let eid = arguments::required_i64(&args, "exchange_id")?;
             let header = args
                 .get("header")
                 .and_then(|v| v.as_str())
@@ -2014,11 +2115,6 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "reply_tabs" => {
             let project_id = require_project_id(&args)?;
-            if args.get("identity").is_some() {
-                return Err(DomainError::invalid(
-                    "put request field `identity` under `draft`",
-                ));
-            }
             let action = args
                 .get("action")
                 .and_then(|v| v.as_str())
@@ -2031,11 +2127,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .and_then(|v| v.as_str())
                         .unwrap_or("tab")
                         .to_string();
-                    let base = args
-                        .get("base_exchange_id")
-                        .and_then(|v| v.as_i64())
-                        .map(ExchangeId);
-                    let draft = parse_request_draft(args.get("draft"))?;
+                    let base = arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
+                    let draft = parse_request_draft(request_draft_value(&args)?.as_ref())?;
                     Ok(json!(
                         state
                             .db
@@ -2056,43 +2149,27 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "reply_send" => {
             let project_id = require_project_id(&args)?;
-            for field in [
-                "identity",
-                "url",
-                "method",
-                "headers",
-                "header_overrides",
-                "body",
-                "body_text",
-                "body_json",
-                "body_params",
-                "body_format",
-            ] {
-                if args.get(field).is_some() {
-                    return Err(DomainError::invalid(format!(
-                        "put request field `{field}` under `draft`"
-                    )));
-                }
-            }
-            let draft = parse_request_draft(args.get("draft"))?;
-            let protocol = match args.get("protocol").and_then(Value::as_str) {
-                Some("h1") => ProtocolPreference::H1,
-                Some("h2") => ProtocolPreference::H2,
-                Some("auto") | None => ProtocolPreference::Auto,
-                Some(_) => return Err(DomainError::invalid("protocol must be auto|h1|h2")),
-            };
+            let draft = parse_request_draft(request_draft_value(&args)?.as_ref())?;
+            let base_exchange_id =
+                arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
+            let protocol = parse_protocol(args.get("protocol").and_then(Value::as_str))?;
+            let preview_bytes = arguments::optional_u64(&args, "preview_bytes")?
+                .map_or(crate::reply::DEFAULT_REPLY_PREVIEW_BYTES, |bytes| {
+                    bytes.min(crate::reply::MAX_REPLY_PREVIEW_BYTES as u64) as usize
+                });
+            let with_response_headers =
+                arguments::optional_bool(&args, "response_headers")?.unwrap_or(false);
             let result = state
                 .reply
-                .send_with_proxy(
+                .send_with_proxy_and_preview(
                     project_id,
-                    args.get("tab_id").and_then(|v| v.as_i64()).map(ReplyTabId),
-                    args.get("base_exchange_id")
-                        .and_then(|v| v.as_i64())
-                        .map(ExchangeId),
+                    arguments::optional_i64(&args, "tab_id")?.map(ReplyTabId),
+                    base_exchange_id,
                     &draft,
                     protocol,
                     0,
                     args.get("upstream_proxy").and_then(Value::as_str),
+                    preview_bytes,
                 )
                 .await?;
             if let Some(exchange_id) = result.exchange_id {
@@ -2103,15 +2180,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
                 );
             }
-            exchange_view::reply_send_view(
-                &state,
-                project_id,
-                args.get("base_exchange_id")
-                    .and_then(|v| v.as_i64())
-                    .map(ExchangeId),
-                &result,
-            )
-            .await
+            let mut view =
+                exchange_view::reply_send_view(&state, project_id, base_exchange_id, &result)
+                    .await?;
+            if with_response_headers {
+                view["response_headers"] = response_header_lines(&result);
+            }
+            Ok(view)
         }
         "reply_send_raw" => {
             let project_id = require_project_id(&args)?;
@@ -2142,17 +2217,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .reply
                 .send_raw_http1(
                     project_id,
-                    args.get("tab_id")
-                        .and_then(|value| value.as_i64())
-                        .map(ReplyTabId),
+                    arguments::optional_i64(&args, "tab_id")?.map(ReplyTabId),
                     target_url,
                     request_bytes,
                     args.get("use_project_cookies")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                    serde_json::from_value(args.clone()).map_err(|error| {
-                        DomainError::invalid(format!("raw HTTP/1.1 options: {error}"))
-                    })?,
+                    raw_http1_options(&args)?,
                 )
                 .await?;
             if let Some(exchange_id) = result.exchange_id {
@@ -2212,10 +2283,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             match action {
                 "list" => Ok(json!(state.fuzzer.list(project_id).await?)),
                 "cancel" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
                     state
                         .fuzzer
                         .cancel_for_project(project_id, FuzzJobId(jid))
@@ -2229,11 +2297,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!({ "ok": true }))
                 }
                 "get" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    let wait = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+                    let jid = arguments::required_i64(&args, "job_id")?;
+                    let wait = arguments::optional_u64(&args, "wait_ms")?.unwrap_or(0);
                     Ok(json!(
                         state
                             .fuzzer
@@ -2246,18 +2311,11 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     ))
                 }
                 "cases" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(|value| value.as_i64())
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    let limit = args
-                        .get("limit")
-                        .and_then(|value| value.as_u64())
+                    let jid = arguments::required_i64(&args, "job_id")?;
+                    let limit = arguments::optional_u64(&args, "limit")?
                         .unwrap_or(100)
                         .min(500) as u32;
-                    let before = args
-                        .get("before_case_index")
-                        .and_then(|value| value.as_u64());
+                    let before = arguments::optional_u64(&args, "before_case_index")?;
                     let (cases, next) = state
                         .fuzzer
                         .list_cases(project_id, FuzzJobId(jid), limit, before)
@@ -2265,10 +2323,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     fuzz_view::case_page(cases, next.is_some())
                 }
                 "groups" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
                     let groups = state
                         .fuzzer
                         .list_response_groups(project_id, FuzzJobId(jid))
@@ -2276,17 +2331,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     fuzz_view::group_page(groups, &args)
                 }
                 "group_cases" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
                     let group_id = args
                         .get("group_id")
                         .and_then(Value::as_str)
                         .ok_or_else(|| DomainError::invalid("group_id required"))?;
-                    let limit = args
-                        .get("limit")
-                        .and_then(Value::as_u64)
+                    let limit = arguments::optional_u64(&args, "limit")?
                         .unwrap_or(100)
                         .min(500) as u32;
                     let (cases, next) = state
@@ -2296,20 +2346,14 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             FuzzJobId(jid),
                             group_id.to_string(),
                             limit,
-                            args.get("before_case_index").and_then(Value::as_u64),
+                            arguments::optional_u64(&args, "before_case_index")?,
                         )
                         .await?;
                     fuzz_view::case_page(cases, next.is_some())
                 }
                 "diff" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    let case_id = args
-                        .get("case_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("case_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
+                    let case_id = arguments::required_i64(&args, "case_id")?;
                     Ok(json!(
                         state
                             .fuzzer
@@ -2317,7 +2361,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                                 project_id,
                                 FuzzJobId(jid),
                                 case_id,
-                                args.get("baseline_case_id").and_then(Value::as_i64),
+                                arguments::optional_i64(&args, "baseline_case_id")?,
                                 args.get("include_text")
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false),
@@ -2333,23 +2377,20 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         "websocket_manage" => {
             let project_id = require_project_id(&args)?;
             let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(250) as u32;
+            let limit = arguments::optional_u64(&args, "limit")?.unwrap_or(250) as u32;
             match action {
                 "list" => Ok(json!({
                     "connections": state.db.list_websocket_connections(project_id, limit).await?
                 })),
                 "messages" => {
-                    let connection_id = args
-                        .get("connection_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("connection_id required"))?;
+                    let connection_id = arguments::required_i64(&args, "connection_id")?;
                     let limit = limit.clamp(1, 1000);
                     let messages = state
                         .db
                         .list_websocket_messages(
                             project_id,
                             connection_id,
-                            args.get("after_id").and_then(Value::as_i64),
+                            arguments::optional_i64(&args, "after_id")?,
                             limit,
                             websocket_view::PREVIEW_BYTES,
                         )
@@ -2357,10 +2398,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     websocket_view::messages_page(messages, limit as usize)
                 }
                 "message" => {
-                    let message_id = args
-                        .get("message_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("message_id required"))?;
+                    let message_id = arguments::required_i64(&args, "message_id")?;
                     let message = state
                         .db
                         .load_websocket_message(project_id, message_id)
@@ -2368,10 +2406,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     websocket_view::message_page(&message, &args)
                 }
                 "send" => {
-                    let connection_id = args
-                        .get("connection_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("connection_id required"))?;
+                    let connection_id = arguments::required_i64(&args, "connection_id")?;
                     let direction = args
                         .get("direction")
                         .and_then(Value::as_str)
@@ -2440,11 +2475,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_start" => {
             let project_id = require_project_id(&args)?;
-            let profile = args
-                .get("profile")
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            let cookie_profile = args.get("cookie_profile").and_then(Value::as_str);
+            let (profile, cookie_profile) = browser_start_profiles(&args);
             let url = args
                 .get("url")
                 .and_then(|v| v.as_str())
@@ -2480,29 +2511,40 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_action" => {
             let project_id = require_project_id(&args)?;
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
-            let action: BrowserAction = serde_json::from_value(
-                args.get("action")
-                    .cloned()
-                    .ok_or_else(|| DomainError::invalid("action required"))?,
-            )
-            .map_err(|e| DomainError::invalid(e.to_string()))?;
+            let sid = arguments::required_i64(&args, "session_id")?;
+            let mut action = arguments::present(&args, "action")
+                .cloned()
+                .ok_or_else(|| DomainError::invalid("action required"))?;
+            arguments::unquote_integers(
+                &mut action,
+                &[
+                    "page_id",
+                    "runtime_generation",
+                    "after_sequence",
+                    "timeout_ms",
+                    "wait_ms",
+                    "max_bytes",
+                    "max_response_bytes",
+                    "limit",
+                    "offset",
+                ],
+            );
+            let (action, ignored_options) = BrowserAction::from_agent_input(action)?;
             Ok(json!(
                 state
                     .browser
-                    .action(project_id, BrowserSessionId(sid), action)
+                    .action_with_ignored_options(
+                        project_id,
+                        BrowserSessionId(sid),
+                        action,
+                        ignored_options
+                    )
                     .await?
             ))
         }
         "browser_evaluate" => {
             let project_id = require_project_id(&args)?;
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let sid = arguments::required_i64(&args, "session_id")?;
             let mut action = serde_json::Map::new();
             action.insert("type".into(), json!("evaluate"));
             for field in ["expression", "frame", "timeout_ms"] {
@@ -2521,10 +2563,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_input" => {
             let project_id = require_project_id(&args)?;
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let sid = arguments::required_i64(&args, "session_id")?;
             let op = args
                 .get("op")
                 .and_then(Value::as_str)
@@ -2540,7 +2579,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 "count",
                 "modifiers",
             ];
-            const SHARED: &[&str] = &["locator", "snapshot"];
+            const SHARED: &[&str] = &["locator", "snapshot", "timeout_ms"];
             let typing = op == "type";
             let mut action = serde_json::Map::new();
             action.insert(
@@ -2594,7 +2633,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("op required"))?;
             let result = match op {
-                "status" => match args.get("session_id").and_then(Value::as_i64) {
+                "status" => match arguments::optional_i64(&args, "session_id")? {
                     Some(session_id) => {
                         state
                             .browser
@@ -2604,9 +2643,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     None => state.browser.cdp_status(project_id).await?,
                 },
                 "enable" | "disable" => {
-                    let session_id = args
-                        .get("session_id")
-                        .and_then(Value::as_i64)
+                    let session_id = arguments::optional_i64(&args, "session_id")?
                         .map(BrowserSessionId)
                         .ok_or_else(|| {
                             DomainError::invalid(
@@ -2655,7 +2692,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "managed_cookies_preserved": true,
                 }));
             }
-            if op == "status" && args.get("session_id").and_then(Value::as_i64).is_none() {
+            let session_id = arguments::optional_i64(&args, "session_id")?;
+            if op == "status" && session_id.is_none() {
                 let status = state.browser.active_status(project_id).await?;
                 return Ok(json!({
                     "runtime": state.browser.status(),
@@ -2664,10 +2702,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "resources": status.resources,
                 }));
             }
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let sid = session_id.ok_or_else(|| DomainError::invalid("session_id required"))?;
             match op {
                 "stop" | "close" => {
                     state
@@ -2695,9 +2730,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("include_js")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
+            let limit = arguments::optional_u64(&args, "limit")?
                 .unwrap_or(crate::get_words::DEFAULT_WORD_LIMIT as u64)
                 .clamp(1, crate::get_words::MAX_WORD_LIMIT as u64) as usize;
             Ok(json!(
@@ -2793,10 +2826,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("include_chromium_profile")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let project_id = args
-                .get("project_id")
-                .and_then(Value::as_i64)
-                .map(ProjectId);
+            let project_id = arguments::optional_i64(&args, "project_id")?.map(ProjectId);
             let supplied_path = args
                 .get("file_path")
                 .and_then(Value::as_str)
@@ -2884,10 +2914,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "exchange_annotate" => {
             let project_id = require_project_id(&args)?;
-            let eid = args
-                .get("exchange_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let eid = arguments::required_i64(&args, "exchange_id")?;
             let display_title = args
                 .get("display_title")
                 .and_then(|value| value.as_str())
@@ -2906,9 +2933,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .collect()
                 })
                 .unwrap_or_default();
-            let expected_revision = args
-                .get("expected_revision")
-                .and_then(|value| value.as_i64());
+            let expected_revision = arguments::optional_i64(&args, "expected_revision")?;
             let annotation = state
                 .db
                 .upsert_annotation(
@@ -3064,6 +3089,11 @@ mod tests {
             schema["properties"]["max_response_bytes"]["maximum"],
             65_536
         );
+        assert_eq!(
+            schema["properties"]["wait_until"]["enum"],
+            json!(["load", "domcontentloaded", "networkidle"])
+        );
+        assert_eq!(schema["properties"]["follow_redirects"]["default"], false);
     }
 
     #[test]
@@ -3168,14 +3198,15 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        // Past the budget Codex drops every description of a tool's schema.
+        // Past 5000 bytes Codex drops every description of a tool's schema;
+        // the margin leaves room for a client that measures a little larger.
         for name in ["browser_action", "browser_evaluate", "browser_input"] {
             let mut normalized = named(name)["inputSchema"].clone();
             remove_ignored_keywords(&mut normalized);
             let normalized_size = serde_json::to_vec(&normalized).unwrap().len();
             println!("{name} normalized schema: {normalized_size} bytes");
             assert!(
-                normalized_size <= 5_000,
+                normalized_size <= 4_700,
                 "{name} normalized schema is {normalized_size} bytes"
             );
         }
@@ -3250,6 +3281,8 @@ mod tests {
             "max_response_bytes",
             "offset",
             "snapshot",
+            "follow_redirects",
+            "wait_until",
         ] {
             assert!(
                 action["properties"][field].is_object(),
@@ -3276,16 +3309,21 @@ mod tests {
             json!({"type":"wait","for_what":"load_state","value":""}),
             json!({"type":"events"}),
             json!({"type":"events","after_sequence":1,"runtime_generation":2}),
+            // pages without op lists the pages.
+            json!({"type":"pages"}),
         ] {
             assert!(
                 serde_json::from_value::<BrowserAction>(action.clone()).is_ok(),
                 "{action}"
             );
         }
+        assert!(matches!(
+            serde_json::from_value(json!({"type":"pages"})),
+            Ok(BrowserAction::Pages { op, .. }) if op == "list"
+        ));
         for action in [
             json!({"type":"navigate"}),
             json!({"type":"click"}),
-            json!({"type":"pages"}),
             json!({"type":"wait","value":"0"}),
             json!({"type":"wait","for_what":"timeout"}),
             json!({"type":"fill","locator":{"css":"input"}}),
@@ -3311,10 +3349,16 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "browser_action")
             .unwrap();
-        assert!(tool["description"]
-            .as_str()
-            .unwrap()
-            .contains("Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page."));
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page."));
+        for fragment in [
+            "op defaults to list",
+            "never retries it, follows redirects only with follow_redirects",
+            "listed in ignored_options",
+        ] {
+            assert!(description.contains(fragment), "must describe {fragment}");
+        }
+        assert!(!description.contains("disables redirects"));
         let inputs = &tool["inputSchema"];
         assert_eq!(
             inputs["required"],
@@ -3336,7 +3380,8 @@ mod tests {
             (
                 "op",
                 vec![
-                    "Required for pages",
+                    "pages: list (default)",
+                    "required",
                     "select/close",
                     "page_id",
                     "runtime_generation",
@@ -3382,10 +3427,24 @@ mod tests {
                 ],
             ),
             ("limit", vec!["1..100", "default 50"]),
-            ("wait_ms", vec!["0..30000", "default 0"]),
+            (
+                "wait_ms",
+                vec!["0..30000", "default 0", "events", "pause after"],
+            ),
             (
                 "timeout_ms",
-                vec!["1..30000", "1000..30000", "default 10000", "default 15000"],
+                vec![
+                    "1..30000",
+                    "1000..30000",
+                    "default 10000",
+                    "default 15000",
+                    "30000 for navigation/wait/snapshot",
+                ],
+            ),
+            ("follow_redirects", vec!["request", "redirect"]),
+            (
+                "wait_until",
+                vec!["navigate/back/forward", "default domcontentloaded"],
             ),
             (
                 "max_bytes",
@@ -3395,6 +3454,7 @@ mod tests {
                     "1..8388608",
                     "default 4194304",
                     "24000",
+                    "snapshot:true",
                 ],
             ),
             ("max_response_bytes", vec!["1..65536", "default 4096"]),
@@ -3456,6 +3516,7 @@ mod tests {
             "type exception",
             "truncated with total_bytes",
             "do not enable browser_cdp",
+            "an object or array that fits is returned as JSON in data.value",
         ] {
             assert!(description.contains(fragment), "must describe {fragment}");
         }
@@ -3479,6 +3540,26 @@ mod tests {
             })
         ));
         assert!(action(json!({"type": "evaluate"})).is_err());
+    }
+
+    #[test]
+    fn browser_start_uses_the_cookie_profile_as_the_profile_when_none_is_given() {
+        for (args, expected) in [
+            (json!({}), ("default", None)),
+            (json!({"profile": "alice"}), ("alice", None)),
+            (json!({"cookie_profile": "bob"}), ("bob", Some("bob"))),
+            (
+                json!({"profile": null, "cookie_profile": "bob"}),
+                ("bob", Some("bob")),
+            ),
+            // A mismatch is still passed on, so browser_start reports it.
+            (
+                json!({"profile": "alice", "cookie_profile": "bob"}),
+                ("alice", Some("bob")),
+            ),
+        ] {
+            assert_eq!(browser_start_profiles(&args), expected, "{args}");
+        }
     }
 
     #[test]
@@ -3516,6 +3597,7 @@ mod tests {
             ("modifiers", vec!["default none"]),
             ("text", vec!["Required for type", "1..4096 bytes", "Enter"]),
             ("snapshot", vec!["data.snapshot"]),
+            ("timeout_ms", vec!["locator", "1..30000", "default 10000"]),
             ("locator", vec!["Omit to use x and y", "focused element"]),
             ("to_locator", vec!["Drag destination"]),
         ] {
@@ -3601,7 +3683,7 @@ mod tests {
             Arc::new(LocalToolBackend { state }) as Arc<dyn ToolBackend>,
             Arc::new(DaemonToolBackend::new(config)) as Arc<dyn ToolBackend>,
         ] {
-            for query in [json!("time:>1970-01-01T00:00:00Z"), json!(100)] {
+            for query in [json!("stauts>=500"), json!(100)] {
                 let request = history_call(json!({"project_id": project.id.get(), "q": query}));
                 let result = handle_rpc(backend.clone(), &request)
                     .await
@@ -3612,7 +3694,7 @@ mod tests {
                 assert_eq!(error["code"], "invalid_argument");
                 let message = error["message"].as_str().unwrap();
                 if query.is_string() {
-                    assert!(message.contains("time>VALUE"));
+                    assert!(message.contains("did you mean status?"));
                 } else {
                     assert!(message.contains("q must be a query string"));
                 }
@@ -3629,7 +3711,10 @@ mod tests {
             }));
             let result = handle_rpc(backend, &corrected).await.unwrap().unwrap();
             assert_eq!(result["isError"], false);
-            assert_eq!(result["structuredContent"], json!({"items": []}));
+            assert_eq!(
+                result["structuredContent"],
+                json!({"items": [], "no_match_terms": ["time>1970-01-01T00:00:00Z"]})
+            );
         }
         cancel.cancel();
         server.await.unwrap().unwrap();
@@ -4261,5 +4346,101 @@ mod tests {
         let draft = parse_request_draft(Some(&json!({"url": "https://example.test/"}))).unwrap();
         assert_eq!(draft.url.as_deref(), Some("https://example.test/"));
         assert!(parse_request_draft(None).unwrap().url.is_none());
+    }
+
+    #[test]
+    fn top_level_request_fields_move_into_the_draft() {
+        let args = json!({
+            "project_id": 1,
+            "url": "https://a.test/",
+            "identity": {"mode": "anonymous"},
+            "body_text": null,
+            "draft": {"method": "POST", "header_overrides": null}
+        });
+        assert_eq!(
+            request_draft_value(&args).unwrap(),
+            Some(json!({
+                "method": "POST",
+                "url": "https://a.test/",
+                "identity": {"mode": "anonymous"}
+            }))
+        );
+        // Without a draft the lifted fields make one; with nothing to lift there is none.
+        assert_eq!(
+            request_draft_value(&json!({"project_id": 1, "method": "HEAD"})).unwrap(),
+            Some(json!({"method": "HEAD"}))
+        );
+        for args in [json!({"project_id": 1}), json!({"draft": null})] {
+            assert_eq!(request_draft_value(&args).unwrap(), None);
+        }
+        // The same value in both places is fine; different values are a conflict.
+        let same = json!({"url": "https://a.test/", "draft": {"url": "https://a.test/"}});
+        assert_eq!(
+            request_draft_value(&same).unwrap(),
+            Some(json!({"url": "https://a.test/"}))
+        );
+        let conflict = json!({"url": "https://a.test/", "draft": {"url": "https://b.test/"}});
+        let error = request_draft_value(&conflict).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("`url`"), "{error}");
+        assert!(error.to_string().contains("different values"), "{error}");
+        // A draft that is not an object cannot take fields.
+        assert!(request_draft_value(&json!({"url": "https://a.test/", "draft": "x"})).is_err());
+        // headers and body are not request fields; the error says where they go.
+        let error = request_draft_value(&json!({"headers": {"X": "1"}})).unwrap_err();
+        assert!(error.to_string().contains("header_overrides"), "{error}");
+        let error = request_draft_value(&json!({"body": "x"})).unwrap_err();
+        assert!(error.to_string().contains("body_text"), "{error}");
+        // Every lifted field is one a draft accepts.
+        for field in LIFTED_DRAFT_FIELDS {
+            validate_reply_draft_request(&json!({ field: null })).unwrap();
+        }
+    }
+
+    #[test]
+    fn input_schemas_stay_small_enough_for_codex_to_keep_descriptions() {
+        // Codex drops every description of a tool whose input schema exceeds
+        // 5,000 bytes; 4,700 leaves room for how it normalizes them.
+        let definitions = tool_defs();
+        for name in [
+            "reply_send",
+            "reply_tabs",
+            "reply_send_raw",
+            "cookies",
+            "job_status",
+            "job_results",
+        ] {
+            let tool = definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let size = serde_json::to_vec(&tool["inputSchema"]).unwrap().len();
+            println!("{name} inputSchema: {size} bytes");
+            assert!(size <= 4_700, "{name} inputSchema is {size} bytes");
+        }
+    }
+
+    #[test]
+    fn protocol_accepts_the_usual_spellings_of_http_versions() {
+        for (value, expected) in [
+            (None, ProtocolPreference::Auto),
+            (Some("auto"), ProtocolPreference::Auto),
+            (Some("h1"), ProtocolPreference::H1),
+            (Some("HTTP/1.1"), ProtocolPreference::H1),
+            (Some("http1.1"), ProtocolPreference::H1),
+            (Some("http/1"), ProtocolPreference::H1),
+            (Some("HTTP1"), ProtocolPreference::H1),
+            (Some("h2"), ProtocolPreference::H2),
+            (Some("http2"), ProtocolPreference::H2),
+            (Some("HTTP/2"), ProtocolPreference::H2),
+            (Some(" H2 "), ProtocolPreference::H2),
+        ] {
+            assert_eq!(parse_protocol(value).unwrap(), expected, "{value:?}");
+        }
+        let error = parse_protocol(Some("h3")).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.to_string().contains("auto, h1 or h2"), "{error}");
     }
 }

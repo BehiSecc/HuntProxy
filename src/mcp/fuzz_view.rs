@@ -2,8 +2,9 @@
 //! [`MAX_OUTPUT_BYTES`] by construction, with a continuation that never skips
 //! a row the page did not return.
 
+use super::arguments::optional_u64;
 use super::budget::{json_len, rows_that_fit, MAX_OUTPUT_BYTES};
-use super::history_view::{offset_arg, offset_page};
+use super::history_view::offset_page;
 use crate::domain::*;
 use crate::fuzzer::FuzzResponseGroup;
 use serde_json::{json, Map, Value};
@@ -23,14 +24,13 @@ pub(super) fn case_page(mut cases: Vec<FuzzCaseResult>, more: bool) -> DomainRes
 /// Response groups from `offset`, largest first, cut to `limit` and to the
 /// output budget. `total` and `next_offset` appear while groups remain.
 pub(super) fn group_page(groups: Vec<FuzzResponseGroup>, args: &Value) -> DomainResult<Value> {
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map_or(usize::MAX, |limit| {
-            usize::try_from(limit.max(1)).unwrap_or(usize::MAX)
-        });
+    let limit = optional_u64(args, "limit")?.map_or(usize::MAX, |limit| {
+        usize::try_from(limit.max(1)).unwrap_or(usize::MAX)
+    });
+    let offset = optional_u64(args, "offset")?
+        .map_or(0, |offset| usize::try_from(offset).unwrap_or(usize::MAX));
     let rows = groups.iter().map(|group| json!(group)).collect();
-    offset_page(Map::new(), "groups", rows, offset_arg(args), limit)
+    offset_page(Map::new(), "groups", rows, offset, limit)
 }
 
 #[cfg(test)]
@@ -156,8 +156,12 @@ mod tests {
             }
         }
         assert_eq!(seen, (0..2_000).collect::<Vec<_>>());
-        let limited = group_page(groups, &json!({"limit": 3, "offset": 10})).unwrap();
+        let limited = group_page(groups.clone(), &json!({"limit": 3, "offset": 10})).unwrap();
         assert_eq!(limited["groups"].as_array().unwrap().len(), 3);
         assert_eq!(limited["next_offset"], 13);
+        let quoted = group_page(groups.clone(), &json!({"limit": "3", "offset": "10"})).unwrap();
+        assert_eq!(quoted, limited);
+        let error = group_page(groups, &json!({"limit": "three"})).unwrap_err();
+        assert_eq!(error.to_string(), "limit must be a non-negative integer");
     }
 }

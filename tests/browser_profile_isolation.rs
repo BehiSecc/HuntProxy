@@ -487,6 +487,7 @@ impl Harness {
                     for_what: "selector".into(),
                     value: "#state[data-ready='true']".into(),
                     snapshot: false,
+                    options: Default::default(),
                 },
             )
             .await
@@ -501,6 +502,7 @@ impl Harness {
                     max_bytes: 24_000,
                     offset: 0,
                     locator: None,
+                    timeout_ms: None,
                 },
             )
             .await
@@ -533,6 +535,7 @@ impl Harness {
                 BrowserAction::Click {
                     locator: css_locator(selector),
                     snapshot: false,
+                    options: Default::default(),
                 },
             )
             .await
@@ -618,10 +621,11 @@ async fn verify_page_evaluation(h: &Harness) {
     assert_eq!(result.message, "expression evaluated");
     let original_page = result.browser.as_ref().unwrap().page_id;
     let data = result.data.unwrap();
+    // An object that fits is returned as JSON, not as JSON text.
     assert_eq!(data["type"], "object");
-    assert_eq!(data["truncated"], false);
+    assert!(data.get("content").is_none());
     assert_eq!(
-        serde_json::from_str::<Value>(data["content"].as_str().unwrap()).unwrap(),
+        data["value"],
         json!({"title": "Profile fixture", "identity": "default", "path": "/app"})
     );
 
@@ -638,7 +642,7 @@ async fn verify_page_evaluation(h: &Harness) {
         .unwrap()
         .data
         .unwrap();
-    let sent: Value = serde_json::from_str(sent["content"].as_str().unwrap()).unwrap();
+    let sent = &sent["value"];
     assert_eq!(sent["method"], "POST");
     assert_eq!(sent["request_body_bytes"], 3);
     assert!(sent["cookie"].as_str().unwrap().contains("sid=default"));
@@ -818,8 +822,8 @@ async fn verify_page_evaluation(h: &Harness) {
         .unwrap();
     assert_eq!(in_popup.browser.unwrap().page_id, popup_page);
     assert_eq!(
-        in_popup.data.unwrap()["content"],
-        "[\"Fixture details\",true]"
+        in_popup.data.unwrap()["value"],
+        json!(["Fixture details", true])
     );
 
     // While a person holds the browser through CDP, the agent does not script it.
@@ -870,6 +874,7 @@ fn pointer(op: &str, x: f64, y: f64) -> BrowserAction {
         count: 1,
         modifiers: vec![],
         snapshot: false,
+        options: Default::default(),
     }
 }
 
@@ -887,10 +892,8 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
             .unwrap()
     };
     // What the page heard since the last read, and a value read in the frame.
-    let heard = || async {
-        let data = run(evaluate("window.heard.splice(0)")).await.data.unwrap();
-        serde_json::from_str::<Value>(data["content"].as_str().unwrap()).unwrap()
-    };
+    let heard =
+        || async { run(evaluate("window.heard.splice(0)")).await.data.unwrap()["value"].clone() };
     let in_checkout = |expression: &str| {
         let expression = expression.to_owned();
         async move {
@@ -909,6 +912,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
         for_what: "load_state".into(),
         value: "load".into(),
         snapshot: false,
+        options: Default::default(),
     })
     .await;
 
@@ -995,6 +999,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
         count: 1,
         modifiers: vec!["Shift".into()],
         snapshot: false,
+        options: Default::default(),
     })
     .await;
     let context_menu = heard().await;
@@ -1049,6 +1054,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
             BrowserAction::Click {
                 locator: delete.clone(),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -1064,6 +1070,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
                 ..delete.clone()
             },
             snapshot: false,
+            options: Default::default(),
         })
         .await;
     }
@@ -1077,6 +1084,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
         text: "ab".into(),
         locator: Some(css_locator("#note")),
         snapshot: false,
+        options: Default::default(),
     })
     .await;
     assert_eq!(typed.data.unwrap(), json!({"characters": 2}));
@@ -1084,6 +1092,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
         text: "c".into(),
         locator: None,
         snapshot: false,
+        options: Default::default(),
     })
     .await;
     assert_eq!(
@@ -1104,17 +1113,20 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
         locator: in_frame("#card-number"),
         value: "4111".into(),
         snapshot: false,
+        options: Default::default(),
     })
     .await;
     run(BrowserAction::Type {
         text: "22".into(),
         locator: Some(in_frame("#card-number")),
         snapshot: false,
+        options: Default::default(),
     })
     .await;
     run(BrowserAction::Click {
         locator: in_frame("#pay"),
         snapshot: false,
+        options: Default::default(),
     })
     .await;
     assert_eq!(
@@ -1126,6 +1138,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
         max_bytes: 24_000,
         offset: 0,
         locator: Some(in_frame("body")),
+        timeout_ms: None,
     })
     .await
     .data
@@ -1147,6 +1160,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
                     ..css_locator("#pay")
                 },
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -1163,6 +1177,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
     run(BrowserAction::Click {
         locator: css_locator("#export"),
         snapshot: false,
+        options: Default::default(),
     })
     .await;
     assert_eq!(
@@ -1174,6 +1189,7 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
     let left = run(BrowserAction::Navigate {
         url: h.fixture.url("localhost", "default"),
         snapshot: false,
+        options: Default::default(),
     })
     .await
     .data
@@ -1356,6 +1372,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
         max_bytes,
         offset,
         locator: Some(css_locator("#page-end")),
+        timeout_ms: None,
     };
     let whole = h
         .service
@@ -1392,6 +1409,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Click {
                 locator: css_locator("#warning"),
                 snapshot: true,
+                options: Default::default(),
             },
         )
         .await
@@ -1460,6 +1478,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
                 body_base64: None,
                 timeout_ms: 5000,
                 max_response_bytes: 4096,
+                follow_redirects: false,
             },
         )
         .await
@@ -1492,6 +1511,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
                 body_base64: None,
                 timeout_ms: 5000,
                 max_response_bytes: 32,
+                follow_redirects: false,
             },
         )
         .await
@@ -1508,24 +1528,40 @@ async fn verify_structured_playwright_actions(h: &Harness) {
         32
     );
 
-    assert!(h
+    let redirect = |follow_redirects| BrowserAction::Request {
+        method: "GET".into(),
+        url: format!("http://localhost:{}/api/redirect", h.fixture.port),
+        headers: vec![],
+        body_text: None,
+        body_base64: None,
+        timeout_ms: 5000,
+        max_response_bytes: 4096,
+        follow_redirects,
+    };
+    let error = h
         .service
-        .action(
-            h.project,
-            session.id,
-            BrowserAction::Request {
-                method: "GET".into(),
-                url: format!("http://localhost:{}/api/redirect", h.fixture.port),
-                headers: vec![],
-                body_text: None,
-                body_base64: None,
-                timeout_ms: 5000,
-                max_response_bytes: 4096,
-            },
-        )
+        .action(h.project, session.id, redirect(false))
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("pass follow_redirects:true"),
+        "{error}"
+    );
     assert_eq!(h.fixture.mutation_count(), 1, "request followed a redirect");
+    // Asked to, it follows the redirect, still sending each request once.
+    let followed = h
+        .service
+        .action(h.project, session.id, redirect(true))
+        .await
+        .unwrap()
+        .data
+        .unwrap();
+    assert_eq!(followed["status"], 200);
+    assert!(followed["final_url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/api/mutate"));
+    assert_eq!(h.fixture.mutation_count(), 2);
 
     assert!(h
         .service
@@ -1540,6 +1576,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
                 body_base64: None,
                 timeout_ms: 1000,
                 max_response_bytes: 4096,
+                follow_redirects: false,
             },
         )
         .await
@@ -1547,7 +1584,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
     tokio::time::sleep(std::time::Duration::from_millis(1700)).await;
     assert_eq!(
         h.fixture.mutation_count(),
-        2,
+        3,
         "timed-out mutation was retried"
     );
 
@@ -1558,6 +1595,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Click {
                 locator: css_locator("#popup"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -1589,6 +1627,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Click {
                 locator: css_locator("#dialog"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -1624,6 +1663,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Click {
                 locator: css_locator("#message"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -1700,6 +1740,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
                 max_bytes: 4096,
                 offset: 0,
                 locator: None,
+                timeout_ms: None,
             },
         )
         .await
@@ -1714,6 +1755,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Click {
                 locator: css_locator("#save-popup-state"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -1766,6 +1808,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
             BrowserAction::Click {
                 locator: css_locator("#read-popup-state"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -1780,6 +1823,7 @@ async fn verify_structured_playwright_actions(h: &Harness) {
                 max_bytes: 4096,
                 offset: 0,
                 locator: None,
+                timeout_ms: None,
             },
         )
         .await
@@ -1967,6 +2011,7 @@ async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
                     for_what: "selector".into(),
                     value: "#upload-state[data-ready='true']".into(),
                     snapshot: false,
+                    options: Default::default(),
                 },
             )
             .await
@@ -2020,6 +2065,7 @@ async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
                     body_base64: None,
                     timeout_ms: 5000,
                     max_response_bytes: 4096,
+                    follow_redirects: false,
                 },
             )
             .await
@@ -2059,6 +2105,7 @@ async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
                     body_base64: None,
                     timeout_ms: 5000,
                     max_response_bytes: 32,
+                    follow_redirects: false,
                 },
             )
             .await
@@ -2127,6 +2174,7 @@ async fn native_file_upload_uses_normal_proxy_capture_and_session_lineage() {
                     body_base64: None,
                     timeout_ms: 5000,
                     max_response_bytes: 4096,
+                    follow_redirects: false,
                 },
             )
             .await
@@ -2216,6 +2264,7 @@ async fn verify_native_file_selection(h: &Harness) {
                 for_what: "selector".into(),
                 value: "#upload-state[data-ready='true']".into(),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -2250,6 +2299,7 @@ async fn verify_native_file_selection(h: &Harness) {
                 max_bytes: 24_000,
                 offset: 0,
                 locator: None,
+                timeout_ms: None,
             },
         )
         .await
@@ -2359,6 +2409,7 @@ async fn verify_native_file_selection(h: &Harness) {
             BrowserAction::Click {
                 locator: css_locator("#warning"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -2557,6 +2608,24 @@ async fn verify_browser_resources(h: &Harness) {
         denied.code(),
         huntproxy::domain::ErrorCode::ConcurrencyLimited
     );
+    // It says what holds the slots and how to free one.
+    let (low, high) = (
+        first.id.get().min(second.id.get()),
+        first.id.get().max(second.id.get()),
+    );
+    let profile = |id| {
+        if id == first.id.get() {
+            "default"
+        } else {
+            "acc2"
+        }
+    };
+    let expected = format!(
+        "project browser concurrency limit reached: 2 of 2 browser slots in use, held by session {low} (profile {}), session {high} (profile {}); browser_manage op=stop with a persistent session's session_id frees one",
+        profile(low),
+        profile(high)
+    );
+    assert!(denied.to_string().contains(&expected), "{denied}");
 
     let handed_off = h.service.enable_cdp(h.project, second.id).await.unwrap();
     let local = h.service.active_status(h.project).await.unwrap();
@@ -2924,6 +2993,7 @@ async fn verify_named_profiles(h: &Harness) {
             BrowserAction::Navigate {
                 url: h.fixture.url("localhost", "www-account"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await
@@ -2939,6 +3009,7 @@ async fn verify_named_profiles(h: &Harness) {
             BrowserAction::Navigate {
                 url: h.fixture.url("www.localhost", "www-account"),
                 snapshot: false,
+                options: Default::default(),
             },
         )
         .await

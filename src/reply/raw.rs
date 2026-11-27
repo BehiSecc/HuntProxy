@@ -162,6 +162,10 @@ pub struct RawReplyResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_error: Option<String>,
     pub responses: Vec<RawResponseSummary>,
+    /// Managed cookie injection rewrote bare-LF header lines as CRLF, so the
+    /// bytes sent differ from the bytes given in more than the Cookie header.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub line_endings_normalized: bool,
     /// Full wire response when capture scope excludes this exchange.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_base64: Option<String>,
@@ -211,6 +215,7 @@ impl ReplyService {
             return Err(DomainError::invalid("raw HTTP/1.1 request cannot be empty"));
         }
         options.validate(request_bytes.len())?;
+        let mut line_endings_normalized = false;
         if use_project_cookies {
             if let Some(profile) = self
                 .db
@@ -223,6 +228,7 @@ impl ReplyService {
                             "split writes cannot be combined with managed cookie injection because injection changes wire byte offsets",
                         ));
                     }
+                    line_endings_normalized = header_block_has_bare_lf(&request_bytes);
                     request_bytes = inject_cookie_header(&request_bytes, &cookie_header)?;
                 }
             }
@@ -389,6 +395,7 @@ impl ReplyService {
             response_complete,
             transport_error: read.transport_error,
             responses,
+            line_endings_normalized,
             response_base64: (!should_capture).then(|| {
                 use base64::Engine;
                 base64::engine::general_purpose::STANDARD.encode(&raw_response)
@@ -1196,31 +1203,59 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Replace or add a Cookie header in a conventional CRLF-framed raw request.
-/// This is used only when the caller explicitly opts into managed cookies.
-pub fn inject_cookie_header(request: &[u8], cookie_value: &str) -> DomainResult<Vec<u8>> {
-    let header_end = find_header_end(request).ok_or_else(|| {
-        DomainError::invalid("managed cookie injection requires a CRLF-framed header block")
-    })?;
-    let head = &request[..header_end - 4];
-    let body = &request[header_end..];
-    let lines = head.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    if lines.is_empty() || lines[0].strip_suffix(b"\r").is_none() {
-        return Err(DomainError::invalid("invalid raw HTTP/1.1 request line"));
+/// The lines of a request's header block without their line endings, and the
+/// body after the empty line that ends the block. A line may end in CRLF or in
+/// a bare LF.
+fn split_header_lines(request: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while let Some(offset) = request[start..].iter().position(|byte| *byte == b'\n') {
+        let end = start + offset;
+        let line = &request[start..end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return Some((lines, &request[end + 1..]));
+        }
+        lines.push(line);
+        start = end + 1;
     }
-    let line_count = lines.len();
+    None
+}
+
+/// Whether a line of the request's header block, or the empty line that ends
+/// it, ends in a bare LF.
+fn header_block_has_bare_lf(request: &[u8]) -> bool {
+    let mut start = 0;
+    while let Some(offset) = request[start..].iter().position(|byte| *byte == b'\n') {
+        let end = start + offset;
+        match request[start..end].strip_suffix(b"\r") {
+            None => return true,
+            Some([]) => return false,
+            Some(_) => start = end + 1,
+        }
+    }
+    false
+}
+
+/// Replace or add a Cookie header in a raw request's header block, which is
+/// rewritten with CRLF line endings even when it came with bare LF. The body is
+/// left as it is. This is used only when the caller explicitly opts into
+/// managed cookies.
+pub fn inject_cookie_header(request: &[u8], cookie_value: &str) -> DomainResult<Vec<u8>> {
+    let (lines, body) = split_header_lines(request).ok_or_else(|| {
+        DomainError::invalid(
+            "managed cookie injection requires a request line and headers followed by an empty line, then the body",
+        )
+    })?;
+    let mut lines = lines.into_iter();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| DomainError::invalid("invalid raw HTTP/1.1 request line"))?;
     let mut output = Vec::with_capacity(request.len() + cookie_value.len() + 12);
-    output.extend_from_slice(lines[0]);
-    output.push(b'\n');
+    output.extend_from_slice(request_line);
+    output.extend_from_slice(b"\r\n");
     let mut replaced = false;
-    for (index, line) in lines.into_iter().enumerate().skip(1) {
-        let line_without_cr = if index + 1 < line_count {
-            line.strip_suffix(b"\r").ok_or_else(|| {
-                DomainError::invalid("managed cookie injection requires CRLF header lines")
-            })?
-        } else {
-            line
-        };
+    for line_without_cr in lines {
         if line_without_cr.starts_with(b" ") || line_without_cr.starts_with(b"\t") {
             return Err(DomainError::invalid(
                 "managed cookie injection requires ordinary HTTP header lines",
@@ -1832,6 +1867,60 @@ mod tests {
             "sid=managed"
         )
         .is_err());
+    }
+
+    #[test]
+    fn managed_cookie_injection_writes_bare_lf_headers_as_crlf_and_keeps_the_body() {
+        let injected = inject_cookie_header(
+            b"POST / HTTP/1.1\nHost: example.com\nCookie: old=1\nX-Test: yes\n\nline1\nline2\r\n",
+            "sid=a",
+        )
+        .unwrap();
+        assert_eq!(
+            injected,
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nCookie: sid=a\r\nX-Test: yes\r\n\r\nline1\nline2\r\n"
+        );
+        // Mixed line endings, and a request with no body.
+        let mixed =
+            inject_cookie_header(b"GET / HTTP/1.1\r\nHost: example.com\nX: 1\r\n\n", "sid=a")
+                .unwrap();
+        assert_eq!(
+            mixed,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nX: 1\r\nCookie: sid=a\r\n\r\n"
+        );
+        // The first empty line ends the headers, whatever its ending.
+        let early = inject_cookie_header(b"GET / HTTP/1.1\n\nA: b\r\n\r\n", "sid=a").unwrap();
+        assert_eq!(
+            early,
+            b"GET / HTTP/1.1\r\nCookie: sid=a\r\n\r\nA: b\r\n\r\n"
+        );
+
+        // Without an empty line after the headers there is nothing to inject into.
+        for request in [
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n".as_slice(),
+            b"GET / HTTP/1.1\nHost: example.com".as_slice(),
+            b"GET / HTTP/1.1".as_slice(),
+            b"".as_slice(),
+        ] {
+            let error = inject_cookie_header(request, "sid=a").unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(
+                error.to_string().contains("followed by an empty line"),
+                "{error}"
+            );
+        }
+        // Only a bare LF inside the header block counts as a rewrite.
+        assert!(header_block_has_bare_lf(b"GET / HTTP/1.1\nHost: x\n\n"));
+        assert!(header_block_has_bare_lf(
+            b"GET / HTTP/1.1\r\nHost: x\n\r\n\r\n"
+        ));
+        assert!(header_block_has_bare_lf(b"GET / HTTP/1.1\r\nHost: x\r\n\n"));
+        assert!(!header_block_has_bare_lf(
+            b"POST / HTTP/1.1\r\nHost: x\r\n\r\nli\nne\n"
+        ));
+        assert!(!header_block_has_bare_lf(b"GET / HTTP/1.1\r\nHost: x\r\n"));
+        assert!(inject_cookie_header(b"\nGET / HTTP/1.1\r\n\r\n", "sid=a").is_err());
+        assert!(inject_cookie_header(b"GET / HTTP/1.1\nHost: x\n y\n\n", "sid=a").is_err());
     }
 
     #[tokio::test]

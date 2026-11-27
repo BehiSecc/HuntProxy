@@ -9,6 +9,7 @@ use deadpool::Runtime;
 use deadpool_sync::SyncWrapper;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -287,30 +288,216 @@ pub fn configure_connection(
         .map_err(|e| DomainError::new(ErrorCode::StorageError, e.to_string()))
 }
 
-/// Whether a stored body contains `needle` (already lowercase), looking through
-/// its HTTP Content-Encoding. A body that does not decode, such as a truncated
-/// capture, an unknown encoding or one past the decoded size limit, is searched
-/// as stored, as it was before encodings were decoded.
-fn body_text_contains(stored: &[u8], content_encoding: Option<&str>, needle: &str) -> bool {
-    let contains = |bytes: &[u8]| {
-        String::from_utf8_lossy(bytes)
-            .to_lowercase()
-            .contains(needle)
-    };
-    match content_encoding.filter(|encoding| !encoding.trim().is_empty()) {
-        None => contains(stored),
+/// A body as `huntproxy_body_contains` searches it: decoded from storage and
+/// through its HTTP Content-Encoding, with ASCII letters lowercased. A body
+/// that does not decode, such as a truncated capture, an unknown encoding or
+/// one past the decoded size limit, is searched as stored, as it was before
+/// encodings were decoded.
+fn searchable_body(
+    codec: &str,
+    content: &[u8],
+    content_encoding: Option<&str>,
+) -> DomainResult<Vec<u8>> {
+    let stored = crate::storage::bodies::decode_body(codec, content)?;
+    let mut bytes = match content_encoding.filter(|encoding| !encoding.trim().is_empty()) {
+        None => stored,
         Some(encoding) => match crate::codec::decode_content_encodings(
-            stored,
+            &stored,
             encoding,
             crate::codec::MAX_DECODED_BODY_OUTPUT,
         ) {
-            Ok(decoded) => contains(&decoded),
+            Ok(decoded) => decoded,
             Err(error) => {
                 tracing::debug!(%error, encoding, "body search reads the body as stored");
-                contains(stored)
+                stored
             }
         },
+    };
+    bytes.make_ascii_lowercase();
+    Ok(bytes)
+}
+
+/// Whether `body` (from [`searchable_body`]) contains `needle` (already
+/// lowercase), ignoring case. An ASCII needle is matched byte for byte in the
+/// valid UTF-8 runs of the body, without copying it: invalid bytes are never
+/// ASCII, so no match can span them. Only a non-ASCII needle needs the
+/// Unicode-lowercased copy that every search used to make; the one difference
+/// is that an ASCII needle no longer matches the few non-ASCII letters whose
+/// lowercase is ASCII, such as the Kelvin sign.
+fn searchable_body_contains(body: &[u8], needle: &str) -> bool {
+    if needle.is_ascii() {
+        return needle.len() <= body.len()
+            && body
+                .utf8_chunks()
+                .any(|chunk| chunk.valid().contains(needle));
     }
+    String::from_utf8_lossy(body)
+        .to_lowercase()
+        .contains(needle)
+}
+
+/// Decoded bodies one history search keeps, newest last: one row's request
+/// and response body, so the terms of `response:~a OR response:~b` decode
+/// their body once.
+const DECODED_BODIES: usize = 2;
+/// Answers one history search keeps, so a body that many exchanges share is
+/// searched once per needle.
+const BODY_ANSWERS: usize = 65_536;
+
+/// A stored body read through one Content-Encoding: `(bodies.id, encoding)`.
+type BodyKey = (i64, Option<String>);
+
+/// State of the history search running on this thread; see [`BodySearchScope`].
+struct BodySearch {
+    deadline: Option<Instant>,
+    /// `started_at` of the first row `huntproxy_search_open` refused.
+    stopped_at: Option<String>,
+    /// `started_at` of the first row searched.
+    first_started_at: Option<String>,
+    decoded: Vec<(BodyKey, Vec<u8>)>,
+    answers: HashMap<(BodyKey, String), bool>,
+}
+
+thread_local! {
+    static BODY_SEARCH: std::cell::RefCell<Option<BodySearch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One history query on this thread: while it lives, `huntproxy_body_contains`
+/// reuses decoded bodies, and `huntproxy_search_open(started_at)` turns false
+/// once `budget` has passed. SQLite runs a statement's functions on the thread
+/// that steps it, so the scope must live inside the `with_conn` closure.
+pub(crate) struct BodySearchScope(());
+
+impl BodySearchScope {
+    pub(crate) fn begin(budget: Option<Duration>) -> Self {
+        BODY_SEARCH.with(|search| {
+            *search.borrow_mut() = Some(BodySearch {
+                deadline: budget.map(|budget| Instant::now() + budget),
+                stopped_at: None,
+                first_started_at: None,
+                decoded: Vec::new(),
+                answers: HashMap::new(),
+            });
+        });
+        Self(())
+    }
+
+    /// The `started_at` of the first row the budget kept out of the search:
+    /// every row the query reached before it was searched in full.
+    pub(crate) fn stopped_at(&self) -> Option<String> {
+        BODY_SEARCH.with(|search| {
+            search
+                .borrow()
+                .as_ref()
+                .and_then(|search| search.stopped_at.clone())
+        })
+    }
+}
+
+impl Drop for BodySearchScope {
+    fn drop(&mut self) {
+        BODY_SEARCH.with(|search| search.borrow_mut().take());
+    }
+}
+
+/// `huntproxy_search_open(started_at)`: true until the search budget has
+/// passed, then false for every remaining row. The query still walks the
+/// rest of the started_at index, but searches no body past the stop, and it
+/// returns exactly the rows it matched before. Rows at the first row's time are always
+/// searched, so a continuation from the stopped row's time gets further.
+/// Outside a [`BodySearchScope`] it is true.
+fn search_open(started_at: &str) -> bool {
+    BODY_SEARCH.with(|search| {
+        let mut search = search.borrow_mut();
+        let Some(search) = search.as_mut() else {
+            return true;
+        };
+        if search.stopped_at.is_some() {
+            return false;
+        }
+        let Some(first) = &search.first_started_at else {
+            search.first_started_at = Some(started_at.to_owned());
+            return true;
+        };
+        if first != started_at
+            && search
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            search.stopped_at = Some(started_at.to_owned());
+            return false;
+        }
+        true
+    })
+}
+
+/// `huntproxy_body_contains(codec, content, needle, content_encoding, body_id)`.
+/// Inside a [`BodySearchScope`], `body_id` (the `bodies.id` of `content`, or
+/// None) lets it reuse decoded bodies and answers.
+fn body_contains(
+    codec: &str,
+    content: &[u8],
+    needle: &str,
+    content_encoding: Option<&str>,
+    body_id: Option<i64>,
+) -> DomainResult<bool> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    let search_uncached = || {
+        let body = searchable_body(codec, content, content_encoding)?;
+        Ok(searchable_body_contains(&body, needle))
+    };
+    BODY_SEARCH.with(|search| {
+        let mut search = search.borrow_mut();
+        let Some(search) = search.as_mut() else {
+            return search_uncached();
+        };
+        // The row is out of the search; its result is never used.
+        if search.stopped_at.is_some() {
+            return Ok(false);
+        }
+        let Some(body_id) = body_id else {
+            return search_uncached();
+        };
+        let key: BodyKey = (body_id, content_encoding.map(str::to_owned));
+        let answer_key = (key, needle.to_owned());
+        if let Some(found) = search.answers.get(&answer_key) {
+            return Ok(*found);
+        }
+        let (key, needle) = &answer_key;
+        let found = match search.decoded.iter().find(|(cached, _)| cached == key) {
+            Some((_, body)) => searchable_body_contains(body, needle),
+            None => {
+                let body = searchable_body(codec, content, content_encoding)?;
+                let found = searchable_body_contains(&body, needle);
+                if search.decoded.len() == DECODED_BODIES {
+                    search.decoded.remove(0);
+                }
+                search.decoded.push((key.clone(), body));
+                found
+            }
+        };
+        if search.answers.len() < BODY_ANSWERS {
+            search.answers.insert(answer_key, found);
+        }
+        Ok(found)
+    })
+}
+
+/// Text or blob argument `index` as bytes, or None for NULL and numbers.
+fn bytes_arg<'a>(context: &'a rusqlite::functions::Context<'_>, index: usize) -> Option<&'a [u8]> {
+    match context.get_raw(index) {
+        rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+fn function_error(error: impl std::fmt::Display) -> rusqlite::Error {
+    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(error.to_string())))
 }
 
 /// How many prepared statements a connection keeps for reuse. Storing one
@@ -349,35 +536,41 @@ fn configure(conn: &Connection, synchronous: &str, busy_timeout_ms: u64) -> rusq
     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))?;
     conn.pragma_update(None, "synchronous", synchronous)?;
     conn.pragma_update(None, "trusted_schema", false)?;
-    // (codec, content, needle, content_encoding): the last argument is the
-    // message's Content-Encoding, or NULL.
+    // (codec, content, needle, content_encoding, body_id): content_encoding
+    // is the message's Content-Encoding, or NULL; body_id is the bodies.id of
+    // content, or NULL.
     conn.create_scalar_function(
         "huntproxy_body_contains",
-        4,
+        5,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |context| {
             let codec = context.get::<String>(0)?;
-            let content = context.get::<Vec<u8>>(1)?;
+            // Borrowed: a stored body is not copied before it is decoded.
+            let content = bytes_arg(context, 1)
+                .ok_or_else(|| function_error("huntproxy_body_contains needs body content"))?;
             let needle = context.get::<String>(2)?.to_lowercase();
             // Captured header values are bytes; one that is not UTF-8 must not
             // fail every body search in its project.
-            let content_encoding = match context.get_raw(3) {
-                rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
-                    Some(String::from_utf8_lossy(value).into_owned())
-                }
-                _ => None,
-            };
-            let stored =
-                crate::storage::bodies::decode_body(&codec, &content).map_err(|error| {
-                    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::other(
-                        error.to_string(),
-                    )))
-                })?;
-            Ok(body_text_contains(
-                &stored,
-                content_encoding.as_deref(),
+            let content_encoding = bytes_arg(context, 3).map(String::from_utf8_lossy);
+            let body_id = context.get::<Option<i64>>(4)?;
+            body_contains(
+                &codec,
+                content,
                 &needle,
-            ))
+                content_encoding.as_deref(),
+                body_id,
+            )
+            .map_err(function_error)
+        },
+    )?;
+    // (started_at): see `search_open`. Not deterministic: it reads the clock.
+    conn.create_scalar_function(
+        "huntproxy_search_open",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |context| {
+            let started_at = bytes_arg(context, 0).unwrap_or_default();
+            Ok(search_open(&String::from_utf8_lossy(started_at)))
         },
     )?;
     // DEFENSIVE mode
@@ -464,7 +657,7 @@ mod tests {
                     };
                     let contains = conn
                         .query_row(
-                            "SELECT huntproxy_body_contains('raw', CAST('Hello' AS BLOB), 'hell', NULL)",
+                            "SELECT huntproxy_body_contains('raw', CAST('Hello' AS BLOB), 'hell', NULL, NULL)",
                             [],
                             |row| row.get::<_, bool>(0),
                         )
@@ -526,12 +719,78 @@ mod tests {
         let found: bool = conn
             .query_row(
                 "SELECT huntproxy_body_contains('raw', CAST('a needle here' AS BLOB), 'needle',
-                                                CAST(X'67FF7A6970' AS TEXT))",
+                                                CAST(X'67FF7A6970' AS TEXT), NULL)",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(found);
+    }
+
+    #[test]
+    fn body_search_ignores_case_without_copying_and_keeps_unicode_needles() {
+        for (body, needle, expected) in [
+            (&b"Hello World"[..], "world", true),
+            (b"HELLO", "hello", true),
+            (b"hello", "help", false),
+            (b"short", "longer than the body", false),
+            (b"anything", "", true),
+            // Invalid UTF-8 between ASCII runs: no match spans it.
+            (b"tok\xffen", "token", false),
+            (b"\xfftoken\xfe", "token", true),
+            // Non-ASCII needles still match Unicode case-insensitively.
+            ("CAFÉ au lait".as_bytes(), "café", true),
+            ("Straße".as_bytes(), "straße", true),
+            ("naïve".as_bytes(), "naive", false),
+        ] {
+            let found = body_contains("raw", body, &needle.to_lowercase(), None, None).unwrap();
+            assert_eq!(found, expected, "{needle:?} in {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_search_scope_reuses_decoded_bodies_and_stops_after_its_budget() {
+        let first = zstd::encode_all(&b"First body with ALPHA"[..], 1).unwrap();
+        let second = b"second body with beta".to_vec();
+        let state = || {
+            BODY_SEARCH.with(|search| {
+                let search = search.borrow();
+                let search = search.as_ref().unwrap();
+                (search.decoded.len(), search.answers.len())
+            })
+        };
+        {
+            let scope = BodySearchScope::begin(None);
+            for _ in 0..2 {
+                assert!(body_contains("zstd", &first, "alpha", None, Some(1)).unwrap());
+                assert!(!body_contains("zstd", &first, "beta", None, Some(1)).unwrap());
+                assert!(body_contains("raw", &second, "beta", None, Some(2)).unwrap());
+                // The same body under another encoding is searched on its own.
+                assert!(body_contains("raw", &second, "beta", Some("gzip"), Some(2)).unwrap());
+            }
+            assert_eq!(state(), (DECODED_BODIES, 4));
+            // Without an id nothing is kept.
+            assert!(body_contains("raw", &second, "body", None, None).unwrap());
+            assert_eq!(state(), (DECODED_BODIES, 4));
+            // Without a deadline the search never stops.
+            assert!(search_open("2026-01-02T00:00:00Z"));
+            assert!(search_open("2026-01-01T00:00:00Z"));
+            assert!(scope.stopped_at().is_none());
+        }
+        BODY_SEARCH.with(|search| assert!(search.borrow().is_none()));
+
+        let scope = BodySearchScope::begin(Some(Duration::ZERO));
+        // Rows at the first row's time are always searched.
+        assert!(search_open("2026-01-03T00:00:00Z"));
+        assert!(search_open("2026-01-03T00:00:00Z"));
+        assert!(!search_open("2026-01-02T00:00:00Z"));
+        assert!(!search_open("2026-01-01T00:00:00Z"));
+        assert_eq!(scope.stopped_at().as_deref(), Some("2026-01-02T00:00:00Z"));
+        // Rows past the stop are not decoded at all.
+        assert!(!body_contains("zstd", b"not zstd", "x", None, Some(3)).unwrap());
+        drop(scope);
+        assert!(body_contains("zstd", b"not zstd", "x", None, Some(3)).is_err());
+        assert!(search_open("2026-01-01T00:00:00Z"));
     }
 
     #[test]

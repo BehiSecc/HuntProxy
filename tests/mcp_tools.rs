@@ -435,3 +435,752 @@ async fn a_tool_call_about_a_project_counts_as_its_browser_activity() {
         std::time::Duration::MAX
     );
 }
+
+#[tokio::test]
+async fn integer_arguments_may_be_numeric_strings_and_null_is_absent() {
+    let (_directory, state, project_id) = test_state().await;
+    let project = project_id.get().to_string();
+    let exchange_id = state
+        .db
+        .insert_exchange(exchange(project_id, "/quoted"))
+        .await
+        .unwrap();
+    let id = exchange_id.get().to_string();
+
+    // Quoted ids work wherever an id is read, and count as project activity.
+    let overview = call_tool(state.clone(), "overview", json!({"project_id": project}))
+        .await
+        .unwrap();
+    assert_eq!(overview["total_exchanges"], 1);
+    assert!(state.browser.project_idle_for(project_id) < std::time::Duration::from_secs(60));
+    let reveal = call_tool(
+        state.clone(),
+        "secret_reveal",
+        json!({"project_id": project, "exchange_id": id, "header": "authorization"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reveal["value"], "Bearer s3cret");
+    let finding = call_tool(
+        state.clone(),
+        "findings",
+        json!({"project_id": project, "action": "add", "exchange_id": id,
+               "title": "t", "description": "d"}),
+    )
+    .await
+    .unwrap();
+    call_tool(
+        state.clone(),
+        "findings",
+        json!({"project_id": project, "action": "remove",
+               "finding_id": finding["id"].as_i64().unwrap().to_string()}),
+    )
+    .await
+    .unwrap();
+    let session = call_tool(
+        state.clone(),
+        "capture_sessions",
+        json!({"project_id": project, "action": "create"}),
+    )
+    .await
+    .unwrap();
+    call_tool(
+        state.clone(),
+        "capture_sessions",
+        json!({"project_id": project, "action": "revoke",
+               "session_id": session["id"].as_i64().unwrap().to_string()}),
+    )
+    .await
+    .unwrap();
+    let annotation = call_tool(
+        state.clone(),
+        "exchange_annotate",
+        json!({"project_id": project, "exchange_id": id, "note": "n", "expected_revision": "0"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(annotation["note"], "n");
+
+    // Null means the argument was not given.
+    let list = call_tool(
+        state.clone(),
+        "projects",
+        json!({"action": "list", "project_id": null}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    call_tool(
+        state.clone(),
+        "projects",
+        json!({"action": "set_limits", "project_id": project, "requests_per_second": 5.0,
+               "max_concurrent_requests": "7"}),
+    )
+    .await
+    .unwrap();
+    let limits = call_tool(
+        state.clone(),
+        "projects",
+        json!({"action": "set_limits", "project_id": project_id.get(),
+               "requests_per_second": null, "max_concurrent_requests": 9}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(limits["requests_per_second"], 5.0);
+    assert_eq!(limits["max_concurrent_requests"], 9);
+
+    // Missing and null ids are "required"; anything else is "must be an integer".
+    for (tool, args, message) in [
+        ("overview", json!({}), "project_id required"),
+        (
+            "overview",
+            json!({"project_id": null}),
+            "project_id required",
+        ),
+        (
+            "overview",
+            json!({"project_id": "abc"}),
+            "project_id must be an integer",
+        ),
+        (
+            "overview",
+            json!({"project_id": ""}),
+            "project_id must be an integer",
+        ),
+        (
+            "overview",
+            json!({"project_id": true}),
+            "project_id must be an integer",
+        ),
+        (
+            "overview",
+            json!({"project_id": 1.5}),
+            "project_id must be an integer",
+        ),
+        (
+            "secret_reveal",
+            json!({"project_id": project, "exchange_id": null, "header": "authorization"}),
+            "exchange_id required",
+        ),
+        (
+            "secret_reveal",
+            json!({"project_id": project, "exchange_id": "x", "header": "authorization"}),
+            "exchange_id must be an integer",
+        ),
+        (
+            "capture_sessions",
+            json!({"project_id": project, "action": "revoke", "session_id": ["1"]}),
+            "session_id must be an integer",
+        ),
+    ] {
+        let error = call_tool(state.clone(), tool, args.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{args}");
+        assert_eq!(error.to_string(), message, "{args}");
+    }
+}
+
+#[tokio::test]
+async fn a_session_id_that_cannot_be_read_never_falls_back_to_the_project_listing() {
+    let (_directory, state, project_id) = test_state().await;
+    let project = project_id.get();
+    for tool in ["browser_manage", "browser_cdp"] {
+        for session_id in [json!("abc"), json!(true), json!(1.5), json!({})] {
+            let error = call_tool(
+                state.clone(),
+                tool,
+                json!({"project_id": project, "op": "status", "session_id": session_id}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(error.to_string(), "session_id must be an integer", "{tool}");
+        }
+    }
+    for tool in ["browser_action", "browser_evaluate", "browser_input"] {
+        let error = call_tool(
+            state.clone(),
+            tool,
+            json!({"project_id": project, "session_id": "abc", "op": "click",
+                   "action": {"type": "snapshot"}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "session_id must be an integer", "{tool}");
+    }
+
+    // A quoted number is read as the id, so the error is about the session.
+    for (tool, args) in [
+        (
+            "browser_manage",
+            json!({"project_id": project, "op": "status", "session_id": "999999"}),
+        ),
+        (
+            "browser_cdp",
+            json!({"project_id": project, "op": "status", "session_id": "999999"}),
+        ),
+        (
+            "browser_action",
+            json!({"project_id": project, "session_id": "999999", "action": {"type": "snapshot"}}),
+        ),
+    ] {
+        let error = call_tool(state.clone(), tool, args).await.unwrap_err();
+        assert!(
+            !error.to_string().contains("must be an integer"),
+            "{tool}: {error}"
+        );
+        assert!(!error.to_string().contains("required"), "{tool}: {error}");
+    }
+}
+
+/// A server that answers every request with `<method> <body>`.
+async fn echo_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(|method: axum::http::Method, body: String| async move {
+        format!("{method} {body}")
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (address, server)
+}
+
+async fn project_for(state: &AppState, address: std::net::SocketAddr) -> i64 {
+    state
+        .db
+        .create_project(CreateProjectRequest {
+            name: "Reply".into(),
+            target_url: format!("http://{address}/"),
+            advanced: None,
+        })
+        .await
+        .unwrap()
+        .id
+        .get()
+}
+
+#[tokio::test]
+async fn reply_send_and_reply_tabs_take_request_fields_beside_the_draft() {
+    let (address, server) = echo_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    let url = format!("http://{address}/echo");
+    let send = |args: Value| {
+        let state = state.clone();
+        async move { call_tool(state, "reply_send", args).await }
+    };
+
+    // Everything beside `draft` is read as if it were inside it.
+    let flat = send(json!({
+        "project_id": project, "url": url, "method": "POST", "body_text": "hello",
+        "identity": {"mode": "anonymous"},
+    }))
+    .await
+    .unwrap();
+    assert_eq!(flat["response_preview"]["text"], "POST hello");
+    assert_eq!(flat["identity"], json!({"mode": "anonymous"}));
+    let mixed = send(json!({
+        "project_id": project, "url": url, "body_text": "hello",
+        "draft": {"method": "PUT"},
+    }))
+    .await
+    .unwrap();
+    assert_eq!(mixed["response_preview"]["text"], "PUT hello");
+    // The same value twice is harmless.
+    send(json!({"project_id": project, "method": "GET", "draft": {"url": url, "method": "GET"}}))
+        .await
+        .unwrap();
+
+    // Two different values for one field are an error naming it.
+    let error = send(json!({
+        "project_id": project, "method": "GET", "draft": {"url": url, "method": "POST"},
+    }))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("`method`"), "{error}");
+    assert!(error.to_string().contains("different values"), "{error}");
+
+    // `headers` and `body` are not request fields; the error points to the right ones.
+    let error = send(json!({"project_id": project, "draft": {"url": url}, "headers": {"X": "1"}}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("header_overrides"), "{error}");
+
+    // A client that fills every property with null still sends a plain request.
+    let nulls = send(json!({
+        "project_id": project, "draft": null, "tab_id": null, "base_exchange_id": null,
+        "protocol": null, "upstream_proxy": null, "identity": null, "url": url,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(nulls["response_preview"]["text"], "GET ");
+    let nested_nulls = send(json!({
+        "project_id": project,
+        "draft": {"url": url, "method": null, "header_overrides": null, "body_text": null,
+                  "body_params": null, "identity": null},
+    }))
+    .await
+    .unwrap();
+    assert_eq!(nested_nulls["response_preview"]["text"], "GET ");
+
+    // Tabs store the lifted fields in their draft.
+    let tab = call_tool(
+        state.clone(),
+        "reply_tabs",
+        json!({"project_id": project, "action": "create", "name": "flat",
+               "url": url, "identity": {"mode": "anonymous"}, "draft": {"method": "POST"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(tab["draft"]["url"], url);
+    assert_eq!(tab["draft"]["method"], "POST");
+    assert_eq!(tab["draft"]["identity"], json!({"mode": "anonymous"}));
+    server.abort();
+}
+
+#[tokio::test]
+async fn reply_send_accepts_http_version_aliases_and_lenient_body_rules() {
+    let (address, server) = echo_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    let url = format!("http://{address}/echo");
+    let send = |draft: Value, protocol: Value| {
+        let state = state.clone();
+        let args = json!({"project_id": project, "draft": draft, "protocol": protocol});
+        async move { call_tool(state, "reply_send", args).await }
+    };
+
+    for protocol in ["h1", "http1", "HTTP/1.1", "http/1.1", "auto"] {
+        let sent = send(json!({"url": url}), json!(protocol)).await.unwrap();
+        assert_eq!(sent["status_code"], 200, "{protocol}");
+    }
+    let error = send(json!({"url": url}), json!("h3")).await.unwrap_err();
+    assert!(error.to_string().contains("auto, h1 or h2"), "{error}");
+
+    // body_cleared wins over a format without a body and over an empty body.
+    for extra in [
+        json!({"body_cleared": true, "body_format": "json"}),
+        json!({"body_cleared": true, "body_text": ""}),
+        json!({"body_cleared": true, "body_format": "raw", "body_text": ""}),
+    ] {
+        let mut draft = json!({"url": url, "method": "POST"});
+        draft
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let sent = send(draft, Value::Null).await.unwrap();
+        assert_eq!(sent["response_preview"]["text"], "POST ", "{extra}");
+    }
+    let error = send(
+        json!({"url": url, "body_cleared": true, "body_text": "x"}),
+        Value::Null,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("body_cleared"), "{error}");
+
+    // A GET has nothing to format, so a body_format is dropped; a POST still needs a body.
+    let sent = send(json!({"url": url, "body_format": "raw"}), Value::Null)
+        .await
+        .unwrap();
+    assert_eq!(sent["response_preview"]["text"], "GET ");
+    let error = send(
+        json!({"url": url, "method": "POST", "body_format": "raw"}),
+        Value::Null,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("explicit body"), "{error}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn reply_send_returns_response_headers_and_a_sized_preview_on_request() {
+    use axum::http::header;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(|| async {
+        (
+            [
+                (header::CONTENT_TYPE, "text/plain"),
+                (header::SET_COOKIE, "sid=topsecret"),
+                (header::HeaderName::from_static("x-custom"), "custom-value"),
+            ],
+            "a".repeat(20_000),
+        )
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    let url = format!("http://{address}/big");
+    let send = |extra: Value| {
+        let state = state.clone();
+        let mut args = json!({"project_id": project, "draft": {"url": url}});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        async move { call_tool(state, "reply_send", args).await }
+    };
+
+    // The default result is unchanged: a 4 KiB preview and no headers.
+    let plain = send(json!({})).await.unwrap();
+    assert_eq!(
+        plain["response_preview"]["text"].as_str().unwrap().len(),
+        4096
+    );
+    assert_eq!(plain["response_preview"]["truncated"], true);
+    assert!(plain.get("response_headers").is_none());
+    for extra in [
+        json!({"response_headers": false}),
+        json!({"response_headers": null, "preview_bytes": null}),
+    ] {
+        let same = send(extra).await.unwrap();
+        assert!(same.get("response_headers").is_none());
+        assert_eq!(
+            same["response_preview"]["text"].as_str().unwrap().len(),
+            4096
+        );
+    }
+
+    // Headers come back as exchange_get renders them: redacted secrets, one line each.
+    let with = send(json!({"response_headers": true, "preview_bytes": 10_000}))
+        .await
+        .unwrap();
+    assert_eq!(
+        with["response_preview"]["text"].as_str().unwrap().len(),
+        10_000
+    );
+    assert_eq!(with["response_preview"]["truncated"], true);
+    let lines = with["response_headers"].as_array().unwrap();
+    assert!(
+        lines.contains(&json!("x-custom: custom-value")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&json!("content-type: text/plain")),
+        "{lines:?}"
+    );
+    assert!(!with.to_string().contains("topsecret"));
+    let stored = call_tool(
+        state.clone(),
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": with["exchange_id"], "body_bytes": 0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(with["response_headers"], stored["response_headers"]);
+
+    // Sizes: 0 returns no text, more than the maximum is cut to it, quoted numbers work.
+    let none = send(json!({"preview_bytes": 0})).await.unwrap();
+    assert_eq!(none["response_preview"]["text"], "");
+    assert_eq!(none["response_preview"]["truncated"], true);
+    let huge = send(json!({"preview_bytes": 1_000_000})).await.unwrap();
+    assert_eq!(
+        huge["response_preview"]["text"].as_str().unwrap().len(),
+        16_384
+    );
+    let quoted = send(json!({"preview_bytes": "100"})).await.unwrap();
+    assert_eq!(
+        quoted["response_preview"]["text"].as_str().unwrap().len(),
+        100
+    );
+    let error = send(json!({"preview_bytes": -1})).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "preview_bytes must be a non-negative integer"
+    );
+    let error = send(json!({"response_headers": "yes"})).await.unwrap_err();
+    assert_eq!(error.to_string(), "response_headers must be a boolean");
+
+    // A reply outside the capture scope is not saved, and still returns its headers.
+    state
+        .db
+        .update_project_scope(
+            ProjectId(project),
+            ScopePolicy {
+                schemes: vec!["http".into()],
+                host_patterns: vec!["127.0.0.1".into()],
+                excluded_host_patterns: vec!["localhost".into()],
+                ports: vec![address.port()],
+                path_prefixes: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let unsaved = call_tool(
+        state.clone(),
+        "reply_send",
+        json!({"project_id": project, "response_headers": true,
+               "draft": {"url": format!("http://localhost:{}/big", address.port())}}),
+    )
+    .await
+    .unwrap();
+    assert!(unsaved["exchange_id"].is_null(), "{unsaved}");
+    let lines = unsaved["response_headers"].as_array().unwrap();
+    assert!(
+        lines.contains(&json!("x-custom: custom-value")),
+        "{lines:?}"
+    );
+    assert!(!unsaved.to_string().contains("topsecret"));
+    server.abort();
+}
+
+/// A server that answers one raw request with `ok` and returns its head.
+async fn one_shot_raw_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the client closed before the headers ended");
+            received.extend_from_slice(&buffer[..read]);
+        }
+        // Whatever follows the headers is in flight with them.
+        while let Ok(Ok(read)) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            socket.read(&mut buffer),
+        )
+        .await
+        {
+            if read == 0 {
+                break;
+            }
+            received.extend_from_slice(&buffer[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        received
+    });
+    (address, server)
+}
+
+#[tokio::test]
+async fn reply_send_raw_and_browser_pages_read_null_and_quoted_options() {
+    let (address, server) = one_shot_raw_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+
+    // Null options are absent and quoted numbers are numbers.
+    let sent = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({
+            "project_id": project.to_string(), "target_url": format!("http://{address}/"),
+            "request": format!("GET / HTTP/1.1\r\nHost: {address}\r\n\r\n"),
+            "encoding": null, "tab_id": null, "use_project_cookies": null,
+            "upstream_proxy": null, "pause_at_byte": "5", "pause_ms": "10",
+            "await_response_before_continue": null, "half_close_write": null,
+            "response_mode": null, "read_timeout_ms": "5000", "idle_timeout_ms": null,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent["status_code"], 200);
+    assert!(server.await.unwrap().starts_with(b"GET / HTTP/1.1\r\n"));
+    let error = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({"project_id": project, "target_url": format!("http://{address}/"),
+               "request": "GET / HTTP/1.1\r\n\r\n", "pause_at_byte": "soon"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "pause_at_byte must be a non-negative integer"
+    );
+
+    // Page ids inside a browser action may be quoted as well.
+    let error = call_tool(
+        state.clone(),
+        "browser_action",
+        json!({"project_id": project, "session_id": 999_999,
+               "action": {"type": "pages", "op": "select", "page_id": "1",
+                          "runtime_generation": "1"}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("invalid type"), "{error}");
+}
+
+#[tokio::test]
+async fn reply_send_raw_injects_managed_cookies_into_bare_lf_requests() {
+    let (address, server) = one_shot_raw_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set",
+               "target_url": format!("http://{address}/"), "cookie": "sid=abc"}),
+    )
+    .await
+    .unwrap();
+
+    // Without a blank line ending the headers there is nothing to inject into.
+    let error = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({"project_id": project, "target_url": format!("http://{address}/"),
+               "request": format!("GET / HTTP/1.1\nHost: {address}"),
+               "use_project_cookies": true}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("empty line"), "{error}");
+
+    // Bare LF headers are sent with CRLF and the cookie; the body is as given.
+    let sent = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({"project_id": project, "target_url": format!("http://{address}/"),
+               "request": format!("POST /x HTTP/1.1\nHost: {address}\nCookie: old=1\nContent-Length: 4\n\nli\nn"),
+               "use_project_cookies": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent["status_code"], 200);
+    // The result says the header bytes were changed beyond the Cookie header.
+    assert_eq!(sent["line_endings_normalized"], true, "{sent}");
+    let received = String::from_utf8(server.await.unwrap()).unwrap();
+    assert_eq!(
+        received,
+        format!("POST /x HTTP/1.1\r\nHost: {address}\r\nCookie: sid=abc\r\nContent-Length: 4\r\n\r\nli\nn")
+    );
+}
+
+#[tokio::test]
+async fn cookies_set_from_a_file_takes_its_one_domain_as_the_target() {
+    let (directory, state, project_id) = test_state().await;
+    let project = project_id.get();
+    let file = |name: &str, text: &str| {
+        let path = directory.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        path.display().to_string()
+    };
+    let one = file(
+        "one.json",
+        r#"[{"name":"sid","value":"abc","domain":".app.example.com","path":"/"},
+            {"name":"theme","value":"dark","domain":"app.example.com"}]"#,
+    );
+    let session = file(
+        "session.json",
+        r#"{"cookies":[{"name":"sid","value":"abc","domain":"app.example.com"}],"origins":[]}"#,
+    );
+    let several = file(
+        "several.json",
+        r#"[{"name":"a","value":"1","domain":"b.example.org"},
+            {"name":"b","value":"2","domain":".a.example.com"}]"#,
+    );
+    let nameless = file("nameless.json", r#"[{"name":"a","value":"1"}]"#);
+    let header = file("header.txt", "sid=abc\n");
+
+    // The file's one domain becomes https://<domain>, for named and project cookies.
+    let named = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "file_path": one,
+               "profile_name": "alice", "target_url": null, "cookie": null}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(named["profile"]["host"], "app.example.com");
+    assert_eq!(named["profile"]["target_url"], "https://app.example.com/");
+    let project_wide = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "file_path": session}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        project_wide["profile"]["target_url"],
+        "https://app.example.com/"
+    );
+
+    // An explicit target_url still wins.
+    let explicit = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "file_path": one,
+               "profile_name": "bob", "target_url": "https://www.example.com/"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        explicit["profile"]["target_url"],
+        "https://www.example.com/"
+    );
+
+    // Several domains are listed; none, or a raw Cookie header, cannot be derived.
+    for (path, expected) in [
+        (&several, "several domains (a.example.com, b.example.org)"),
+        (&nameless, "carry no domain"),
+        (&header, "raw Cookie header"),
+    ] {
+        let error = call_tool(
+            state.clone(),
+            "cookies",
+            json!({"project_id": project, "action": "set", "file_path": path}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error.to_string().starts_with("target_url required"),
+            "{error}"
+        );
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    // An inline cookie never names its site.
+    let error = call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set", "cookie": "sid=abc"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "target_url required");
+}
+
+#[tokio::test]
+async fn job_status_accepts_wait_ms_and_reads_it_like_other_integers() {
+    let (_directory, state, _) = test_state().await;
+    let unknown = uuid::Uuid::new_v4().to_string();
+    for wait_ms in [json!(null), json!(0), json!("25"), json!(30_000)] {
+        let started = std::time::Instant::now();
+        let error = call_tool(
+            state.clone(),
+            "job_status",
+            json!({"job_id": unknown, "wait_ms": wait_ms}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NotFound, "{wait_ms}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+    for wait_ms in [json!("soon"), json!(-1), json!(1.5)] {
+        let error = call_tool(
+            state.clone(),
+            "job_status",
+            json!({"job_id": unknown, "wait_ms": wait_ms}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{wait_ms}");
+        assert_eq!(
+            error.to_string(),
+            "wait_ms must be a non-negative integer",
+            "{wait_ms}"
+        );
+    }
+}

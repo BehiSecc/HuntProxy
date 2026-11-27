@@ -105,6 +105,8 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
   const evaluate = async (expression, extra = {}) => ({ ...(await execute(session, { type: "evaluate", expression, ...extra })).data });
   const value = async (expression, extra) => {
     const data = await evaluate(expression, extra);
+    // An object or array that fits is returned as it is.
+    if ("value" in data) return data.value;
     assert.equal(data.truncated, false, expression);
     return data.type === "string" || data.type === "node" || data.type === "function" ? data.content : JSON.parse(data.content);
   };
@@ -246,15 +248,15 @@ test("evaluate runs page JavaScript in the selected page and its frames", {
   await t.test("frames are selected by name or URL", async () => {
     // Same site as the page: it shares the page's process and CDP session.
     const help = await evaluate("[widget.path, location.hash, typeof app]", { frame: "help" });
-    assert.deepEqual(JSON.parse(help.content), ["/help", "#top", "undefined"]);
+    assert.deepEqual(help.value, ["/help", "#top", "undefined"]);
     assert.equal(help.frame_url, `http://127.0.0.1:${widgetPort}/help`);
-    assert.deepEqual(JSON.parse((await evaluate("widget", { frame: "/help?topic=cart" })).content), { host: `127.0.0.1:${widgetPort}`, path: "/help" });
+    assert.deepEqual((await evaluate("widget", { frame: "/help?topic=cart" })).value, { host: `127.0.0.1:${widgetPort}`, path: "/help" });
     // Another site: an out-of-process frame with a CDP session of its own.
     const slot = await evaluate("document.querySelector('#who')", { frame: "ads/slot" });
     assert.deepEqual([slot.type, slot.content], ["node", "<p id=\"who\">widget</p>"]);
     assert.equal(slot.frame_url, `http://localhost:${widgetPort}/ads/slot`);
     assert.equal((await evaluate("await new Promise((resolve) => setTimeout(() => resolve(widget.host), 50))", { frame: `http://localhost:${widgetPort}/ads/other` })).content, `localhost:${widgetPort}`);
-    assert.equal((await evaluate("{host: location.host}", { frame: "help" })).content, `{"host":"127.0.0.1:${widgetPort}"}`);
+    assert.deepEqual((await evaluate("{host: location.host}", { frame: "help" })).value, { host: `127.0.0.1:${widgetPort}` });
     assert.match((await evaluate("nope()", { frame: "help" })).content, /^ReferenceError: nope is not defined/);
     // A frame whose document runs no script of its own can still be evaluated in.
     assert.equal((await evaluate("document.title + ' ' + typeof widget", { frame: "legal" })).content, "Legal undefined");

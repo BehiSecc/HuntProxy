@@ -1,13 +1,14 @@
 //! Immutable exchange records.
 
 use crate::domain::*;
-use crate::history::{filter_to_sql, FilterNode};
+use crate::history::{filter_to_sql, pins_exchange_id, uses_body_search, FilterNode};
 use crate::policy::{present_headers, PresentationOptions};
 use crate::storage::annotations::load_labels_conn;
 use crate::storage::bodies::{
     prepare_body, prepare_body_file, store_body_conn, store_body_file_conn,
     store_prepared_body_conn, PreparedBody, PreparedBodyFile, StoredBody,
 };
+use crate::storage::db::BodySearchScope;
 use crate::storage::headers::{insert_headers_conn, load_headers_conn};
 use crate::storage::projects::{now_rfc3339, parse_time};
 use crate::storage::Db;
@@ -56,11 +57,22 @@ impl<'body> PreparedCapture<'body> {
     }
 }
 
-const HISTORY_SELECT: &str =
-    "SELECT exchange_id, source, started_at, duration_ms, method, scheme, authority, host, port, path, query,
+const HISTORY_COLUMNS: &str =
+    "exchange_id, source, started_at, duration_ms, method, scheme, authority, host, port, path, query,
             status_code, mime, request_length, response_length, completion, capture_quality,
-            page_title, display_title, parent_exchange_id, transport_provenance
-     FROM exchanges";
+            page_title, display_title, parent_exchange_id, transport_provenance";
+
+/// One page of [`Db::search_history`].
+#[derive(Debug, Clone)]
+pub struct HistoryPage {
+    pub items: Vec<ExchangeSummary>,
+    /// `(started_at, exchange_id)` to pass as the cursor of the next page.
+    pub next: Option<(String, i64)>,
+    /// Set when the time budget stopped a body search: the stored
+    /// `started_at` back to which it searched. Every exchange newer than it
+    /// was searched; `next` continues from it.
+    pub searched_back_to: Option<String>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewExchange {
@@ -662,16 +674,42 @@ impl Db {
         before_started: Option<String>,
         before_id: Option<i64>,
     ) -> DomainResult<(Vec<ExchangeSummary>, Option<(String, i64)>)> {
+        let page = self
+            .search_history(project_id, filter, limit, before_started, before_id, None)
+            .await?;
+        Ok((page.items, page.next))
+    }
+
+    /// [`Self::list_history_filtered`] with a time budget for body searches
+    /// (`request:` and `response:` terms). A body search that runs past
+    /// `budget` stops and returns the rows it matched, with
+    /// [`HistoryPage::searched_back_to`] set and `next` continuing it.
+    pub async fn search_history(
+        &self,
+        project_id: ProjectId,
+        filter: Option<FilterNode>,
+        limit: u32,
+        before_started: Option<String>,
+        before_id: Option<i64>,
+        budget: Option<std::time::Duration>,
+    ) -> DomainResult<HistoryPage> {
         let limit = limit.clamp(1, 500) as usize;
+        // A filter that names its exchange ids is bounded by the primary key.
+        let budget = budget.filter(|_| {
+            filter
+                .as_ref()
+                .is_some_and(|filter| uses_body_search(filter) && !pins_exchange_id(filter))
+        });
         let (filter_sql, filter_binds) = match filter {
             Some(filter) => filter_to_sql(&filter)?,
             None => ("1=1".into(), Vec::new()),
         };
         self.with_conn(move |conn| {
+            let scope = BodySearchScope::begin(budget);
             let mut bind_values: Vec<Value> = filter_binds.into_iter().map(Value::Text).collect();
             let project_idx = bind_values.len() + 1;
             bind_values.push(Value::Integer(project_id.get()));
-            let mut where_sql = format!("({filter_sql}) AND project_id=?{project_idx}");
+            let mut where_sql = format!("project_id=?{project_idx}");
             if let (Some(started_at), Some(exchange_id)) = (before_started, before_id) {
                 let started_idx = bind_values.len() + 1;
                 bind_values.push(Value::Text(started_at));
@@ -681,10 +719,22 @@ impl Db {
                     " AND (started_at < ?{started_idx} OR (started_at = ?{started_idx} AND exchange_id < ?{exchange_idx}))"
                 ));
             }
+            // A budgeted search walks the started_at index newest first, so
+            // the rows it reaches before it stops are exactly the newest ones.
+            // SQLite checks terms without subqueries first, in order, so the
+            // budget is checked on every row after the cursor, from index
+            // columns alone, before any filter term reads the row. Once it
+            // has stopped, the rest of the scan reads only index entries.
+            let mut from = "exchanges";
+            if budget.is_some() {
+                from = "exchanges INDEXED BY idx_exchanges_started";
+                where_sql.push_str(" AND huntproxy_search_open(started_at)");
+            }
+            where_sql.push_str(&format!(" AND ({filter_sql})"));
             let limit_idx = bind_values.len() + 1;
             bind_values.push(Value::Integer((limit + 1) as i64));
             let sql = format!(
-                "{HISTORY_SELECT} WHERE {where_sql} ORDER BY started_at DESC, exchange_id DESC LIMIT ?{limit_idx}"
+                "SELECT {HISTORY_COLUMNS} FROM {from} WHERE {where_sql} ORDER BY started_at DESC, exchange_id DESC LIMIT ?{limit_idx}"
             );
             let mut stmt = conn.prepare(&sql).map_err(storage_error)?;
             let rows = stmt
@@ -692,23 +742,14 @@ impl Db {
                     raw_summary(project_id, row)
                 })
                 .map_err(storage_error)?;
-            let mut items = collect_rows(rows)?;
-            let has_more = items.len() > limit;
-            if has_more {
-                items.truncate(limit);
-            }
-            for item in &mut items {
+            let items = collect_rows(rows)?;
+            let stopped_at = scope.stopped_at();
+            drop(scope);
+            let mut page = history_page(items, limit, stopped_at);
+            for item in &mut page.items {
                 item.labels = load_labels_conn(conn, project_id, item.exchange_id)?;
             }
-            let next = has_more.then(|| {
-                let last = items.last().expect("history overflow must contain an item");
-                let started_at = last
-                    .started_at
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default();
-                (started_at, last.exchange_id.get())
-            });
-            Ok((items, next))
+            Ok(page)
         })
         .await
     }
@@ -896,6 +937,52 @@ impl Db {
             }
         })
         .await
+    }
+}
+
+/// Cursor id that continues a stopped search at the start of its
+/// `started_at`: above any exchange id, and exact as a JavaScript number
+/// (2^53 - 1), so clients that parse JSON numbers as doubles send it back
+/// unchanged.
+pub const STOPPED_SEARCH_CURSOR_ID: i64 = (1 << 53) - 1;
+
+/// One page from up to `limit + 1` rows in page order. `stopped_at` is the
+/// `started_at` where a budgeted search stopped, if it did.
+fn history_page(
+    mut items: Vec<ExchangeSummary>,
+    limit: usize,
+    stopped_at: Option<String>,
+) -> HistoryPage {
+    let has_more = items.len() > limit;
+    // A full page is exact when the search stopped at a time older than its
+    // last row: every row at or above that row's time was searched. Rows
+    // sharing one started_at are read in rowid order, not page order, so
+    // when it stopped within that time a refused row could belong on this
+    // page; the stop then wins.
+    let searched_back_to = stopped_at
+        .filter(|stopped_at| !has_more || parse_time(stopped_at) >= items[limit - 1].started_at);
+    items.truncate(limit);
+    let next = if let Some(stopped_at) = &searched_back_to {
+        // Rows sharing the stopped row's time may not all have been
+        // searched; the continuation, which starts at that time, returns
+        // them instead.
+        let stopped = parse_time(stopped_at);
+        items.retain(|item| item.started_at != stopped);
+        Some((stopped_at.clone(), STOPPED_SEARCH_CURSOR_ID))
+    } else {
+        has_more.then(|| {
+            let last = items.last().expect("history overflow must contain an item");
+            let started_at = last
+                .started_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            (started_at, last.exchange_id.get())
+        })
+    };
+    HistoryPage {
+        items,
+        next,
+        searched_back_to,
     }
 }
 
@@ -2107,6 +2194,257 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(ids, expected, "{query}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_body_search_out_of_budget_returns_the_newest_matches_and_continues() {
+        let db = Db::open_in_memory().await.unwrap();
+        let project = db
+            .create_project(CreateProjectRequest {
+                name: "budgeted search".into(),
+                target_url: "https://example.com/".into(),
+                advanced: None,
+            })
+            .await
+            .unwrap();
+        // Oldest first; the third and fourth share one started_at.
+        let mut ids = Vec::new();
+        for (index, body) in ["needle", "hay", "hay", "needle", "hay", "NEEDLE"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut exchange = spool_exchange(project.id);
+            exchange.path = format!("/{index}");
+            exchange.response_body = Some(format!("{body} {index}").into_bytes());
+            let id = db.insert_exchange(exchange).await.unwrap();
+            let second = if index == 3 { 2 } else { index };
+            let started_at = format!("2026-11-24T06:30:0{second}Z");
+            db.with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE exchanges SET started_at=?1 WHERE exchange_id=?2",
+                    params![started_at, id.get()],
+                )
+                .map_err(storage_error)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let filter = crate::history::parse_text_query("response:~needle").unwrap();
+        let expected = vec![ids[5], ids[3], ids[0]];
+        let unbudgeted = db
+            .search_history(project.id, Some(filter.clone()), 50, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unbudgeted
+                .items
+                .iter()
+                .map(|item| item.exchange_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(unbudgeted.searched_back_to.is_none() && unbudgeted.next.is_none());
+
+        // A zero budget searches the rows at one started_at per call; the
+        // continuations return every match exactly once, newest first.
+        let mut seen = Vec::new();
+        let mut stops = Vec::new();
+        let mut cursor = (None, None);
+        for _ in 0..10 {
+            let page = db
+                .search_history(
+                    project.id,
+                    Some(filter.clone()),
+                    50,
+                    cursor.0.clone(),
+                    cursor.1,
+                    Some(std::time::Duration::ZERO),
+                )
+                .await
+                .unwrap();
+            seen.extend(page.items.iter().map(|item| item.exchange_id));
+            if let Some(stopped) = &page.searched_back_to {
+                assert_eq!(page.next, Some((stopped.clone(), STOPPED_SEARCH_CURSOR_ID)));
+                stops.push(stopped.clone());
+            }
+            match page.next {
+                Some((started_at, id)) => cursor = (Some(started_at), Some(id)),
+                None => break,
+            }
+        }
+        assert_eq!(seen, expected);
+        assert_eq!(
+            stops,
+            [
+                "2026-11-24T06:30:04Z",
+                "2026-11-24T06:30:02Z",
+                "2026-11-24T06:30:01Z",
+                "2026-11-24T06:30:00Z",
+            ]
+        );
+
+        // Within the budget a page ends as it always did.
+        let page = db
+            .search_history(
+                project.id,
+                Some(filter.clone()),
+                1,
+                None,
+                None,
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        assert!(page.searched_back_to.is_none());
+        assert_eq!(page.items[0].exchange_id, ids[5]);
+        assert_eq!(
+            page.next,
+            Some(("2026-11-24T06:30:05Z".into(), ids[5].get()))
+        );
+
+        // Searches without a body term have no budget.
+        let filter = crate::history::parse_text_query("path:/1").unwrap();
+        let page = db
+            .search_history(
+                project.id,
+                Some(filter),
+                50,
+                None,
+                None,
+                Some(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.searched_back_to.is_none());
+
+        // The budget is checked on rows a plain term rejects too, so a
+        // selective filter cannot walk the whole project past it.
+        let search = |q: String| {
+            let db = db.clone();
+            async move {
+                db.search_history(
+                    project.id,
+                    Some(crate::history::parse_text_query(&q).unwrap()),
+                    50,
+                    None,
+                    None,
+                    Some(std::time::Duration::ZERO),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let page = search("path:/0 response:~needle".into()).await;
+        assert!(page.items.is_empty());
+        assert_eq!(
+            page.searched_back_to.as_deref(),
+            Some("2026-11-24T06:30:04Z")
+        );
+        // A filter that names its exchange id uses the key and no budget.
+        let page = search(format!("exchange_id:{} response:~needle", ids[0].get())).await;
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].exchange_id, ids[0]);
+        assert!(page.searched_back_to.is_none() && page.next.is_none());
+    }
+
+    #[test]
+    fn a_page_that_ends_where_the_search_stopped_is_partial() {
+        let row = |id: i64, started_at: &str| ExchangeSummary {
+            project_id: ProjectId(1),
+            exchange_id: ExchangeId(id),
+            source: ExchangeSource::Proxy,
+            started_at: parse_time(started_at),
+            duration_ms: None,
+            method: "GET".into(),
+            scheme: "https".into(),
+            authority: "example.com".into(),
+            host: "example.com".into(),
+            port: 443,
+            path: "/".into(),
+            query: None,
+            status_code: None,
+            mime: None,
+            request_length: None,
+            response_length: None,
+            completion: CompletionState::Complete,
+            capture_quality: CaptureQuality::Semantic,
+            page_title: None,
+            display_title: None,
+            labels: Vec::new(),
+            parent_exchange_id: None,
+            transport_provenance: None,
+        };
+        let newer = "2026-11-24T06:30:01Z";
+        let group = "2026-11-24T06:30:00Z";
+        // Group ids 5, 10 and 20 were read in that order and the search
+        // stopped before 20: a page of two ending at 10, with 5 as overflow,
+        // must not hand out a cursor below 10 that skips 20.
+        let page = history_page(
+            vec![row(30, newer), row(10, group), row(5, group)],
+            2,
+            Some(group.into()),
+        );
+        assert_eq!(page.searched_back_to.as_deref(), Some(group));
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.exchange_id.get())
+                .collect::<Vec<_>>(),
+            [30]
+        );
+        assert_eq!(page.next, Some((group.into(), STOPPED_SEARCH_CURSOR_ID)));
+        // Stopped at a time older than the last row: the full page is exact.
+        let page = history_page(
+            vec![row(30, newer), row(10, newer), row(5, group)],
+            2,
+            Some(group.into()),
+        );
+        assert!(page.searched_back_to.is_none());
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.next, Some((newer.into(), 10)));
+    }
+
+    #[tokio::test]
+    async fn a_budgeted_body_search_walks_the_started_at_index() {
+        let db = Db::open_in_memory().await.unwrap();
+        // The plan the budgeted query uses, for a body term with a filter
+        // that has its own index: rows must come in started_at order, without
+        // a sort of the whole result.
+        let plan = db
+            .with_conn(|conn| {
+                let (filter_sql, binds) = filter_to_sql(
+                    &crate::history::parse_text_query("method:GET response:~a OR request:~b")
+                        .unwrap(),
+                )?;
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT {HISTORY_COLUMNS} FROM exchanges INDEXED BY idx_exchanges_started \
+                     WHERE project_id=1 AND huntproxy_search_open(started_at) AND ({filter_sql}) \
+                     ORDER BY started_at DESC, exchange_id DESC LIMIT 51"
+                );
+                let mut stmt = conn.prepare(&sql).map_err(storage_error)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .map_err(storage_error)?;
+                collect_rows(rows)
+            })
+            .await
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("USING INDEX idx_exchanges_started")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step == "USE TEMP B-TREE FOR ORDER BY"),
+            "{plan:?}"
+        );
     }
 
     #[tokio::test]

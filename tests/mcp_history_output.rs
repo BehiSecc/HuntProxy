@@ -204,13 +204,44 @@ async fn an_empty_and_query_names_the_terms_that_match_nothing_alone() {
 
     // Each term matches on its own: only the combination is empty.
     let result = search(&state, project_id, "path:/one method:POST").await;
-    assert_eq!(result, json!({"items": []}));
-    // A single term needs no hint.
-    let result = search(&state, project_id, "path:/missing").await;
-    assert_eq!(result, json!({"items": []}));
+    assert_eq!(
+        result,
+        json!({
+            "items": [],
+            "hint": "Each term matches some exchanges on its own, but no exchange matches all of them."
+        })
+    );
+    // A query of one term names it: the search itself checked it alone.
+    for q in [
+        "path:/missing",
+        "response:~nowhere",
+        "zzzz",
+        "NOT host:example.com",
+        "path:/missing OR method:PATCH",
+    ] {
+        let result = search(&state, project_id, q).await;
+        assert_eq!(result["items"], json!([]), "{q}");
+        if q.contains(" OR ") {
+            // OR queries are not checked branch by branch.
+            assert_eq!(result, json!({"items": []}), "{q}");
+        } else {
+            assert_eq!(result["no_match_terms"], json!([q]), "{q}");
+        }
+    }
     // Body searches are never checked on their own.
     let result = search(&state, project_id, "response:~nowhere path:/missing").await;
     assert_eq!(result["no_match_terms"], json!(["path:/missing"]));
+    assert!(result.get("hint").is_none());
+    let result = search(&state, project_id, "response:~nowhere path:/one").await;
+    assert_eq!(
+        result,
+        json!({
+            "items": [],
+            "hint": "Each term checked alone matches some exchanges; not checked alone: response:~nowhere."
+        })
+    );
+    let result = search(&state, project_id, "response:~nowhere request:~nothing").await;
+    assert_eq!(result, json!({"items": []}));
     // Quoted and bare terms are shown in query syntax.
     let result = search(&state, project_id, "path:~\"no such\" zzzz method:GET").await;
     assert_eq!(
@@ -293,6 +324,103 @@ async fn query_language_additions_find_the_expected_exchanges() {
         error.to_string().contains(r#"query:~"user_id=5""#),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn colon_comparisons_header_hints_and_null_arguments() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut small = exchange(project_id, "GET", "/small");
+    small.response_body = Some(vec![b'a'; 100]);
+    let small = state.db.insert_exchange(small).await.unwrap().get();
+    let mut large = exchange(project_id, "GET", "/large");
+    large.response_body = Some(vec![b'a'; 30_000]);
+    let large = state.db.insert_exchange(large).await.unwrap().get();
+    let project = project_id.get();
+
+    for (q, expected) in [
+        ("response_size:>25000", vec![large]),
+        ("response_size:<=25000", vec![small]),
+        ("time:>=2000-01-01T00:00:00Z", vec![large, small]),
+        ("time:<2000-01-01T00:00:00Z", vec![]),
+    ] {
+        assert_eq!(
+            item_ids(&search(&state, project_id, q).await),
+            expected,
+            "{q}"
+        );
+    }
+
+    // A header name used as a field points at the header search.
+    let error = call_tool(
+        state.clone(),
+        "history_search",
+        json!({"project_id": project, "q": "cache-control:~public"}),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains(r#"response:~"public""#), "{message}");
+    assert!(!message.contains("query:~"), "{message}");
+
+    // Clients that send every property send the unused ones as null.
+    let result = call(
+        &state,
+        "history_search",
+        json!({"project_id": project, "q": null, "limit": null, "cursor": null, "urls": null}),
+    )
+    .await;
+    assert_eq!(item_ids(&result), vec![large, small]);
+    let error = call_tool(
+        state.clone(),
+        "history_search",
+        json!({"project_id": project, "urls": "tiny"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("full or short"), "{error}");
+}
+
+#[tokio::test]
+async fn short_urls_cut_long_query_strings_on_request() {
+    let (_directory, state, project_id) = test_state().await;
+    let query = format!("token={}", "x".repeat(150));
+    let mut long = exchange(project_id, "GET", "/callback");
+    long.query = Some(query.clone());
+    state.db.insert_exchange(long).await.unwrap();
+    let mut short = exchange(project_id, "GET", "/page");
+    short.query = Some("id=5".into());
+    state.db.insert_exchange(short).await.unwrap();
+    let project = project_id.get();
+
+    let full = call(&state, "history_search", json!({"project_id": project})).await;
+    let explicit = call(
+        &state,
+        "history_search",
+        json!({"project_id": project, "urls": "full"}),
+    )
+    .await;
+    assert_eq!(full, explicit);
+    assert_eq!(
+        full["items"][1]["url"],
+        format!("https://example.com/callback?{query}")
+    );
+
+    let cut = call(
+        &state,
+        "history_search",
+        json!({"project_id": project, "urls": "short"}),
+    )
+    .await;
+    assert_eq!(cut["items"][0]["url"], "https://example.com/page?id=5");
+    assert_eq!(
+        cut["items"][1]["url"],
+        format!("https://example.com/callback?{}…[+76 chars]", &query[..80])
+    );
+    // Only the URL changes.
+    let mut restored = cut.clone();
+    restored["items"][1]["url"] = full["items"][1]["url"].clone();
+    assert_eq!(restored, full);
 }
 
 #[tokio::test]
@@ -506,4 +634,24 @@ async fn sitemap_lists_flat_routes_and_pages_with_offsets() {
     let mut sorted = paths.clone();
     sorted.sort();
     assert_eq!(paths, sorted);
+}
+
+#[tokio::test]
+async fn history_search_accepts_numeric_strings_for_integer_arguments() {
+    let (_directory, state, project_id) = test_state().await;
+    for path in ["/a", "/b", "/c"] {
+        state
+            .db
+            .insert_exchange(exchange(project_id, "GET", path))
+            .await
+            .unwrap();
+    }
+    let quoted = call(
+        &state,
+        "history_search",
+        json!({"project_id": project_id.get().to_string(), "q": "method:GET", "limit": "2"}),
+    )
+    .await;
+    assert_eq!(quoted["items"].as_array().unwrap().len(), 2, "{quoted}");
+    assert!(quoted.get("next").is_some(), "{quoted}");
 }
