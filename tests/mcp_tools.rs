@@ -435,3 +435,201 @@ async fn a_tool_call_about_a_project_counts_as_its_browser_activity() {
         std::time::Duration::MAX
     );
 }
+
+#[tokio::test]
+async fn integer_arguments_may_be_numeric_strings_and_null_is_absent() {
+    let (_directory, state, project_id) = test_state().await;
+    let project = project_id.get().to_string();
+    let exchange_id = state
+        .db
+        .insert_exchange(exchange(project_id, "/quoted"))
+        .await
+        .unwrap();
+    let id = exchange_id.get().to_string();
+
+    // Quoted ids work wherever an id is read, and count as project activity.
+    let overview = call_tool(state.clone(), "overview", json!({"project_id": project}))
+        .await
+        .unwrap();
+    assert_eq!(overview["total_exchanges"], 1);
+    assert!(state.browser.project_idle_for(project_id) < std::time::Duration::from_secs(60));
+    let reveal = call_tool(
+        state.clone(),
+        "secret_reveal",
+        json!({"project_id": project, "exchange_id": id, "header": "authorization"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reveal["value"], "Bearer s3cret");
+    let finding = call_tool(
+        state.clone(),
+        "findings",
+        json!({"project_id": project, "action": "add", "exchange_id": id,
+               "title": "t", "description": "d"}),
+    )
+    .await
+    .unwrap();
+    call_tool(
+        state.clone(),
+        "findings",
+        json!({"project_id": project, "action": "remove",
+               "finding_id": finding["id"].as_i64().unwrap().to_string()}),
+    )
+    .await
+    .unwrap();
+    let session = call_tool(
+        state.clone(),
+        "capture_sessions",
+        json!({"project_id": project, "action": "create"}),
+    )
+    .await
+    .unwrap();
+    call_tool(
+        state.clone(),
+        "capture_sessions",
+        json!({"project_id": project, "action": "revoke",
+               "session_id": session["id"].as_i64().unwrap().to_string()}),
+    )
+    .await
+    .unwrap();
+    let annotation = call_tool(
+        state.clone(),
+        "exchange_annotate",
+        json!({"project_id": project, "exchange_id": id, "note": "n", "expected_revision": "0"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(annotation["note"], "n");
+
+    // Null means the argument was not given.
+    let list = call_tool(
+        state.clone(),
+        "projects",
+        json!({"action": "list", "project_id": null}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    call_tool(
+        state.clone(),
+        "projects",
+        json!({"action": "set_limits", "project_id": project, "requests_per_second": 5.0,
+               "max_concurrent_requests": "7"}),
+    )
+    .await
+    .unwrap();
+    let limits = call_tool(
+        state.clone(),
+        "projects",
+        json!({"action": "set_limits", "project_id": project_id.get(),
+               "requests_per_second": null, "max_concurrent_requests": 9}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(limits["requests_per_second"], 5.0);
+    assert_eq!(limits["max_concurrent_requests"], 9);
+
+    // Missing and null ids are "required"; anything else is "must be an integer".
+    for (tool, args, message) in [
+        ("overview", json!({}), "project_id required"),
+        (
+            "overview",
+            json!({"project_id": null}),
+            "project_id required",
+        ),
+        (
+            "overview",
+            json!({"project_id": "abc"}),
+            "project_id must be an integer",
+        ),
+        (
+            "overview",
+            json!({"project_id": ""}),
+            "project_id must be an integer",
+        ),
+        (
+            "overview",
+            json!({"project_id": true}),
+            "project_id must be an integer",
+        ),
+        (
+            "overview",
+            json!({"project_id": 1.5}),
+            "project_id must be an integer",
+        ),
+        (
+            "secret_reveal",
+            json!({"project_id": project, "exchange_id": null, "header": "authorization"}),
+            "exchange_id required",
+        ),
+        (
+            "secret_reveal",
+            json!({"project_id": project, "exchange_id": "x", "header": "authorization"}),
+            "exchange_id must be an integer",
+        ),
+        (
+            "capture_sessions",
+            json!({"project_id": project, "action": "revoke", "session_id": ["1"]}),
+            "session_id must be an integer",
+        ),
+    ] {
+        let error = call_tool(state.clone(), tool, args.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{args}");
+        assert_eq!(error.to_string(), message, "{args}");
+    }
+}
+
+#[tokio::test]
+async fn a_session_id_that_cannot_be_read_never_falls_back_to_the_project_listing() {
+    let (_directory, state, project_id) = test_state().await;
+    let project = project_id.get();
+    for tool in ["browser_manage", "browser_cdp"] {
+        for session_id in [json!("abc"), json!(true), json!(1.5), json!({})] {
+            let error = call_tool(
+                state.clone(),
+                tool,
+                json!({"project_id": project, "op": "status", "session_id": session_id}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(error.to_string(), "session_id must be an integer", "{tool}");
+        }
+    }
+    for tool in ["browser_action", "browser_evaluate", "browser_input"] {
+        let error = call_tool(
+            state.clone(),
+            tool,
+            json!({"project_id": project, "session_id": "abc", "op": "click",
+                   "action": {"type": "snapshot"}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "session_id must be an integer", "{tool}");
+    }
+
+    // A quoted number is read as the id, so the error is about the session.
+    for (tool, args) in [
+        (
+            "browser_manage",
+            json!({"project_id": project, "op": "status", "session_id": "999999"}),
+        ),
+        (
+            "browser_cdp",
+            json!({"project_id": project, "op": "status", "session_id": "999999"}),
+        ),
+        (
+            "browser_action",
+            json!({"project_id": project, "session_id": "999999", "action": {"type": "snapshot"}}),
+        ),
+    ] {
+        let error = call_tool(state.clone(), tool, args).await.unwrap_err();
+        assert!(
+            !error.to_string().contains("must be an integer"),
+            "{tool}: {error}"
+        );
+        assert!(!error.to_string().contains("required"), "{tool}: {error}");
+    }
+}

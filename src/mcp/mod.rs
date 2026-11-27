@@ -1,5 +1,6 @@
 //! Minimal stdio JSON-RPC MCP server. Protocol on stdout; diagnostics on stderr.
 
+mod arguments;
 pub(crate) mod budget;
 mod exchange_view;
 mod fuzz_view;
@@ -1080,11 +1081,7 @@ fn tool_call_result(name: &str, result: Value, is_error: bool) -> Value {
 }
 
 fn require_project_id(args: &Value) -> DomainResult<ProjectId> {
-    let id = args
-        .get("project_id")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| DomainError::invalid("project_id required"))?;
-    Ok(ProjectId(id))
+    arguments::required_i64(args, "project_id").map(ProjectId)
 }
 
 async fn fetch_page_analyzer_bundle(
@@ -1225,7 +1222,8 @@ fn emit_event(state: &AppState, project_id: ProjectId, kind: &str, payload: Valu
 
 pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainResult<Value> {
     // Any call about a project keeps that project's browsers open.
-    if let Some(project_id) = args.get("project_id").and_then(Value::as_i64) {
+    // A malformed id is reported by the handler; here it only skips the touch.
+    if let Ok(Some(project_id)) = arguments::optional_i64(&args, "project_id") {
         state.browser.touch_project(ProjectId(project_id));
     }
     match name {
@@ -1251,10 +1249,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("action")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("action required"))?;
-            let base_exchange_id = args
-                .get("base_exchange_id")
-                .and_then(Value::as_i64)
-                .map(ExchangeId);
+            let base_exchange_id =
+                arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
             let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
             state
                 .plugins
@@ -1271,11 +1267,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("action")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("action required"))?;
-            let base_exchange_id = args
-                .get("base_exchange_id")
-                .or_else(|| args.get("exchange_id"))
-                .and_then(Value::as_i64)
-                .map(ExchangeId);
+            let base_exchange_id = if arguments::present(&args, "base_exchange_id").is_some() {
+                arguments::optional_i64(&args, "base_exchange_id")?
+            } else {
+                arguments::optional_i64(&args, "exchange_id")?
+            }
+            .map(ExchangeId);
             let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
             Ok(json!(
                 state
@@ -1302,7 +1299,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .plugins
                         .resume_analysis(
                             id,
-                            args.get("js_stage_timeout_ms").and_then(Value::as_u64),
+                            arguments::optional_u64(&args, "js_stage_timeout_ms")?,
                         )
                         .await?
                 ));
@@ -1322,8 +1319,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         ))
                     }
                 };
-                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(25) as usize;
+                let offset = arguments::optional_u64(&args, "offset")?.unwrap_or(0) as usize;
+                let limit = arguments::optional_u64(&args, "limit")?.unwrap_or(25) as usize;
                 job_view::findings_page(state.plugins.results(id, view, offset, limit)?)
             } else {
                 let job = if name == "job_cancel" {
@@ -1341,7 +1338,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .unwrap_or("list");
             match action {
                 "list" => {
-                    if args.get("project_id").is_some() {
+                    if arguments::present(&args, "project_id").is_some() {
                         Ok(json!(
                             state.project_detail(require_project_id(&args)?).await?
                         ))
@@ -1414,27 +1411,27 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 "set_limits" => {
                     let project_id = require_project_id(&args)?;
                     let update = RequestBudgetUpdate {
-                        requests_per_second: args
-                            .get("requests_per_second")
+                        requests_per_second: arguments::present(&args, "requests_per_second")
                             .map(|value| {
                                 value.as_f64().ok_or_else(|| {
                                     DomainError::invalid("requests_per_second must be a number")
                                 })
                             })
                             .transpose()?,
-                        max_concurrent_requests: args
-                            .get("max_concurrent_requests")
-                            .map(|value| {
-                                value
-                                    .as_u64()
-                                    .and_then(|value| u32::try_from(value).ok())
-                                    .ok_or_else(|| {
-                                        DomainError::invalid(
-                                            "max_concurrent_requests must be a positive integer",
-                                        )
-                                    })
-                            })
-                            .transpose()?,
+                        max_concurrent_requests: arguments::present(
+                            &args,
+                            "max_concurrent_requests",
+                        )
+                        .map(|value| {
+                            arguments::integer(value)
+                                .and_then(|value| u32::try_from(value).ok())
+                                .ok_or_else(|| {
+                                    DomainError::invalid(
+                                        "max_concurrent_requests must be a positive integer",
+                                    )
+                                })
+                        })
+                        .transpose()?,
                     };
                     let project = state
                         .db
@@ -1506,10 +1503,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!(session))
                 }
                 "revoke" => {
-                    let sid = args
-                        .get("session_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("session_id required"))?;
+                    let sid = arguments::required_i64(&args, "session_id")?;
                     state
                         .db
                         .revoke_capture_session(project_id, CaptureSessionId(sid))
@@ -1523,10 +1517,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!({ "ok": true }))
                 }
                 "renew" => {
-                    let sid = args
-                        .get("session_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("session_id required"))?;
+                    let sid = arguments::required_i64(&args, "session_id")?;
                     let session = state
                         .db
                         .renew_capture_session(project_id, CaptureSessionId(sid))
@@ -1617,19 +1608,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     let rule = if args.get("action").and_then(Value::as_str) == Some("add") {
                         state.db.create_request_rule(project_id, input).await?
                     } else {
-                        let id = args
-                            .get("rule_id")
-                            .and_then(Value::as_i64)
-                            .ok_or_else(|| DomainError::invalid("rule_id required"))?;
+                        let id = arguments::required_i64(&args, "rule_id")?;
                         state.db.update_request_rule(project_id, id, input).await?
                     };
                     Ok(json!(rule))
                 }
                 "remove" => {
-                    let id = args
-                        .get("rule_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("rule_id required"))?;
+                    let id = arguments::required_i64(&args, "rule_id")?;
                     state.db.delete_request_rule(project_id, id).await?;
                     Ok(json!({ "ok": true }))
                 }
@@ -1683,10 +1668,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "findings": state.db.list_findings(project_id).await?
                 })),
                 "add" => {
-                    let exchange_id = args
-                        .get("exchange_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+                    let exchange_id = arguments::required_i64(&args, "exchange_id")?;
                     let title = args
                         .get("title")
                         .and_then(Value::as_str)
@@ -1724,10 +1706,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!(finding))
                 }
                 "remove" => {
-                    let finding_id = args
-                        .get("finding_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("finding_id required"))?;
+                    let finding_id = arguments::required_i64(&args, "finding_id")?;
                     state
                         .db
                         .delete_finding(project_id, FindingId(finding_id))
@@ -1757,14 +1736,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         "exchange_get" => exchange_view::exchange_get(&state, &args).await,
         "exchange_compare" => {
             let project_id = require_project_id(&args)?;
-            let left = args
-                .get("left_exchange_id")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| DomainError::invalid("left_exchange_id required"))?;
-            let right = args
-                .get("right_exchange_id")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| DomainError::invalid("right_exchange_id required"))?;
+            let left = arguments::required_i64(&args, "left_exchange_id")?;
+            let right = arguments::required_i64(&args, "right_exchange_id")?;
             exchange_view::compare_view(
                 &crate::compare::compare_saved_exchanges(
                     &state.db,
@@ -1783,10 +1756,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "page_analyzer" => {
             let project_id = require_project_id(&args)?;
-            let exchange_id = args
-                .get("exchange_id")
-                .and_then(Value::as_i64)
-                .map(ExchangeId);
+            let exchange_id = arguments::optional_i64(&args, "exchange_id")?.map(ExchangeId);
             let url = args.get("url").and_then(Value::as_str);
             match (exchange_id, url) {
                 (Some(exchange_id), None) => {
@@ -1925,11 +1895,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "copy_as" => {
             let project_id = require_project_id(&args)?;
-            let exchange_id = args
-                .get("exchange_id")
-                .and_then(Value::as_i64)
-                .map(ExchangeId)
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let exchange_id = ExchangeId(arguments::required_i64(&args, "exchange_id")?);
             let format: crate::copy_as::CopyAsFormat = serde_json::from_value(
                 args.get("format")
                     .cloned()
@@ -1967,10 +1933,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         "exchange_body" => exchange_view::exchange_body(&state, &args).await,
         "secret_reveal" => {
             let project_id = require_project_id(&args)?;
-            let eid = args
-                .get("exchange_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let eid = arguments::required_i64(&args, "exchange_id")?;
             let header = args
                 .get("header")
                 .and_then(|v| v.as_str())
@@ -2031,10 +1994,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .and_then(|v| v.as_str())
                         .unwrap_or("tab")
                         .to_string();
-                    let base = args
-                        .get("base_exchange_id")
-                        .and_then(|v| v.as_i64())
-                        .map(ExchangeId);
+                    let base = arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
                     let draft = parse_request_draft(args.get("draft"))?;
                     Ok(json!(
                         state
@@ -2075,6 +2035,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 }
             }
             let draft = parse_request_draft(args.get("draft"))?;
+            let base_exchange_id =
+                arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
             let protocol = match args.get("protocol").and_then(Value::as_str) {
                 Some("h1") => ProtocolPreference::H1,
                 Some("h2") => ProtocolPreference::H2,
@@ -2085,10 +2047,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .reply
                 .send_with_proxy(
                     project_id,
-                    args.get("tab_id").and_then(|v| v.as_i64()).map(ReplyTabId),
-                    args.get("base_exchange_id")
-                        .and_then(|v| v.as_i64())
-                        .map(ExchangeId),
+                    arguments::optional_i64(&args, "tab_id")?.map(ReplyTabId),
+                    base_exchange_id,
                     &draft,
                     protocol,
                     0,
@@ -2103,15 +2063,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
                 );
             }
-            exchange_view::reply_send_view(
-                &state,
-                project_id,
-                args.get("base_exchange_id")
-                    .and_then(|v| v.as_i64())
-                    .map(ExchangeId),
-                &result,
-            )
-            .await
+            exchange_view::reply_send_view(&state, project_id, base_exchange_id, &result).await
         }
         "reply_send_raw" => {
             let project_id = require_project_id(&args)?;
@@ -2142,9 +2094,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .reply
                 .send_raw_http1(
                     project_id,
-                    args.get("tab_id")
-                        .and_then(|value| value.as_i64())
-                        .map(ReplyTabId),
+                    arguments::optional_i64(&args, "tab_id")?.map(ReplyTabId),
                     target_url,
                     request_bytes,
                     args.get("use_project_cookies")
@@ -2212,10 +2162,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             match action {
                 "list" => Ok(json!(state.fuzzer.list(project_id).await?)),
                 "cancel" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
                     state
                         .fuzzer
                         .cancel_for_project(project_id, FuzzJobId(jid))
@@ -2229,11 +2176,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     Ok(json!({ "ok": true }))
                 }
                 "get" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(|v| v.as_i64())
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    let wait = args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+                    let jid = arguments::required_i64(&args, "job_id")?;
+                    let wait = arguments::optional_u64(&args, "wait_ms")?.unwrap_or(0);
                     Ok(json!(
                         state
                             .fuzzer
@@ -2246,18 +2190,11 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     ))
                 }
                 "cases" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(|value| value.as_i64())
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    let limit = args
-                        .get("limit")
-                        .and_then(|value| value.as_u64())
+                    let jid = arguments::required_i64(&args, "job_id")?;
+                    let limit = arguments::optional_u64(&args, "limit")?
                         .unwrap_or(100)
                         .min(500) as u32;
-                    let before = args
-                        .get("before_case_index")
-                        .and_then(|value| value.as_u64());
+                    let before = arguments::optional_u64(&args, "before_case_index")?;
                     let (cases, next) = state
                         .fuzzer
                         .list_cases(project_id, FuzzJobId(jid), limit, before)
@@ -2265,10 +2202,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     fuzz_view::case_page(cases, next.is_some())
                 }
                 "groups" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
                     let groups = state
                         .fuzzer
                         .list_response_groups(project_id, FuzzJobId(jid))
@@ -2276,17 +2210,12 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     fuzz_view::group_page(groups, &args)
                 }
                 "group_cases" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
                     let group_id = args
                         .get("group_id")
                         .and_then(Value::as_str)
                         .ok_or_else(|| DomainError::invalid("group_id required"))?;
-                    let limit = args
-                        .get("limit")
-                        .and_then(Value::as_u64)
+                    let limit = arguments::optional_u64(&args, "limit")?
                         .unwrap_or(100)
                         .min(500) as u32;
                     let (cases, next) = state
@@ -2296,20 +2225,14 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                             FuzzJobId(jid),
                             group_id.to_string(),
                             limit,
-                            args.get("before_case_index").and_then(Value::as_u64),
+                            arguments::optional_u64(&args, "before_case_index")?,
                         )
                         .await?;
                     fuzz_view::case_page(cases, next.is_some())
                 }
                 "diff" => {
-                    let jid = args
-                        .get("job_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("job_id required"))?;
-                    let case_id = args
-                        .get("case_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("case_id required"))?;
+                    let jid = arguments::required_i64(&args, "job_id")?;
+                    let case_id = arguments::required_i64(&args, "case_id")?;
                     Ok(json!(
                         state
                             .fuzzer
@@ -2317,7 +2240,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                                 project_id,
                                 FuzzJobId(jid),
                                 case_id,
-                                args.get("baseline_case_id").and_then(Value::as_i64),
+                                arguments::optional_i64(&args, "baseline_case_id")?,
                                 args.get("include_text")
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false),
@@ -2333,23 +2256,20 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         "websocket_manage" => {
             let project_id = require_project_id(&args)?;
             let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(250) as u32;
+            let limit = arguments::optional_u64(&args, "limit")?.unwrap_or(250) as u32;
             match action {
                 "list" => Ok(json!({
                     "connections": state.db.list_websocket_connections(project_id, limit).await?
                 })),
                 "messages" => {
-                    let connection_id = args
-                        .get("connection_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("connection_id required"))?;
+                    let connection_id = arguments::required_i64(&args, "connection_id")?;
                     let limit = limit.clamp(1, 1000);
                     let messages = state
                         .db
                         .list_websocket_messages(
                             project_id,
                             connection_id,
-                            args.get("after_id").and_then(Value::as_i64),
+                            arguments::optional_i64(&args, "after_id")?,
                             limit,
                             websocket_view::PREVIEW_BYTES,
                         )
@@ -2357,10 +2277,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     websocket_view::messages_page(messages, limit as usize)
                 }
                 "message" => {
-                    let message_id = args
-                        .get("message_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("message_id required"))?;
+                    let message_id = arguments::required_i64(&args, "message_id")?;
                     let message = state
                         .db
                         .load_websocket_message(project_id, message_id)
@@ -2368,10 +2285,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     websocket_view::message_page(&message, &args)
                 }
                 "send" => {
-                    let connection_id = args
-                        .get("connection_id")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| DomainError::invalid("connection_id required"))?;
+                    let connection_id = arguments::required_i64(&args, "connection_id")?;
                     let direction = args
                         .get("direction")
                         .and_then(Value::as_str)
@@ -2480,10 +2394,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_action" => {
             let project_id = require_project_id(&args)?;
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let sid = arguments::required_i64(&args, "session_id")?;
             let action: BrowserAction = serde_json::from_value(
                 args.get("action")
                     .cloned()
@@ -2499,10 +2410,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_evaluate" => {
             let project_id = require_project_id(&args)?;
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let sid = arguments::required_i64(&args, "session_id")?;
             let mut action = serde_json::Map::new();
             action.insert("type".into(), json!("evaluate"));
             for field in ["expression", "frame", "timeout_ms"] {
@@ -2521,10 +2429,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_input" => {
             let project_id = require_project_id(&args)?;
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let sid = arguments::required_i64(&args, "session_id")?;
             let op = args
                 .get("op")
                 .and_then(Value::as_str)
@@ -2594,7 +2499,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .and_then(Value::as_str)
                 .ok_or_else(|| DomainError::invalid("op required"))?;
             let result = match op {
-                "status" => match args.get("session_id").and_then(Value::as_i64) {
+                "status" => match arguments::optional_i64(&args, "session_id")? {
                     Some(session_id) => {
                         state
                             .browser
@@ -2604,9 +2509,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     None => state.browser.cdp_status(project_id).await?,
                 },
                 "enable" | "disable" => {
-                    let session_id = args
-                        .get("session_id")
-                        .and_then(Value::as_i64)
+                    let session_id = arguments::optional_i64(&args, "session_id")?
                         .map(BrowserSessionId)
                         .ok_or_else(|| {
                             DomainError::invalid(
@@ -2655,7 +2558,8 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "managed_cookies_preserved": true,
                 }));
             }
-            if op == "status" && args.get("session_id").and_then(Value::as_i64).is_none() {
+            let session_id = arguments::optional_i64(&args, "session_id")?;
+            if op == "status" && session_id.is_none() {
                 let status = state.browser.active_status(project_id).await?;
                 return Ok(json!({
                     "runtime": state.browser.status(),
@@ -2664,10 +2568,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     "resources": status.resources,
                 }));
             }
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("session_id required"))?;
+            let sid = session_id.ok_or_else(|| DomainError::invalid("session_id required"))?;
             match op {
                 "stop" | "close" => {
                     state
@@ -2695,9 +2596,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("include_js")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
+            let limit = arguments::optional_u64(&args, "limit")?
                 .unwrap_or(crate::get_words::DEFAULT_WORD_LIMIT as u64)
                 .clamp(1, crate::get_words::MAX_WORD_LIMIT as u64) as usize;
             Ok(json!(
@@ -2793,10 +2692,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 .get("include_chromium_profile")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let project_id = args
-                .get("project_id")
-                .and_then(Value::as_i64)
-                .map(ProjectId);
+            let project_id = arguments::optional_i64(&args, "project_id")?.map(ProjectId);
             let supplied_path = args
                 .get("file_path")
                 .and_then(Value::as_str)
@@ -2884,10 +2780,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "exchange_annotate" => {
             let project_id = require_project_id(&args)?;
-            let eid = args
-                .get("exchange_id")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| DomainError::invalid("exchange_id required"))?;
+            let eid = arguments::required_i64(&args, "exchange_id")?;
             let display_title = args
                 .get("display_title")
                 .and_then(|value| value.as_str())
@@ -2906,9 +2799,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                         .collect()
                 })
                 .unwrap_or_default();
-            let expected_revision = args
-                .get("expected_revision")
-                .and_then(|value| value.as_i64());
+            let expected_revision = arguments::optional_i64(&args, "expected_revision")?;
             let annotation = state
                 .db
                 .upsert_annotation(
