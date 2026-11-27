@@ -690,8 +690,6 @@ async fn history_query_errors_explain_repairs_without_returning_items() {
         .unwrap();
     let app = huntproxy::api::router(state);
     for (query, repair) in [
-        ("time:>1970-01-01T00:00:00Z", "time>VALUE"),
-        ("status:>=400", "status>=VALUE"),
         ("started_at>1970-01-01T00:00:00Z", "use time"),
         ("method:GET OR", "require a following term"),
         ("request>monthly", "request:~text"),
@@ -724,6 +722,7 @@ async fn history_query_errors_explain_repairs_without_returning_items() {
         assert!(error.get("total").is_none());
     }
     let corrected = app
+        .clone()
         .oneshot(
             Request::get(format!(
                 "/api/v1/projects/{}/history?q=time%3E1970-01-01T00%3A00%3A00Z",
@@ -738,6 +737,28 @@ async fn history_query_errors_explain_repairs_without_returning_items() {
     let corrected = json_response(corrected).await;
     assert_eq!(corrected["items"].as_array().unwrap().len(), 1);
     assert_eq!(corrected["total"], 1);
+
+    // A colon before a comparison is accepted and means the same.
+    for (query, expected) in [("time:>1970-01-01T00:00:00Z", 1), ("status:>=400", 0)] {
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("q", query)
+            .finish();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/projects/{}/history?{encoded}",
+                    project_id.get()
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        let page = json_response(response).await;
+        assert_eq!(page["items"].as_array().unwrap().len(), expected, "{query}");
+    }
 }
 
 #[tokio::test]
@@ -755,7 +776,6 @@ async fn mcp_history_query_validation_never_broadens_invalid_queries() {
         serde_json::json!({"field": "method", "value": "GET"}),
         serde_json::json!(["method:GET"]),
         serde_json::json!(true),
-        serde_json::Value::Null,
     ] {
         let error = huntproxy::mcp::call_tool(
             state.clone(),
@@ -773,6 +793,8 @@ async fn mcp_history_query_validation_never_broadens_invalid_queries() {
     }
     for args in [
         serde_json::json!({"project_id": project_id.get()}),
+        // A client that sends every property sends null for an unused one.
+        serde_json::json!({"project_id": project_id.get(), "q": null}),
         serde_json::json!({"project_id": project_id.get(), "q": "  "}),
         serde_json::json!({"project_id": project_id.get(), "q": "method:GET"}),
     ] {
