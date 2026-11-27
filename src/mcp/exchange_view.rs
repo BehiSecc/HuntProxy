@@ -237,7 +237,11 @@ pub(crate) async fn exchange_get(state: &AppState, args: &Value) -> DomainResult
             let ids = ids
                 .as_array()
                 .filter(|ids| (1..=MAX_BATCH_IDS).contains(&ids.len()))
-                .and_then(|ids| ids.iter().map(arguments::integer).collect::<Option<Vec<_>>>())
+                .and_then(|ids| {
+                    ids.iter()
+                        .map(arguments::integer)
+                        .collect::<Option<Vec<_>>>()
+                })
                 .ok_or_else(|| {
                     DomainError::invalid(format!(
                         "exchange_ids must be 1 to {MAX_BATCH_IDS} integer exchange ids"

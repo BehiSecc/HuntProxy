@@ -1,6 +1,7 @@
 //! MCP presentation of history_search, js_files and sitemap: compact rows that
 //! fit [`MAX_OUTPUT_BYTES`] by construction, with an exact continuation.
 
+use super::arguments;
 use super::budget::{json_len, rows_that_fit, MAX_OUTPUT_BYTES};
 use super::view::{exchange_row, short_url};
 use super::{
@@ -65,9 +66,7 @@ async fn search_with_budget(
     if let Some(filter) = &filter {
         validate_filter(filter)?;
     }
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
+    let limit = unsigned_arg(args, "limit")
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .clamp(1, 500) as u32;
     let (before_started, before_id) = parse_history_cursor(args.get("cursor"))?;
@@ -250,9 +249,7 @@ fn javascript_row(file: JavascriptFile) -> Value {
 pub(super) async fn js_files(state: &AppState, args: &Value) -> DomainResult<Value> {
     let project_id = require_project_id(args)?;
     let domain = normalize_domain_filter(args.get("domain").and_then(Value::as_str))?;
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
+    let limit = unsigned_arg(args, "limit")
         .unwrap_or(DEFAULT_JAVASCRIPT_LIMIT)
         .clamp(1, u64::from(MAX_JAVASCRIPT_FILES)) as usize;
     let offset = offset_arg(args);
@@ -338,11 +335,7 @@ async fn load_javascript_files(
         .browser
         .start_ephemeral(project_id, url.to_string())
         .await?;
-    let settle_ms = args
-        .get("settle_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(2_000)
-        .min(30_000);
+    let settle_ms = unsigned_arg(args, "settle_ms").unwrap_or(2_000).min(30_000);
     tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
     let files_result = state.browser.javascript_files(project_id, session.id).await;
     let stop_result = state.browser.stop(project_id, session.id).await;
@@ -417,10 +410,16 @@ fn route_row(route: SitemapRoute) -> Value {
     Value::Object(row)
 }
 
+/// A non-negative integer argument, given as a number or a numeric string.
+/// Anything else counts as absent, so the caller's default applies.
+fn unsigned_arg(args: &Value, name: &str) -> Option<u64> {
+    args.get(name)
+        .and_then(arguments::integer)
+        .and_then(|value| u64::try_from(value).ok())
+}
+
 pub(super) fn offset_arg(args: &Value) -> usize {
-    args.get("offset")
-        .and_then(Value::as_u64)
-        .map_or(0, |offset| usize::try_from(offset).unwrap_or(usize::MAX))
+    unsigned_arg(args, "offset").map_or(0, |offset| usize::try_from(offset).unwrap_or(usize::MAX))
 }
 
 /// Adds `rows[offset..]` to `envelope` under `key`, cut to `limit` rows and to

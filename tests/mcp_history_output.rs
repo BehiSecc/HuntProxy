@@ -635,3 +635,23 @@ async fn sitemap_lists_flat_routes_and_pages_with_offsets() {
     sorted.sort();
     assert_eq!(paths, sorted);
 }
+
+#[tokio::test]
+async fn history_search_accepts_numeric_strings_for_integer_arguments() {
+    let (_directory, state, project_id) = test_state().await;
+    for path in ["/a", "/b", "/c"] {
+        state
+            .db
+            .insert_exchange(exchange(project_id, "GET", path))
+            .await
+            .unwrap();
+    }
+    let quoted = call(
+        &state,
+        "history_search",
+        json!({"project_id": project_id.get().to_string(), "q": "method:GET", "limit": "2"}),
+    )
+    .await;
+    assert_eq!(quoted["items"].as_array().unwrap().len(), 2, "{quoted}");
+    assert!(quoted.get("next").is_some(), "{quoted}");
+}

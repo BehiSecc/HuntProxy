@@ -1911,9 +1911,13 @@ mod tests {
         }
         // Only a bare LF inside the header block counts as a rewrite.
         assert!(header_block_has_bare_lf(b"GET / HTTP/1.1\nHost: x\n\n"));
-        assert!(header_block_has_bare_lf(b"GET / HTTP/1.1\r\nHost: x\n\r\n\r\n"));
+        assert!(header_block_has_bare_lf(
+            b"GET / HTTP/1.1\r\nHost: x\n\r\n\r\n"
+        ));
         assert!(header_block_has_bare_lf(b"GET / HTTP/1.1\r\nHost: x\r\n\n"));
-        assert!(!header_block_has_bare_lf(b"POST / HTTP/1.1\r\nHost: x\r\n\r\nli\nne\n"));
+        assert!(!header_block_has_bare_lf(
+            b"POST / HTTP/1.1\r\nHost: x\r\n\r\nli\nne\n"
+        ));
         assert!(!header_block_has_bare_lf(b"GET / HTTP/1.1\r\nHost: x\r\n"));
         assert!(inject_cookie_header(b"\nGET / HTTP/1.1\r\n\r\n", "sid=a").is_err());
         assert!(inject_cookie_header(b"GET / HTTP/1.1\nHost: x\n y\n\n", "sid=a").is_err());
