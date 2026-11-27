@@ -144,6 +144,77 @@ fn is_own_api_target(target: &TargetRef, listener: SocketAddr) -> bool {
             && std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok())
 }
 
+const OWN_API_REFUSED: &str = "HuntProxy does not proxy clients on other machines to its own API; \
+     connect to the API address directly with its token";
+
+/// A proxy client on another machine must never be connected to this daemon's
+/// API: the proxy would dial it from this machine, so the API would see a local
+/// peer and skip its token. The check uses the addresses the proxy is about to
+/// dial, not the URL text, so a name that resolves to this machine and a
+/// request rule that rewrites the target are covered too.
+fn refuse_own_api_dial_for_remote_client(
+    client: SocketAddr,
+    dial: &ValidatedDial,
+    api_listen: SocketAddr,
+) -> DomainResult<()> {
+    if client.ip().to_canonical().is_loopback() {
+        return Ok(());
+    }
+    let reaches_api = |addr: &SocketAddr| {
+        let ip = addr.ip().to_canonical();
+        let listen_ip = api_listen.ip().to_canonical();
+        addr.port() == api_listen.port()
+            && (ip == listen_ip
+                || ip.is_unspecified()
+                || (ip.is_loopback() && (listen_ip.is_loopback() || listen_ip.is_unspecified()))
+                || (listen_ip.is_unspecified()
+                    && std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()))
+    };
+    if dial.approved_socket_addrs.iter().any(reaches_api) {
+        tracing::warn!(%client, "refused to proxy a remote client to the own api");
+        return Err(DomainError::new(ErrorCode::Forbidden, OWN_API_REFUSED));
+    }
+    Ok(())
+}
+
+const FOREIGN_HOST_REFUSED: &str = "a proxy client on another machine cannot send a Host that \
+     names this machine (localhost or a loopback address) and differs from the URL";
+
+/// An upstream proxy resolves the URL's name again, so a name that rebinds to
+/// this machine could reach the API from loopback. If the forwarded Host then
+/// names localhost or a loopback address, the API treats the request as local.
+/// So a client on another machine may not send such a Host unless it is the
+/// URL's own authority. Any other Host, such as a different name for Host
+/// header testing, is forwarded as sent. The loopback test is the API's own,
+/// so both sides agree on which Hosts are local.
+fn refuse_foreign_host_for_remote_client(
+    client: SocketAddr,
+    headers: &http::HeaderMap,
+    url: &str,
+) -> DomainResult<()> {
+    if client.ip().to_canonical().is_loopback() {
+        return Ok(());
+    }
+    let Some(host) = headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| crate::api::is_loopback_authority(host))
+    else {
+        return Ok(());
+    };
+    let target = url::Url::parse(url).map_err(|error| DomainError::invalid(error.to_string()))?;
+    let matches = url::Url::parse(&format!("{}://{host}/", target.scheme())).is_ok_and(|parsed| {
+        parsed.host() == target.host()
+            && parsed.port_or_known_default() == target.port_or_known_default()
+    });
+    if matches {
+        Ok(())
+    } else {
+        tracing::warn!(%client, "refused a remote proxy request with a loopback Host that differs from its URL");
+        Err(DomainError::new(ErrorCode::Forbidden, FOREIGN_HOST_REFUSED))
+    }
+}
+
 fn pin_api_dial(mut dial: ValidatedDial, listener: SocketAddr) -> Option<ValidatedDial> {
     dial.approved_socket_addrs.retain(|addr| {
         if listener.ip().is_unspecified() {
@@ -205,35 +276,49 @@ pub async fn serve_proxy_listener(
                 if let Err(error) = stream.set_nodelay(true) {
                     tracing::debug!(%error, "could not disable Nagle on a proxy connection");
                 }
-                let state = state.clone();
-                let authority = authority.clone();
-                let revocations = revocations.clone();
-                let connection_cancel = cancel.clone();
-                tokio::spawn(async move {
-                    let service = service_fn(move |request| {
-                        let state = state.clone();
-                        let authority = authority.clone();
-                        let revocations = revocations.clone();
-                        async move {
-                            handle_outer(state, authority, revocations, request, peer).await
-                        }
-                    });
-                    let connection = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .with_upgrades();
-                    tokio::select! {
-                        _ = connection_cancel.cancelled() => {}
-                        result = connection => {
-                            if let Err(error) = result {
-                                tracing::debug!(%error, "proxy connection closed");
-                            }
-                        }
-                    }
-                });
+                spawn_proxy_connection(
+                    state.clone(),
+                    authority.clone(),
+                    revocations.clone(),
+                    stream,
+                    peer,
+                    cancel.clone(),
+                );
             }
         }
     }
     Ok(())
+}
+
+/// Serves one client connection. `peer` is the client's address, which decides
+/// whether the client may reach this daemon's own API through the proxy.
+fn spawn_proxy_connection(
+    state: Arc<AppState>,
+    authority: Arc<MitmAuthority>,
+    revocations: Arc<TunnelRevocations>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let service = service_fn(move |request| {
+            let state = state.clone();
+            let authority = authority.clone();
+            let revocations = revocations.clone();
+            async move { handle_outer(state, authority, revocations, request, peer).await }
+        });
+        let connection = http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades();
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            result = connection => {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "proxy connection closed");
+                }
+            }
+        }
+    });
 }
 
 async fn handle_outer(
@@ -241,9 +326,9 @@ async fn handle_outer(
     authority: Arc<MitmAuthority>,
     revocations: Arc<TunnelRevocations>,
     request: Request<Incoming>,
-    _peer: SocketAddr,
+    peer: SocketAddr,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
-    let result = handle_authenticated(state, authority, revocations, request).await;
+    let result = handle_authenticated(state, authority, revocations, request, peer).await;
     Ok(match result {
         Ok(response) => response,
         Err(error) => proxy_error_response(error),
@@ -255,6 +340,7 @@ async fn handle_authenticated(
     authority: Arc<MitmAuthority>,
     revocations: Arc<TunnelRevocations>,
     mut request: Request<Incoming>,
+    client: SocketAddr,
 ) -> DomainResult<Response<ProxyBody>> {
     let auth = request
         .headers()
@@ -270,9 +356,9 @@ async fn handle_authenticated(
     request.headers_mut().remove("proxy-authorization");
 
     if request.method() == Method::CONNECT {
-        handle_connect(state, authority, revocations, request, session).await
+        handle_connect(state, authority, revocations, request, session, client).await
     } else {
-        forward_request(state, request, session, None).await
+        forward_request(state, request, session, None, client).await
     }
 }
 
@@ -281,10 +367,11 @@ async fn forward_request(
     mut request: Request<Incoming>,
     session: CaptureSession,
     forced_scheme: Option<&str>,
+    client: SocketAddr,
 ) -> DomainResult<Response<ProxyBody>> {
     request.headers_mut().remove(PROJECT_HINT_HEADER);
     if websocket::is_upgrade(&request) {
-        return websocket::handle(state, request, session, forced_scheme).await;
+        return websocket::handle(state, request, session, forced_scheme, client).await;
     }
     let project = state.db.get_project(session.project_id).await?;
     let (mut parts, incoming) = request.into_parts();
@@ -292,6 +379,7 @@ async fn forward_request(
         take_internal_crawler_marker(&mut parts.headers, session.is_browser_bound);
     let browser_origin = take_browser_origin_marker(&mut parts.headers, session.is_browser_bound)?;
     let mut url = request_url(&parts, forced_scheme)?;
+    refuse_foreign_host_for_remote_client(client, &parts.headers, &url)?;
     let original_url = url.clone();
     let original_target = TargetRef::from_url(&url)?;
     enforce_browser_request_origin(browser_origin.as_deref(), &url, false)?;
@@ -387,6 +475,7 @@ async fn forward_request(
         Some(dial) => dial,
         None => resolve_validated_dial(&wire_url, &project.scope, Duration::from_secs(60)).await?,
     };
+    refuse_own_api_dial_for_remote_client(client, &dial, api_listen)?;
     let method = parts.method.clone();
     let mut headers = parts
         .headers
@@ -1234,6 +1323,7 @@ async fn handle_connect(
     revocations: Arc<TunnelRevocations>,
     request: Request<Incoming>,
     session: CaptureSession,
+    client: SocketAddr,
 ) -> DomainResult<Response<ProxyBody>> {
     let connect_authority = request
         .uri()
@@ -1244,7 +1334,10 @@ async fn handle_connect(
     let project = state.db.get_project(session.project_id).await?;
     // Resolve before acknowledging the tunnel so an invalid/unresolvable
     // authority fails early. Decrypted requests resolve their own targets.
-    resolve_validated_dial(&scope_url, &project.scope, Duration::from_secs(60)).await?;
+    let dial = resolve_validated_dial(&scope_url, &project.scope, Duration::from_secs(60)).await?;
+    // Requests inside the tunnel are checked again: their Host can name
+    // another target.
+    refuse_own_api_dial_for_remote_client(client, &dial, state.config.api_listen)?;
     let host = TargetRef::from_url(&scope_url)?.host;
     let tls_config = authority.server_config(&host)?;
     let shutdown = state.shutdown.clone();
@@ -1284,10 +1377,10 @@ async fn handle_connect(
                         }
                     },
                 };
-                serve_connect_io(tls, state, session, "https", &revocations).await;
+                serve_connect_io(tls, state, session, "https", &revocations, client).await;
             }
             Some(first) if first.is_ascii_alphabetic() => {
-                serve_connect_io(stream, state, session, "http", &revocations).await;
+                serve_connect_io(stream, state, session, "http", &revocations, client).await;
             }
             Some(_) => {
                 tracing::debug!("CONNECT requires TLS or an HTTP request");
@@ -1308,6 +1401,7 @@ async fn serve_connect_io<I>(
     session: CaptureSession,
     scheme: &'static str,
     revocations: &Arc<TunnelRevocations>,
+    client: SocketAddr,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1318,7 +1412,8 @@ async fn serve_connect_io<I>(
         let state = service_state.clone();
         let session = service_session.clone();
         async move {
-            let response = match forward_request(state, inner, session, Some(scheme)).await {
+            let response = match forward_request(state, inner, session, Some(scheme), client).await
+            {
                 Ok(response) => response,
                 Err(error) => proxy_error_response(error),
             };
@@ -1353,7 +1448,9 @@ fn proxy_error_response(error: DomainError) -> Response<ProxyBody> {
             .expect("static proxy auth response");
     }
     let status = match error.code() {
-        ErrorCode::ScopeDenied | ErrorCode::DnsBlocked => StatusCode::FORBIDDEN,
+        ErrorCode::ScopeDenied | ErrorCode::DnsBlocked | ErrorCode::Forbidden => {
+            StatusCode::FORBIDDEN
+        }
         ErrorCode::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
@@ -1405,6 +1502,8 @@ fn proxy_error_message(error: &DomainError) -> String {
     }
     match error.code() {
         ErrorCode::ScopeDenied => "request denied by scope".into(),
+        // Only this module's own refusals use this code; their messages are static.
+        ErrorCode::Forbidden => error.to_string(),
         ErrorCode::DnsBlocked => "DNS lookup failed".into(),
         ErrorCode::BodyTooLarge => "request body too large".into(),
         ErrorCode::Timeout => "request timed out".into(),
@@ -2324,6 +2423,400 @@ mod tests {
         proxy.await.unwrap().unwrap();
     }
 
+    const LOOPBACK_CLIENT: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40000);
+
+    /// Serves the proxy on a loopback socket but reports every client as
+    /// `peer`, so a test can act as a client on another machine.
+    async fn serve_proxy_as_peer(
+        state: Arc<AppState>,
+        peer: SocketAddr,
+        cancel: CancellationToken,
+    ) -> SocketAddr {
+        let listener = bind_proxy("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let authority = Arc::new(MitmAuthority::load(&state).unwrap());
+        let revocations = Arc::new(TunnelRevocations::default());
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    accept = listener.accept() => accept.unwrap(),
+                };
+                spawn_proxy_connection(
+                    state.clone(),
+                    authority.clone(),
+                    revocations.clone(),
+                    stream,
+                    peer,
+                    cancel.clone(),
+                );
+            }
+        });
+        addr
+    }
+
+    /// Answers every request with `200 ok` and counts the connections.
+    async fn counting_origin(listener: TcpListener, hits: Arc<AtomicU64>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            hits.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    }
+
+    /// A host name, other than `localhost`, that this machine resolves to a
+    /// loopback address.
+    async fn loopback_name(port: u16) -> Option<&'static str> {
+        for name in [
+            "localhost.",
+            "localhost.localdomain",
+            "huntproxy-test.localhost",
+        ] {
+            if let Ok(mut addrs) = tokio::net::lookup_host((name, port)).await {
+                if addrs.any(|addr| addr.ip().is_loopback()) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+
+    async fn proxy_exchange(proxy: SocketAddr, raw: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        socket.write_all(raw.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
+            .await
+            .expect("the proxy closes the connection")
+            .unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn remote_proxy_clients_never_reach_the_own_api() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, _, session) = proxy_test_fixture(&directory).await;
+        let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_addr = api.local_addr().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        Arc::get_mut(&mut state).unwrap().config.api_listen = api_addr;
+        let api_hits = Arc::new(AtomicU64::new(0));
+        let upstream_hits = Arc::new(AtomicU64::new(0));
+        let api_server = tokio::spawn(counting_origin(api, api_hits.clone()));
+        let upstream_server = tokio::spawn(counting_origin(upstream, upstream_hits.clone()));
+        let cancel = CancellationToken::new();
+        let remote = serve_proxy_as_peer(
+            state.clone(),
+            "192.0.2.50:40000".parse().unwrap(),
+            cancel.clone(),
+        )
+        .await;
+        let local = serve_proxy_as_peer(state.clone(), LOOPBACK_CLIENT, cancel.clone()).await;
+        let token = session.token_once.as_deref().unwrap();
+        let port = api_addr.port();
+        let name = loopback_name(port).await;
+        let mut hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+        match name {
+            Some(name) => hosts.push(format!("{name}:{port}")),
+            None => eprintln!("no loopback host name resolves here; skipping that case"),
+        }
+        let absolute = |host: &str| {
+            format!("GET http://{host}/api/v1/projects HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n")
+        };
+        let refused = |response: &str| {
+            response.starts_with("HTTP/1.1 403") && response.contains(OWN_API_REFUSED)
+        };
+
+        for host in &hosts {
+            // Absolute form, origin form with a Host header, and a WebSocket upgrade.
+            for raw in [
+                absolute(host),
+                format!("GET /api/v1/projects HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"),
+                format!("GET http://{host}/events HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"),
+                format!("CONNECT {host} HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"),
+            ] {
+                let response = proxy_exchange(remote, &raw).await;
+                assert!(refused(&response), "{raw}\n{response}");
+            }
+            // A tunnel to an ordinary host cannot name the API in its Host header.
+            let mut tunnel = open_test_connect(remote, upstream_addr, token).await;
+            tunnel
+                .write_all(
+                    format!("GET /api/v1/projects HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(refused(&String::from_utf8_lossy(&response)), "{host}");
+        }
+        assert_eq!(api_hits.load(Ordering::SeqCst), 0);
+
+        // A client on another machine still reaches ordinary upstreams.
+        let response = proxy_exchange(remote, &absolute(&upstream_addr.to_string())).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200") && response.ends_with("ok"),
+            "{response}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        // Loopback clients keep reaching the API as before.
+        for host in &hosts[..2] {
+            let response = proxy_exchange(local, &absolute(host)).await;
+            assert!(
+                response.starts_with("HTTP/1.1 200") && response.ends_with("ok"),
+                "{response}"
+            );
+        }
+        assert_eq!(api_hits.load(Ordering::SeqCst), 2);
+        if let Some(name) = name {
+            let response = proxy_exchange(local, &absolute(&format!("{name}:{port}"))).await;
+            assert!(!refused(&response), "{response}");
+        }
+        drop(open_test_connect(local, api_addr, token).await);
+
+        cancel.cancel();
+        api_server.abort();
+        upstream_server.abort();
+    }
+
+    #[test]
+    fn remote_clients_are_refused_exactly_the_hosts_the_api_treats_as_local() {
+        let remote: SocketAddr = "192.0.2.50:40000".parse().unwrap();
+        let refused = |client: SocketAddr, host: &str, url: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::HOST, host.parse().unwrap());
+            refuse_foreign_host_for_remote_client(client, &headers, url).is_err()
+        };
+        let spellings = [
+            "localhost",
+            "LOCALHOST",
+            "localhost:17890",
+            "LocalHost:1",
+            "localhost.",
+            "localhost:notaport",
+            "localhost.evil.example",
+            "127.0.0.1",
+            "127.0.0.1:17890",
+            "127.0.0.2:9999",
+            "127.1",
+            "2130706433",
+            "::1",
+            "[::1]",
+            "[::1]:17890",
+            "[::ffff:127.0.0.1]:17890",
+            "[::ffff:7f00:1]",
+            "0.0.0.0:17890",
+            "10.0.0.5:17890",
+            "other.example",
+            "127.0.0.1:17890@other.example",
+            "other.example@127.0.0.1",
+            "",
+        ];
+        let mut local = 0;
+        for host in spellings {
+            let api_local = crate::api::is_loopback_authority(host);
+            local += usize::from(api_local);
+            // Against another URL, the proxy refuses exactly the Hosts the
+            // API's tokenless rule accepts.
+            assert_eq!(
+                refused(remote, host, "http://192.0.2.10:17890/"),
+                api_local,
+                "{host:?}"
+            );
+            assert!(!refused(LOOPBACK_CLIENT, host, "http://192.0.2.10:17890/"));
+        }
+        assert!(local >= 10, "the list must exercise local Hosts");
+        // The URL's own authority, in any spelling, is not refused here.
+        for (host, url) in [
+            ("localhost:17890", "http://localhost:17890/"),
+            ("LOCALHOST:17890", "http://localhost:17890/"),
+            ("localhost:80", "http://localhost/"),
+            ("[::1]:9999", "http://[::1]:9999/"),
+        ] {
+            assert!(!refused(remote, host, url), "{host} {url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_proxy_clients_cannot_send_a_foreign_host_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, project, session) = proxy_test_fixture(&directory).await;
+        let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_addr = api.local_addr().unwrap();
+        Arc::get_mut(&mut state).unwrap().config.api_listen = api_addr;
+        let api_hits = Arc::new(AtomicU64::new(0));
+        let api_server = tokio::spawn(counting_origin(api, api_hits.clone()));
+        // An upstream proxy on this machine resolves names itself, so it could
+        // reach the API from loopback if it received a loopback Host.
+        let upstream_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_proxy_addr = upstream_proxy.local_addr().unwrap();
+        let (heads_tx, mut heads_rx) = mpsc::unbounded_channel::<String>();
+        let upstream_server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = upstream_proxy.accept().await else {
+                    break;
+                };
+                let heads_tx = heads_tx.clone();
+                tokio::spawn(async move {
+                    // Records the request head; a CONNECT is followed into its
+                    // tunnel, where the request itself is.
+                    loop {
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            match socket.read(&mut byte).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => head.push(byte[0]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                        if head.starts_with("connect ") {
+                            if socket
+                                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        let _ = heads_tx.send(head);
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                        return;
+                    }
+                });
+            }
+        });
+        state
+            .db
+            .set_project_upstream_proxy(project.id, Some(format!("http://{upstream_proxy_addr}")))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let remote = serve_proxy_as_peer(
+            state.clone(),
+            "192.0.2.50:40000".parse().unwrap(),
+            cancel.clone(),
+        )
+        .await;
+        let local = serve_proxy_as_peer(state.clone(), LOOPBACK_CLIENT, cancel.clone()).await;
+        let token = session.token_once.as_deref().unwrap();
+        let port = api_addr.port();
+        // Stands in for a name that HuntProxy resolves to a public address.
+        let target = format!("192.0.2.10:{port}");
+        let request = |host: &str| {
+            format!("GET http://{target}/api/v1/projects HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n")
+        };
+        let refused = |response: &str| {
+            response.starts_with("HTTP/1.1 403") && response.contains(FOREIGN_HOST_REFUSED)
+        };
+
+        // A plain request, a WebSocket upgrade and a request inside a tunnel.
+        let send_all = |proxy: SocketAddr, host: String| {
+            let target = target.clone();
+            async move {
+                let plain = proxy_exchange(proxy, &request(&host)).await;
+                let upgrade = proxy_exchange(proxy, &format!("GET http://{target}/events HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")).await;
+                let mut tunnel = open_test_connect(proxy, target.parse().unwrap(), token).await;
+                tunnel
+                    .write_all(
+                        format!("GET http://{target}/api/v1/projects HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let mut tunneled = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut tunneled))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                [
+                    plain,
+                    upgrade,
+                    String::from_utf8_lossy(&tunneled).into_owned(),
+                ]
+            }
+        };
+
+        // A Host naming this machine that differs from the URL is refused.
+        for host in [
+            format!("127.0.0.1:{port}"),
+            "localhost".into(),
+            "LOCALHOST".into(),
+            format!("[::1]:{port}"),
+            format!("[::ffff:127.0.0.1]:{port}"),
+            "127.0.0.1:9999".into(),
+        ] {
+            for response in send_all(remote, host.clone()).await {
+                assert!(refused(&response), "{host}\n{response}");
+            }
+        }
+        assert!(
+            heads_rx.try_recv().is_err(),
+            "a refused request went upstream"
+        );
+
+        // Any other Host, as used for Host header testing, is forwarded intact.
+        for response in send_all(remote, "other.example".into()).await {
+            assert!(!refused(&response), "{response}");
+            let head = heads_rx.recv().await.unwrap();
+            assert!(head.contains("\r\nhost: other.example\r\n"), "{head}");
+        }
+
+        // The URL's own Host, in any spelling, is forwarded.
+        for host in [target.clone(), target.to_ascii_uppercase()] {
+            let response = proxy_exchange(remote, &request(&host)).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let head = heads_rx.recv().await.unwrap();
+            assert!(head.contains(&format!("\r\nhost: {target}\r\n")), "{head}");
+        }
+
+        // Loopback clients are unchanged: their Host is forwarded as sent.
+        let response = proxy_exchange(local, &request(&format!("127.0.0.1:{port}"))).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(heads_rx
+            .recv()
+            .await
+            .unwrap()
+            .contains(&format!("\r\nhost: 127.0.0.1:{port}\r\n")));
+        assert_eq!(api_hits.load(Ordering::SeqCst), 0);
+
+        cancel.cancel();
+        api_server.abort();
+        upstream_server.abort();
+    }
+
     #[tokio::test]
     async fn chrome_background_is_forwarded_but_only_external_capture_is_saved() {
         use crate::storage::IpRotationGateway;
@@ -2494,7 +2987,7 @@ mod tests {
                 let state = state.clone();
                 let session = session.clone();
                 async move {
-                    let response = forward_request(state, request, session, None)
+                    let response = forward_request(state, request, session, None, LOOPBACK_CLIENT)
                         .await
                         .unwrap_or_else(proxy_error_response);
                     Ok::<_, Infallible>(response)

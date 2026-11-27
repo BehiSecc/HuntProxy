@@ -725,9 +725,21 @@ async fn daemon_health(config: &Config) -> DomainResult<()> {
         let mut stream = tokio::net::UnixStream::connect(config.socket_path()).await?;
         #[cfg(not(unix))]
         let mut stream = tokio::net::TcpStream::connect(config.api_listen).await?;
+        // Only the TCP listener checks credentials; a non-loopback bind needs
+        // the token even from this machine.
+        #[cfg(unix)]
+        let auth = String::new();
+        #[cfg(not(unix))]
+        let auth = config
+            .auth_token()
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
         stream
             .write_all(
-                b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                format!(
+                    "GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await?;
         let mut response = Vec::new();

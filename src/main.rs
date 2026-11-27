@@ -235,8 +235,8 @@ async fn run(cli: Cli) -> DomainResult<()> {
             println!("  command: HuntProxy");
             println!("  args:    [\"mcp\"]");
             println!(
-                "  UI (optional): http://{} (run HuntProxy serve)",
-                cfg.api_listen
+                "  ui:            {} (optional; run HuntProxy serve)",
+                huntproxy::api::ui_link(cfg.api_listen, cfg.auth_token())
             );
             println!("  proxy:         {}", cfg.proxy_listen);
             Ok(())
@@ -436,6 +436,10 @@ async fn run(cli: Cli) -> DomainResult<()> {
             match daemon_get(&cfg, "/api/v1/health").await {
                 Ok(v) => {
                     println!("daemon: running");
+                    println!(
+                        "ui: {}",
+                        huntproxy::api::ui_link(cfg.api_listen, cfg.auth_token())
+                    );
                     println!("{v}");
                 }
                 Err(e) => println!("daemon: unhealthy ({e})"),
@@ -987,15 +991,14 @@ async fn ensure_daemon(cfg: &Config) -> DomainResult<()> {
 }
 async fn daemon_get(cfg: &Config, path: &str) -> DomainResult<String> {
     let url = format!("http://{}{path}", cfg.api_listen);
-    let client = reqwest_get(&url).await?;
-    Ok(client)
+    simple_http("GET", &url, None, cfg.auth_token()).await
 }
 
 async fn daemon_post(cfg: &Config, path: &str, body: &str) -> DomainResult<String> {
     let url = format!("http://{}{path}", cfg.api_listen);
     // Use hyper client manually to avoid requiring reqwest in bin always —
     // use tokio tcp + simple HTTP.
-    simple_http("POST", &url, Some(body)).await
+    simple_http("POST", &url, Some(body), cfg.auth_token()).await
 }
 
 async fn daemon_request(
@@ -1005,14 +1008,17 @@ async fn daemon_request(
     body: Option<&str>,
 ) -> DomainResult<String> {
     let url = format!("http://{}{path}", cfg.api_listen);
-    simple_http(method, &url, body).await
+    simple_http(method, &url, body, cfg.auth_token()).await
 }
 
-async fn reqwest_get(url: &str) -> DomainResult<String> {
-    simple_http("GET", url, None).await
-}
-
-async fn simple_http(method: &str, url: &str, body: Option<&str>) -> DomainResult<String> {
+/// `token` is sent as a Bearer credential, which a non-loopback API listener
+/// requires even from this machine: the peer address is then not loopback.
+async fn simple_http(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    token: Option<&str>,
+) -> DomainResult<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let u = url::Url::parse(url).map_err(|e| DomainError::invalid(e.to_string()))?;
     let host = u.host_str().unwrap_or("127.0.0.1");
@@ -1026,13 +1032,18 @@ async fn simple_http(method: &str, url: &str, body: Option<&str>) -> DomainResul
         .await
         .map_err(|e| DomainError::new(ErrorCode::DaemonNotRunning, e.to_string()))?;
     let payload = body.unwrap_or("");
+    let auth = token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let req = if body.is_some() {
         format!(
-            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
         )
     } else {
-        format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}Connection: close\r\n\r\n"
+        )
     };
     stream
         .write_all(req.as_bytes())

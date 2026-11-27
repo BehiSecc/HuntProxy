@@ -10,4 +10,4 @@ Each release pins its own Node.js and browser SDK, kept under `~/.huntproxy/runt
 
 Active browsers and jobs stop during replacement. Saved projects, history, identities, and browser profile storage remain available. Older `.huntproxy` bundles are upgraded during ordinary import.
 
-`HuntProxy backup` copies only the SQLite database. For an independent full backup, stop HuntProxy and copy `~/.huntproxy` and any configured external paths. See the [release notes](releases/v0.4.5.md) for compatibility changes.
+`HuntProxy backup` copies only the SQLite database. For an independent full backup, stop HuntProxy and copy `~/.huntproxy` and any configured external paths. See the [release notes](releases/v0.4.6.md) for compatibility changes.
