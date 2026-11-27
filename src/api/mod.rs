@@ -50,6 +50,8 @@ pub async fn serve_api_listener(
             tracing::debug!(%error, "could not disable Nagle on an API connection");
         }
     });
+    // The guard needs the peer address to tell local clients from remote ones.
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await
@@ -360,45 +362,301 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// The TCP listener serves the UI and API to local clients only. Any web page a
-/// browser loads can send requests to a loopback port, and DNS rebinding can make
-/// those requests look same-origin. Reject requests whose Host is not this
-/// listener's loopback name or address, and cross-site requests by Origin or
-/// Sec-Fetch-Site. The private Unix socket does not need this guard.
+/// The TCP listener serves the UI and API. A request is accepted when it is
+/// local or authenticated:
+///
+/// - Local: the peer is loopback and the request passes the browser guard. Any
+///   web page a browser loads can send requests to a loopback port, and DNS
+///   rebinding can make those requests look same-origin, so the guard requires
+///   a loopback Host and rejects a foreign Origin and `Sec-Fetch-Site:
+///   cross-site`.
+/// - Authenticated: the request carries `remote_auth_token` as a Bearer token,
+///   or the UI session cookie that the sign-in link (`/?token=…`) sets. The
+///   Host check is skipped, so a LAN address or a DNS name works. A browser
+///   sends the cookie on its own, so a cookie request must also be same-origin.
+///
+/// Every other non-loopback peer gets 401. The private Unix socket does not
+/// need this guard.
 pub fn tcp_router(state: Arc<AppState>, listen: std::net::SocketAddr) -> Router {
+    let access = TcpAccess::new(state.config.auth_token(), listen.port());
     router(state).layer(axum::middleware::from_fn_with_state(
-        listen,
-        reject_foreign_browser_requests,
+        access,
+        guard_tcp_requests,
     ))
 }
 
-async fn reject_foreign_browser_requests(
-    State(listen): State<std::net::SocketAddr>,
+/// The UI address printed by `HuntProxy status` and `init`. A non-loopback
+/// listener needs authentication, so its address is the sign-in link.
+pub fn ui_link(listen: std::net::SocketAddr, token: Option<&str>) -> String {
+    if listen.ip().is_loopback() {
+        return format!("http://{listen}/");
+    }
+    let host = if listen.ip().is_unspecified() {
+        format!("<this-host>:{}", listen.port())
+    } else {
+        listen.to_string()
+    };
+    match token {
+        Some(token) => {
+            let token: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+            format!("http://{host}/?{SIGN_IN_PARAM}={token}")
+        }
+        None => format!("http://{host}/"),
+    }
+}
+
+const SIGN_IN_PARAM: &str = "token";
+const SESSION_MAX_AGE_SECONDS: u32 = 30 * 24 * 60 * 60;
+
+#[derive(Clone)]
+struct TcpAccess {
+    /// SHA-256 of the token, so comparing a candidate does not leak its length.
+    token_digest: Option<[u8; 32]>,
+    /// The session cookie value: derived from the token rather than equal to
+    /// it, stable across daemon restarts, and invalid once the token changes.
+    session: Option<Arc<str>>,
+    /// Includes the port, so two instances on one host keep separate cookies.
+    cookie_name: Arc<str>,
+}
+
+impl TcpAccess {
+    fn new(token: Option<&str>, port: u16) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            token_digest: token.map(|token| Sha256::digest(token.as_bytes()).into()),
+            session: token.map(|token| {
+                hex::encode(Sha256::digest(
+                    format!("huntproxy-ui-session-v1:{token}").as_bytes(),
+                ))
+                .into()
+            }),
+            cookie_name: format!("huntproxy_session_{port}").into(),
+        }
+    }
+
+    fn token_matches(&self, candidate: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        use subtle::ConstantTimeEq;
+        self.token_digest.is_some_and(|expected| {
+            let candidate: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+            bool::from(expected.ct_eq(&candidate))
+        })
+    }
+
+    fn has_valid_bearer(&self, headers: &http::HeaderMap) -> bool {
+        headers
+            .get_all(http::header::AUTHORIZATION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|value| {
+                let (scheme, credential) = value.trim().split_once(' ')?;
+                scheme
+                    .eq_ignore_ascii_case("bearer")
+                    .then(|| credential.trim())
+            })
+            .any(|credential| self.token_matches(credential))
+    }
+
+    fn has_valid_session(&self, headers: &http::HeaderMap) -> bool {
+        use subtle::ConstantTimeEq;
+        let Some(session) = self.session.as_deref() else {
+            return false;
+        };
+        headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .any(|(name, value)| {
+                name == &*self.cookie_name && bool::from(value.as_bytes().ct_eq(session.as_bytes()))
+            })
+    }
+
+    fn session_cookie(&self) -> Option<String> {
+        let session = self.session.as_deref()?;
+        Some(format!(
+            "{}={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE_SECONDS}",
+            self.cookie_name
+        ))
+    }
+}
+
+async fn guard_tcp_requests(
+    State(access): State<TcpAccess>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    // Without connect info the peer is unknown and treated as remote.
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip().to_canonical());
     let headers = request.headers();
-    let host = headers
-        .get(http::header::HOST)
-        .and_then(|value| value.to_str().ok());
-    let host_ok = host.is_some_and(|value| is_allowed_authority(value, listen));
+
+    if request.method() == http::Method::GET && request.uri().path() == "/" {
+        if let Some(candidate) = query_value(request.uri().query(), SIGN_IN_PARAM) {
+            if access.token_matches(&candidate) {
+                return sign_in_response(&access, request.uri().query().unwrap_or(""));
+            }
+            tracing::warn!(?peer, "rejected a ui sign-in link with a wrong token");
+            return unauthorized_response(headers);
+        }
+    }
+    if access.has_valid_bearer(headers) {
+        return next.run(request).await;
+    }
+    if access.has_valid_session(headers) {
+        if is_same_origin_browser_request(headers) {
+            return next.run(request).await;
+        }
+        return forbidden_response(headers);
+    }
+    if !peer.is_some_and(|ip| ip.is_loopback()) {
+        tracing::warn!(?peer, "rejected an unauthenticated api request");
+        return unauthorized_response(headers);
+    }
+    if is_local_browser_request(headers) {
+        return next.run(request).await;
+    }
+    forbidden_response(headers)
+}
+
+/// Host is `localhost` or a loopback IP, Origin (if any) is `http://` on such a
+/// host, and the request is not cross-site.
+fn is_local_browser_request(headers: &http::HeaderMap) -> bool {
+    let host_ok = header_str(headers, http::header::HOST).is_some_and(is_loopback_authority);
     let origin_ok = match headers.get(http::header::ORIGIN) {
         None => true,
         Some(value) => value
             .to_str()
             .ok()
             .and_then(|origin| origin.strip_prefix("http://"))
-            .is_some_and(|authority| is_allowed_authority(authority, listen)),
+            .is_some_and(is_loopback_authority),
     };
-    let fetch_site_ok = !headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"));
-    if host_ok && origin_ok && fetch_site_ok {
-        return next.run(request).await;
+    host_ok && origin_ok && !is_cross_site(headers)
+}
+
+/// For cookie-authenticated requests: Origin (if any) is `http://` plus this
+/// request's Host, and the request is not cross-site.
+fn is_same_origin_browser_request(headers: &http::HeaderMap) -> bool {
+    let origin_ok = match headers.get(http::header::ORIGIN) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.strip_prefix("http://"))
+            .zip(header_str(headers, http::header::HOST))
+            .is_some_and(|(origin, host)| origin.eq_ignore_ascii_case(host)),
+    };
+    origin_ok && !is_cross_site(headers)
+}
+
+fn is_cross_site(headers: &http::HeaderMap) -> bool {
+    header_str(headers, "sec-fetch-site")
+        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+}
+
+fn header_str(headers: &http::HeaderMap, name: impl http::header::AsHeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The first value of a query parameter, decoded.
+fn query_value(query: Option<&str>, name: &str) -> Option<String> {
+    url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+/// Sets the session cookie and redirects to `/` without the token, so it does
+/// not stay in the address bar, the history or a Referer.
+fn sign_in_response(access: &TcpAccess, query: &str) -> Response {
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            url::form_urlencoded::parse(pair.as_bytes())
+                .next()
+                .is_some_and(|(key, _)| key != SIGN_IN_PARAM)
+        })
+        .collect();
+    let location = if kept.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{}", kept.join("&"))
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(http::header::LOCATION, location)
+        .header(http::header::REFERRER_POLICY, "no-referrer")
+        .header(http::header::CACHE_CONTROL, "no-store");
+    if let Some(cookie) = access.session_cookie() {
+        response = response.header(http::header::SET_COOKIE, cookie);
     }
+    response
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+const SIGN_IN_REQUIRED_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HuntProxy sign-in</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 0; padding: 18vh 16px; font: 16px/1.5 system-ui, sans-serif; background: #f6f7f9; color: #1d2330; }
+main { max-width: 34rem; margin: 0 auto; }
+h1 { font-size: 1.25rem; margin: 0 0 .75rem; }
+code { padding: .1rem .3rem; border-radius: 4px; background: #e4e7ec; }
+@media (prefers-color-scheme: dark) {
+  body { background: #14171c; color: #e3e6eb; }
+  code { background: #2a2f38; }
+}
+</style>
+</head>
+<body>
+<main>
+<h1>Sign-in link required</h1>
+<p>This HuntProxy is reachable from other machines, so its UI needs a sign-in link. On the machine running HuntProxy, run <code>HuntProxy status</code> and open the <code>ui:</code> link it prints.</p>
+</main>
+</body>
+</html>
+"#;
+
+fn unauthorized_response(headers: &http::HeaderMap) -> Response {
+    let wants_html = headers
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|accept| accept.contains("text/html"));
+    let mut response = if wants_html {
+        (StatusCode::UNAUTHORIZED, Html(SIGN_IN_REQUIRED_PAGE)).into_response()
+    } else {
+        error_response(DomainError::new(
+            ErrorCode::Unauthorized,
+            "send Authorization: Bearer <remote_auth_token>, or open the sign-in link shown by HuntProxy status",
+        ))
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::WWW_AUTHENTICATE,
+        http::HeaderValue::from_static("Bearer"),
+    );
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        http::header::REFERRER_POLICY,
+        http::HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+fn forbidden_response(headers: &http::HeaderMap) -> Response {
     tracing::warn!(
-        host = host.unwrap_or("-"),
+        host = header_str(headers, http::header::HOST).unwrap_or("-"),
         "rejected api request with a foreign host or origin"
     );
     (
@@ -406,17 +664,17 @@ async fn reject_foreign_browser_requests(
         Json(serde_json::json!({
             "error": {
                 "code": "forbidden",
-                "message": "requests must come from a local client using a loopback host"
+                "message": "requests must use a loopback host or authenticate, and must not come from another site"
             }
         })),
     )
         .into_response()
 }
 
-/// Accept `localhost`, a loopback IP, or the exact listen IP. Reject every other
-/// name, so a rebound domain cannot pass. Any port is accepted, because a
-/// container or SSH tunnel can publish the API on a different local port.
-fn is_allowed_authority(authority: &str, listen: std::net::SocketAddr) -> bool {
+/// Accept `localhost` or a loopback IP. Reject every other name, so a rebound
+/// domain cannot pass. Any port is accepted, because a container or SSH tunnel
+/// can publish the API on a different local port.
+fn is_loopback_authority(authority: &str) -> bool {
     let host = match authority.rsplit_once(':') {
         Some((host, _)) if !host.ends_with(']') && host.contains(':') => authority,
         Some((host, port)) if port.parse::<u16>().is_ok() => host,
@@ -427,10 +685,8 @@ fn is_allowed_authority(authority: &str, listen: std::net::SocketAddr) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback() || ip == listen.ip(),
-        Err(_) => false,
-    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 async fn prevent_api_caching(
@@ -2606,12 +2862,12 @@ mod foreign_request_guard_tests {
     use super::*;
     use tower::ServiceExt;
 
-    fn listen() -> std::net::SocketAddr {
-        "127.0.0.1:17890".parse().unwrap()
-    }
+    const TOKEN: &str = "s3cret token/+";
+    const LOOPBACK: &str = "127.0.0.1:50000";
+    const LAN_PEER: &str = "192.168.1.20:50000";
 
     #[test]
-    fn allows_only_loopback_authorities_on_the_listen_port() {
+    fn allows_only_loopback_authorities_on_any_port() {
         for ok in [
             "127.0.0.1:17890",
             "127.0.0.1",
@@ -2622,8 +2878,9 @@ mod foreign_request_guard_tests {
             "127.0.0.2:17890",
             "localhost:8080",
             "127.0.0.1:1",
+            "[::ffff:127.0.0.1]:17890",
         ] {
-            assert!(is_allowed_authority(ok, listen()), "{ok}");
+            assert!(is_loopback_authority(ok), "{ok}");
         }
         for bad in [
             "evil.example",
@@ -2631,72 +2888,370 @@ mod foreign_request_guard_tests {
             "localhost:notaport",
             "localhost.evil.example:17890",
             "192.168.1.3:17890",
+            // A non-loopback listen IP is not local: once every non-loopback
+            // peer must authenticate, an authenticated request skips the Host
+            // check, so the listen IP needs no exception here.
+            "10.0.0.5:17890",
+            "0.0.0.0:17890",
             "",
         ] {
-            assert!(!is_allowed_authority(bad, listen()), "{bad}");
+            assert!(!is_loopback_authority(bad), "{bad}");
+        }
+    }
+
+    fn app(token: Option<&str>) -> Router {
+        Router::new()
+            .route("/", get(|| async { "ui" }))
+            .route("/api/v1/projects", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                TcpAccess::new(token, 17890),
+                guard_tcp_requests,
+            ))
+    }
+
+    async fn send(
+        token: Option<&str>,
+        peer: Option<&str>,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut request = axum::http::Request::builder().uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut request = request.body(Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ));
+        }
+        app(token).oneshot(request).await.unwrap()
+    }
+
+    async fn status(token: Option<&str>, peer: &str, headers: &[(&str, &str)]) -> StatusCode {
+        send(token, Some(peer), "/api/v1/projects", headers)
+            .await
+            .status()
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn session_cookie(token: &str, port: u16) -> String {
+        let access = TcpAccess::new(Some(token), port);
+        format!(
+            "{}={}",
+            access.cookie_name,
+            access.session.as_deref().unwrap()
+        )
+    }
+
+    fn encoded(value: &str) -> String {
+        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    }
+
+    #[tokio::test]
+    async fn loopback_peers_need_no_token_but_must_pass_the_browser_guard() {
+        for token in [None, Some(TOKEN)] {
+            for peer in [LOOPBACK, "[::1]:50000", "[::ffff:127.0.0.1]:50000"] {
+                assert_eq!(
+                    status(token, peer, &[("host", "127.0.0.1:17890")]).await,
+                    StatusCode::OK
+                );
+            }
+            assert_eq!(
+                status(
+                    token,
+                    LOOPBACK,
+                    &[
+                        ("host", "localhost:17890"),
+                        ("origin", "http://localhost:17890"),
+                        ("sec-fetch-site", "same-origin"),
+                    ]
+                )
+                .await,
+                StatusCode::OK
+            );
+            for headers in [
+                &[][..],
+                &[("host", "rebind.evil.example:17890")][..],
+                &[("host", "0.0.0.0:17890")][..],
+                &[
+                    ("host", "127.0.0.1:17890"),
+                    ("origin", "http://evil.example"),
+                ][..],
+                &[("host", "127.0.0.1:17890"), ("origin", "null")][..],
+                &[
+                    ("host", "127.0.0.1:17890"),
+                    ("sec-fetch-site", "cross-site"),
+                ][..],
+            ] {
+                assert_eq!(
+                    status(token, LOOPBACK, headers).await,
+                    StatusCode::FORBIDDEN,
+                    "{headers:?}"
+                );
+            }
+        }
+        // A loopback peer may also authenticate, which skips the Host check.
+        let bearer = format!("Bearer {TOKEN}");
+        assert_eq!(
+            status(
+                Some(TOKEN),
+                LOOPBACK,
+                &[("host", "0.0.0.0:17890"), ("authorization", &bearer)]
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_peers_without_credentials_get_401() {
+        let response = send(
+            Some(TOKEN),
+            Some(LAN_PEER),
+            "/api/v1/projects",
+            &[("host", "10.0.0.5:17890")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"));
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(body["code"], "unauthorized");
+
+        let response = send(
+            Some(TOKEN),
+            Some(LAN_PEER),
+            "/",
+            &[
+                ("host", "10.0.0.5:17890"),
+                ("accept", "text/html,application/xhtml+xml,*/*;q=0.8"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let page = body_text(response).await;
+        assert!(page.contains("HuntProxy status"));
+        for field in ["<form", "<input", "<textarea", "<script"] {
+            assert!(!page.contains(field), "{field}");
+        }
+
+        // No connect info means an unknown peer, which is treated as remote.
+        assert_eq!(
+            send(
+                Some(TOKEN),
+                None,
+                "/api/v1/projects",
+                &[("host", "127.0.0.1:17890")]
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_token_remote_peers_are_always_refused() {
+        for headers in [
+            &[("host", "127.0.0.1:17890")][..],
+            &[("host", "127.0.0.1:17890"), ("authorization", "Bearer ")][..],
+            &[("host", "127.0.0.1:17890"), ("authorization", "Bearer x")][..],
+        ] {
+            assert_eq!(
+                status(None, LAN_PEER, headers).await,
+                StatusCode::UNAUTHORIZED,
+                "{headers:?}"
+            );
+        }
+        assert_eq!(
+            send(
+                None,
+                Some(LAN_PEER),
+                "/?token=",
+                &[("host", "127.0.0.1:17890")]
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bearer_token_authenticates_any_host() {
+        let host = ("host", "huntproxy.lan:17890");
+        assert_eq!(
+            status(
+                Some(TOKEN),
+                LAN_PEER,
+                &[host, ("authorization", "Bearer wrong")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(Some(TOKEN), LAN_PEER, &[host, ("authorization", TOKEN)]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        for scheme in ["Bearer", "bearer"] {
+            let value = format!("{scheme} {TOKEN}");
+            assert_eq!(
+                status(
+                    Some(TOKEN),
+                    LAN_PEER,
+                    &[
+                        host,
+                        ("authorization", &value),
+                        // A Bearer request is not a browser's ambient
+                        // credential, so its Origin is not checked.
+                        ("origin", "http://elsewhere.example"),
+                    ]
+                )
+                .await,
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_session_cookie_authenticates_same_origin_requests() {
+        let cookie = session_cookie(TOKEN, 17890);
+        assert!(!cookie.contains(TOKEN));
+        let host = ("host", "10.0.0.5:17890");
+        let with_others = format!("theme=dark; {cookie}; other=1");
+        for headers in [
+            &[host, ("cookie", &cookie)][..],
+            &[host, ("cookie", &with_others)][..],
+            &[
+                host,
+                ("cookie", &cookie),
+                ("origin", "http://10.0.0.5:17890"),
+                ("sec-fetch-site", "same-origin"),
+            ][..],
+            &[("host", "huntproxy.lan:17890"), ("cookie", &cookie)][..],
+        ] {
+            assert_eq!(
+                status(Some(TOKEN), LAN_PEER, headers).await,
+                StatusCode::OK,
+                "{headers:?}"
+            );
+        }
+        for headers in [
+            &[host, ("cookie", &cookie), ("origin", "http://evil.example")][..],
+            &[
+                host,
+                ("cookie", &cookie),
+                ("origin", "http://10.0.0.5:8080"),
+            ][..],
+            &[
+                host,
+                ("cookie", &cookie),
+                ("origin", "https://10.0.0.5:17890"),
+            ][..],
+            &[host, ("cookie", &cookie), ("sec-fetch-site", "cross-site")][..],
+        ] {
+            assert_eq!(
+                status(Some(TOKEN), LAN_PEER, headers).await,
+                StatusCode::FORBIDDEN,
+                "{headers:?}"
+            );
+        }
+        let stale = session_cookie("an older token", 17890);
+        let other_port = session_cookie(TOKEN, 17891);
+        let raw_token = format!("huntproxy_session_17890={TOKEN}");
+        for wrong in [&stale, &other_port, &raw_token] {
+            assert_eq!(
+                status(Some(TOKEN), LAN_PEER, &[host, ("cookie", wrong)]).await,
+                StatusCode::UNAUTHORIZED,
+                "{wrong}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_link_sets_the_cookie_and_drops_the_token() {
+        let uri = format!("/?project=7&token={}&view=a%20b", encoded(TOKEN));
+        let response = send(
+            Some(TOKEN),
+            Some(LAN_PEER),
+            &uri,
+            &[("host", "10.0.0.5:17890"), ("accept", "text/html")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let headers = response.headers();
+        assert_eq!(headers[http::header::LOCATION], "/?project=7&view=a%20b");
+        assert_eq!(headers[http::header::REFERRER_POLICY], "no-referrer");
+        assert_eq!(headers[http::header::CACHE_CONTROL], "no-store");
+        let set_cookie = headers[http::header::SET_COOKIE].to_str().unwrap();
+        let cookie = session_cookie(TOKEN, 17890);
+        assert_eq!(
+            set_cookie,
+            format!("{cookie}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000")
+        );
+        assert!(!set_cookie.contains("Secure"));
+
+        let response = send(
+            Some(TOKEN),
+            Some(LAN_PEER),
+            &format!("/?token={}", encoded(TOKEN)),
+            &[("host", "10.0.0.5:17890")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[http::header::LOCATION], "/");
+
+        for wrong in ["/?token=wrong", "/?token=", "/?project=7&token=s3cret"] {
+            let response = send(
+                Some(TOKEN),
+                Some(LAN_PEER),
+                wrong,
+                &[("host", "10.0.0.5:17890"), ("accept", "text/html")],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{wrong}");
+            assert!(response.headers().get(http::header::SET_COOKIE).is_none());
+            assert!(body_text(response).await.contains("HuntProxy status"));
         }
     }
 
     #[test]
-    fn accepts_the_exact_non_loopback_listen_ip() {
-        let lan: std::net::SocketAddr = "10.0.0.5:17890".parse().unwrap();
-        assert!(is_allowed_authority("10.0.0.5:17890", lan));
-        assert!(!is_allowed_authority("10.0.0.6:17890", lan));
-    }
-
-    async fn status(headers: &[(&str, &str)]) -> StatusCode {
-        let app = Router::new()
-            .route("/api/v1/projects", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
-                listen(),
-                reject_foreign_browser_requests,
-            ));
-        let mut request = axum::http::Request::builder().uri("/api/v1/projects");
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        app.oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap()
-            .status()
-    }
-
-    #[tokio::test]
-    async fn middleware_blocks_rebinding_and_cross_site_requests() {
-        assert_eq!(status(&[("host", "127.0.0.1:17890")]).await, StatusCode::OK);
+    fn the_ui_link_signs_in_only_on_non_loopback_binds() {
+        let link = |listen: &str, token| ui_link(listen.parse().unwrap(), token);
         assert_eq!(
-            status(&[
-                ("host", "localhost:17890"),
-                ("origin", "http://localhost:17890"),
-                ("sec-fetch-site", "same-origin"),
-            ])
-            .await,
-            StatusCode::OK
+            link("127.0.0.1:17890", Some(TOKEN)),
+            "http://127.0.0.1:17890/"
         );
-        assert_eq!(status(&[]).await, StatusCode::FORBIDDEN);
+        assert_eq!(link("[::1]:17890", None), "http://[::1]:17890/");
+        let token = encoded(TOKEN);
         assert_eq!(
-            status(&[("host", "rebind.evil.example:17890")]).await,
-            StatusCode::FORBIDDEN
+            link("10.0.0.5:17890", Some(TOKEN)),
+            format!("http://10.0.0.5:17890/?token={token}")
         );
         assert_eq!(
-            status(&[
-                ("host", "127.0.0.1:17890"),
-                ("origin", "http://evil.example")
-            ])
-            .await,
-            StatusCode::FORBIDDEN
+            link("0.0.0.0:17890", Some(TOKEN)),
+            format!("http://<this-host>:17890/?token={token}")
         );
         assert_eq!(
-            status(&[("host", "127.0.0.1:17890"), ("origin", "null")]).await,
-            StatusCode::FORBIDDEN
+            link("[::]:17890", Some(TOKEN)),
+            format!("http://<this-host>:17890/?token={token}")
         );
+        let signed_in = link("10.0.0.5:17890", Some(TOKEN));
+        let query = signed_in.split_once('?').unwrap().1;
         assert_eq!(
-            status(&[
-                ("host", "127.0.0.1:17890"),
-                ("sec-fetch-site", "cross-site")
-            ])
-            .await,
-            StatusCode::FORBIDDEN
+            query_value(Some(query), SIGN_IN_PARAM).as_deref(),
+            Some(TOKEN)
         );
     }
 }
