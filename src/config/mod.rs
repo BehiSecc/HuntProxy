@@ -27,7 +27,7 @@ pub struct Config {
     pub api_listen: SocketAddr,
     pub proxy_listen: SocketAddr,
     pub log_level: String,
-    /// Require auth when binding non-loopback.
+    /// Required when binding non-loopback. Read it through `auth_token`.
     pub remote_auth_token: Option<String>,
     pub mcp_listen: Option<SocketAddr>,
     pub sqlite_synchronous: String,
@@ -316,15 +316,23 @@ impl Config {
         }
     }
 
+    /// The token that authenticates TCP API clients. An empty value counts as
+    /// unset, so it can never match an empty credential.
+    pub fn auth_token(&self) -> Option<&str> {
+        self.remote_auth_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+    }
+
     pub fn validate(&self) -> DomainResult<()> {
-        if !self.api_listen.ip().is_loopback() && self.remote_auth_token.is_none() {
+        if !self.api_listen.ip().is_loopback() && self.auth_token().is_none() {
             return Err(DomainError::new(
                 ErrorCode::ConfigInvalid,
                 "non-loopback API listen requires remote_auth_token",
             ));
         }
         if let Some(addr) = self.mcp_listen {
-            if !addr.ip().is_loopback() && self.remote_auth_token.is_none() {
+            if !addr.ip().is_loopback() && self.auth_token().is_none() {
                 return Err(DomainError::new(
                     ErrorCode::ConfigInvalid,
                     "non-loopback MCP listen requires remote_auth_token",
@@ -893,5 +901,22 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn an_empty_auth_token_counts_as_unset() {
+        let lan = Config {
+            api_listen: "10.0.0.5:17890".parse().unwrap(),
+            remote_auth_token: Some(String::new()),
+            ..Config::default()
+        };
+        assert_eq!(lan.auth_token(), None);
+        assert!(lan.validate().is_err());
+        let lan = Config {
+            remote_auth_token: Some("secret".into()),
+            ..lan
+        };
+        assert_eq!(lan.auth_token(), Some("secret"));
+        assert!(lan.validate().is_ok());
     }
 }
