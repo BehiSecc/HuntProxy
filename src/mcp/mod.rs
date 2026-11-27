@@ -569,7 +569,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"exchange_body","description":"Read a body beyond what exchange_get inlines. Pages fit the output budget; continue at next_offset while truncated. search finds a literal, ASCII case-insensitive string; match offsets work as offset. save writes the whole body to a private file and returns its path for local tools. Responses are decoded (gzip/br/deflate/zstd) unless raw=true, which also reads a body whose decoding fails; side=request redacts raw HTTP/1.1 request headers. available=false means no body. utf8 is lossy for non-UTF-8 bytes; encoding=base64 is exact.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"response"},"offset":{"type":"integer","minimum":0,"default":0},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384},"raw":{"type":"boolean","default":false},"encoding":{"type":"string","enum":["utf8","base64"],"default":"utf8"},"search":{"type":"string"},"context_bytes":{"type":"integer","minimum":0,"maximum":exchange_view::MAX_CONTEXT_BYTES,"default":160,"description":"Context around each search match."},"save":{"type":"boolean","default":false}},"required":["project_id","exchange_id"],"additionalProperties":false}},
         {"name":"secret_reveal","description":"Reveal a sensitive header value (audited)","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"exchange_id":{"type":"integer"},"side":{"type":"string","enum":["request","response"],"default":"request"},"header":{"type":"string"}},"required":["project_id","exchange_id","header"]}},
         {"name":"reply_tabs","description":"List or create Reply tabs. Draft fields are optional.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create"]},"name":{"type":"string"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema()},"required":["project_id","action"]}},
-        {"name":"reply_send","description":"Send a semantic HTTP request and return status, a decoded 4 KiB response preview and the saved exchange_id; read more of the response with exchange_body. With base_exchange_id, diff gives the base status, length and whether the body is identical. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"reply_send","description":"Send a semantic HTTP request and return status, a decoded 4 KiB response preview and the saved exchange_id; read more of the response with exchange_body. With base_exchange_id, diff gives the base status, length and whether the body is identical. Put request fields under draft (for example draft.url and draft.method); omitted draft fields use safe defaults or inherit from base_exchange_id. upstream_proxy is a transient http://, socks5://, or socks5h:// override.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"tab_id":{"type":"integer"},"base_exchange_id":{"type":"integer"},"draft":reply_draft_schema(),"protocol":{"type":"string","enum":["auto","h1","h2"]},"upstream_proxy":{"type":"string"},"response_headers":{"type":"boolean","description":"Also return the response headers as \"name: value\" lines, secrets redacted."},"preview_bytes":{"type":"integer","minimum":0,"maximum":16384,"default":4096,"description":"Response preview size in bytes."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"reply_send_raw","description":"Send exact raw HTTP/1.1 bytes, optionally through an upstream proxy, split-writing at one byte offset, reading an early response before same-socket continuation, half-closing the write side, and collecting multiple responses until idle. Use base64 whenever byte offsets or non-UTF-8 bytes matter. This does not provide malformed HTTP/2 framing.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"target_url":{"type":"string"},"request":{"type":"string"},"encoding":{"type":"string","enum":["utf8","base64"]},"tab_id":{"type":"integer"},"use_project_cookies":{"type":"boolean"},"upstream_proxy":{"type":"string","description":"Transient http://, socks5://, or socks5h:// proxy override."},"pause_at_byte":{"type":"integer","minimum":1,"description":"Split the exact decoded request at this byte offset."},"pause_ms":{"type":"integer","minimum":1,"maximum":120000},"await_response_before_continue":{"type":"boolean","default":false,"description":"Read one early response while the split request is incomplete, then continue on the same connection."},"half_close_write":{"type":"boolean","default":false},"response_mode":{"type":"string","enum":["auto","until_idle","until_close"],"default":"auto"},"read_timeout_ms":{"type":"integer","minimum":1,"maximum":120000,"default":60000},"idle_timeout_ms":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["project_id","target_url","request"]}},
         {"name":"fuzz_start","description":"Start a bounded fuzz job. Put §name§ markers in draft.url, a header override, or the body (body_text, body_override, body_json strings or body_params); use the same name in insertion_points. Payloads may be inline wordlists, local UTF-8 wordlist_files, inclusive number ranges, or native Recollapse-style regex bypass generators. Returns the queued job at once; fuzz_manage get with wait_ms returns as soon as it ends.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"template":fuzz_template_schema(),"confirm_large":{"type":"boolean","default":false}},"required":["project_id","template"]}},
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Pages fit the output budget: continue cases and group_cases with before_case_index=next_before_case_index, and groups (largest first) with offset=next_offset.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0,"description":"groups: next_offset from the previous page."},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"get: wait up to this long for the job to end instead of polling; returns as soon as it does."}},"required":["project_id","action"],"additionalProperties":false}},
@@ -1048,6 +1048,23 @@ fn parse_protocol(value: Option<&str>) -> DomainResult<ProtocolPreference> {
             "protocol must be auto, h1 or h2 (http/1.1 and http/2 also work)",
         )),
     }
+}
+
+/// The response headers as exchange_get shows them: `name: value` lines with
+/// secrets redacted and noisy headers hidden.
+fn response_header_lines(result: &crate::reply::ReplySendResult) -> Vec<String> {
+    let presented = match (&result.saved_response, &result.response) {
+        (Some(saved), _) => {
+            let options = crate::policy::PresentationOptions::default();
+            crate::policy::present_headers(&saved.headers, &options).headers
+        }
+        (None, Some(unsaved)) => unsaved.headers.clone(),
+        (None, None) => Vec::new(),
+    };
+    presented
+        .iter()
+        .map(|header| format!("{}: {}", header.name, header.value))
+        .collect()
 }
 
 /// Parses a request-supplied `draft`, rejecting unknown keys so fields such as
@@ -2093,9 +2110,15 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
             let base_exchange_id =
                 arguments::optional_i64(&args, "base_exchange_id")?.map(ExchangeId);
             let protocol = parse_protocol(args.get("protocol").and_then(Value::as_str))?;
+            let preview_bytes = arguments::optional_u64(&args, "preview_bytes")?
+                .map_or(crate::reply::DEFAULT_REPLY_PREVIEW_BYTES, |bytes| {
+                    bytes.min(crate::reply::MAX_REPLY_PREVIEW_BYTES as u64) as usize
+                });
+            let with_response_headers =
+                arguments::optional_bool(&args, "response_headers")?.unwrap_or(false);
             let result = state
                 .reply
-                .send_with_proxy(
+                .send_with_proxy_and_preview(
                     project_id,
                     arguments::optional_i64(&args, "tab_id")?.map(ReplyTabId),
                     base_exchange_id,
@@ -2103,6 +2126,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     protocol,
                     0,
                     args.get("upstream_proxy").and_then(Value::as_str),
+                    preview_bytes,
                 )
                 .await?;
             if let Some(exchange_id) = result.exchange_id {
@@ -2113,7 +2137,13 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                     json!({ "exchange_id": exchange_id.get(), "source": "reply" }),
                 );
             }
-            exchange_view::reply_send_view(&state, project_id, base_exchange_id, &result).await
+            let mut view =
+                exchange_view::reply_send_view(&state, project_id, base_exchange_id, &result)
+                    .await?;
+            if with_response_headers {
+                view["response_headers"] = json!(response_header_lines(&result));
+            }
+            Ok(view)
         }
         "reply_send_raw" => {
             let project_id = require_project_id(&args)?;
@@ -4250,6 +4280,31 @@ mod tests {
         // Every lifted field is one a draft accepts.
         for field in LIFTED_DRAFT_FIELDS {
             validate_reply_draft_request(&json!({ field: null })).unwrap();
+        }
+    }
+
+    #[test]
+    fn input_schemas_stay_small_enough_for_codex_to_keep_descriptions() {
+        // Codex drops every description of a tool whose input schema exceeds
+        // 5,000 bytes; 4,700 leaves room for how it normalizes them.
+        let definitions = tool_defs();
+        for name in [
+            "reply_send",
+            "reply_tabs",
+            "reply_send_raw",
+            "cookies",
+            "job_status",
+            "job_results",
+        ] {
+            let tool = definitions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let size = serde_json::to_vec(&tool["inputSchema"]).unwrap().len();
+            println!("{name} inputSchema: {size} bytes");
+            assert!(size <= 4_700, "{name} inputSchema is {size} bytes");
         }
     }
 

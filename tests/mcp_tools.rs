@@ -794,3 +794,135 @@ async fn reply_send_accepts_http_version_aliases_and_lenient_body_rules() {
     assert!(error.to_string().contains("explicit body"), "{error}");
     server.abort();
 }
+
+#[tokio::test]
+async fn reply_send_returns_response_headers_and_a_sized_preview_on_request() {
+    use axum::http::header;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(|| async {
+        (
+            [
+                (header::CONTENT_TYPE, "text/plain"),
+                (header::SET_COOKIE, "sid=topsecret"),
+                (header::HeaderName::from_static("x-custom"), "custom-value"),
+            ],
+            "a".repeat(20_000),
+        )
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    let url = format!("http://{address}/big");
+    let send = |extra: Value| {
+        let state = state.clone();
+        let mut args = json!({"project_id": project, "draft": {"url": url}});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        async move { call_tool(state, "reply_send", args).await }
+    };
+
+    // The default result is unchanged: a 4 KiB preview and no headers.
+    let plain = send(json!({})).await.unwrap();
+    assert_eq!(
+        plain["response_preview"]["text"].as_str().unwrap().len(),
+        4096
+    );
+    assert_eq!(plain["response_preview"]["truncated"], true);
+    assert!(plain.get("response_headers").is_none());
+    for extra in [
+        json!({"response_headers": false}),
+        json!({"response_headers": null, "preview_bytes": null}),
+    ] {
+        let same = send(extra).await.unwrap();
+        assert!(same.get("response_headers").is_none());
+        assert_eq!(
+            same["response_preview"]["text"].as_str().unwrap().len(),
+            4096
+        );
+    }
+
+    // Headers come back as exchange_get renders them: redacted secrets, one line each.
+    let with = send(json!({"response_headers": true, "preview_bytes": 10_000}))
+        .await
+        .unwrap();
+    assert_eq!(
+        with["response_preview"]["text"].as_str().unwrap().len(),
+        10_000
+    );
+    assert_eq!(with["response_preview"]["truncated"], true);
+    let lines = with["response_headers"].as_array().unwrap();
+    assert!(
+        lines.contains(&json!("x-custom: custom-value")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&json!("content-type: text/plain")),
+        "{lines:?}"
+    );
+    assert!(!with.to_string().contains("topsecret"));
+    let stored = call_tool(
+        state.clone(),
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": with["exchange_id"], "body_bytes": 0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(with["response_headers"], stored["response_headers"]);
+
+    // Sizes: 0 returns no text, more than the maximum is cut to it, quoted numbers work.
+    let none = send(json!({"preview_bytes": 0})).await.unwrap();
+    assert_eq!(none["response_preview"]["text"], "");
+    assert_eq!(none["response_preview"]["truncated"], true);
+    let huge = send(json!({"preview_bytes": 1_000_000})).await.unwrap();
+    assert_eq!(
+        huge["response_preview"]["text"].as_str().unwrap().len(),
+        16_384
+    );
+    let quoted = send(json!({"preview_bytes": "100"})).await.unwrap();
+    assert_eq!(
+        quoted["response_preview"]["text"].as_str().unwrap().len(),
+        100
+    );
+    let error = send(json!({"preview_bytes": -1})).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "preview_bytes must be a non-negative integer"
+    );
+    let error = send(json!({"response_headers": "yes"})).await.unwrap_err();
+    assert_eq!(error.to_string(), "response_headers must be a boolean");
+
+    // A reply outside the capture scope is not saved, and still returns its headers.
+    state
+        .db
+        .update_project_scope(
+            ProjectId(project),
+            ScopePolicy {
+                schemes: vec!["http".into()],
+                host_patterns: vec!["127.0.0.1".into()],
+                excluded_host_patterns: vec!["localhost".into()],
+                ports: vec![address.port()],
+                path_prefixes: vec![],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let unsaved = call_tool(
+        state.clone(),
+        "reply_send",
+        json!({"project_id": project, "response_headers": true,
+               "draft": {"url": format!("http://localhost:{}/big", address.port())}}),
+    )
+    .await
+    .unwrap();
+    assert!(unsaved["exchange_id"].is_null(), "{unsaved}");
+    let lines = unsaved["response_headers"].as_array().unwrap();
+    assert!(
+        lines.contains(&json!("x-custom: custom-value")),
+        "{lines:?}"
+    );
+    assert!(!unsaved.to_string().contains("topsecret"));
+    server.abort();
+}

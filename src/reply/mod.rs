@@ -740,6 +740,11 @@ impl ReplySendContext {
 /// The total timeout of a Reply send unless its context shortens it.
 const REPLY_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Bytes of the decoded response a send returns as its preview, unless the
+/// caller asks for another size up to [`MAX_REPLY_PREVIEW_BYTES`].
+pub const DEFAULT_REPLY_PREVIEW_BYTES: usize = 4096;
+pub const MAX_REPLY_PREVIEW_BYTES: usize = 16_384;
+
 /// A send that failed, with the exchange saved for the failed attempt.
 #[derive(Debug)]
 pub(crate) struct FailedSend {
@@ -823,6 +828,32 @@ impl ReplyService {
         follow_redirects: u32,
         upstream_proxy: Option<&str>,
     ) -> DomainResult<ReplySendResult> {
+        self.send_with_proxy_and_preview(
+            project_id,
+            tab_id,
+            base_exchange_id,
+            draft,
+            protocol,
+            follow_redirects,
+            upstream_proxy,
+            DEFAULT_REPLY_PREVIEW_BYTES,
+        )
+        .await
+    }
+
+    /// [`Self::send_with_proxy`] with a response preview of `preview_bytes`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_with_proxy_and_preview(
+        &self,
+        project_id: ProjectId,
+        tab_id: Option<ReplyTabId>,
+        base_exchange_id: Option<ExchangeId>,
+        draft: &ReplyDraft,
+        protocol: ProtocolPreference,
+        follow_redirects: u32,
+        upstream_proxy: Option<&str>,
+        preview_bytes: usize,
+    ) -> DomainResult<ReplySendResult> {
         self.send_with_context_and_proxy(
             project_id,
             base_exchange_id,
@@ -834,6 +865,7 @@ impl ReplyService {
             None,
             None,
             None,
+            preview_bytes,
         )
         .await
     }
@@ -858,6 +890,7 @@ impl ReplyService {
             None,
             None,
             None,
+            DEFAULT_REPLY_PREVIEW_BYTES,
         )
         .await
     }
@@ -883,6 +916,7 @@ impl ReplyService {
             None,
             None,
             slots,
+            DEFAULT_REPLY_PREVIEW_BYTES,
         )
         .await
     }
@@ -912,6 +946,7 @@ impl ReplyService {
             identity,
             None,
             Some(slots),
+            DEFAULT_REPLY_PREVIEW_BYTES,
         )
         .await
     }
@@ -937,6 +972,7 @@ impl ReplyService {
             None,
             Some(expected_origin),
             None,
+            DEFAULT_REPLY_PREVIEW_BYTES,
         )
         .await
     }
@@ -954,6 +990,7 @@ impl ReplyService {
         pinned_identity: Option<&crate::cookies::StoredCookieProfile>,
         expected_origin: Option<&str>,
         slots: Option<RequestSlots>,
+        preview_bytes: usize,
     ) -> DomainResult<ReplySendResult> {
         self.send_recording_failure(
             project_id,
@@ -966,6 +1003,7 @@ impl ReplyService {
             pinned_identity,
             expected_origin,
             slots,
+            preview_bytes,
         )
         .await
         .map_err(|failed| failed.error)
@@ -984,6 +1022,7 @@ impl ReplyService {
         pinned_identity: Option<&crate::cookies::StoredCookieProfile>,
         expected_origin: Option<&str>,
         slots: Option<RequestSlots>,
+        preview_bytes: usize,
     ) -> Result<ReplySendResult, FailedSend> {
         let project = self.db.get_project(project_id).await?;
         let named_identity = match pinned_identity {
@@ -1322,8 +1361,7 @@ impl ReplyService {
         let page_title = crate::page_title::is_html_mime(mime.as_deref())
             .then(|| crate::page_title::extract_html_title(&preview_body))
             .flatten();
-        const REPLY_PREVIEW_BYTES: usize = 4096;
-        let preview_end = preview_body.len().min(REPLY_PREVIEW_BYTES);
+        let preview_end = preview_body.len().min(preview_bytes);
         let response_preview = ReplyBodyPreview {
             text: String::from_utf8_lossy(&preview_body[..preview_end]).into_owned(),
             truncated: preview_end < preview_body.len() || out.body_truncated,

@@ -50,10 +50,33 @@ pub(super) fn optional_u64(args: &Value, name: &str) -> DomainResult<Option<u64>
         .transpose()
 }
 
+pub(super) fn optional_bool(args: &Value, name: &str) -> DomainResult<Option<bool>> {
+    present(args, name)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| DomainError::invalid(format!("{name} must be a boolean")))
+        })
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn booleans_must_be_booleans_and_null_is_absent() {
+        let args = json!({"yes": true, "no": false, "text": "true", "nothing": null});
+        assert_eq!(optional_bool(&args, "yes").unwrap(), Some(true));
+        assert_eq!(optional_bool(&args, "no").unwrap(), Some(false));
+        assert_eq!(optional_bool(&args, "nothing").unwrap(), None);
+        assert_eq!(optional_bool(&args, "absent").unwrap(), None);
+        assert_eq!(
+            optional_bool(&args, "text").unwrap_err().to_string(),
+            "text must be a boolean"
+        );
+    }
 
     #[test]
     fn integers_may_be_numbers_or_numeric_strings() {
