@@ -50,6 +50,7 @@ pub(super) async fn handle(
     let upgrade = hyper::upgrade::on(&mut request);
     let (parts, _body) = request.into_parts();
     let mut http_url = websocket_policy_url(&request_url(&parts, forced_scheme)?)?;
+    super::refuse_foreign_host_for_remote_client(client, &parts.headers, &http_url)?;
     let exempt =
         super::own_api_block_exemption(&TargetRef::from_url(&http_url)?, state.config.api_listen);
     let outcome = crate::request_rules::apply_url_rules_with_blocks(

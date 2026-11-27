@@ -177,6 +177,42 @@ fn refuse_own_api_dial_for_remote_client(
     Ok(())
 }
 
+const FOREIGN_HOST_REFUSED: &str =
+    "a proxy client on another machine must send the Host of the URL it requests";
+
+/// A proxy client on another machine must send the Host of the URL it asks
+/// for. An upstream proxy resolves the URL's name again, so a name that
+/// rebinds to this machine could otherwise reach the API from loopback with a
+/// forwarded loopback Host, which the API treats as local.
+fn refuse_foreign_host_for_remote_client(
+    client: SocketAddr,
+    headers: &http::HeaderMap,
+    url: &str,
+) -> DomainResult<()> {
+    if client.ip().to_canonical().is_loopback() {
+        return Ok(());
+    }
+    let Some(host) = headers.get(http::header::HOST) else {
+        return Ok(());
+    };
+    let target = url::Url::parse(url).map_err(|error| DomainError::invalid(error.to_string()))?;
+    let matches = host
+        .to_str()
+        .ok()
+        .filter(|host| !host.contains(['/', '\\', '@', '?', '#']))
+        .and_then(|host| url::Url::parse(&format!("{}://{host}/", target.scheme())).ok())
+        .is_some_and(|parsed| {
+            parsed.host() == target.host()
+                && parsed.port_or_known_default() == target.port_or_known_default()
+        });
+    if matches {
+        Ok(())
+    } else {
+        tracing::warn!(%client, "refused a remote proxy request whose Host differs from its URL");
+        Err(DomainError::new(ErrorCode::Forbidden, FOREIGN_HOST_REFUSED))
+    }
+}
+
 fn pin_api_dial(mut dial: ValidatedDial, listener: SocketAddr) -> Option<ValidatedDial> {
     dial.approved_socket_addrs.retain(|addr| {
         if listener.ip().is_unspecified() {
@@ -341,6 +377,7 @@ async fn forward_request(
         take_internal_crawler_marker(&mut parts.headers, session.is_browser_bound);
     let browser_origin = take_browser_origin_marker(&mut parts.headers, session.is_browser_bound)?;
     let mut url = request_url(&parts, forced_scheme)?;
+    refuse_foreign_host_for_remote_client(client, &parts.headers, &url)?;
     let original_url = url.clone();
     let original_target = TargetRef::from_url(&url)?;
     enforce_browser_request_origin(browser_origin.as_deref(), &url, false)?;
@@ -1463,7 +1500,8 @@ fn proxy_error_message(error: &DomainError) -> String {
     }
     match error.code() {
         ErrorCode::ScopeDenied => "request denied by scope".into(),
-        ErrorCode::Forbidden => OWN_API_REFUSED.into(),
+        // Only this module's own refusals use this code; their messages are static.
+        ErrorCode::Forbidden => error.to_string(),
         ErrorCode::DnsBlocked => "DNS lookup failed".into(),
         ErrorCode::BodyTooLarge => "request body too large".into(),
         ErrorCode::Timeout => "request timed out".into(),
@@ -2559,6 +2597,124 @@ mod tests {
             assert!(!refused(&response), "{response}");
         }
         drop(open_test_connect(local, api_addr, token).await);
+
+        cancel.cancel();
+        api_server.abort();
+        upstream_server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_proxy_clients_cannot_send_a_foreign_host_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let (mut state, project, session) = proxy_test_fixture(&directory).await;
+        let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_addr = api.local_addr().unwrap();
+        Arc::get_mut(&mut state).unwrap().config.api_listen = api_addr;
+        let api_hits = Arc::new(AtomicU64::new(0));
+        let api_server = tokio::spawn(counting_origin(api, api_hits.clone()));
+        // An upstream proxy on this machine resolves names itself, so it could
+        // reach the API from loopback if it received a loopback Host.
+        let upstream_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_proxy_addr = upstream_proxy.local_addr().unwrap();
+        let (heads_tx, mut heads_rx) = mpsc::unbounded_channel::<String>();
+        let upstream_server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = upstream_proxy.accept().await else {
+                    break;
+                };
+                let heads_tx = heads_tx.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    while !head.windows(4).any(|part| part == b"\r\n\r\n") {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => head.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    let _ = heads_tx.send(String::from_utf8_lossy(&head).to_ascii_lowercase());
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        state
+            .db
+            .set_project_upstream_proxy(project.id, Some(format!("http://{upstream_proxy_addr}")))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let remote = serve_proxy_as_peer(
+            state.clone(),
+            "192.0.2.50:40000".parse().unwrap(),
+            cancel.clone(),
+        )
+        .await;
+        let local = serve_proxy_as_peer(state.clone(), LOOPBACK_CLIENT, cancel.clone()).await;
+        let token = session.token_once.as_deref().unwrap();
+        let port = api_addr.port();
+        // Stands in for a name that HuntProxy resolves to a public address.
+        let target = format!("192.0.2.10:{port}");
+        let request = |host: &str| {
+            format!("GET http://{target}/api/v1/projects HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n")
+        };
+        let refused = |response: &str| {
+            response.starts_with("HTTP/1.1 403") && response.contains(FOREIGN_HOST_REFUSED)
+        };
+
+        for host in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            "192.0.2.10".into(),
+            format!("192.0.2.10:{port}@127.0.0.1"),
+        ] {
+            let response = proxy_exchange(remote, &request(&host)).await;
+            assert!(refused(&response), "{host}\n{response}");
+            let upgrade = format!("GET http://{target}/events HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+            let response = proxy_exchange(remote, &upgrade).await;
+            assert!(refused(&response), "{host}\n{response}");
+            let target_addr: SocketAddr = target.parse().unwrap();
+            let mut tunnel = open_test_connect(remote, target_addr, token).await;
+            tunnel
+                .write_all(
+                    format!("GET http://{target}/api/v1/projects HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(refused(&String::from_utf8_lossy(&response)), "{host}");
+        }
+        assert!(
+            heads_rx.try_recv().is_err(),
+            "a refused request went upstream"
+        );
+
+        // The URL's own Host, in any spelling, is forwarded.
+        for host in [target.clone(), target.to_ascii_uppercase()] {
+            let response = proxy_exchange(remote, &request(&host)).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let head = heads_rx.recv().await.unwrap();
+            assert!(head.contains(&format!("\r\nhost: {target}\r\n")), "{head}");
+        }
+
+        // Loopback clients are unchanged: their Host is forwarded as sent.
+        let response = proxy_exchange(local, &request(&format!("127.0.0.1:{port}"))).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(heads_rx
+            .recv()
+            .await
+            .unwrap()
+            .contains(&format!("\r\nhost: 127.0.0.1:{port}\r\n")));
+        assert_eq!(api_hits.load(Ordering::SeqCst), 0);
 
         cancel.cancel();
         api_server.abort();
