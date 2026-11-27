@@ -700,8 +700,9 @@ fn forbidden_response(headers: &http::HeaderMap) -> Response {
 
 /// Accept `localhost` or a loopback IP. Reject every other name, so a rebound
 /// domain cannot pass. Any port is accepted, because a container or SSH tunnel
-/// can publish the API on a different local port.
-fn is_loopback_authority(authority: &str) -> bool {
+/// can publish the API on a different local port. The proxy uses the same test
+/// to refuse loopback Hosts from remote clients, so keep the two in one place.
+pub(crate) fn is_loopback_authority(authority: &str) -> bool {
     let host = match authority.rsplit_once(':') {
         Some((host, _)) if !host.ends_with(']') && host.contains(':') => authority,
         Some((host, port)) if port.parse::<u16>().is_ok() => host,

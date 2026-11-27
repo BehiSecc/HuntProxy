@@ -177,13 +177,16 @@ fn refuse_own_api_dial_for_remote_client(
     Ok(())
 }
 
-const FOREIGN_HOST_REFUSED: &str =
-    "a proxy client on another machine must send the Host of the URL it requests";
+const FOREIGN_HOST_REFUSED: &str = "a proxy client on another machine cannot send a Host that \
+     names this machine (localhost or a loopback address) and differs from the URL";
 
-/// A proxy client on another machine must send the Host of the URL it asks
-/// for. An upstream proxy resolves the URL's name again, so a name that
-/// rebinds to this machine could otherwise reach the API from loopback with a
-/// forwarded loopback Host, which the API treats as local.
+/// An upstream proxy resolves the URL's name again, so a name that rebinds to
+/// this machine could reach the API from loopback. If the forwarded Host then
+/// names localhost or a loopback address, the API treats the request as local.
+/// So a client on another machine may not send such a Host unless it is the
+/// URL's own authority. Any other Host, such as a different name for Host
+/// header testing, is forwarded as sent. The loopback test is the API's own,
+/// so both sides agree on which Hosts are local.
 fn refuse_foreign_host_for_remote_client(
     client: SocketAddr,
     headers: &http::HeaderMap,
@@ -192,23 +195,22 @@ fn refuse_foreign_host_for_remote_client(
     if client.ip().to_canonical().is_loopback() {
         return Ok(());
     }
-    let Some(host) = headers.get(http::header::HOST) else {
+    let Some(host) = headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| crate::api::is_loopback_authority(host))
+    else {
         return Ok(());
     };
     let target = url::Url::parse(url).map_err(|error| DomainError::invalid(error.to_string()))?;
-    let matches = host
-        .to_str()
-        .ok()
-        .filter(|host| !host.contains(['/', '\\', '@', '?', '#']))
-        .and_then(|host| url::Url::parse(&format!("{}://{host}/", target.scheme())).ok())
-        .is_some_and(|parsed| {
-            parsed.host() == target.host()
-                && parsed.port_or_known_default() == target.port_or_known_default()
-        });
+    let matches = url::Url::parse(&format!("{}://{host}/", target.scheme())).is_ok_and(|parsed| {
+        parsed.host() == target.host()
+            && parsed.port_or_known_default() == target.port_or_known_default()
+    });
     if matches {
         Ok(())
     } else {
-        tracing::warn!(%client, "refused a remote proxy request whose Host differs from its URL");
+        tracing::warn!(%client, "refused a remote proxy request with a loopback Host that differs from its URL");
         Err(DomainError::new(ErrorCode::Forbidden, FOREIGN_HOST_REFUSED))
     }
 }
@@ -2603,6 +2605,64 @@ mod tests {
         upstream_server.abort();
     }
 
+    #[test]
+    fn remote_clients_are_refused_exactly_the_hosts_the_api_treats_as_local() {
+        let remote: SocketAddr = "192.0.2.50:40000".parse().unwrap();
+        let refused = |client: SocketAddr, host: &str, url: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::HOST, host.parse().unwrap());
+            refuse_foreign_host_for_remote_client(client, &headers, url).is_err()
+        };
+        let spellings = [
+            "localhost",
+            "LOCALHOST",
+            "localhost:17890",
+            "LocalHost:1",
+            "localhost.",
+            "localhost:notaport",
+            "localhost.evil.example",
+            "127.0.0.1",
+            "127.0.0.1:17890",
+            "127.0.0.2:9999",
+            "127.1",
+            "2130706433",
+            "::1",
+            "[::1]",
+            "[::1]:17890",
+            "[::ffff:127.0.0.1]:17890",
+            "[::ffff:7f00:1]",
+            "0.0.0.0:17890",
+            "10.0.0.5:17890",
+            "other.example",
+            "127.0.0.1:17890@other.example",
+            "other.example@127.0.0.1",
+            "",
+        ];
+        let mut local = 0;
+        for host in spellings {
+            let api_local = crate::api::is_loopback_authority(host);
+            local += usize::from(api_local);
+            // Against another URL, the proxy refuses exactly the Hosts the
+            // API's tokenless rule accepts.
+            assert_eq!(
+                refused(remote, host, "http://192.0.2.10:17890/"),
+                api_local,
+                "{host:?}"
+            );
+            assert!(!refused(LOOPBACK_CLIENT, host, "http://192.0.2.10:17890/"));
+        }
+        assert!(local >= 10, "the list must exercise local Hosts");
+        // The URL's own authority, in any spelling, is not refused here.
+        for (host, url) in [
+            ("localhost:17890", "http://localhost:17890/"),
+            ("LOCALHOST:17890", "http://localhost:17890/"),
+            ("localhost:80", "http://localhost/"),
+            ("[::1]:9999", "http://[::1]:9999/"),
+        ] {
+            assert!(!refused(remote, host, url), "{host} {url}");
+        }
+    }
+
     #[tokio::test]
     async fn remote_proxy_clients_cannot_send_a_foreign_host_upstream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2625,20 +2685,36 @@ mod tests {
                 };
                 let heads_tx = heads_tx.clone();
                 tokio::spawn(async move {
-                    let mut head = Vec::new();
-                    let mut buffer = [0u8; 4096];
-                    while !head.windows(4).any(|part| part == b"\r\n\r\n") {
-                        match socket.read(&mut buffer).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(read) => head.extend_from_slice(&buffer[..read]),
+                    // Records the request head; a CONNECT is followed into its
+                    // tunnel, where the request itself is.
+                    loop {
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            match socket.read(&mut byte).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => head.push(byte[0]),
+                            }
                         }
+                        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                        if head.starts_with("connect ") {
+                            if socket
+                                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        let _ = heads_tx.send(head);
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                        return;
                     }
-                    let _ = heads_tx.send(String::from_utf8_lossy(&head).to_ascii_lowercase());
-                    let _ = socket
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        )
-                        .await;
                 });
             }
         });
@@ -2666,37 +2742,57 @@ mod tests {
             response.starts_with("HTTP/1.1 403") && response.contains(FOREIGN_HOST_REFUSED)
         };
 
+        // A plain request, a WebSocket upgrade and a request inside a tunnel.
+        let send_all = |proxy: SocketAddr, host: String| {
+            let target = target.clone();
+            async move {
+                let plain = proxy_exchange(proxy, &request(&host)).await;
+                let upgrade = proxy_exchange(proxy, &format!("GET http://{target}/events HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")).await;
+                let mut tunnel = open_test_connect(proxy, target.parse().unwrap(), token).await;
+                tunnel
+                    .write_all(
+                        format!("GET http://{target}/api/v1/projects HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let mut tunneled = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut tunneled))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                [
+                    plain,
+                    upgrade,
+                    String::from_utf8_lossy(&tunneled).into_owned(),
+                ]
+            }
+        };
+
+        // A Host naming this machine that differs from the URL is refused.
         for host in [
             format!("127.0.0.1:{port}"),
-            format!("localhost:{port}"),
-            "192.0.2.10".into(),
-            format!("192.0.2.10:{port}@127.0.0.1"),
+            "localhost".into(),
+            "LOCALHOST".into(),
+            format!("[::1]:{port}"),
+            format!("[::ffff:127.0.0.1]:{port}"),
+            "127.0.0.1:9999".into(),
         ] {
-            let response = proxy_exchange(remote, &request(&host)).await;
-            assert!(refused(&response), "{host}\n{response}");
-            let upgrade = format!("GET http://{target}/events HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
-            let response = proxy_exchange(remote, &upgrade).await;
-            assert!(refused(&response), "{host}\n{response}");
-            let target_addr: SocketAddr = target.parse().unwrap();
-            let mut tunnel = open_test_connect(remote, target_addr, token).await;
-            tunnel
-                .write_all(
-                    format!("GET http://{target}/api/v1/projects HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
-                        .as_bytes(),
-                )
-                .await
-                .unwrap();
-            let mut response = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut response))
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(refused(&String::from_utf8_lossy(&response)), "{host}");
+            for response in send_all(remote, host.clone()).await {
+                assert!(refused(&response), "{host}\n{response}");
+            }
         }
         assert!(
             heads_rx.try_recv().is_err(),
             "a refused request went upstream"
         );
+
+        // Any other Host, as used for Host header testing, is forwarded intact.
+        for response in send_all(remote, "other.example".into()).await {
+            assert!(!refused(&response), "{response}");
+            let head = heads_rx.recv().await.unwrap();
+            assert!(head.contains("\r\nhost: other.example\r\n"), "{head}");
+        }
 
         // The URL's own Host, in any spelling, is forwarded.
         for host in [target.clone(), target.to_ascii_uppercase()] {
