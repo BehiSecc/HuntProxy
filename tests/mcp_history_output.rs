@@ -366,10 +366,61 @@ async fn colon_comparisons_header_hints_and_null_arguments() {
     let result = call(
         &state,
         "history_search",
-        json!({"project_id": project, "q": null, "limit": null, "cursor": null}),
+        json!({"project_id": project, "q": null, "limit": null, "cursor": null, "urls": null}),
     )
     .await;
     assert_eq!(item_ids(&result), vec![large, small]);
+    let error = call_tool(
+        state.clone(),
+        "history_search",
+        json!({"project_id": project, "urls": "tiny"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("full or short"), "{error}");
+}
+
+#[tokio::test]
+async fn short_urls_cut_long_query_strings_on_request() {
+    let (_directory, state, project_id) = test_state().await;
+    let query = format!("token={}", "x".repeat(150));
+    let mut long = exchange(project_id, "GET", "/callback");
+    long.query = Some(query.clone());
+    state.db.insert_exchange(long).await.unwrap();
+    let mut short = exchange(project_id, "GET", "/page");
+    short.query = Some("id=5".into());
+    state.db.insert_exchange(short).await.unwrap();
+    let project = project_id.get();
+
+    let full = call(&state, "history_search", json!({"project_id": project})).await;
+    let explicit = call(
+        &state,
+        "history_search",
+        json!({"project_id": project, "urls": "full"}),
+    )
+    .await;
+    assert_eq!(full, explicit);
+    assert_eq!(
+        full["items"][1]["url"],
+        format!("https://example.com/callback?{query}")
+    );
+
+    let cut = call(
+        &state,
+        "history_search",
+        json!({"project_id": project, "urls": "short"}),
+    )
+    .await;
+    assert_eq!(cut["items"][0]["url"], "https://example.com/page?id=5");
+    assert_eq!(
+        cut["items"][1]["url"],
+        format!("https://example.com/callback?{}…[+76 chars]", &query[..80])
+    );
+    // Only the URL changes.
+    let mut restored = cut.clone();
+    restored["items"][1]["url"] = full["items"][1]["url"].clone();
+    assert_eq!(restored, full);
 }
 
 #[tokio::test]

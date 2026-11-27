@@ -64,6 +64,33 @@ fn exchange_url(summary: &ExchangeSummary) -> String {
     url
 }
 
+/// Query characters a short URL keeps.
+const SHORT_QUERY_CHARS: usize = 80;
+
+/// [`exchange_url`] with a query string over [`SHORT_QUERY_CHARS`]
+/// characters cut to that length and marked with how many were dropped, as in
+/// `?q=1&…[+120 chars]`. Scheme, authority and path are kept.
+pub(crate) fn short_url(summary: &ExchangeSummary) -> String {
+    let url = exchange_url(summary);
+    let Some(query) = summary.query.as_deref() else {
+        return url;
+    };
+    let total = query.chars().count();
+    if total <= SHORT_QUERY_CHARS {
+        return url;
+    }
+    let kept = query
+        .char_indices()
+        .nth(SHORT_QUERY_CHARS)
+        .map_or(query.len(), |(index, _)| index);
+    let prefix = url.len() - query.len();
+    format!(
+        "{}…[+{} chars]",
+        &url[..prefix + kept],
+        total - SHORT_QUERY_CHARS
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +185,22 @@ mod tests {
         ] {
             assert!(row.get(absent).is_none(), "{absent}");
         }
+    }
+
+    #[test]
+    fn short_urls_cut_long_query_strings_only() {
+        let mut summary = summary();
+        assert_eq!(short_url(&summary), "https://example.test:8443/api/items");
+        summary.query = Some("a".repeat(80));
+        assert_eq!(short_url(&summary), exchange_url(&summary));
+        summary.query = Some(format!("{}é{}", "b".repeat(79), "c".repeat(40)));
+        assert_eq!(
+            short_url(&summary),
+            format!(
+                "https://example.test:8443/api/items?{}é…[+40 chars]",
+                "b".repeat(79)
+            )
+        );
     }
 
     #[test]

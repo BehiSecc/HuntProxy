@@ -2,7 +2,7 @@
 //! fit [`MAX_OUTPUT_BYTES`] by construction, with an exact continuation.
 
 use super::budget::{json_len, rows_that_fit, MAX_OUTPUT_BYTES};
-use super::view::exchange_row;
+use super::view::{exchange_row, short_url};
 use super::{
     host_matches_domain, normalize_domain_filter, parse_history_cursor, require_project_id,
 };
@@ -48,6 +48,16 @@ async fn search_with_budget(
             )))
         }
     };
+    let short_urls = match args.get("urls") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(urls)) if urls == "full" => false,
+        Some(Value::String(urls)) if urls == "short" => true,
+        Some(_) => {
+            return Err(DomainError::invalid(
+                "history_search urls must be full or short",
+            ))
+        }
+    };
     let filter = query
         .filter(|query| !query.trim().is_empty())
         .map(parse_text_query)
@@ -74,7 +84,10 @@ async fn search_with_budget(
         )
         .await?;
     let items = page.items;
-    let mut rows = items.iter().map(exchange_row).collect::<Vec<_>>();
+    let mut rows = items
+        .iter()
+        .map(|summary| history_row(summary, short_urls))
+        .collect::<Vec<_>>();
     let mut envelope = json!({"items": [], "next": [LONGEST_STARTED_AT, i64::MAX]});
     if let Some(searched_back_to) = &page.searched_back_to {
         envelope["partial"] = json!(true);
@@ -112,6 +125,15 @@ async fn search_with_budget(
         }
     }
     Ok(Value::Object(result))
+}
+
+/// One history row; `short_urls` cuts long query strings (see [`short_url`]).
+fn history_row(summary: &ExchangeSummary, short_urls: bool) -> Value {
+    let mut row = exchange_row(summary);
+    if short_urls {
+        row["url"] = json!(short_url(summary));
+    }
+    row
 }
 
 /// The `[started_at, exchange_id]` cursor for the page after `summary`, in the
@@ -554,8 +576,16 @@ mod tests {
         let size = schema.to_string().len();
         assert!(size <= 4_700, "history_search inputSchema is {size} bytes");
         assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["urls"]["enum"],
+            json!(["full", "short"])
+        );
         let description = tool["description"].as_str().unwrap();
         assert!(description.contains("partial:true"), "{description}");
+        let urls = schema["properties"]["urls"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(urls.contains("exchange_get returns the full URL"), "{urls}");
     }
 
     #[test]
