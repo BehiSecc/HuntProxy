@@ -1052,7 +1052,7 @@ fn parse_protocol(value: Option<&str>) -> DomainResult<ProtocolPreference> {
 
 /// The response headers as exchange_get shows them: `name: value` lines with
 /// secrets redacted and noisy headers hidden.
-fn response_header_lines(result: &crate::reply::ReplySendResult) -> Vec<String> {
+fn response_header_lines(result: &crate::reply::ReplySendResult) -> Value {
     let presented = match (&result.saved_response, &result.response) {
         (Some(saved), _) => {
             let options = crate::policy::PresentationOptions::default();
@@ -1061,10 +1061,7 @@ fn response_header_lines(result: &crate::reply::ReplySendResult) -> Vec<String> 
         (None, Some(unsaved)) => unsaved.headers.clone(),
         (None, None) => Vec::new(),
     };
-    presented
-        .iter()
-        .map(|header| format!("{}: {}", header.name, header.value))
-        .collect()
+    exchange_view::header_lines(&presented)
 }
 
 /// The options of a raw send, read from the tool arguments. Null counts as
@@ -2171,7 +2168,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
                 exchange_view::reply_send_view(&state, project_id, base_exchange_id, &result)
                     .await?;
             if with_response_headers {
-                view["response_headers"] = json!(response_header_lines(&result));
+                view["response_headers"] = response_header_lines(&result);
             }
             Ok(view)
         }
