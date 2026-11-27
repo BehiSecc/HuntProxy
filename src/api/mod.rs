@@ -507,7 +507,7 @@ async fn guard_tcp_requests(
         return next.run(request).await;
     }
     if access.has_valid_session(headers) {
-        if is_same_origin_browser_request(headers) {
+        if is_same_origin_browser_request(request.method(), headers) {
             return next.run(request).await;
         }
         return forbidden_response(headers);
@@ -516,30 +516,25 @@ async fn guard_tcp_requests(
         tracing::warn!(?peer, "rejected an unauthenticated api request");
         return unauthorized_response(headers);
     }
-    if is_local_browser_request(headers) {
+    if is_local_browser_request(request.method(), headers) {
         return next.run(request).await;
     }
     forbidden_response(headers)
 }
 
-/// Host is `localhost` or a loopback IP, Origin (if any) is `http://` on such a
-/// host, and the request is not cross-site.
-fn is_local_browser_request(headers: &http::HeaderMap) -> bool {
-    let host_ok = header_str(headers, http::header::HOST).is_some_and(is_loopback_authority);
-    let origin_ok = match headers.get(http::header::ORIGIN) {
-        None => true,
-        Some(value) => value
-            .to_str()
-            .ok()
-            .and_then(|origin| origin.strip_prefix("http://"))
-            .is_some_and(is_loopback_authority),
-    };
-    host_ok && origin_ok && !is_cross_site(headers)
+/// Host is `localhost` or a loopback IP, and the request is same-origin with
+/// it.
+fn is_local_browser_request(method: &http::Method, headers: &http::HeaderMap) -> bool {
+    header_str(headers, http::header::HOST).is_some_and(is_loopback_authority)
+        && is_same_origin_browser_request(method, headers)
 }
 
-/// For cookie-authenticated requests: Origin (if any) is `http://` plus this
-/// request's Host, and the request is not cross-site.
-fn is_same_origin_browser_request(headers: &http::HeaderMap) -> bool {
+/// Origin (if any) is `http://` plus this request's Host, so a page on another
+/// port of the same host does not pass. `Sec-Fetch-Site` (if any) is
+/// `same-origin` or `none`; `same-site` is accepted only for a top-level GET
+/// navigation, so links from other local pages keep working. Clients that send
+/// neither header (curl, the CLI) pass.
+fn is_same_origin_browser_request(method: &http::Method, headers: &http::HeaderMap) -> bool {
     let origin_ok = match headers.get(http::header::ORIGIN) {
         None => true,
         Some(value) => value
@@ -549,12 +544,21 @@ fn is_same_origin_browser_request(headers: &http::HeaderMap) -> bool {
             .zip(header_str(headers, http::header::HOST))
             .is_some_and(|(origin, host)| origin.eq_ignore_ascii_case(host)),
     };
-    origin_ok && !is_cross_site(headers)
-}
-
-fn is_cross_site(headers: &http::HeaderMap) -> bool {
-    header_str(headers, "sec-fetch-site")
-        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+    let is = |name: &str, expected: &str| {
+        header_str(headers, name).is_some_and(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let site_ok = match header_str(headers, "sec-fetch-site") {
+        None => true,
+        Some(site) if site.eq_ignore_ascii_case("same-origin") => true,
+        Some(site) if site.eq_ignore_ascii_case("none") => true,
+        Some(site) if site.eq_ignore_ascii_case("same-site") => {
+            method == http::Method::GET
+                && is("sec-fetch-mode", "navigate")
+                && is("sec-fetch-dest", "document")
+        }
+        Some(_) => false,
+    };
+    origin_ok && site_ok
 }
 
 fn header_str(headers: &http::HeaderMap, name: impl http::header::AsHeaderName) -> Option<&str> {
@@ -2772,7 +2776,14 @@ async fn codec_transform(Json(body): Json<CodecBody>) -> Response {
 }
 
 async fn ui_index() -> impl IntoResponse {
-    Html(include_str!("../../web/index.html"))
+    // No other page may frame the UI.
+    (
+        [(
+            http::header::CONTENT_SECURITY_POLICY,
+            "frame-ancestors 'none'",
+        )],
+        Html(include_str!("../../web/index.html")),
+    )
 }
 
 fn error_response(e: DomainError) -> Response {
@@ -2902,7 +2913,10 @@ mod foreign_request_guard_tests {
     fn app(token: Option<&str>) -> Router {
         Router::new()
             .route("/", get(|| async { "ui" }))
-            .route("/api/v1/projects", get(|| async { "ok" }))
+            .route(
+                "/api/v1/projects",
+                get(|| async { "ok" }).post(|| async { "ok" }),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 TcpAccess::new(token, 17890),
                 guard_tcp_requests,
@@ -2915,7 +2929,17 @@ mod foreign_request_guard_tests {
         uri: &str,
         headers: &[(&str, &str)],
     ) -> Response {
-        let mut request = axum::http::Request::builder().uri(uri);
+        send_as(http::Method::GET, token, peer, uri, headers).await
+    }
+
+    async fn send_as(
+        method: http::Method,
+        token: Option<&str>,
+        peer: Option<&str>,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
@@ -3252,6 +3276,144 @@ mod foreign_request_guard_tests {
         assert_eq!(
             query_value(Some(query), SIGN_IN_PARAM).as_deref(),
             Some(TOKEN)
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_requests_must_be_same_origin_except_top_level_navigations() {
+        let cookie = session_cookie(TOKEN, 17890);
+        // The same checks apply to local requests and to cookie requests.
+        let cases: [(&str, &str, Option<&str>); 2] = [
+            (LOOPBACK, "127.0.0.1:17890", None),
+            (LAN_PEER, "10.0.0.5:17890", Some(&cookie)),
+        ];
+        for (peer, host, cookie) in cases {
+            let origin = format!("http://{host}");
+            let other_port = format!("http://{}:8080", host.split_once(':').unwrap().0);
+            let check = |method: http::Method, uri: &'static str, extra: Vec<(&str, String)>| {
+                let mut headers = vec![("host".to_string(), host.to_string())];
+                if let Some(cookie) = cookie {
+                    headers.push(("cookie".into(), cookie.to_string()));
+                }
+                headers.extend(
+                    extra
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value)),
+                );
+                async move {
+                    let headers: Vec<(&str, &str)> = headers
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str()))
+                        .collect();
+                    send_as(method, Some(TOKEN), Some(peer), uri, &headers)
+                        .await
+                        .status()
+                }
+            };
+            let navigation = |site: &str, dest: &str| {
+                vec![
+                    ("sec-fetch-site", site.to_string()),
+                    ("sec-fetch-mode", "navigate".to_string()),
+                    ("sec-fetch-dest", dest.to_string()),
+                ]
+            };
+            let ok = StatusCode::OK;
+            let forbidden = StatusCode::FORBIDDEN;
+            for (method, uri, extra, expected) in [
+                // curl and the CLI send neither header.
+                (http::Method::POST, "/api/v1/projects", vec![], ok),
+                (
+                    http::Method::POST,
+                    "/api/v1/projects",
+                    vec![
+                        ("origin", origin.clone()),
+                        ("sec-fetch-site", "same-origin".into()),
+                    ],
+                    ok,
+                ),
+                (http::Method::GET, "/", navigation("none", "document"), ok),
+                (
+                    http::Method::GET,
+                    "/",
+                    navigation("same-site", "document"),
+                    ok,
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/projects",
+                    vec![("origin", other_port.clone())],
+                    forbidden,
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/projects",
+                    vec![
+                        ("origin", other_port.clone()),
+                        ("sec-fetch-site", "same-site".into()),
+                        ("sec-fetch-mode", "no-cors".into()),
+                        ("sec-fetch-dest", "empty".into()),
+                    ],
+                    forbidden,
+                ),
+                (
+                    http::Method::GET,
+                    "/api/v1/projects",
+                    vec![
+                        ("sec-fetch-site", "same-site".into()),
+                        ("sec-fetch-mode", "cors".into()),
+                        ("sec-fetch-dest", "empty".into()),
+                    ],
+                    forbidden,
+                ),
+                (
+                    http::Method::GET,
+                    "/",
+                    navigation("same-site", "iframe"),
+                    forbidden,
+                ),
+                (
+                    http::Method::POST,
+                    "/api/v1/projects",
+                    navigation("same-site", "document"),
+                    forbidden,
+                ),
+                (
+                    http::Method::GET,
+                    "/",
+                    navigation("cross-site", "document"),
+                    forbidden,
+                ),
+            ] {
+                assert_eq!(
+                    check(method.clone(), uri, extra.clone()).await,
+                    expected,
+                    "{peer} {method} {uri} {extra:?}"
+                );
+            }
+        }
+
+        // An SSH tunnel publishes the UI on another local port.
+        assert_eq!(
+            status(
+                None,
+                LOOPBACK,
+                &[
+                    ("host", "localhost:8754"),
+                    ("origin", "http://localhost:8754"),
+                    ("sec-fetch-site", "same-origin"),
+                ]
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ui_document_cannot_be_framed() {
+        let response = ui_index().await.into_response();
+        assert_eq!(
+            response.headers()[http::header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'none'"
         );
     }
 }
