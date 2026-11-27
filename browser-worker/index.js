@@ -2374,6 +2374,14 @@ function evaluationContent(value) {
   return value === undefined ? "undefined" : JSON.stringify(value);
 }
 
+// An object or array result returned as it is, so the caller reads JSON
+// instead of JSON encoded in a string; undefined when it is something else or
+// too large to return whole, and then it is reported as text that can be cut.
+function evaluationValue(value) {
+  if (value === null || typeof value !== "object") return undefined;
+  return Buffer.byteLength(JSON.stringify(value)) <= MAX_SNAPSHOT_BYTES ? value : undefined;
+}
+
 // Runs agent JavaScript in the main world of the selected page, or of one of
 // its frames, the way the DevTools console does: statements and top-level
 // await are allowed, declarations can be repeated between calls, and the
@@ -2463,6 +2471,12 @@ async function performEvaluate(session, page, action) {
     else void work.then(release, release);
   }
   const thrown = outcome.exception;
+  const native = evaluationValue(thrown ? undefined : outcome.value);
+  if (native !== undefined) {
+    const data = { type: outcome.type, value: native };
+    if (target.url !== undefined) data.frame_url = publicLocation(target.url);
+    return { message: "expression evaluated", data };
+  }
   const content = thrown
     // The stack of a called function source ends in the function that called it here.
     ? String(thrown.exception?.description ?? thrown.exception?.value ?? thrown.text)

@@ -1004,7 +1004,9 @@ fn validate_browser_page_url(value: &str) -> DomainResult<()> {
 fn fit_action_result(action: &BrowserAction, result: &mut ActionResult) -> DomainResult<()> {
     match action {
         BrowserAction::Snapshot { .. } => fit_text_content(result, "", true),
-        BrowserAction::Inspect { .. } | BrowserAction::Evaluate { .. } => {
+        BrowserAction::Inspect { .. } => fit_text_content(result, "", false),
+        BrowserAction::Evaluate { .. } => {
+            value_to_content_if_oversized(result)?;
             fit_text_content(result, "", false)
         }
         BrowserAction::Events { .. } => fit_event_rows(result),
@@ -1016,6 +1018,28 @@ fn fit_action_result(action: &BrowserAction, result: &mut ActionResult) -> Domai
 fn result_len(result: &ActionResult) -> DomainResult<usize> {
     let value = serde_json::to_value(result).map_err(|error| DomainError::Other(error.into()))?;
     Ok(crate::mcp::budget::json_len(&value))
+}
+
+/// An evaluation returns an object or array as JSON in `data.value` when it
+/// fits; one that does not is turned into the JSON text `data.content`, which
+/// can then be cut like any other.
+fn value_to_content_if_oversized(result: &mut ActionResult) -> DomainResult<()> {
+    let has_value = result
+        .data
+        .as_ref()
+        .is_some_and(|data| data.get("value").is_some());
+    if !has_value || result_len(result)? <= ACTION_OUTPUT_BYTES {
+        return Ok(());
+    }
+    let Some(Value::Object(data)) = result.data.as_mut() else {
+        return Ok(());
+    };
+    let value = data.remove("value").unwrap_or(Value::Null);
+    let content =
+        serde_json::to_string(&value).map_err(|error| DomainError::Other(error.into()))?;
+    data.insert("total_bytes".into(), json!(content.len()));
+    data.insert("content".into(), Value::String(content));
+    Ok(())
 }
 
 /// Cuts the `content` of the object at `pointer` in `result.data`, which also
@@ -5799,6 +5823,31 @@ mod tests {
             "headers":[{"name":"x-test","value":"ok","extra":true}]
         }))
         .is_err());
+    }
+
+    #[test]
+    fn an_evaluated_object_is_returned_as_json_unless_it_must_be_cut() {
+        let evaluate: BrowserAction =
+            serde_json::from_value(json!({"type": "evaluate", "expression": "({a: 1})"})).unwrap();
+        let small = json!({"type": "object", "value": {"items": [1, 2], "name": "Shop"}});
+        let mut result = result_with(small.clone());
+        fit_action_result(&evaluate, &mut result).unwrap();
+        assert_eq!(result.data.unwrap(), small);
+
+        // One that does not fit the result becomes JSON text, cut like any other.
+        let rows = (0..2_000)
+            .map(|index| json!({"id": index, "name": "é\"🦀"}))
+            .collect::<Vec<_>>();
+        let mut result = result_with(json!({"type": "object", "value": rows}));
+        fit_action_result(&evaluate, &mut result).unwrap();
+        fitted_len(&result);
+        let data = result.data.unwrap();
+        let whole = serde_json::to_string(&rows).unwrap();
+        assert!(data.get("value").is_none());
+        assert!(whole.starts_with(data["content"].as_str().unwrap()));
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["total_bytes"], whole.len());
+        assert_eq!(data["type"], "object");
     }
 
     #[test]

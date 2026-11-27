@@ -82,8 +82,11 @@ test("no response carries half a surrogate pair, whatever the page puts in its s
   assert.equal(listed.checkpoint.title, "half �");
   await assert.rejects(call("session.action", { session_id: 1, action: { type: "click", locator: { css: "p", frame: "missing" } } }),
     (error) => error.code === -32602 && error.message.includes(`name=${"n".repeat(63)}�`));
-  const half = await call("session.action", { session_id: 1, action: { type: "evaluate", expression: "({ key: 'v\\ud83d' })" } });
+  const half = await call("session.action", { session_id: 1, action: { type: "evaluate", expression: "JSON.stringify({ key: 'v\\ud83d' })" } });
   assert.equal(half.data.content, "{\"key\":\"v\\ud83d\"}");
+  // An object comes back as JSON, its half pair replaced like any other.
+  const object = await call("session.action", { session_id: 1, action: { type: "evaluate", expression: "({ key: 'v\\ud83d' })" } });
+  assert.deepEqual(object.data.value, { key: "v�" });
   const unpaired = /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})|(?<!\\ud[89ab][0-9a-f]{2})\\ud[c-f][0-9a-f]{2}/i;
   for (const line of call.lines) {
     // An escaped backslash before "ud83d" is page text that spells an escape, not one.

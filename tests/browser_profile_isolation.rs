@@ -618,10 +618,11 @@ async fn verify_page_evaluation(h: &Harness) {
     assert_eq!(result.message, "expression evaluated");
     let original_page = result.browser.as_ref().unwrap().page_id;
     let data = result.data.unwrap();
+    // An object that fits is returned as JSON, not as JSON text.
     assert_eq!(data["type"], "object");
-    assert_eq!(data["truncated"], false);
+    assert!(data.get("content").is_none());
     assert_eq!(
-        serde_json::from_str::<Value>(data["content"].as_str().unwrap()).unwrap(),
+        data["value"],
         json!({"title": "Profile fixture", "identity": "default", "path": "/app"})
     );
 
@@ -638,7 +639,7 @@ async fn verify_page_evaluation(h: &Harness) {
         .unwrap()
         .data
         .unwrap();
-    let sent: Value = serde_json::from_str(sent["content"].as_str().unwrap()).unwrap();
+    let sent = &sent["value"];
     assert_eq!(sent["method"], "POST");
     assert_eq!(sent["request_body_bytes"], 3);
     assert!(sent["cookie"].as_str().unwrap().contains("sid=default"));
@@ -818,8 +819,8 @@ async fn verify_page_evaluation(h: &Harness) {
         .unwrap();
     assert_eq!(in_popup.browser.unwrap().page_id, popup_page);
     assert_eq!(
-        in_popup.data.unwrap()["content"],
-        "[\"Fixture details\",true]"
+        in_popup.data.unwrap()["value"],
+        json!(["Fixture details", true])
     );
 
     // While a person holds the browser through CDP, the agent does not script it.
@@ -887,10 +888,8 @@ async fn verify_pointer_and_keyboard_input(h: &Harness) {
             .unwrap()
     };
     // What the page heard since the last read, and a value read in the frame.
-    let heard = || async {
-        let data = run(evaluate("window.heard.splice(0)")).await.data.unwrap();
-        serde_json::from_str::<Value>(data["content"].as_str().unwrap()).unwrap()
-    };
+    let heard =
+        || async { run(evaluate("window.heard.splice(0)")).await.data.unwrap()["value"].clone() };
     let in_checkout = |expression: &str| {
         let expression = expression.to_owned();
         async move {
