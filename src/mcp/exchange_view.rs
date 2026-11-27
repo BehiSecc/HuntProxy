@@ -3,6 +3,7 @@
 //! in `tool_call_result` should never have to cut it. The REST API and web UI
 //! keep the full serde shapes from `crate::domain`.
 
+use super::arguments;
 use super::budget::{escaped_len, json_len, rows_that_fit, water_level, MAX_OUTPUT_BYTES};
 use super::require_project_id;
 use super::view::exchange_row;
@@ -71,13 +72,7 @@ fn present<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
 }
 
 pub(super) fn optional_u64(args: &Value, key: &str) -> DomainResult<Option<u64>> {
-    present(args, key)
-        .map(|value| {
-            value.as_u64().ok_or_else(|| {
-                DomainError::invalid(format!("{key} must be a non-negative integer"))
-            })
-        })
-        .transpose()
+    arguments::optional_u64(args, key)
 }
 
 fn optional_bool(args: &Value, key: &str) -> DomainResult<Option<bool>> {
@@ -95,10 +90,7 @@ pub(super) fn to_usize(value: u64) -> usize {
 }
 
 fn required_exchange_id(args: &Value) -> DomainResult<ExchangeId> {
-    present(args, "exchange_id")
-        .and_then(Value::as_i64)
-        .map(ExchangeId)
-        .ok_or_else(|| DomainError::invalid("exchange_id required"))
+    arguments::required_i64(args, "exchange_id").map(ExchangeId)
 }
 
 fn to_json<T: Serialize>(value: &T) -> DomainResult<Value> {
@@ -245,7 +237,7 @@ pub(crate) async fn exchange_get(state: &AppState, args: &Value) -> DomainResult
             let ids = ids
                 .as_array()
                 .filter(|ids| (1..=MAX_BATCH_IDS).contains(&ids.len()))
-                .and_then(|ids| ids.iter().map(Value::as_i64).collect::<Option<Vec<_>>>())
+                .and_then(|ids| ids.iter().map(arguments::integer).collect::<Option<Vec<_>>>())
                 .ok_or_else(|| {
                     DomainError::invalid(format!(
                         "exchange_ids must be 1 to {MAX_BATCH_IDS} integer exchange ids"

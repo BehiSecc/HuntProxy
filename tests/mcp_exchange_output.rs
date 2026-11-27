@@ -927,7 +927,7 @@ async fn exchange_get_batches_share_the_budget_in_request_order() {
         json!({"project_id": project_id.get(), "exchange_id": small, "exchange_ids": [small]}),
         json!({"project_id": project_id.get(), "exchange_ids": []}),
         json!({"project_id": project_id.get(), "exchange_ids": (0..21).collect::<Vec<_>>()}),
-        json!({"project_id": project_id.get(), "exchange_ids": ["1"]}),
+        json!({"project_id": project_id.get(), "exchange_ids": ["one"]}),
         json!({"project_id": project_id.get(), "exchange_id": small, "body_bytes": -1}),
     ] {
         let error = call_err(&state, "exchange_get", args).await;
@@ -1537,4 +1537,45 @@ async fn reply_send_reports_a_compact_comparison_with_its_base() {
         json!({"base_status": 200, "base_length": 9, "same_body": true})
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn exchange_tools_accept_numeric_strings_for_integer_arguments() {
+    let (_directory, state, project_id) = test_state().await;
+    let first = insert(&state, exchange(project_id, "/first")).await;
+    let second = insert(&state, exchange(project_id, "/second")).await;
+    let project = project_id.get().to_string();
+
+    let single = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": first.to_string(), "body_bytes": "0"}),
+    )
+    .await;
+    assert_eq!(single["exchange_id"], first);
+    assert!(single.get("response_body").is_none(), "{single}");
+
+    let batch = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_ids": [first.to_string(), second]}),
+    )
+    .await;
+    assert_eq!(batch["exchanges"].as_array().unwrap().len(), 2);
+
+    let body = call(
+        &state,
+        "exchange_body",
+        json!({"project_id": project, "exchange_id": second.to_string(), "max_bytes": "64"}),
+    )
+    .await;
+    assert!(body.get("error").is_none(), "{body}");
+
+    let error = call_err(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": "abc"}),
+    )
+    .await;
+    assert_eq!(error.to_string(), "exchange_id must be an integer");
 }
