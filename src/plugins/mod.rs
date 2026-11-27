@@ -214,6 +214,17 @@ pub enum PluginJobState {
     Cancelled,
 }
 
+impl PluginJobState {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// The longest a status call waits for a job to end.
+const MAX_STATUS_WAIT: Duration = Duration::from_secs(30);
+/// How often a waiting status call looks at the job again.
+const STATUS_WAIT_STEP: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginJobPhase {
@@ -519,10 +530,7 @@ impl Drop for CheckpointReservation {
 }
 
 fn recommended_poll_interval_ms(job: &PluginJobRecord) -> Option<u64> {
-    if matches!(
-        job.state,
-        PluginJobState::Completed | PluginJobState::Failed | PluginJobState::Cancelled
-    ) {
+    if job.state.is_terminal() {
         return None;
     }
     match job.phase {
@@ -1489,6 +1497,20 @@ impl PluginService {
             .get(&id)
             .map(|job| job.view.read().status())
             .ok_or_else(|| DomainError::not_found("plugin job"))
+    }
+
+    /// The job's status once it has ended or `wait` has passed, whichever is
+    /// first. `wait` is capped at 30 seconds.
+    pub async fn wait_status(&self, id: Uuid, wait: Duration) -> DomainResult<PluginJobView> {
+        let deadline = Instant::now() + wait.min(MAX_STATUS_WAIT);
+        loop {
+            let status = self.status(id)?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if status.state.is_terminal() || left.is_zero() {
+                return Ok(status);
+            }
+            tokio::time::sleep(STATUS_WAIT_STEP.min(left)).await;
+        }
     }
 
     pub fn cancel(&self, id: Uuid) -> DomainResult<PluginJobView> {
@@ -7455,6 +7477,70 @@ print(json.dumps({{"deleted": True}}))
             view.phase = PluginJobPhase::Finished;
         }
         assert_eq!(job.view.read().status().recommended_poll_interval_ms, None);
+    }
+
+    #[tokio::test]
+    async fn job_status_waits_for_a_job_to_end_but_not_past_the_deadline() {
+        let db = Arc::new(crate::storage::Db::open_in_memory().await.unwrap());
+        let reply = Arc::new(ReplyService {
+            db: db.clone(),
+            transport: Arc::new(UnusedTransport),
+            placeholder_key: crate::reply::PlaceholderKey::from_bytes(vec![9; 32]),
+            upstream_proxies: Default::default(),
+            verify_upstream_tls: true,
+            request_limiter: Default::default(),
+        });
+        let service = PluginService {
+            directory: PathBuf::from("plugins"),
+            reply,
+            db,
+            browser: None,
+            plugins: Arc::new(HashMap::new()),
+            load_issues: Arc::new(Vec::new()),
+            jobs: Arc::new(DashMap::new()),
+            active_jobs: Arc::new(tokio::sync::Semaphore::new(1)),
+            preview_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            analysis_retry_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            analysis_checkpoint_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+        let running = test_job(PluginJobState::Running);
+        let id = running.view.read().id;
+        service.jobs.insert(id, running.clone());
+
+        // Without a wait, or when the job outlasts it, the current status returns.
+        let started = Instant::now();
+        let status = service.wait_status(id, Duration::ZERO).await.unwrap();
+        assert_eq!(status.state, PluginJobState::Running);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let status = service
+            .wait_status(id, Duration::from_millis(250))
+            .await
+            .unwrap();
+        assert_eq!(status.state, PluginJobState::Running);
+        assert!(started.elapsed() >= Duration::from_millis(250));
+
+        // A job that ends during the wait ends it at once.
+        let finishing = running.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut view = finishing.view.write();
+            view.state = PluginJobState::Completed;
+            view.phase = PluginJobPhase::Finished;
+        });
+        let started = Instant::now();
+        let status = service.wait_status(id, MAX_STATUS_WAIT).await.unwrap();
+        assert_eq!(status.state, PluginJobState::Completed);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // An ended job returns at once, and an unknown job is not found.
+        let started = Instant::now();
+        service.wait_status(id, MAX_STATUS_WAIT).await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let error = service
+            .wait_status(Uuid::new_v4(), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NotFound);
     }
 
     #[tokio::test]

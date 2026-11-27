@@ -1149,3 +1149,36 @@ async fn cookies_set_from_a_file_takes_its_one_domain_as_the_target() {
     .unwrap_err();
     assert_eq!(error.to_string(), "target_url required");
 }
+
+#[tokio::test]
+async fn job_status_accepts_wait_ms_and_reads_it_like_other_integers() {
+    let (_directory, state, _) = test_state().await;
+    let unknown = uuid::Uuid::new_v4().to_string();
+    for wait_ms in [json!(null), json!(0), json!("25"), json!(30_000)] {
+        let started = std::time::Instant::now();
+        let error = call_tool(
+            state.clone(),
+            "job_status",
+            json!({"job_id": unknown, "wait_ms": wait_ms}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NotFound, "{wait_ms}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+    for wait_ms in [json!("soon"), json!(-1), json!(1.5)] {
+        let error = call_tool(
+            state.clone(),
+            "job_status",
+            json!({"job_id": unknown, "wait_ms": wait_ms}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{wait_ms}");
+        assert_eq!(
+            error.to_string(),
+            "wait_ms must be a non-negative integer",
+            "{wait_ms}"
+        );
+    }
+}
