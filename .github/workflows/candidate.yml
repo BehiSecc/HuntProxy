@@ -161,7 +161,8 @@ jobs:
           for fixture in \
             "0.2.0 2016a21c7ee7a03cccf6f9406a4ecce6231ab3ecea41e1bd354d76881ef8b0a3" \
             "0.3.0 7d5742db477a92ea935a1385eccbe8ea354a8568dcb04fb30f4652af46c6fe3f" \
-            "0.4.0 48736fd1b8f3cea38065dcb167e29389ed18f3efa2dd93d8a014703e95107b18"; do
+            "0.4.0 48736fd1b8f3cea38065dcb167e29389ed18f3efa2dd93d8a014703e95107b18" \
+            "0.4.5 6b31d966620d522e2c93e3dca04918ae8c8f7fa4c8a034441e8d746824966e04"; do
             read -r version sha256 <<<"$fixture"
             archive="${RUNNER_TEMP}/huntproxy-v${version}-linux-x86_64.tar.gz"
             fixture_dir="${RUNNER_TEMP}/huntproxy-v${version}"
@@ -175,14 +176,14 @@ jobs:
             [[ "$("$fixture_dir/HuntProxy" --version)" == "HuntProxy ${version}" ]]
           done
 
-      - name: Exercise full data and bundle upgrades from v0.2.0, v0.3.0 and v0.4.0
+      - name: Exercise full data and bundle upgrades from v0.2.0, v0.3.0, v0.4.0 and v0.4.5
         shell: bash
         env:
           HUNTPROXY_DATA_DIR: ${{ runner.temp }}/huntproxy-upgrade-default
           TMPDIR: ${{ runner.temp }}
         run: |
           set -Eeuo pipefail
-          for version in 0.2.0 0.3.0 0.4.0; do
+          for version in 0.2.0 0.3.0 0.4.0 0.4.5; do
             echo "::group::Upgrade from v${version}"
             HUNTPROXY_PREVIOUS_BINARY="${RUNNER_TEMP}/huntproxy-v${version}/HuntProxy" \
               cargo test --locked --test upgrade_workflows -- --ignored --test-threads=1 --nocapture
