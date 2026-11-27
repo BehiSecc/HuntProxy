@@ -950,6 +950,38 @@ fn browser_managed_request_header(name: &str, value: &str) -> bool {
     })
 }
 
+/// What holds a project's browser slots, from its active sessions' IDs and
+/// the profiles of the persistent ones, so the caller can free one.
+fn concurrency_limit_message(
+    limit: u32,
+    sessions: impl Iterator<Item = (i64, Option<impl std::fmt::Display>)>,
+) -> String {
+    let mut sessions = sessions.collect::<Vec<_>>();
+    sessions.sort_by_key(|(id, _)| *id);
+    let used = sessions.len();
+    let mut holders = Vec::new();
+    let mut ephemeral = 0;
+    for (id, profile) in sessions {
+        match profile {
+            Some(profile) => holders.push(format!("session {id} (profile {profile})")),
+            None => ephemeral += 1,
+        }
+    }
+    match ephemeral {
+        0 => {}
+        1 => holders.push("1 ephemeral session".into()),
+        count => holders.push(format!("{count} ephemeral sessions")),
+    }
+    let held = if holders.is_empty() {
+        String::new()
+    } else {
+        format!(", held by {}", holders.join(", "))
+    };
+    format!(
+        "project browser concurrency limit reached: {used} of {limit} browser slots in use{held}; browser_manage op=stop with a session_id frees one"
+    )
+}
+
 fn validate_browser_page_url(value: &str) -> DomainResult<()> {
     if value == "about:blank" {
         return Ok(());
@@ -2188,7 +2220,18 @@ impl BrowserService {
         if active_for_project >= project.limits.max_concurrent_browsers {
             return Err(DomainError::new(
                 ErrorCode::ConcurrencyLimited,
-                "project browser concurrency limit reached",
+                concurrency_limit_message(
+                    project.limits.max_concurrent_browsers,
+                    runtimes
+                        .iter()
+                        .filter(|(_, runtime)| runtime.project_id == project_id)
+                        .map(|(id, runtime)| {
+                            (
+                                *id,
+                                runtime.profile.as_deref().filter(|_| runtime.persistent),
+                            )
+                        }),
+                ),
             ));
         }
         if persistent {
@@ -5756,6 +5799,20 @@ mod tests {
             "headers":[{"name":"x-test","value":"ok","extra":true}]
         }))
         .is_err());
+    }
+
+    #[test]
+    fn the_concurrency_limit_names_what_holds_the_slots() {
+        let message = concurrency_limit_message(
+            3,
+            [(9, None), (4, Some("default")), (7, Some("admin"))].into_iter(),
+        );
+        assert_eq!(
+            message,
+            "project browser concurrency limit reached: 3 of 3 browser slots in use, held by session 4 (profile default), session 7 (profile admin), 1 ephemeral session; browser_manage op=stop with a session_id frees one"
+        );
+        let message = concurrency_limit_message(2, [(1, None::<&str>), (2, None)].into_iter());
+        assert!(message.contains("2 of 2 browser slots in use, held by 2 ephemeral sessions;"));
     }
 
     #[test]

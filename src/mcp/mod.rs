@@ -510,6 +510,19 @@ fn request_rules_tool_def() -> Value {
     }"#).expect("request rules tool schema is valid JSON")
 }
 
+/// browser_start's browser profile and cookie profile. A cookie profile seeds
+/// the browser profile of the same name, so it also names the profile when
+/// none is given.
+fn browser_start_profiles(args: &Value) -> (&str, Option<&str>) {
+    let cookie_profile = args.get("cookie_profile").and_then(Value::as_str);
+    let profile = args
+        .get("profile")
+        .and_then(Value::as_str)
+        .or(cookie_profile)
+        .unwrap_or("default");
+    (profile, cookie_profile)
+}
+
 fn browser_input_tool_def() -> Value {
     let mut element = locator_schema();
     element["description"] = json!("Element to click, hover, drag from, or type into. One strategy: role/name, text, test_id, css. nth picks one match (0 first, -1 last); frame: iframe name or URL part. Omit to use x and y, or to type into the focused element.");
@@ -575,7 +588,7 @@ pub(crate) fn tool_defs() -> Value {
         {"name":"fuzz_manage","description":"List, inspect, cancel, group, diff, or page through fuzz jobs and cases. Case results include their saved exchange_id; exchange_get with exchange_ids reads several without replaying them. Pages fit the output budget: continue cases and group_cases with before_case_index=next_before_case_index, and groups (largest first) with offset=next_offset.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","get","cancel","cases","groups","group_cases","diff"]},"job_id":{"type":"integer"},"case_id":{"type":"integer"},"baseline_case_id":{"type":"integer"},"group_id":{"type":"string"},"include_text":{"type":"boolean","default":false},"limit":{"type":"integer","minimum":1,"maximum":500},"before_case_index":{"type":"integer","minimum":0},"offset":{"type":"integer","minimum":0,"description":"groups: next_offset from the previous page."},"wait_ms":{"type":"integer","minimum":0,"maximum":30000,"default":0,"description":"get: wait up to this long for the job to end instead of polling; returns as soon as it does."}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"websocket_manage","description":"List intercepted WebSocket connections and messages, read one message's whole payload, or inject a text/binary message into an active connection. messages lists the oldest first with the first 2 KB of each payload (payload_cut=true when there is more); pages fit the output budget, so continue with after_id=next_after_id while it is present. message reads one payload by message_id; continue at next_offset while truncated.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","messages","message","send"]},"connection_id":{"type":"integer","description":"Required for messages and send."},"after_id":{"type":"integer","description":"messages: list messages with a larger id; pass next_after_id."},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":250,"description":"Most connections or messages to list; a messages page may hold fewer to fit the output budget."},"message_id":{"type":"integer","description":"Required for message."},"offset":{"type":"integer","minimum":0,"default":0,"description":"message: payload byte to start at; pass next_offset."},"max_bytes":{"type":"integer","minimum":1,"maximum":exchange_view::MAX_PAGE_BYTES,"default":16384,"description":"message: most payload bytes to read; a page may hold fewer to fit the output budget."},"direction":{"type":"string","enum":["to_server","to_client"]},"encoding":{"type":"string","enum":["text","base64"],"description":"send: how payload is written (default text). message: how the page is written; by default text for UTF-8 payloads, base64 otherwise."},"payload":{"type":"string"}},"required":["project_id","action"],"additionalProperties":false}},
         {"name":"browser_profiles","description":"List, create, or delete named persistent Chromium identities for a project. default always exists and cannot be deleted. Deleting a named profile requires it to be stopped first.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"action":{"type":"string","enum":["list","create","delete"]},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Required for create and delete."}},"required":["project_id","action"],"additionalProperties":false}},
-        {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
+        {"name":"browser_start","description":"Start or resume a persistent Chromium identity. profile defaults to default; different profiles can stay open simultaneously and each returns its own session_id. Omitting cookie_profile preserves the browser jar without injecting project or named cookies. Pass a matching cookie_profile created by cookies(profile_name=...) to seed its cookie jar. A seed also writes any localStorage/sessionStorage saved with the cookie profile, on the main tab before the first navigation and without contacting the target, so token-based apps load authenticated; sessionStorage exists only on that tab, not in tabs opened later. Repeated unchanged seeds preserve newer browser cookies and storage; use refresh_cookies=true to explicitly reimport. An active matching profile is resumed without relaunching. Omit url to resume the selected profile's last page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer"},"profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","default":"default"},"cookie_profile":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Must match profile, which defaults to it. Seeds new or changed cookies and storage; unchanged seeds are not reimported unless refresh_cookies=true."},"refresh_cookies":{"type":"boolean","default":false,"description":"Requires matching cookie_profile; explicitly reimports it into this browser profile."},"url":{"type":"string","default":"about:blank","description":"Optional page to open. Omitted or about:blank resumes the selected profile's last page."}},"required":["project_id"],"additionalProperties":false}},
         {"name":"browser_action","description":"Navigate, inspect, or interact with an active browser session. Required project_id and session_id are integer IDs returned by projects and browser_start. For pages, supply op; select/close also require page_id and runtime_generation. For wait, supply for_what and value. For events with after_sequence greater than 0, supply the matching runtime_generation. Structured Playwright action. Use pages to list/select/open/close tabs and events to observe popups, dialogs, navigation, requests, console errors, and window messages. console, page_error and dialog events carry the first 1000 characters of their text. Page IDs and event cursors are valid only for their runtime_generation. request sends one same-origin request with the live browser cookie jar, disables redirects/retries, and returns a bounded base64 body preview; use history_search for saved proxy evidence. screenshot returns an MCP image. Prefer accessibility snapshots: scope large pages with locator or page with offset, and add snapshot:true to an interaction instead of a separate snapshot call. A locator's nth picks one of several matches and its frame acts inside an iframe; pages list names each page's frames. Use browser_input for mouse input at a point, hover, drag and typed keystrokes, and browser_evaluate to run JavaScript in the page.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"action":browser_action_schema()},"required":["project_id","session_id","action"],"additionalProperties":false}},
         {"name":"browser_evaluate","description":"Run JavaScript in the selected page of an active browser session and return its result. Use it to read page state and globals, call the application's own functions and APIs with the live session, or reach DOM that locators cannot; do not enable browser_cdp to script the page. expression runs in the page's main world as in the DevTools console: statements and top-level await work, declarations may be repeated between calls, a () => ... function source is called, and console helpers such as getEventListeners() and $$() are available. The page's CSP does not restrict it. frame runs it in one frame of the page instead, including cross-origin frames; browser_action pages lists them. data.content is the result: a string or DOM node (its outerHTML) as text, anything else as JSON; data.type names the JavaScript type, and a thrown exception is returned with type exception. content is cut to fit and then reports truncated with total_bytes, so return only what you need. Requests the page sends are captured in History like other browser traffic. Choose the tab with browser_action pages.","inputSchema":{"type":"object","properties":{"project_id":{"type":"integer","description":"Required integer ID returned by projects; owns session."},"session_id":{"type":"integer","description":"Required integer ID returned by browser_start."},"expression":{"type":"string","minLength":1,"maxLength":65536,"description":"JavaScript, at most 65536 bytes. The value of the last expression is returned, and a promise is awaited."},"frame":{"type":"string","minLength":1,"maxLength":2048,"description":"Frame name, or part of its URL, matching exactly one frame of the selected page. Omit for the page itself."},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000,"default":10000,"description":"Stop waiting after 1..30000 ms, default 10000; a running loop is terminated."}},"required":["project_id","session_id","expression"],"additionalProperties":false}},
         browser_input_tool_def(),
@@ -2459,11 +2472,7 @@ pub async fn call_tool(state: Arc<AppState>, name: &str, args: Value) -> DomainR
         }
         "browser_start" => {
             let project_id = require_project_id(&args)?;
-            let profile = args
-                .get("profile")
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            let cookie_profile = args.get("cookie_profile").and_then(Value::as_str);
+            let (profile, cookie_profile) = browser_start_profiles(&args);
             let url = args
                 .get("url")
                 .and_then(|v| v.as_str())
@@ -3479,6 +3488,26 @@ mod tests {
             })
         ));
         assert!(action(json!({"type": "evaluate"})).is_err());
+    }
+
+    #[test]
+    fn browser_start_uses_the_cookie_profile_as_the_profile_when_none_is_given() {
+        for (args, expected) in [
+            (json!({}), ("default", None)),
+            (json!({"profile": "alice"}), ("alice", None)),
+            (json!({"cookie_profile": "bob"}), ("bob", Some("bob"))),
+            (
+                json!({"profile": null, "cookie_profile": "bob"}),
+                ("bob", Some("bob")),
+            ),
+            // A mismatch is still passed on, so browser_start reports it.
+            (
+                json!({"profile": "alice", "cookie_profile": "bob"}),
+                ("alice", Some("bob")),
+            ),
+        ] {
+            assert_eq!(browser_start_profiles(&args), expected, "{args}");
+        }
     }
 
     #[test]

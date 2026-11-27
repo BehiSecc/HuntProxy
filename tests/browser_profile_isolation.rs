@@ -2558,6 +2558,24 @@ async fn verify_browser_resources(h: &Harness) {
         huntproxy::domain::ErrorCode::ConcurrencyLimited
     );
 
+    // It says what holds the slots and how to free one.
+    let (low, high) = (
+        first.id.get().min(second.id.get()),
+        first.id.get().max(second.id.get()),
+    );
+    let profile = |id| {
+        if id == first.id.get() {
+            "default"
+        } else {
+            "acc2"
+        }
+    };
+    let expected = format!(
+        "project browser concurrency limit reached: 2 of 2 browser slots in use, held by session {low} (profile {}), session {high} (profile {}); browser_manage op=stop with a session_id frees one",
+        profile(low),
+        profile(high)
+    );
+    assert!(denied.to_string().contains(&expected), "{denied}");
     let handed_off = h.service.enable_cdp(h.project, second.id).await.unwrap();
     let local = h.service.active_status(h.project).await.unwrap();
     assert!(!local.resources.cdp_port_in_use);
