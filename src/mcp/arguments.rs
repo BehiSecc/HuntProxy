@@ -50,6 +50,18 @@ pub(super) fn optional_u64(args: &Value, name: &str) -> DomainResult<Option<u64>
         .transpose()
 }
 
+/// Turns numeric strings in the named fields of `object` into numbers, for a
+/// typed parser that reads it next. Other values are left for that parser.
+pub(super) fn unquote_integers(object: &mut Value, fields: &[&str]) {
+    for field in fields {
+        if let Some(value @ Value::String(_)) = object.get_mut(*field) {
+            if let Some(number) = integer(value) {
+                *value = number.into();
+            }
+        }
+    }
+}
+
 pub(super) fn optional_bool(args: &Value, name: &str) -> DomainResult<Option<bool>> {
     present(args, name)
         .map(|value| {
@@ -64,6 +76,24 @@ pub(super) fn optional_bool(args: &Value, name: &str) -> DomainResult<Option<boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn quoted_integers_in_named_fields_become_numbers() {
+        let mut action = json!({"page_id": "7", "runtime_generation": 3, "after_sequence": "x",
+                                "url": "12", "limit": " 5 "});
+        unquote_integers(
+            &mut action,
+            &["page_id", "runtime_generation", "after_sequence", "gone"],
+        );
+        assert_eq!(
+            action,
+            json!({"page_id": 7, "runtime_generation": 3, "after_sequence": "x",
+                   "url": "12", "limit": " 5 "})
+        );
+        let mut text = json!("5");
+        unquote_integers(&mut text, &["page_id"]);
+        assert_eq!(text, json!("5"));
+    }
 
     #[test]
     fn booleans_must_be_booleans_and_null_is_absent() {

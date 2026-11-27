@@ -926,3 +926,132 @@ async fn reply_send_returns_response_headers_and_a_sized_preview_on_request() {
     assert!(!unsaved.to_string().contains("topsecret"));
     server.abort();
 }
+
+/// A server that answers one raw request with `ok` and returns its head.
+async fn one_shot_raw_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "the client closed before the headers ended");
+            received.extend_from_slice(&buffer[..read]);
+        }
+        // Whatever follows the headers is in flight with them.
+        while let Ok(Ok(read)) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            socket.read(&mut buffer),
+        )
+        .await
+        {
+            if read == 0 {
+                break;
+            }
+            received.extend_from_slice(&buffer[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        received
+    });
+    (address, server)
+}
+
+#[tokio::test]
+async fn reply_send_raw_and_browser_pages_read_null_and_quoted_options() {
+    let (address, server) = one_shot_raw_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+
+    // Null options are absent and quoted numbers are numbers.
+    let sent = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({
+            "project_id": project.to_string(), "target_url": format!("http://{address}/"),
+            "request": format!("GET / HTTP/1.1\r\nHost: {address}\r\n\r\n"),
+            "encoding": null, "tab_id": null, "use_project_cookies": null,
+            "upstream_proxy": null, "pause_at_byte": "5", "pause_ms": "10",
+            "await_response_before_continue": null, "half_close_write": null,
+            "response_mode": null, "read_timeout_ms": "5000", "idle_timeout_ms": null,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent["status_code"], 200);
+    assert!(server.await.unwrap().starts_with(b"GET / HTTP/1.1\r\n"));
+    let error = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({"project_id": project, "target_url": format!("http://{address}/"),
+               "request": "GET / HTTP/1.1\r\n\r\n", "pause_at_byte": "soon"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "pause_at_byte must be a non-negative integer"
+    );
+
+    // Page ids inside a browser action may be quoted as well.
+    let error = call_tool(
+        state.clone(),
+        "browser_action",
+        json!({"project_id": project, "session_id": 999_999,
+               "action": {"type": "pages", "op": "select", "page_id": "1",
+                          "runtime_generation": "1"}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("invalid type"), "{error}");
+}
+
+#[tokio::test]
+async fn reply_send_raw_injects_managed_cookies_into_bare_lf_requests() {
+    let (address, server) = one_shot_raw_server().await;
+    let (_directory, state, _) = test_state().await;
+    let project = project_for(&state, address).await;
+    call_tool(
+        state.clone(),
+        "cookies",
+        json!({"project_id": project, "action": "set",
+               "target_url": format!("http://{address}/"), "cookie": "sid=abc"}),
+    )
+    .await
+    .unwrap();
+
+    // Without a blank line ending the headers there is nothing to inject into.
+    let error = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({"project_id": project, "target_url": format!("http://{address}/"),
+               "request": format!("GET / HTTP/1.1\nHost: {address}"),
+               "use_project_cookies": true}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.to_string().contains("empty line"), "{error}");
+
+    // Bare LF headers are sent with CRLF and the cookie; the body is as given.
+    let sent = call_tool(
+        state.clone(),
+        "reply_send_raw",
+        json!({"project_id": project, "target_url": format!("http://{address}/"),
+               "request": format!("POST /x HTTP/1.1\nHost: {address}\nCookie: old=1\nContent-Length: 4\n\nli\nn"),
+               "use_project_cookies": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent["status_code"], 200);
+    let received = String::from_utf8(server.await.unwrap()).unwrap();
+    assert_eq!(
+        received,
+        format!("POST /x HTTP/1.1\r\nHost: {address}\r\nCookie: sid=abc\r\nContent-Length: 4\r\n\r\nli\nn")
+    );
+}
