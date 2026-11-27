@@ -204,13 +204,44 @@ async fn an_empty_and_query_names_the_terms_that_match_nothing_alone() {
 
     // Each term matches on its own: only the combination is empty.
     let result = search(&state, project_id, "path:/one method:POST").await;
-    assert_eq!(result, json!({"items": []}));
-    // A single term needs no hint.
-    let result = search(&state, project_id, "path:/missing").await;
-    assert_eq!(result, json!({"items": []}));
+    assert_eq!(
+        result,
+        json!({
+            "items": [],
+            "hint": "Each term matches some exchanges on its own, but no exchange matches all of them."
+        })
+    );
+    // A query of one term names it: the search itself checked it alone.
+    for q in [
+        "path:/missing",
+        "response:~nowhere",
+        "zzzz",
+        "NOT host:example.com",
+        "path:/missing OR method:PATCH",
+    ] {
+        let result = search(&state, project_id, q).await;
+        assert_eq!(result["items"], json!([]), "{q}");
+        if q.contains(" OR ") {
+            // OR queries are not checked branch by branch.
+            assert_eq!(result, json!({"items": []}), "{q}");
+        } else {
+            assert_eq!(result["no_match_terms"], json!([q]), "{q}");
+        }
+    }
     // Body searches are never checked on their own.
     let result = search(&state, project_id, "response:~nowhere path:/missing").await;
     assert_eq!(result["no_match_terms"], json!(["path:/missing"]));
+    assert!(result.get("hint").is_none());
+    let result = search(&state, project_id, "response:~nowhere path:/one").await;
+    assert_eq!(
+        result,
+        json!({
+            "items": [],
+            "hint": "Each term checked alone matches some exchanges; not checked alone: response:~nowhere."
+        })
+    );
+    let result = search(&state, project_id, "response:~nowhere request:~nothing").await;
+    assert_eq!(result, json!({"items": []}));
     // Quoted and bare terms are shown in query syntax.
     let result = search(&state, project_id, "path:~\"no such\" zzzz method:GET").await;
     assert_eq!(
@@ -293,6 +324,52 @@ async fn query_language_additions_find_the_expected_exchanges() {
         error.to_string().contains(r#"query:~"user_id=5""#),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn colon_comparisons_header_hints_and_null_arguments() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut small = exchange(project_id, "GET", "/small");
+    small.response_body = Some(vec![b'a'; 100]);
+    let small = state.db.insert_exchange(small).await.unwrap().get();
+    let mut large = exchange(project_id, "GET", "/large");
+    large.response_body = Some(vec![b'a'; 30_000]);
+    let large = state.db.insert_exchange(large).await.unwrap().get();
+    let project = project_id.get();
+
+    for (q, expected) in [
+        ("response_size:>25000", vec![large]),
+        ("response_size:<=25000", vec![small]),
+        ("time:>=2000-01-01T00:00:00Z", vec![large, small]),
+        ("time:<2000-01-01T00:00:00Z", vec![]),
+    ] {
+        assert_eq!(
+            item_ids(&search(&state, project_id, q).await),
+            expected,
+            "{q}"
+        );
+    }
+
+    // A header name used as a field points at the header search.
+    let error = call_tool(
+        state.clone(),
+        "history_search",
+        json!({"project_id": project, "q": "cache-control:~public"}),
+    )
+    .await
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains(r#"response:~"public""#), "{message}");
+    assert!(!message.contains("query:~"), "{message}");
+
+    // Clients that send every property send the unused ones as null.
+    let result = call(
+        &state,
+        "history_search",
+        json!({"project_id": project, "q": null, "limit": null, "cursor": null}),
+    )
+    .await;
+    assert_eq!(item_ids(&result), vec![large, small]);
 }
 
 #[tokio::test]

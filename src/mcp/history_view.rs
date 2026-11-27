@@ -9,8 +9,8 @@ use super::{
 use crate::app::AppState;
 use crate::domain::*;
 use crate::history::{
-    filter_to_text, parse_text_query, query_error, uses_body_search, validate_filter, FilterNode,
-    HISTORY_QUERY_SYNTAX,
+    filter_to_text, is_bare_word, parse_text_query, query_error, uses_body_search, validate_filter,
+    FilterNode, HISTORY_QUERY_SYNTAX,
 };
 use serde_json::{json, Map, Value};
 
@@ -40,7 +40,7 @@ async fn search_with_budget(
 ) -> DomainResult<Value> {
     let project_id = require_project_id(args)?;
     let query = match args.get("q") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(Value::String(query)) => Some(query.as_str()),
         Some(_) => {
             return Err(query_error(format!(
@@ -103,9 +103,12 @@ async fn search_with_budget(
         result.insert("searched_back_to".into(), json!(searched_back_to));
         result.insert("note".into(), json!(PARTIAL_NOTE));
     } else if let Some(filter) = filter.filter(|_| no_rows && first_page) {
-        let terms = no_match_terms(state, project_id, &filter).await?;
-        if !terms.is_empty() {
-            result.insert("no_match_terms".into(), json!(terms));
+        let explanation = explain_no_match(state, project_id, &filter).await?;
+        if !explanation.missing.is_empty() {
+            result.insert("no_match_terms".into(), json!(explanation.missing));
+        }
+        if let Some(hint) = explanation.hint {
+            result.insert("hint".into(), json!(hint));
         }
     }
     Ok(Value::Object(result))
@@ -121,35 +124,64 @@ fn history_cursor(summary: &ExchangeSummary) -> DomainResult<Value> {
     Ok(json!([started_at, summary.exchange_id]))
 }
 
-/// Top-level terms of an AND query that match no exchange on their own, found
-/// with single-row lookups. Body searches are skipped because each would scan
-/// decoded bodies.
-async fn no_match_terms(
+/// Why a first page matched nothing, found without a body search.
+struct NoMatch {
+    /// Terms that match no exchange on their own.
+    missing: Vec<String>,
+    /// Set when every term checked matches some exchanges alone.
+    hint: Option<String>,
+}
+
+/// A query that is one term and matched nothing names that term. Top-level
+/// terms of an AND query are checked alone with single-row lookups, except
+/// body searches, which would scan decoded bodies; OR queries are not checked.
+async fn explain_no_match(
     state: &AppState,
     project_id: ProjectId,
     filter: &FilterNode,
-) -> DomainResult<Vec<String>> {
-    let FilterNode::And { and: terms } = filter else {
-        return Ok(Vec::new());
+) -> DomainResult<NoMatch> {
+    let mut explanation = NoMatch {
+        missing: Vec::new(),
+        hint: None,
     };
-    if terms.len() < 2 {
-        return Ok(Vec::new());
-    }
-    let mut missing = Vec::new();
-    for term in terms
-        .iter()
-        .filter(|term| !uses_body_search(term))
-        .take(MAX_NO_MATCH_CHECKS)
-    {
+    let terms = match filter {
+        FilterNode::And { and } if and.len() >= 2 => and,
+        FilterNode::And { .. } => return Ok(explanation),
+        FilterNode::Or { .. } if !is_bare_word(filter) => return Ok(explanation),
+        // The search itself was this term alone.
+        single => {
+            explanation.missing.push(filter_to_text(single));
+            return Ok(explanation);
+        }
+    };
+    let mut unchecked = Vec::new();
+    let mut checked = 0;
+    for term in terms {
+        if uses_body_search(term) || checked == MAX_NO_MATCH_CHECKS {
+            unchecked.push(filter_to_text(term));
+            continue;
+        }
+        checked += 1;
         let (items, _) = state
             .db
             .list_history_filtered(project_id, Some(term.clone()), 1, None, None)
             .await?;
         if items.is_empty() {
-            missing.push(filter_to_text(term));
+            explanation.missing.push(filter_to_text(term));
         }
     }
-    Ok(missing)
+    if explanation.missing.is_empty() && checked > 0 {
+        explanation.hint = Some(if unchecked.is_empty() {
+            "Each term matches some exchanges on its own, but no exchange matches all of them."
+                .into()
+        } else {
+            format!(
+                "Each term checked alone matches some exchanges; not checked alone: {}.",
+                unchecked.join(", ")
+            )
+        });
+    }
+    Ok(explanation)
 }
 
 /// One JavaScript file before presentation; history and page loads share it.

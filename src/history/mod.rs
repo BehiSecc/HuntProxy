@@ -113,6 +113,12 @@ fn is_body_field(field: &str) -> bool {
     matches!(field, "request" | "response")
 }
 
+/// Whether `node` is the OR group a bare word such as `upload` expands to,
+/// which reads as one term.
+pub fn is_bare_word(node: &FilterNode) -> bool {
+    bare_word(node).is_some()
+}
+
 /// The word when `node` is the OR group a bare word expands to.
 fn bare_word(node: &FilterNode) -> Option<&serde_json::Value> {
     let FilterNode::Or { or } = node else {
@@ -256,18 +262,72 @@ fn unknown_field_error(field: &str, op: &str, value: &serde_json::Value) -> Doma
     let closest = closest_field(&lower)
         .map(|correct| format!("did you mean {correct}? "))
         .unwrap_or_default();
-    let value = match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+    let value = text_value(value);
+    let escape = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+    let suggestion = match header_side(&lower) {
+        // Header names and values are matched separately, so the hint
+        // searches for the value (or the name when there is none).
+        Some(side) => {
+            let other = if side == "request" {
+                "response"
+            } else {
+                "request"
+            };
+            let needle = escape(if value.is_empty() { field } else { &value });
+            format!("For a {side} header use {side}:~\"{needle}\" ({other}:~ for {other} headers).")
+        }
+        None => format!(
+            "For a URL parameter use query:~\"{}\".",
+            escape(&format!("{field}={value}"))
+        ),
     };
-    let parameter = format!("{field}={value}")
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
     query_error(format!(
-        "unknown filter field: {field}; {closest}For a URL parameter use query:~\"{parameter}\". Supported fields: {}",
+        "unknown filter field: {field}; {closest}{suggestion} Supported fields: {}",
         ALLOWED_FIELDS.join(", "),
     ))
+}
+
+/// Request header names agents filter on as if they were fields.
+const REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "authorization",
+    "cookie",
+    "origin",
+    "referer",
+    "user-agent",
+];
+
+/// Response header names agents filter on as if they were fields.
+const RESPONSE_HEADERS: &[&str] = &[
+    "age",
+    "cache-control",
+    "content-encoding",
+    "content-length",
+    "content-security-policy",
+    "etag",
+    "expires",
+    "last-modified",
+    "location",
+    "pragma",
+    "server",
+    "set-cookie",
+    "strict-transport-security",
+    "vary",
+    "via",
+    "www-authenticate",
+];
+
+/// The side whose headers a field named `name` (lowercase) most likely
+/// means, or None when it looks like a URL parameter instead.
+fn header_side(name: &str) -> Option<&'static str> {
+    if REQUEST_HEADERS.contains(&name) || ["sec-", "if-"].iter().any(|p| name.starts_with(p)) {
+        return Some("request");
+    }
+    let response_prefixes = ["access-control-", "content-", "cf-", "x-"];
+    (RESPONSE_HEADERS.contains(&name) || response_prefixes.iter().any(|p| name.starts_with(p)))
+        .then_some("response")
 }
 
 /// The supported field within two edits of `field`, for typos such as `stauts`.
@@ -874,13 +934,13 @@ impl QueryParser {
 
 fn parse_one_term(part: &str) -> Result<FilterNode, String> {
     if let Some((field, rest)) = part.split_once(">=") {
-        return Ok(term(field, "gte", rest));
+        return Ok(comparison(field, "gte", rest));
     }
     if let Some((field, rest)) = part.split_once("<=") {
-        return Ok(term(field, "lte", rest));
+        return Ok(comparison(field, "lte", rest));
     }
     if let Some((field, rest)) = part.split_once("!=") {
-        return Ok(term(field, "ne", rest));
+        return Ok(comparison(field, "ne", rest));
     }
     // `field=value` for a known field; any other `a=b` stays a bare word.
     if let Some((field, rest)) = part
@@ -890,10 +950,10 @@ fn parse_one_term(part: &str) -> Result<FilterNode, String> {
         return parse_one_term(&format!("{field}:{rest}"));
     }
     if let Some((field, rest)) = part.split_once('>') {
-        return Ok(term(field, "gt", rest));
+        return Ok(comparison(field, "gt", rest));
     }
     if let Some((field, rest)) = part.split_once('<') {
-        return Ok(term(field, "lt", rest));
+        return Ok(comparison(field, "lt", rest));
     }
     if let Some((field, rest)) = part.split_once(':') {
         if let Some(value) = rest.strip_prefix('~') {
@@ -916,6 +976,15 @@ fn parse_one_term(part: &str) -> Result<FilterNode, String> {
             .map(|field| term(field, "contains", part))
             .collect(),
     })
+}
+
+/// A comparison term; `time:>=X` reads as `time>=X`, as agents often write it.
+fn comparison(field: &str, op: &str, value: &str) -> FilterNode {
+    let field = field
+        .strip_suffix(':')
+        .filter(|field| ALLOWED_FIELDS.contains(field))
+        .unwrap_or(field);
+    term(field, op, value)
 }
 
 fn term(field: &str, op: &str, value: &str) -> FilterNode {
@@ -1179,6 +1248,42 @@ mod tests {
     }
 
     #[test]
+    fn unknown_header_fields_point_at_header_searches() {
+        let error = |input: &str| {
+            filter_to_sql(&parse_text_query(input).unwrap())
+                .unwrap_err()
+                .to_string()
+        };
+        for (input, expected) in [
+            (
+                "cache-control:~public",
+                r#"For a response header use response:~"public" (request:~ for request headers)."#,
+            ),
+            ("server:sffe", r#"response:~"sffe""#),
+            ("X-Frame-Options:DENY", r#"response:~"DENY""#),
+            (
+                "user-agent:~curl",
+                r#"For a request header use request:~"curl" (response:~ for response headers)."#,
+            ),
+            ("sec-fetch-site:none", r#"request:~"none""#),
+            ("set-cookie:*", r#"response:~"set-cookie""#),
+        ] {
+            let message = error(input);
+            assert!(message.contains(expected), "{input}: {message}");
+            assert!(!message.contains("query:~"), "{input}: {message}");
+        }
+        // URL-parameter-like names keep the query hint.
+        for (input, expected) in [
+            ("rpcids:X", r#"query:~"rpcids=X""#),
+            ("source-path:/a", r#"query:~"source-path=/a""#),
+        ] {
+            let message = error(input);
+            assert!(message.contains(expected), "{input}: {message}");
+            assert!(!message.contains("header"), "{input}: {message}");
+        }
+    }
+
+    #[test]
     fn filter_text_round_trips_through_the_parser() {
         for input in [
             "path:/foo",
@@ -1213,7 +1318,39 @@ mod tests {
     }
 
     #[test]
-    fn colon_comparison_errors_give_a_valid_field_specific_correction() {
+    fn a_colon_before_a_comparison_is_accepted() {
+        for (field, value) in [
+            ("time", "2026-11-24T06:30:00Z"),
+            ("status", "400"),
+            ("duration", "1000"),
+            ("request_size", "1024"),
+            ("response_size", "25000"),
+        ] {
+            for op in [">", ">=", "<", "<=", "!="] {
+                let with_colon = parse_text_query(&format!("{field}:{op}{value}")).unwrap();
+                let plain = parse_text_query(&format!("{field}{op}{value}")).unwrap();
+                assert_eq!(
+                    filter_to_sql(&with_colon).unwrap(),
+                    filter_to_sql(&plain).unwrap(),
+                    "{field}:{op}"
+                );
+                assert_eq!(filter_to_text(&with_colon), format!("{field}{op}{value}"));
+            }
+        }
+        // Fields without comparisons keep their own explanation.
+        for (input, expected) in [
+            ("request:>1", "use request:~text"),
+            ("label:>a", "label:reviewed"),
+        ] {
+            let error = filter_to_sql(&parse_text_query(input).unwrap()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{input}: {error}");
+        }
+        // An unknown field keeps its colon and its error.
+        assert!(filter_to_sql(&parse_text_query("size:>5").unwrap()).is_err());
+    }
+
+    #[test]
+    fn colon_comparison_errors_in_json_filters_give_a_valid_field_specific_correction() {
         for (field, value) in [
             ("time", "2026-10-12T00:00:00Z"),
             ("status", "400"),
@@ -1221,8 +1358,14 @@ mod tests {
             ("request_size", "1024"),
             ("response_size", "1024"),
         ] {
-            for op in [">", ">=", "<", "<=", "!="] {
-                let invalid = parse_text_query(&format!("{field}:{op}{value}")).unwrap();
+            for (op, name) in [
+                (">", "gt"),
+                (">=", "gte"),
+                ("<", "lt"),
+                ("<=", "lte"),
+                ("!=", "ne"),
+            ] {
+                let invalid = term(&format!("{field}:"), name, value);
                 let error = filter_to_sql(&invalid).unwrap_err();
                 assert_eq!(error.code(), crate::domain::ErrorCode::InvalidArgument);
                 let envelope = crate::domain::ErrorEnvelope::from(&error);
