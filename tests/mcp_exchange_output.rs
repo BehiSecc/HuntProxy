@@ -978,6 +978,94 @@ async fn read_all_pages(
 }
 
 #[tokio::test]
+async fn a_body_that_fails_to_decode_points_to_the_raw_read() {
+    let (_directory, state, project_id) = test_state().await;
+    let project = project_id.get();
+    let mut broken = exchange(project_id, "/broken");
+    broken.response_headers = vec![
+        header("Content-Type", "text/plain", 0),
+        header("Content-Encoding", "gzip", 1),
+    ];
+    broken.response_body = Some(b"not gzip at all".to_vec());
+    let id = insert(&state, broken).await;
+
+    // exchange_get still succeeds; the body carries the error and the way out.
+    let result = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": id}),
+    )
+    .await;
+    let message = result["response_body"]["error"].as_str().unwrap();
+    assert!(message.starts_with("gzip decode:"), "{message}");
+    assert!(
+        message.ends_with("; retry exchange_body with raw=true to read the stored bytes"),
+        "{message}"
+    );
+    assert_eq!(
+        result["request_body"],
+        json!({"text": r#"{"a":1}"#, "total": 7}),
+        "the request side is not decoded"
+    );
+    let batch = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_ids": [id]}),
+    )
+    .await;
+    assert_eq!(
+        batch["exchanges"][0]["response_body"]["error"],
+        result["response_body"]["error"]
+    );
+
+    // exchange_body fails with the same hint, whatever it was asked to do.
+    for args in [
+        json!({"project_id": project, "exchange_id": id}),
+        json!({"project_id": project, "exchange_id": id, "search": "gzip"}),
+        json!({"project_id": project, "exchange_id": id, "save": true}),
+    ] {
+        let error = call_err(&state, "exchange_body", args).await;
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error
+                .to_string()
+                .ends_with("; retry exchange_body with raw=true to read the stored bytes"),
+            "{error}"
+        );
+    }
+
+    // raw=true reads the stored bytes, and the hint's advice works.
+    let raw = call(
+        &state,
+        "exchange_body",
+        json!({"project_id": project, "exchange_id": id, "raw": true}),
+    )
+    .await;
+    assert_eq!(raw["preview"], "not gzip at all");
+
+    // An unsupported encoding gets the same advice; other errors are unchanged.
+    let mut unknown = exchange(project_id, "/unknown");
+    unknown.response_headers = vec![header("Content-Encoding", "x-custom", 0)];
+    let unknown_id = insert(&state, unknown).await;
+    let error = call_err(
+        &state,
+        "exchange_body",
+        json!({"project_id": project, "exchange_id": unknown_id}),
+    )
+    .await;
+    assert!(error.to_string().contains("unsupported content encoding"));
+    assert!(error.to_string().contains("raw=true"));
+    let error = call_err(
+        &state,
+        "exchange_body",
+        json!({"project_id": project, "exchange_id": 999_999}),
+    )
+    .await;
+    assert_eq!(error.code(), ErrorCode::NotFound);
+    assert!(!error.to_string().contains("raw=true"));
+}
+
+#[tokio::test]
 async fn exchange_body_pages_fit_the_budget_and_reassemble_exactly() {
     let (_directory, state, project_id) = test_state().await;
     let text = escape_heavy_text(100_000);

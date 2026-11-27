@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 const DEFAULT_INLINE_BODY_BYTES: u64 = 4096;
 pub(crate) const MAX_INLINE_BODY_BYTES: u64 = 16_384;
@@ -54,6 +55,8 @@ const COMPACT_HIDDEN_RESPONSE: [&str; 9] = [
 ];
 /// `headers: "compact"` keeps this many characters of a header value.
 const COMPACT_VALUE_CHARS: usize = 256;
+/// Appended to the error of a response body that could not be decoded.
+const RAW_BODY_HINT: &str = "retry exchange_body with raw=true to read the stored bytes";
 
 /// Representation and provenance values that most captures share.
 const DEFAULT_PROVENANCE: [(&str, &str); 4] = [
@@ -426,22 +429,58 @@ async fn load_exchange(
                 &detail.response_body_hash,
             ),
         ] {
-            let body = match state
-                .prepared_body(project_id, exchange_id, side, false)
-                .await
-            {
-                Ok(None) => continue,
-                Ok(Some(body)) if body.data.is_empty() => continue,
-                Ok(Some(body)) => {
-                    let hash = stored_hash.clone().unwrap_or_else(|| body.sha256.clone());
-                    inline_body(&body, body_bytes, hash)
-                }
-                Err(error) => InlineBody::Fixed(json!({ "error": error.to_string() })),
-            };
+            let body =
+                match prepared_body_with_hint(state, project_id, exchange_id, side, false).await {
+                    Ok(None) => continue,
+                    Ok(Some(body)) if body.data.is_empty() => continue,
+                    Ok(Some(body)) => {
+                        let hash = stored_hash.clone().unwrap_or_else(|| body.sha256.clone());
+                        inline_body(&body, body_bytes, hash)
+                    }
+                    Err(error) => InlineBody::Fixed(json!({ "error": error.to_string() })),
+                };
             bodies.push((key, body));
         }
     }
     Ok(LoadedExchange { head, bodies })
+}
+
+/// A response body that cannot be decoded fails with an invalid-argument or
+/// too-large error; its stored bytes stay readable with `raw=true`.
+fn with_raw_hint(error: DomainError) -> DomainError {
+    match error {
+        DomainError::App {
+            code: code @ (ErrorCode::InvalidArgument | ErrorCode::BodyTooLarge),
+            message,
+            details,
+        } if !message.contains("raw=true") => DomainError::App {
+            code,
+            message: format!("{message}; {RAW_BODY_HINT}"),
+            details,
+        },
+        error => error,
+    }
+}
+
+/// [`AppState::prepared_body`], where a response that fails to decode says
+/// how to read the stored bytes.
+async fn prepared_body_with_hint(
+    state: &AppState,
+    project_id: ProjectId,
+    exchange_id: ExchangeId,
+    side: MessageSide,
+    raw: bool,
+) -> DomainResult<Option<Arc<PreparedBody>>> {
+    state
+        .prepared_body(project_id, exchange_id, side, raw)
+        .await
+        .map_err(|error| {
+            if side == MessageSide::Response && !raw {
+                with_raw_hint(error)
+            } else {
+                error
+            }
+        })
 }
 
 fn inline_body(body: &PreparedBody, body_bytes: usize, hash: String) -> InlineBody {
@@ -637,9 +676,7 @@ pub(crate) async fn exchange_body(state: &AppState, args: &Value) -> DomainResul
         ));
     }
 
-    let Some(body) = state
-        .prepared_body(project_id, exchange_id, side, raw)
-        .await?
+    let Some(body) = prepared_body_with_hint(state, project_id, exchange_id, side, raw).await?
     else {
         return Ok(json!({ "available": false, "total": 0 }));
     };
@@ -1482,6 +1519,45 @@ mod tests {
             let error = header_mode(&json!({ "headers": bad })).unwrap_err();
             assert_eq!(error.code(), ErrorCode::InvalidArgument);
         }
+    }
+
+    #[test]
+    fn decode_failures_point_to_the_raw_read_once() {
+        for error in [
+            DomainError::invalid("gzip decode: invalid gzip header"),
+            DomainError::new(
+                ErrorCode::BodyTooLarge,
+                "decoded gzip body exceeds 10 bytes",
+            ),
+        ] {
+            let code = error.code();
+            let hinted = with_raw_hint(error);
+            assert_eq!(hinted.code(), code);
+            assert!(
+                hinted.to_string().ends_with(&format!("; {RAW_BODY_HINT}")),
+                "{hinted}"
+            );
+            // A message that already names raw=true is left alone.
+            let again = with_raw_hint(DomainError::invalid(hinted.to_string()));
+            assert_eq!(again.to_string(), hinted.to_string());
+        }
+        // Other failures keep their message and details.
+        for error in [
+            DomainError::not_found("exchange"),
+            DomainError::new(ErrorCode::StorageError, "disk full"),
+            DomainError::Other(anyhow::anyhow!("boom")),
+        ] {
+            let message = error.to_string();
+            assert_eq!(with_raw_hint(error).to_string(), message);
+        }
+        let DomainError::App { details, .. } = with_raw_hint(DomainError::with_details(
+            ErrorCode::InvalidArgument,
+            "zstd decode: bad frame",
+            json!({"encoding": "zstd"}),
+        )) else {
+            unreachable!();
+        };
+        assert_eq!(details, Some(json!({"encoding": "zstd"})));
     }
 
     #[test]
