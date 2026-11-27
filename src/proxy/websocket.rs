@@ -44,6 +44,7 @@ pub(super) async fn handle(
     mut request: Request<Incoming>,
     session: CaptureSession,
     forced_scheme: Option<&str>,
+    client: std::net::SocketAddr,
 ) -> DomainResult<Response<ProxyBody>> {
     let project = state.db.get_project(session.project_id).await?;
     let upgrade = hyper::upgrade::on(&mut request);
@@ -86,6 +87,7 @@ pub(super) async fn handle(
     let capture = url_is_in_scope(&http_url, &project.scope)?
         && !is_own_api_target(&target, state.config.api_listen);
     let dial = resolve_validated_dial(&http_url, &project.scope, Duration::from_secs(60)).await?;
+    super::refuse_own_api_dial_for_remote_client(client, &dial, state.config.api_listen)?;
     let upstream_proxy = state
         .db
         .resolve_upstream_proxy(
