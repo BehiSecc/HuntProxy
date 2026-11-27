@@ -2597,15 +2597,9 @@ async fn identity_selectors_reject_misplaced_fields_before_dispatch() {
         "insertion_points":[{"name":"month","location":"url"}],
         "wordlists":[["october"]]
     });
+    // The MCP reply_send and reply_tabs take a top-level identity as if it were
+    // in `draft`; see mcp_tools.rs. fuzz_start has no such leniency.
     for (tool, args) in [
-        (
-            "reply_send",
-            serde_json::json!({"project_id":project_id,"identity":selection}),
-        ),
-        (
-            "reply_tabs",
-            serde_json::json!({"project_id":project_id,"action":"create","identity":selection}),
-        ),
         (
             "fuzz_start",
             serde_json::json!({"project_id":project_id,"identity":selection,"template":template}),
