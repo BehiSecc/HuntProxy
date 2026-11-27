@@ -462,14 +462,16 @@ async function uploadFiles(session, action) {
     const waiting = new Promise((resolve, reject) => {
       onChooser = (event) => { chooser = event; resolve(event); };
       session.page.once("filechooser", onChooser);
-      timer = setTimeout(() => reject(rpcError(-32000, "upload file chooser timed out")), timeout);
+      timer = setTimeout(() => reject(rpcError(-32000, `upload file chooser did not open within ${timeout} ms; `
+        + "the locator must be the control that opens the file dialog, or target the input[type=file] itself without via_chooser")),
+      timeout);
     });
     try {
       click = locator.click({ timeout });
       const [event] = await Promise.all([waiting, click]);
       clearTimeout(timer);
       const remaining = timeout - (Date.now() - started);
-      if (remaining <= 0) throw rpcError(-32000, "upload file chooser timed out");
+      if (remaining <= 0) throw rpcError(-32000, `upload file chooser timed out after ${timeout} ms`);
       await event.setFiles(files, { timeout: remaining });
     } finally {
       clearTimeout(timer);
@@ -1674,7 +1676,7 @@ function childFrames(page) {
   return page.frames().filter((frame) => frame !== page.mainFrame() && !frame.isDetached());
 }
 
-async function performWait(page, forWhat, value) {
+async function performWait(page, forWhat, value, timeout) {
   switch (forWhat) {
     case "timeout": {
       const milliseconds = Number(value);
@@ -1685,16 +1687,16 @@ async function performWait(page, forWhat, value) {
       return { waited_ms: milliseconds };
     }
     case "url":
-      await page.waitForURL(value, { timeout: 30_000 });
+      await page.waitForURL(value, { timeout });
       return { url: page.url() };
     case "selector":
-      await page.locator(value).waitFor({ state: "visible", timeout: 30_000 });
+      await page.locator(value).waitFor({ state: "visible", timeout });
       return { selector: value, state: "visible" };
     case "text":
-      await page.getByText(value).first().waitFor({ state: "visible", timeout: 30_000 });
+      await page.getByText(value).first().waitFor({ state: "visible", timeout });
       return { text: value, state: "visible" };
     case "load_state":
-      await page.waitForLoadState(value || "domcontentloaded", { timeout: 30_000 });
+      await page.waitForLoadState(value || "domcontentloaded", { timeout });
       return { load_state: value || "domcontentloaded" };
     default:
       throw rpcError(-32602, "wait for_what must be timeout|url|selector|text|load_state");
@@ -1737,7 +1739,7 @@ function requireRuntimeGeneration(session, value) {
 }
 
 async function performPages(session, action) {
-  const op = String(action.op || "");
+  const op = String(action.op ?? "list");
   if (op === "list") {
     return { message: "browser pages listed", data: {
       runtime_generation: session.runtimeGeneration,
@@ -1936,12 +1938,15 @@ async function browserRequestInIsolatedWorld(request) {
         method: request.method,
         headers: request.headers,
         credentials: "include",
-        redirect: "error",
+        // "manual" stops at a redirect without following it; page fetch then
+        // reports it as an opaque response with no status or body.
+        redirect: request.follow_redirects ? "follow" : "manual",
         signal: controller.signal,
       };
       if (request.body_text !== null) options.body = request.body_text;
       if (request.body_base64 !== null) options.body = decodeBase64(request.body_base64);
       const response = await fetch(request.url, options);
+      if (response.type === "opaqueredirect") return { huntproxy_error: "redirect" };
       const chunks = [];
       let kept = 0;
       let received = 0;
@@ -2026,6 +2031,7 @@ async function performBrowserRequest(session, action) {
     body_base64: action.body_base64 ?? null,
     timeout_ms: timeoutMs,
     max_response_bytes: maxResponseBytes,
+    follow_redirects: action.follow_redirects === true,
   };
   const connection = await session.context.newCDPSession(page);
   let result;
@@ -2057,8 +2063,12 @@ async function performBrowserRequest(session, action) {
   if (result.huntproxy_error === "timeout") {
     throw rpcError(-32000, "browser request timed out; it was not retried");
   }
+  if (result.huntproxy_error === "redirect") {
+    throw rpcError(-32000, "browser request got a redirect, which page fetch cannot expose; pass follow_redirects:true "
+      + "to follow it, or find the 3xx response in history_search or resend it with reply_send");
+  }
   if (result.huntproxy_error) {
-    throw rpcError(-32000, "browser request failed; redirects are disabled and it was not retried");
+    throw rpcError(-32000, "browser request failed without a response (network error, CORS or CSP); it was not retried");
   }
   return { message: "browser request completed", data: result };
 }
@@ -2177,14 +2187,15 @@ async function performSnapshot(session, page, action) {
     throw rpcError(-32602, "snapshot offset must be a non-negative integer");
   }
   const maxBytes = Math.max(1, Math.min(Number(action.max_bytes) || MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES));
+  const timeout = actionTimeout(action, NAVIGATION_TIMEOUT_MS);
   let content;
   if (!action.locator) {
-    content = format === "dom" ? await page.content() : await page.locator("body").ariaSnapshot();
+    content = format === "dom" ? await page.content() : await page.locator("body").ariaSnapshot({ timeout });
   } else if (format === "dom") {
     content = await evaluateElement(session, page, locatorFor(page, action.locator),
-      (element) => element.outerHTML, 30_000);
+      (element) => element.outerHTML, timeout);
   } else {
-    content = await locatorFor(page, action.locator).ariaSnapshot({ timeout: 30_000 });
+    content = await locatorFor(page, action.locator).ariaSnapshot({ timeout });
   }
   return { message: "snapshot captured", data: { format, ...snapshotSlice(content, offset, maxBytes) } };
 }
@@ -2497,14 +2508,15 @@ const SNAPSHOT_AFTER_ACTIONS = new Set([
 // Playwright has waited for any navigation the action started to commit, and
 // this waits for its DOM like navigate does. A failure is reported beside the
 // action result, which already happened and must not look failed.
-async function snapshotAfterAction(session) {
+// `maxBytes` bounds it as the snapshot action's max_bytes does.
+async function snapshotAfterAction(session, maxBytes) {
   try {
     const page = await activePage(session);
     for (let attempt = 1; ; attempt += 1) {
       await page.waitForLoadState("domcontentloaded", { timeout: 30_000 });
       try {
         const content = await page.locator("body").ariaSnapshot({ timeout: 30_000 });
-        return snapshotSlice(content, 0, MAX_SNAPSHOT_BYTES);
+        return snapshotSlice(content, 0, Math.max(1, Math.min(Number(maxBytes) || MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_BYTES)));
       } catch (error) {
         // A navigation can replace the document during the capture; retry once on the new one.
         if (attempt > 1 || !/context was destroyed|navigat/i.test(String(error?.message))) throw error;
@@ -2532,14 +2544,14 @@ function pointerPoint(x, y, label) {
 
 // Where a pointer action aims: the point given, or the centre of the element
 // a locator resolves to once it has been scrolled into view.
-async function pointerTarget(page, locator, point, label, scroll = true) {
+async function pointerTarget(page, locator, point, label, scroll, timeout) {
   if (Boolean(locator) === Boolean(point)) {
     throw rpcError(-32602, `${label} requires either a locator or x and y`);
   }
   if (point) return point;
   const element = locatorFor(page, locator);
-  if (scroll) await element.scrollIntoViewIfNeeded({ timeout: 30_000 });
-  const box = await element.boundingBox({ timeout: 30_000 });
+  if (scroll) await element.scrollIntoViewIfNeeded({ timeout });
+  const box = await element.boundingBox({ timeout });
   if (!box) throw rpcError(-32000, `${label} element is not visible`);
   return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
 }
@@ -2616,6 +2628,7 @@ async function performPointer(page, action) {
   const button = action.button ?? "left";
   const count = action.count ?? 1;
   const modifiers = action.modifiers ?? [];
+  const timeout = actionTimeout(action, LOCATOR_TIMEOUT_MS);
   if (!POINTER_BUTTONS.has(button) || !Number.isInteger(count) || count < 1 || count > 3
       || !Array.isArray(modifiers) || modifiers.some((key) => !POINTER_MODIFIERS.has(key))) {
     throw rpcError(-32602,
@@ -2635,7 +2648,7 @@ async function performPointer(page, action) {
       // An element gets Playwright's actionability checks; a point is clicked
       // as it is, and the result names what it landed on.
       if (action.locator) {
-        await locatorFor(page, action.locator).click({ button, clickCount: count, modifiers, timeout: 30_000 });
+        await locatorFor(page, action.locator).click({ button, clickCount: count, modifiers, timeout });
         return { message: "pointer clicked", data: { url: page.url() } };
       }
       {
@@ -2649,7 +2662,7 @@ async function performPointer(page, action) {
       if (Boolean(action.locator) === Boolean(point)) {
         throw rpcError(-32602, "pointer hover requires either a locator or x and y");
       }
-      if (action.locator) await locatorFor(page, action.locator).hover({ modifiers, timeout: 30_000 });
+      if (action.locator) await locatorFor(page, action.locator).hover({ modifiers, timeout });
       else await holdingModifiers(page, modifiers, () => page.mouse.move(point.x, point.y));
       return { message: "pointer moved", data: null };
     case "drag": {
@@ -2659,11 +2672,11 @@ async function performPointer(page, action) {
       // lies under it: with a point at either end nothing is scrolled, and an
       // element end has to be in view already.
       const scroll = !point && !destination;
-      let from = await pointerTarget(page, action.locator, point, "pointer drag", scroll);
-      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination", scroll);
+      let from = await pointerTarget(page, action.locator, point, "pointer drag", scroll, timeout);
+      const to = await pointerTarget(page, action.to_locator, destination, "pointer drag destination", scroll, timeout);
       if (scroll) {
         // Bringing the destination into view may have moved the source.
-        from = await pointerTarget(page, action.locator, point, "pointer drag", false);
+        from = await pointerTarget(page, action.locator, point, "pointer drag", false, timeout);
       }
       if (action.locator || action.to_locator) {
         const view = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
@@ -2703,8 +2716,9 @@ async function performType(page, action) {
     throw rpcError(-32602, `type requires text of 1..${MAX_TYPE_BYTES} bytes`);
   }
   if (action.locator) {
+    const timeout = actionTimeout(action, LOCATOR_TIMEOUT_MS);
     const element = locatorFor(page, action.locator);
-    await element.focus({ timeout: 30_000 });
+    await element.focus({ timeout });
     // Focusing leaves the caret at the start of what a field holds; a person
     // clicking in to add text puts it at the end, and so does this.
     const placed = await element.evaluate((node) => {
@@ -2727,7 +2741,7 @@ async function performType(page, action) {
         // value, so those keep the caret where focus put it.
         return node.type !== "email" && node.type !== "number";
       }
-    }, undefined, { timeout: 30_000 });
+    }, undefined, { timeout });
     if (!placed) await page.keyboard.press("End");
   }
   // One character at a time, so a page whose key handlers are slow is given
@@ -2749,15 +2763,68 @@ const PAGE_ACTIONS = new Set([
   "pointer", "type", "scroll", "screenshot", "press", "wait", "back", "forward",
 ]);
 
-// Playwright's own text for a locator that matches several elements lists
-// them; say how to choose one instead of the call log that follows.
+const LOCATOR_TIMEOUT_MS = 10_000;
+const NAVIGATION_TIMEOUT_MS = 30_000;
+const CALL_LOG_LINES = 4;
+
+// The action's timeout_ms, or `fallback` when it has none.
+function actionTimeout(action, fallback) {
+  const timeout = action.timeout_ms ?? fallback;
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 30_000) {
+    throw rpcError(-32602, "timeout_ms must be 1..30000");
+  }
+  return timeout;
+}
+
+// Playwright options for navigate, back and forward.
+function navigation(action) {
+  const waitUntil = action.wait_until ?? "domcontentloaded";
+  if (!["load", "domcontentloaded", "networkidle"].includes(waitUntil)) {
+    throw rpcError(-32602, "wait_until must be load|domcontentloaded|networkidle");
+  }
+  return { waitUntil, timeout: actionTimeout(action, NAVIGATION_TIMEOUT_MS) };
+}
+
+// Playwright follows a failed locator action with a call log that repeats
+// every retry. Say what went wrong and what to do about it instead, keeping
+// only the first lines of the log.
 function actionError(error, action) {
-  const message = String(error?.message || "");
-  if (Number.isSafeInteger(error?.code) || !message.includes("strict mode violation")
-      || !(action.locator || action.to_locator)) {
+  // Playwright dims its call log with terminal escapes.
+  const message = String(error?.message || "").replace(/\x1b\[[0-9;]*m/g, "");
+  const located = action.locator || action.to_locator
+    || (action.type === "wait" && ["selector", "text"].includes(action.for_what));
+  if (Number.isSafeInteger(error?.code) || !located) return error;
+  const [head, log = ""] = message.split("\nCall log:");
+  const summary = head.trimEnd();
+  const lines = log.split("\n").map((line) => line.trim().replace(/^-\s*/, "")).filter(Boolean);
+  const target = lines.find((line) => line.startsWith("waiting for "))?.slice("waiting for ".length)
+    .replace(/ to be (?:visible|hidden|attached|detached)$/, "")
+    ?? JSON.stringify(action.locator || action.to_locator || action.value);
+  const milliseconds = Number(/Timeout (\d+)ms exceeded/.exec(summary)?.[1] ?? action.timeout_ms);
+  const blocker = lines.find((line) => line.endsWith(" intercepts pointer events"));
+  let text;
+  if (message.includes("strict mode violation") && (action.locator || action.to_locator)) {
+    text = `${summary}\nSet nth on the locator to pick one of them: 0 is the first, -1 the last.`;
+  } else if (message.includes("Element is not a <select> element")) {
+    text = `${summary}\nThis is not a native <select>, so it is probably a custom listbox: click it, then click the option.`;
+  } else if (message.includes("Node is not an HTMLInputElement")) {
+    text = `${summary}\nupload sets files on an input[type=file]: target that input, even when it is hidden, `
+      + "or pass via_chooser:true to click the control that opens the file dialog.";
+  } else if (blocker) {
+    const element = blocker.slice(0, -" intercepts pointer events".length).slice(0, 300);
+    // A forced click would land on that element too: real input goes to
+    // whatever is on top. Only a click dispatched to the element reaches it.
+    text = `${target} was found, but ${element} intercepts pointer events, so the click could not land`
+      + `${milliseconds ? ` within ${milliseconds} ms` : ""}. Close the overlay first (press Escape or click its close control), `
+      + "or click the element itself from browser_evaluate with element.click().";
+  } else if (/Timeout \d+ms exceeded/.test(summary) && !lines.some((line) => line.includes("resolved to"))) {
+    text = `no element matched ${target} within ${milliseconds} ms; take a snapshot to see what is on the page`;
+  } else if (lines.length) {
+    text = `${summary}\nCall log:\n${lines.slice(0, CALL_LOG_LINES).map((line) => `  - ${line}`).join("\n")}`;
+  } else {
     return error;
   }
-  return rpcError(-32000, `${message.split("\nCall log:")[0].trimEnd()}\nSet nth on the locator to pick one of them: 0 is the first, -1 the last.`);
+  return rpcError(-32000, text);
 }
 
 const FRAME_WAIT_MS = 5_000;
@@ -2782,11 +2849,18 @@ async function executeAction(session, action = {}) {
   } catch (error) {
     throw actionError(error, action);
   }
+  // A fixed pause for what the action set off, such as a page that renders
+  // after a click, instead of a separate wait action.
+  if (action.wait_ms > 0 && WAIT_AFTER_ACTIONS.has(action.type)) {
+    await new Promise((resolve) => setTimeout(resolve, action.wait_ms));
+  }
   if (action.snapshot === true && SNAPSHOT_AFTER_ACTIONS.has(action.type)) {
-    result.data = { ...result.data, snapshot: await snapshotAfterAction(session) };
+    result.data = { ...result.data, snapshot: await snapshotAfterAction(session, action.max_bytes) };
   }
   return result;
 }
+
+const WAIT_AFTER_ACTIONS = new Set(["navigate", "click", "fill", "select", "press", "type", "back", "forward"]);
 
 async function performAction(session, action) {
   const page = await activePage(session);
@@ -2797,23 +2871,20 @@ async function performAction(session, action) {
   await awaitNamedFrames(page, action);
   switch (action.type) {
     case "navigate": {
-      const response = await navigateWithProxyCheck(page, () => page.goto(action.url, {
-        waitUntil: "domcontentloaded",
-        timeout: 30_000,
-      }));
+      const response = await navigateWithProxyCheck(page, () => page.goto(action.url, navigation(action)));
       await reconcileCurrentOriginStorage(session);
       return { message: "navigation completed", data: { url: page.url(), status: response?.status() ?? null } };
     }
     case "snapshot":
       return performSnapshot(session, page, action);
     case "click":
-      await locatorFor(page, action.locator).click({ timeout: 30_000 });
+      await locatorFor(page, action.locator).click({ timeout: actionTimeout(action, LOCATOR_TIMEOUT_MS) });
       return { message: "element clicked", data: { url: page.url() } };
     case "fill":
-      await locatorFor(page, action.locator).fill(action.value ?? "", { timeout: 30_000 });
+      await locatorFor(page, action.locator).fill(action.value ?? "", { timeout: actionTimeout(action, LOCATOR_TIMEOUT_MS) });
       return { message: "field filled", data: null };
     case "select":
-      await locatorFor(page, action.locator).selectOption(action.value, { timeout: 30_000 });
+      await locatorFor(page, action.locator).selectOption(action.value, { timeout: actionTimeout(action, LOCATOR_TIMEOUT_MS) });
       return { message: "option selected", data: null };
     case "upload":
       return uploadFiles(session, action);
@@ -2837,7 +2908,7 @@ async function performAction(session, action) {
       return performBrowserRequest(session, action);
     case "press":
       if (action.locator) {
-        await locatorFor(page, action.locator).press(action.key, { timeout: 30_000 });
+        await locatorFor(page, action.locator).press(action.key, { timeout: actionTimeout(action, LOCATOR_TIMEOUT_MS) });
       } else {
         await page.keyboard.press(action.key);
       }
@@ -2845,15 +2916,15 @@ async function performAction(session, action) {
     case "wait":
       return {
         message: "wait completed",
-        data: await performWait(page, action.for_what, action.value),
+        data: await performWait(page, action.for_what, action.value, actionTimeout(action, NAVIGATION_TIMEOUT_MS)),
       };
     case "back": {
-      const response = await navigateWithProxyCheck(page, () => page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }));
+      const response = await navigateWithProxyCheck(page, () => page.goBack(navigation(action)));
       await reconcileCurrentOriginStorage(session);
       return { message: "went back", data: { url: page.url(), status: response?.status() ?? null } };
     }
     case "forward": {
-      const response = await navigateWithProxyCheck(page, () => page.goForward({ waitUntil: "domcontentloaded", timeout: 30_000 }));
+      const response = await navigateWithProxyCheck(page, () => page.goForward(navigation(action)));
       await reconcileCurrentOriginStorage(session);
       return { message: "went forward", data: { url: page.url(), status: response?.status() ?? null } };
     }

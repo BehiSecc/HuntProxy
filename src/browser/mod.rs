@@ -316,6 +316,25 @@ fn cookie_seed_hash(cookies: &[Value], origins: &[StorageOrigin]) -> DomainResul
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Settings the page interactions share. Each is optional, and the worker
+/// applies the action's own default when one is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionOptions {
+    /// How long to wait for the locator, navigation or condition: 1..30000
+    /// ms, by default 10000 for an element and 30000 for a navigation or wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// A pause after the action, before the result and its snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+    /// Bounds the `snapshot: true` result as the snapshot action's does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// When a navigation counts as done: load, domcontentloaded or networkidle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_until: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserAction {
@@ -324,6 +343,8 @@ pub enum BrowserAction {
         /// Also return the resulting page's accessibility snapshot.
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Snapshot {
         #[serde(default = "default_snapshot_format")]
@@ -336,23 +357,31 @@ pub enum BrowserAction {
         offset: u64,
         /// Captures only this element's subtree.
         locator: Option<Locator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     Click {
         locator: Locator,
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Fill {
         locator: Locator,
         value: String,
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Select {
         locator: Locator,
         value: String,
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Upload {
         locator: Locator,
@@ -394,6 +423,8 @@ pub enum BrowserAction {
         modifiers: Vec<String>,
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     /// Sends text as keystrokes to `locator`, or to whatever has focus.
     Type {
@@ -401,8 +432,12 @@ pub enum BrowserAction {
         locator: Option<Locator>,
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Pages {
+        /// `list` when omitted.
+        #[serde(default = "default_pages_op")]
         op: String,
         page_id: Option<u64>,
         runtime_generation: Option<u64>,
@@ -444,26 +479,37 @@ pub enum BrowserAction {
         timeout_ms: u64,
         #[serde(default = "default_browser_request_response_bytes")]
         max_response_bytes: u64,
+        /// Follows a redirect instead of failing on it; sent once either way.
+        #[serde(default)]
+        follow_redirects: bool,
     },
     Press {
         locator: Option<Locator>,
         key: String,
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Wait {
         for_what: String,
         value: String,
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Back {
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Forward {
         #[serde(default)]
         snapshot: bool,
+        #[serde(flatten)]
+        options: InteractionOptions,
     },
     Close,
 }
@@ -480,10 +526,99 @@ impl BrowserAction {
             | Self::Wait { snapshot, .. }
             | Self::Pointer { snapshot, .. }
             | Self::Type { snapshot, .. }
-            | Self::Back { snapshot }
-            | Self::Forward { snapshot } => *snapshot,
+            | Self::Back { snapshot, .. }
+            | Self::Forward { snapshot, .. } => *snapshot,
             _ => false,
         }
+    }
+
+    /// The shared interaction settings, for the actions that take them.
+    fn options(&self) -> Option<&InteractionOptions> {
+        match self {
+            Self::Navigate { options, .. }
+            | Self::Click { options, .. }
+            | Self::Fill { options, .. }
+            | Self::Select { options, .. }
+            | Self::Press { options, .. }
+            | Self::Wait { options, .. }
+            | Self::Pointer { options, .. }
+            | Self::Type { options, .. }
+            | Self::Back { options, .. }
+            | Self::Forward { options, .. } => Some(options),
+            _ => None,
+        }
+    }
+
+    fn options_mut(&mut self) -> Option<&mut InteractionOptions> {
+        match self {
+            Self::Navigate { options, .. }
+            | Self::Click { options, .. }
+            | Self::Fill { options, .. }
+            | Self::Select { options, .. }
+            | Self::Press { options, .. }
+            | Self::Wait { options, .. }
+            | Self::Pointer { options, .. }
+            | Self::Type { options, .. }
+            | Self::Back { options, .. }
+            | Self::Forward { options, .. } => Some(options),
+            _ => None,
+        }
+    }
+
+    /// Shared settings this action was given but does not use.
+    fn unused_options(&self) -> Vec<&'static str> {
+        let Some(options) = self.options() else {
+            return Vec::new();
+        };
+        let navigation = matches!(
+            self,
+            Self::Navigate { .. } | Self::Back { .. } | Self::Forward { .. }
+        );
+        let waits_after = !matches!(self, Self::Wait { .. } | Self::Pointer { .. });
+        [
+            ("wait_ms", options.wait_ms.is_some() && !waits_after),
+            (
+                "max_bytes",
+                options.max_bytes.is_some() && !self.wants_snapshot(),
+            ),
+            ("wait_until", options.wait_until.is_some() && !navigation),
+        ]
+        .into_iter()
+        .filter_map(|(name, unused)| unused.then_some(name))
+        .collect()
+    }
+
+    /// Reads an action as agents send it. A null option is the same as an
+    /// absent one, and an option this action does not take is named in the
+    /// returned list instead of failing the call or vanishing: `op` naming the
+    /// action's own type and `snapshot` on a snapshot action are accepted as
+    /// they are.
+    pub fn from_agent_input(value: Value) -> DomainResult<(Self, Vec<String>)> {
+        let Value::Object(mut fields) = value else {
+            return Err(DomainError::invalid("action must be an object"));
+        };
+        fields.retain(|_, value| !value.is_null());
+        let action: Self = serde_json::from_value(Value::Object(fields.clone()))
+            .map_err(|error| DomainError::invalid(error.to_string()))?;
+        // Every field the action read is serialized back, so what is missing
+        // there was not read.
+        let read = serde_json::to_value(&action)
+            .map_err(|error| DomainError::new(ErrorCode::Internal, error.to_string()))?;
+        let kind = fields.get("type").cloned().unwrap_or(Value::Null);
+        let mut ignored = fields
+            .iter()
+            .filter(|(name, value)| {
+                read.get(name.as_str()).is_none()
+                    && !(name.as_str() == "op" && **value == kind)
+                    && !(name.as_str() == "snapshot" && kind == "snapshot")
+            })
+            .map(|(name, _)| name.chars().take(64).collect::<String>())
+            .collect::<Vec<_>>();
+        ignored.extend(action.unused_options().into_iter().map(String::from));
+        ignored.sort();
+        ignored.dedup();
+        ignored.truncate(MAX_IGNORED_OPTIONS);
+        Ok((action, ignored))
     }
 
     /// Every locator the action carries.
@@ -516,6 +651,13 @@ impl BrowserAction {
 fn default_browser_action_timeout() -> u64 {
     10_000
 }
+
+fn default_pages_op() -> String {
+    "list".into()
+}
+
+/// The most option names an action result lists as ignored.
+const MAX_IGNORED_OPTIONS: usize = 16;
 
 fn default_pointer_button() -> String {
     "left".into()
@@ -583,6 +725,30 @@ fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
         {
             return Err(DomainError::invalid(
                 "locator nth must be -1000000..1000000",
+            ));
+        }
+    }
+    let timeout_ms = match action {
+        BrowserAction::Snapshot { timeout_ms, .. } => *timeout_ms,
+        _ => action.options().and_then(|options| options.timeout_ms),
+    };
+    if timeout_ms.is_some_and(|timeout| !(1..=30_000).contains(&timeout)) {
+        return Err(DomainError::invalid("timeout_ms must be 1..30000"));
+    }
+    if let Some(options) = action.options() {
+        if options.wait_ms.is_some_and(|wait| wait > 30_000) {
+            return Err(DomainError::invalid("wait_ms must be 0..30000"));
+        }
+        if options.max_bytes == Some(0) {
+            return Err(DomainError::invalid("max_bytes must be at least 1"));
+        }
+        if options
+            .wait_until
+            .as_deref()
+            .is_some_and(|wait| !matches!(wait, "load" | "domcontentloaded" | "networkidle"))
+        {
+            return Err(DomainError::invalid(
+                "wait_until must be load|domcontentloaded|networkidle",
             ));
         }
     }
@@ -808,6 +974,7 @@ fn validate_browser_action(action: &BrowserAction) -> DomainResult<()> {
             body_base64,
             timeout_ms,
             max_response_bytes,
+            ..
         } => {
             let method = method.to_ascii_uppercase();
             if !matches!(
@@ -1153,6 +1320,9 @@ pub struct ActionResult {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserActionContext>,
+    /// Options the action was given but does not use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_options: Vec<String>,
 }
 
 /// Result of a bounded, host-owned cross-site navigation template. Secret
@@ -3242,10 +3412,26 @@ impl BrowserService {
         session_id: BrowserSessionId,
         action: BrowserAction,
     ) -> DomainResult<ActionResult> {
+        self.action_with_ignored_options(project_id, session_id, action, Vec::new())
+            .await
+    }
+
+    /// [`Self::action`] for an action read by [`BrowserAction::from_agent_input`]:
+    /// the result lists the options it ignored.
+    pub async fn action_with_ignored_options(
+        &self,
+        project_id: ProjectId,
+        session_id: BrowserSessionId,
+        action: BrowserAction,
+        ignored_options: Vec<String>,
+    ) -> DomainResult<ActionResult> {
         validate_browser_action(&action)?;
         let mut action = action;
         if let BrowserAction::Snapshot { max_bytes, .. } = &mut action {
             *max_bytes = (*max_bytes).min(MAX_SNAPSHOT_BYTES);
+        }
+        if let Some(options) = action.options_mut() {
+            options.max_bytes = options.max_bytes.map(|bytes| bytes.min(MAX_SNAPSHOT_BYTES));
         }
         if matches!(&action, BrowserAction::Close) {
             self.stop(project_id, session_id).await?;
@@ -3255,6 +3441,7 @@ impl BrowserService {
                 message: "session closed".into(),
                 data: None,
                 browser: None,
+                ignored_options,
             });
         }
         let operation_lock = self.session_operation_lock(session_id).await;
@@ -3410,6 +3597,7 @@ impl BrowserService {
                         format!("invalid browser action context: {error}"),
                     )
                 })?,
+            ignored_options,
         };
         fit_action_result(&action, &mut action_result)?;
         Ok(action_result)
@@ -5378,7 +5566,9 @@ mod tests {
                 max_bytes,
                 offset,
                 locator,
+                timeout_ms,
             } => {
+                assert!(timeout_ms.is_none());
                 assert_eq!(format, "accessibility");
                 assert_eq!(max_bytes, 24_000);
                 assert_eq!(offset, 0);
@@ -5431,6 +5621,7 @@ mod tests {
                 runtime_generation: 1,
                 page_id: 1,
             }),
+            ignored_options: Vec::new(),
         }
     }
 
@@ -5482,6 +5673,7 @@ mod tests {
             max_bytes: MAX_SNAPSHOT_BYTES,
             offset: 0,
             locator: None,
+            timeout_ms: None,
         };
         for page in [hostile_page(1_700_000), "plain ".repeat(40_000)] {
             let mut reassembled = String::new();
@@ -5823,6 +6015,127 @@ mod tests {
             "headers":[{"name":"x-test","value":"ok","extra":true}]
         }))
         .is_err());
+    }
+
+    #[test]
+    fn agent_actions_read_null_as_absent_and_name_the_options_they_ignore() {
+        let read = |value: Value| BrowserAction::from_agent_input(value).unwrap();
+        // A client that sends every schema property sends the unused ones as null.
+        let (click, ignored) = read(json!({
+            "type": "click", "locator": {"css": "#save", "nth": null}, "url": null,
+            "snapshot": null, "timeout_ms": 5000, "wait_ms": null, "max_bytes": null,
+            "for_what": null, "value": null, "op": "click", "exact": true,
+        }));
+        assert_eq!(ignored, ["exact"]);
+        let BrowserAction::Click {
+            snapshot, options, ..
+        } = &click
+        else {
+            panic!("wrong browser action: {click:?}");
+        };
+        assert!(!snapshot);
+        assert_eq!(
+            options,
+            &InteractionOptions {
+                timeout_ms: Some(5000),
+                ..InteractionOptions::default()
+            }
+        );
+        // The worker receives what was set and nothing for what was not.
+        let sent = serde_json::to_value(&click).unwrap();
+        assert_eq!(sent["timeout_ms"], 5000);
+        assert!(sent.get("wait_ms").is_none() && sent.get("wait_until").is_none());
+
+        for (value, expected) in [
+            // What the audit saw agents send, now honoured.
+            (
+                json!({"type":"navigate","url":"https://app.test/","timeout_ms":30000,"wait_ms":2500,"wait_until":"networkidle","snapshot":true,"max_bytes":3000}),
+                vec![],
+            ),
+            (
+                json!({"type":"click","locator":{"css":"a"},"wait_ms":500}),
+                vec![],
+            ),
+            // A forced click lands on whatever covers the element, so there is none.
+            (
+                json!({"type":"click","locator":{"css":"a"},"force":true}),
+                vec!["force"],
+            ),
+            (
+                json!({"type":"wait","for_what":"selector","value":"#x","timeout_ms":15000}),
+                vec![],
+            ),
+            (
+                json!({"type":"snapshot","snapshot":true,"timeout_ms":1000}),
+                vec![],
+            ),
+            (json!({"type":"pages"}), vec![]),
+            // Settings an action takes only in other circumstances.
+            (
+                json!({"type":"click","locator":{"css":"a"},"max_bytes":12000}),
+                vec!["max_bytes"],
+            ),
+            (
+                json!({"type":"wait","for_what":"timeout","value":"1","wait_ms":1,"force":false}),
+                vec!["force", "wait_ms"],
+            ),
+            (
+                json!({"type":"fill","locator":{"css":"input"},"value":"a","wait_until":"load"}),
+                vec!["wait_until"],
+            ),
+            // Unknown options, and an op that names another action.
+            (
+                json!({"type":"snapshot","selector":"main","op":"click"}),
+                vec!["op", "selector"],
+            ),
+            (
+                json!({"type":"request","method":"GET","url":"https://app.test/","redirect":"follow"}),
+                vec!["redirect"],
+            ),
+        ] {
+            let (action, ignored) = read(value.clone());
+            validate_browser_action(&action).unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(ignored, expected, "{value}");
+        }
+        let (pages, _) = read(json!({"type": "pages", "op": null}));
+        assert!(matches!(pages, BrowserAction::Pages { op, .. } if op == "list"));
+        let (request, _) = read(json!({"type":"request","method":"GET","url":"https://app.test/"}));
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["follow_redirects"],
+            false
+        );
+
+        assert!(BrowserAction::from_agent_input(json!("click")).is_err());
+        assert!(BrowserAction::from_agent_input(json!({"type": "click"})).is_err());
+        let many = (0..40)
+            .map(|index| (format!("unknown_{index:02}"), json!(1)))
+            .chain([("type".to_string(), json!("back"))])
+            .collect::<serde_json::Map<_, _>>();
+        let (_, ignored) = read(Value::Object(many));
+        assert_eq!(ignored.len(), MAX_IGNORED_OPTIONS);
+    }
+
+    #[test]
+    fn interaction_options_are_bounded() {
+        for value in [
+            json!({"type":"click","locator":{"css":"a"},"timeout_ms":0}),
+            json!({"type":"navigate","url":"https://app.test/","timeout_ms":30_001}),
+            json!({"type":"snapshot","timeout_ms":0}),
+            json!({"type":"fill","locator":{"css":"a"},"value":"","wait_ms":30_001}),
+            json!({"type":"press","key":"Enter","snapshot":true,"max_bytes":0}),
+            json!({"type":"back","wait_until":"commit"}),
+        ] {
+            let action: BrowserAction = serde_json::from_value(value.clone()).unwrap();
+            assert!(validate_browser_action(&action).is_err(), "{value}");
+        }
+        for value in [
+            json!({"type":"click","locator":{"css":"a"},"timeout_ms":1,"wait_ms":30_000}),
+            json!({"type":"forward","wait_until":"load","timeout_ms":30_000}),
+            json!({"type":"type","text":"a","snapshot":true,"max_bytes":1}),
+        ] {
+            let action: BrowserAction = serde_json::from_value(value.clone()).unwrap();
+            validate_browser_action(&action).unwrap_or_else(|error| panic!("{value}: {error}"));
+        }
     }
 
     #[test]

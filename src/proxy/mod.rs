@@ -3208,6 +3208,7 @@ mod tests {
                         BrowserAction::Navigate {
                             url: format!("http://{origin_addr}{path}"),
                             snapshot: false,
+                            options: Default::default(),
                         },
                     )
                     .await
@@ -3235,6 +3236,7 @@ mod tests {
                     BrowserAction::Navigate {
                         url: format!("http://{origin_addr}/failure"),
                         snapshot: false,
+                        options: Default::default(),
                     },
                 )
                 .await
