@@ -10,11 +10,13 @@ use crate::app::{AppState, PreparedBody};
 use crate::compare::{BodyComparison, ExchangeComparison, HeaderComparison, ValueChange};
 use crate::domain::*;
 use crate::history::ResponseDiff;
-use crate::policy::PresentationOptions;
+use crate::policy::{PresentationOptions, REDACTED_PLACEHOLDER};
 use crate::reply::ReplySendResult;
 use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::Path;
 
 const DEFAULT_INLINE_BODY_BYTES: u64 = 4096;
@@ -34,6 +36,24 @@ const MAX_LISTED_MATCHES: usize = 200;
 const COMPARE_VALUE_BYTES: usize = 256;
 /// Retries when a rendered result still overshoots the budget.
 const MAX_FIT_ATTEMPTS: usize = 4;
+/// Request headers `headers: "compact"` hides, besides the `sec-ch-ua*` family.
+const COMPACT_HIDDEN_REQUEST: [&str; 3] = ["user-agent", "accept-encoding", "pragma"];
+/// Client-hint request headers that `headers: "compact"` hides by prefix.
+const CLIENT_HINT_PREFIX: &str = "sec-ch-ua";
+/// Response headers `headers: "compact"` hides.
+const COMPACT_HIDDEN_RESPONSE: [&str; 9] = [
+    "accept-ch",
+    "permissions-policy",
+    "report-to",
+    "nel",
+    "alt-svc",
+    "content-security-policy-report-only",
+    "cross-origin-opener-policy-report-only",
+    "date",
+    "x-xss-protection",
+];
+/// `headers: "compact"` keeps this many characters of a header value.
+const COMPACT_VALUE_CHARS: usize = 256;
 
 /// Representation and provenance values that most captures share.
 const DEFAULT_PROVENANCE: [(&str, &str); 4] = [
@@ -180,6 +200,26 @@ enum Entry {
     Failed(Value),
 }
 
+/// Which headers exchange_get lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderMode {
+    /// Every presented header.
+    Full,
+    /// Low-signal headers hidden and long values cut.
+    Compact,
+    /// No header lists, only the counts.
+    Omit,
+}
+
+fn header_mode(args: &Value) -> DomainResult<HeaderMode> {
+    match present(args, "headers").map(Value::as_str) {
+        None | Some(Some("full")) => Ok(HeaderMode::Full),
+        Some(Some("compact")) => Ok(HeaderMode::Compact),
+        Some(Some("none")) => Ok(HeaderMode::Omit),
+        Some(_) => Err(DomainError::invalid("headers must be full|compact|none")),
+    }
+}
+
 pub(crate) async fn exchange_get(state: &AppState, args: &Value) -> DomainResult<Value> {
     let project_id = require_project_id(args)?;
     let body_bytes = to_usize(
@@ -187,10 +227,11 @@ pub(crate) async fn exchange_get(state: &AppState, args: &Value) -> DomainResult
             .unwrap_or(DEFAULT_INLINE_BODY_BYTES)
             .min(MAX_INLINE_BODY_BYTES),
     );
+    let headers = header_mode(args)?;
     match (present(args, "exchange_id"), present(args, "exchange_ids")) {
         (Some(_), None) => {
             let id = required_exchange_id(args)?;
-            let loaded = load_exchange(state, project_id, id, body_bytes).await?;
+            let loaded = load_exchange(state, project_id, id, body_bytes, headers).await?;
             Ok(fit_exchanges(
                 vec![Entry::Loaded(loaded)],
                 Vec::new(),
@@ -210,7 +251,9 @@ pub(crate) async fn exchange_get(state: &AppState, args: &Value) -> DomainResult
             let mut entries = Vec::with_capacity(ids.len());
             for &id in &ids {
                 entries.push(
-                    match load_exchange(state, project_id, ExchangeId(id), body_bytes).await {
+                    match load_exchange(state, project_id, ExchangeId(id), body_bytes, headers)
+                        .await
+                    {
                         Ok(loaded) => Entry::Loaded(loaded),
                         Err(error) => {
                             Entry::Failed(json!({ "exchange_id": id, "error": error.to_string() }))
@@ -226,11 +269,61 @@ pub(crate) async fn exchange_get(state: &AppState, args: &Value) -> DomainResult
     }
 }
 
-fn header_lines(headers: &[PresentedHeader]) -> Value {
+/// One `name: value` line per header. A name that repeats with the redacted
+/// placeholder (one `cookie` entry per stored cookie) is listed once.
+pub(super) fn header_lines(headers: &[PresentedHeader]) -> Value {
+    let mut redacted = HashSet::new();
     headers
         .iter()
+        .filter(|header| {
+            header.value != REDACTED_PLACEHOLDER
+                || redacted.insert(header.name.to_ascii_lowercase())
+        })
         .map(|header| Value::String(format!("{}: {}", header.name, header.value)))
         .collect()
+}
+
+fn compact_hides_request(name: &str) -> bool {
+    COMPACT_HIDDEN_REQUEST.contains(&name) || name.starts_with(CLIENT_HINT_PREFIX)
+}
+
+fn compact_hides_response(name: &str) -> bool {
+    COMPACT_HIDDEN_RESPONSE.contains(&name)
+}
+
+/// `value` cut to [`COMPACT_VALUE_CHARS`] characters, with a marker that says
+/// how many were dropped.
+fn cut_value(value: &str) -> String {
+    match value.char_indices().nth(COMPACT_VALUE_CHARS) {
+        Some((end, _)) => format!(
+            "{}... [{} chars dropped]",
+            &value[..end],
+            value[end..].chars().count()
+        ),
+        None => value.to_owned(),
+    }
+}
+
+/// The headers `headers: "compact"` lists: those `hides` does not name, with
+/// long values cut. Each hidden lowercase name is added once to `hidden`.
+fn compact_headers(
+    headers: &[PresentedHeader],
+    hides: fn(&str) -> bool,
+    hidden: &mut Vec<String>,
+) -> Vec<PresentedHeader> {
+    let mut kept = Vec::with_capacity(headers.len());
+    for header in headers {
+        let name = header.name.to_ascii_lowercase();
+        if !hides(&name) {
+            kept.push(PresentedHeader {
+                value: cut_value(&header.value),
+                ..header.clone()
+            });
+        } else if !hidden.contains(&name) {
+            hidden.push(name);
+        }
+    }
+    kept
 }
 
 async fn load_exchange(
@@ -238,6 +331,7 @@ async fn load_exchange(
     project_id: ProjectId,
     exchange_id: ExchangeId,
     body_bytes: usize,
+    mode: HeaderMode,
 ) -> DomainResult<LoadedExchange> {
     let detail = state
         .db
@@ -264,13 +358,30 @@ async fn load_exchange(
             head.insert(key.into(), value);
         }
     }
-    for (key, headers) in [
-        ("request_headers", &detail.request_headers),
-        ("response_headers", &detail.response_headers),
+    let mut hidden_headers = Vec::new();
+    for (key, headers, hides) in [
+        (
+            "request_headers",
+            &detail.request_headers,
+            compact_hides_request as fn(&str) -> bool,
+        ),
+        (
+            "response_headers",
+            &detail.response_headers,
+            compact_hides_response,
+        ),
     ] {
-        if !headers.is_empty() {
-            head.insert(key.into(), header_lines(headers));
+        let listed = match mode {
+            HeaderMode::Full => Cow::Borrowed(headers.as_slice()),
+            HeaderMode::Compact => Cow::Owned(compact_headers(headers, hides, &mut hidden_headers)),
+            HeaderMode::Omit => continue,
+        };
+        if !listed.is_empty() {
+            head.insert(key.into(), header_lines(&listed));
         }
+    }
+    if !hidden_headers.is_empty() {
+        head.insert("hidden_headers".into(), json!(hidden_headers));
     }
     for (key, count) in [
         ("redacted_count", detail.redacted_count),
@@ -1259,6 +1370,142 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(found, [0, 8, 20]);
         assert_eq!(find_ignore_ascii_case(b"ab", b"abc", 0), None);
+    }
+
+    fn presented(name: &str, value: &str) -> PresentedHeader {
+        PresentedHeader {
+            name: name.into(),
+            value: value.into(),
+            redacted: value == REDACTED_PLACEHOLDER,
+            noisy: false,
+        }
+    }
+
+    #[test]
+    fn a_repeated_redacted_header_is_listed_once_where_it_first_appears() {
+        let headers = [
+            presented("Cookie", REDACTED_PLACEHOLDER),
+            presented("accept", "*/*"),
+            presented("cookie", REDACTED_PLACEHOLDER),
+            presented("x-dup", "1"),
+            presented("x-dup", "1"),
+            presented("authorization", REDACTED_PLACEHOLDER),
+            presented("Cookie", REDACTED_PLACEHOLDER),
+        ];
+        assert_eq!(
+            header_lines(&headers),
+            json!([
+                "Cookie: <redacted>",
+                "accept: */*",
+                "x-dup: 1",
+                "x-dup: 1",
+                "authorization: <redacted>"
+            ])
+        );
+        assert_eq!(header_lines(&[]), json!([]));
+    }
+
+    #[test]
+    fn cut_value_counts_characters_and_names_the_dropped_ones() {
+        let exact = "a".repeat(COMPACT_VALUE_CHARS);
+        assert_eq!(cut_value(&exact), exact);
+        assert_eq!(
+            cut_value(&format!("{exact}b")),
+            format!("{exact}... [1 chars dropped]")
+        );
+        let euros = "€".repeat(COMPACT_VALUE_CHARS + 44);
+        assert_eq!(
+            cut_value(&euros),
+            format!("{}... [44 chars dropped]", "€".repeat(COMPACT_VALUE_CHARS))
+        );
+        assert_eq!(cut_value(""), "");
+    }
+
+    #[test]
+    fn compact_headers_hide_by_name_and_report_each_hidden_name_once() {
+        let headers = [
+            presented("User-Agent", "Mozilla"),
+            presented("accept", "*/*"),
+            presented("sec-ch-ua-full-version-list", "\"Chromium\";v=\"1\""),
+            presented("user-agent", "again"),
+            presented("pragma", "no-cache"),
+            presented("cookie", REDACTED_PLACEHOLDER),
+            presented("x-long", &"v".repeat(COMPACT_VALUE_CHARS + 5)),
+        ];
+        let mut hidden = Vec::new();
+        let kept = compact_headers(&headers, compact_hides_request, &mut hidden);
+        assert_eq!(
+            hidden,
+            ["user-agent", "sec-ch-ua-full-version-list", "pragma"]
+        );
+        let lines = header_lines(&kept);
+        assert_eq!(
+            lines,
+            json!([
+                "accept: */*",
+                "cookie: <redacted>",
+                format!(
+                    "x-long: {}... [5 chars dropped]",
+                    "v".repeat(COMPACT_VALUE_CHARS)
+                )
+            ])
+        );
+        // A name hidden on one side is not hidden on the other.
+        let mut hidden = Vec::new();
+        let kept = compact_headers(
+            &[presented("user-agent", "server"), presented("date", "now")],
+            compact_hides_response,
+            &mut hidden,
+        );
+        assert_eq!(header_lines(&kept), json!(["user-agent: server"]));
+        assert_eq!(hidden, ["date"]);
+    }
+
+    #[test]
+    fn header_arguments_default_to_full_and_treat_null_as_absent() {
+        for args in [
+            json!({}),
+            json!({"headers": null}),
+            json!({"headers": "full"}),
+        ] {
+            assert_eq!(header_mode(&args).unwrap(), HeaderMode::Full);
+        }
+        assert_eq!(
+            header_mode(&json!({"headers": "compact"})).unwrap(),
+            HeaderMode::Compact
+        );
+        assert_eq!(
+            header_mode(&json!({"headers": "none"})).unwrap(),
+            HeaderMode::Omit
+        );
+        for bad in [json!("all"), json!(""), json!(true), json!(["full"])] {
+            let error = header_mode(&json!({ "headers": bad })).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn exchange_tool_schemas_stay_under_the_codex_description_limit() {
+        let defs = super::super::tool_defs();
+        for name in ["exchange_get", "exchange_body"] {
+            let tool = defs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let size = tool["inputSchema"].to_string().len();
+            assert!(size <= 4_700, "{name} inputSchema is {size} bytes");
+        }
+        let defs = defs.as_array().unwrap();
+        let get = defs
+            .iter()
+            .find(|tool| tool["name"] == "exchange_get")
+            .unwrap();
+        assert_eq!(
+            get["inputSchema"]["properties"]["headers"]["enum"],
+            json!(["full", "compact", "none"])
+        );
     }
 
     #[test]

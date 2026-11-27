@@ -145,6 +145,547 @@ fn escape_heavy_text(len: usize) -> String {
     unit.repeat(len / unit.len() + 1)
 }
 
+fn headers_from(pairs: Vec<(String, String)>) -> Vec<HeaderEntry> {
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (name, value))| header(name, value, ordinal as u32))
+        .collect()
+}
+
+/// A browser exchange shaped like audited agent traffic: sixteen stored cookie
+/// entries, client-hint request headers, a very long vendor header and
+/// policy-heavy response headers with repeated `set-cookie` lines.
+fn browser_exchange(project_id: ProjectId, index: usize) -> NewExchange {
+    let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+    let mut request = vec![
+        pair("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+        pair("accept-encoding", "gzip, deflate, br, zstd"),
+        pair("accept-language", "en-US,en;q=0.9"),
+        pair("cache-control", "max-age=0"),
+    ];
+    request.extend((0..16).map(|n| pair("cookie", &format!("cookie_{n}={}", "c".repeat(60)))));
+    request.extend([
+        pair("mcn-clientinfo-digest", &"d".repeat(900)),
+        pair("priority", "u=0, i"),
+        pair("referer", "https://example.com/search?q=widgets"),
+        pair("sec-ch-ua", "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\""),
+        pair("sec-ch-ua-arch", "\"x86\""),
+        pair("sec-ch-ua-bitness", "\"64\""),
+        pair("sec-ch-ua-form-factors", "\"Desktop\""),
+        pair("sec-ch-ua-full-version", "\"146.0.7680.80\""),
+        pair("sec-ch-ua-full-version-list", "\"Chromium\";v=\"146.0.7680.80\", \"Not-A.Brand\";v=\"24.0.0.0\", \"Google Chrome\";v=\"146.0.7680.80\""),
+        pair("sec-ch-ua-mobile", "?0"),
+        pair("sec-ch-ua-model", "\"\""),
+        pair("sec-ch-ua-platform", "\"Linux\""),
+        pair("sec-ch-ua-platform-version", "\"6.8.0\""),
+        pair("sec-ch-ua-wow64", "?0"),
+        pair("sec-fetch-dest", "document"),
+        pair("sec-fetch-mode", "navigate"),
+        pair("sec-fetch-site", "same-origin"),
+        pair("sec-fetch-user", "?1"),
+        pair("upgrade-insecure-requests", "1"),
+        pair("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"),
+    ]);
+    let mut response = vec![
+        pair("accept-ch", "Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Model, Sec-CH-UA-Platform-Version"),
+        pair("alt-svc", "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000"),
+        pair("cache-control", "private, max-age=0"),
+        pair("content-security-policy", &format!("default-src 'self'; script-src 'self' 'nonce-abc123' {}; img-src 'self' data:", "https://cdn.example.com ".repeat(24))),
+        pair("content-security-policy-report-only", &format!("default-src 'none'; script-src {}; report-uri /csp-report", "https://stats.example.com ".repeat(12))),
+        pair("content-type", "text/html; charset=utf-8"),
+        pair("cross-origin-opener-policy", "same-origin-allow-popups"),
+        pair("date", "Wed, 25 Nov 2026 10:11:12 GMT"),
+        pair("nel", "{\"report_to\":\"default\",\"max_age\":2592000}"),
+        pair("permissions-policy", "accelerometer=(), autoplay=(), camera=(), geolocation=(self), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"),
+        pair("report-to", "{\"group\":\"default\",\"max_age\":2592000,\"endpoints\":[{\"url\":\"https://example.com/reports\"}]}"),
+        pair("server", "nginx"),
+    ];
+    response.extend((0..3).map(|n| {
+        pair(
+            "set-cookie",
+            &format!("track_{n}=1; Path=/; Secure; HttpOnly"),
+        )
+    }));
+    response.extend([
+        pair("vary", "Accept-Encoding"),
+        pair("x-xss-protection", "0"),
+    ]);
+
+    let mut captured = exchange(project_id, &format!("/page/{index}"));
+    captured.method = "GET".into();
+    captured.mime = Some("text/html".into());
+    captured.request_headers = headers_from(request);
+    captured.response_headers = headers_from(response);
+    captured.request_body = None;
+    captured.response_body = Some(format!("<p>row {index}</p>\n").repeat(100).into_bytes());
+    captured
+}
+
+fn lines(result: &Value, key: &str) -> Vec<String> {
+    result[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{key} missing in {result}"))
+        .iter()
+        .map(|line| line.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn stored_value(entries: &[HeaderEntry], name: &str) -> String {
+    let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+    String::from_utf8(entry.value.clone()).unwrap()
+}
+
+/// Reads `ids` in one call and returns the output size, the ids that came
+/// back and `not_returned`. `extra` holds more arguments.
+async fn read_batch(
+    state: &Arc<AppState>,
+    project_id: ProjectId,
+    ids: &[i64],
+    extra: Value,
+) -> (usize, Vec<i64>, Vec<i64>) {
+    let mut args = json!({"project_id": project_id.get(), "exchange_ids": ids});
+    for (key, value) in extra.as_object().unwrap() {
+        args[key] = value.clone();
+    }
+    let result = call(state, "exchange_get", args).await;
+    let ids_of = |ids: &Value| -> Vec<i64> {
+        ids.as_array()
+            .map(|ids| ids.iter().map(|id| id.as_i64().unwrap()).collect())
+            .unwrap_or_default()
+    };
+    let returned = result["exchanges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["exchange_id"].as_i64().unwrap())
+        .collect();
+    (
+        result.to_string().len(),
+        returned,
+        ids_of(&result["not_returned"]),
+    )
+}
+
+#[tokio::test]
+async fn exchange_get_lists_a_repeated_redacted_header_once() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut captured = exchange(project_id, "/cookies");
+    captured.request_headers = vec![
+        header("Cookie", "a=1", 0),
+        header("Accept", "*/*", 1),
+        header("cookie", "b=2", 2),
+        header("Cookie", "c=3", 3),
+        header("X-Dup", "one", 4),
+        header("X-Dup", "one", 5),
+        header("Authorization", "Bearer s3cret", 6),
+    ];
+    captured.response_headers = vec![
+        header("Set-Cookie", "a=1; Path=/", 0),
+        header("Content-Type", "text/plain", 1),
+        header("set-cookie", "b=2", 2),
+    ];
+    let id = insert(&state, captured).await;
+    let project = project_id.get();
+
+    for headers in [None, Some("full"), Some("compact")] {
+        let mut args = json!({"project_id": project, "exchange_id": id});
+        if let Some(headers) = headers {
+            args["headers"] = json!(headers);
+        }
+        let result = call(&state, "exchange_get", args).await;
+        assert_eq!(
+            lines(&result, "request_headers"),
+            [
+                "Cookie: <redacted>",
+                "Accept: */*",
+                "X-Dup: one",
+                "X-Dup: one",
+                "Authorization: <redacted>"
+            ],
+            "{headers:?}"
+        );
+        assert_eq!(
+            lines(&result, "response_headers"),
+            ["Set-Cookie: <redacted>", "Content-Type: text/plain"]
+        );
+        // Every redacted entry is still counted.
+        assert_eq!(result["redacted_count"], 6);
+        assert!(!result.to_string().contains("s3cret"));
+    }
+
+    // A batch lists them once as well.
+    let result = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_ids": [id]}),
+    )
+    .await;
+    assert_eq!(
+        result["exchanges"][0]["response_headers"],
+        json!(["Set-Cookie: <redacted>", "Content-Type: text/plain"])
+    );
+}
+
+#[tokio::test]
+async fn exchange_get_default_headers_are_unchanged_apart_from_collapsed_redactions() {
+    use huntproxy::policy::{is_sensitive_header, NOISY_HEADERS};
+
+    let (_directory, state, project_id) = test_state().await;
+    let captured = browser_exchange(project_id, 0);
+    let (stored_request, stored_response) = (
+        captured.request_headers.clone(),
+        captured.response_headers.clone(),
+    );
+    let id = insert(&state, captured).await;
+    let project = project_id.get();
+
+    // Every stored header that was listed before is still listed in order, in
+    // full, with sensitive values redacted and a repeated redaction once.
+    let expected = |entries: &[HeaderEntry]| -> Vec<String> {
+        let mut redacted = std::collections::HashSet::new();
+        entries
+            .iter()
+            .filter(|entry| !NOISY_HEADERS.contains(&entry.name.as_str()))
+            .filter_map(|entry| {
+                if !is_sensitive_header(&entry.name) {
+                    let value = String::from_utf8(entry.value.clone()).unwrap();
+                    Some(format!("{}: {value}", entry.name))
+                } else if redacted.insert(entry.name.clone()) {
+                    Some(format!("{}: {REDACTED_PLACEHOLDER}", entry.name))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let default = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": id}),
+    )
+    .await;
+    assert_eq!(
+        lines(&default, "request_headers"),
+        expected(&stored_request)
+    );
+    assert_eq!(
+        lines(&default, "response_headers"),
+        expected(&stored_response)
+    );
+    assert_eq!(lines(&default, "request_headers").len(), 9);
+    assert_eq!(lines(&default, "response_headers").len(), 15);
+    let digest = stored_value(&stored_request, "mcn-clientinfo-digest");
+    assert!(
+        lines(&default, "request_headers").contains(&format!("mcn-clientinfo-digest: {digest}"))
+    );
+    assert!(lines(&default, "request_headers")
+        .iter()
+        .any(|line| line.starts_with("user-agent: Mozilla")));
+    assert!(lines(&default, "response_headers")
+        .iter()
+        .any(|line| line.starts_with("date: ")));
+    assert_eq!(default["redacted_count"], 19);
+    assert_eq!(default["noisy_hidden_count"], 16);
+    assert!(default.get("hidden_headers").is_none());
+
+    // Naming the default, or sending null as some clients do, changes nothing.
+    for headers in [json!("full"), Value::Null] {
+        let same = call(
+            &state,
+            "exchange_get",
+            json!({"project_id": project, "exchange_id": id, "headers": headers}),
+        )
+        .await;
+        assert_eq!(same, default);
+    }
+}
+
+#[tokio::test]
+async fn exchange_get_compact_hides_low_signal_headers_and_cuts_long_values() {
+    let (_directory, state, project_id) = test_state().await;
+    let captured = browser_exchange(project_id, 0);
+    let (stored_request, stored_response) = (
+        captured.request_headers.clone(),
+        captured.response_headers.clone(),
+    );
+    let id = insert(&state, captured).await;
+    let project = project_id.get();
+
+    let full = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": id}),
+    )
+    .await;
+    let compact = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": id, "headers": "compact"}),
+    )
+    .await;
+
+    let cut = |value: String| {
+        let dropped = value.chars().count() - 256;
+        format!("{}... [{dropped} chars dropped]", &value[..256])
+    };
+    assert_eq!(
+        lines(&compact, "request_headers"),
+        [
+            format!("accept: {}", stored_value(&stored_request, "accept")),
+            "cache-control: max-age=0".to_string(),
+            "cookie: <redacted>".to_string(),
+            format!(
+                "mcn-clientinfo-digest: {}",
+                cut(stored_value(&stored_request, "mcn-clientinfo-digest"))
+            ),
+            "referer: https://example.com/search?q=widgets".to_string(),
+        ]
+    );
+    assert_eq!(
+        lines(&compact, "response_headers"),
+        [
+            "cache-control: private, max-age=0".to_string(),
+            format!(
+                "content-security-policy: {}",
+                cut(stored_value(&stored_response, "content-security-policy"))
+            ),
+            "content-type: text/html; charset=utf-8".to_string(),
+            "cross-origin-opener-policy: same-origin-allow-popups".to_string(),
+            "server: nginx".to_string(),
+            "set-cookie: <redacted>".to_string(),
+            "vary: Accept-Encoding".to_string(),
+        ]
+    );
+    // Each hidden name once: what headers=full would add.
+    assert_eq!(
+        compact["hidden_headers"],
+        json!([
+            "accept-encoding",
+            "sec-ch-ua-form-factors",
+            "sec-ch-ua-full-version-list",
+            "user-agent",
+            "accept-ch",
+            "alt-svc",
+            "content-security-policy-report-only",
+            "date",
+            "nel",
+            "permissions-policy",
+            "report-to",
+            "x-xss-protection"
+        ])
+    );
+    let listed = |result: &Value| {
+        [
+            lines(result, "request_headers"),
+            lines(result, "response_headers"),
+        ]
+        .concat()
+        .into_iter()
+        .map(|line| line.split(": ").next().unwrap().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+    };
+    let added = listed(&full)
+        .difference(&listed(&compact))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let hidden = compact["hidden_headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(added, hidden, "hidden_headers names exactly what full adds");
+    // Counts keep their meaning; the body and the rest of the row are as before.
+    assert_eq!(compact["redacted_count"], full["redacted_count"]);
+    assert_eq!(compact["noisy_hidden_count"], 16);
+    assert_eq!(compact["response_body"], full["response_body"]);
+    assert!(full.get("hidden_headers").is_none());
+    assert!(compact.to_string().len() < full.to_string().len());
+    let keys = |result: &Value| {
+        result
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let mut expected_keys = keys(&full);
+    expected_keys.insert("hidden_headers".into());
+    assert_eq!(keys(&compact), expected_keys);
+
+    // Short values are never cut, and a value at the limit is kept whole.
+    let mut limits = exchange(project_id, "/limits");
+    limits.request_headers = vec![
+        header("X-Exact", &"e".repeat(256), 0),
+        header("X-Over", &"o".repeat(257), 1),
+        header("X-Euro", &"€".repeat(300), 2),
+        header("Pragma", "no-cache", 3),
+    ];
+    limits.response_headers = vec![header("Pragma", "no-cache", 0)];
+    let limits_id = insert(&state, limits).await;
+    let result = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": limits_id, "headers": "compact"}),
+    )
+    .await;
+    assert_eq!(
+        lines(&result, "request_headers"),
+        [
+            format!("X-Exact: {}", "e".repeat(256)),
+            format!("X-Over: {}... [1 chars dropped]", "o".repeat(256)),
+            format!("X-Euro: {}... [44 chars dropped]", "€".repeat(256)),
+        ]
+    );
+    // pragma is hidden on the request side only.
+    assert_eq!(lines(&result, "response_headers"), ["Pragma: no-cache"]);
+    assert_eq!(result["hidden_headers"], json!(["pragma"]));
+
+    // Nothing hidden: no hidden_headers.
+    let plain = insert(&state, exchange(project_id, "/plain")).await;
+    let result = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": plain, "headers": "compact"}),
+    )
+    .await;
+    assert!(result.get("hidden_headers").is_none());
+    assert_eq!(
+        lines(&result, "request_headers"),
+        [
+            format!("Authorization: {REDACTED_PLACEHOLDER}"),
+            "Content-Type: application/json".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn exchange_get_headers_none_omits_both_lists_and_keeps_the_counts() {
+    let (_directory, state, project_id) = test_state().await;
+    let id = insert(&state, browser_exchange(project_id, 0)).await;
+
+    let result = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project_id.get(), "exchange_id": id, "headers": "none"}),
+    )
+    .await;
+    for absent in ["request_headers", "response_headers", "hidden_headers"] {
+        assert!(result.get(absent).is_none(), "{absent}");
+    }
+    assert_eq!(result["redacted_count"], 19);
+    assert_eq!(result["noisy_hidden_count"], 16);
+    assert_eq!(result["exchange_id"], id);
+    assert_eq!(result["response_body"]["total"], 1_300);
+}
+
+#[tokio::test]
+async fn compact_and_none_headers_return_more_of_a_batch() {
+    let (_directory, state, project_id) = test_state().await;
+    let mut ids = Vec::new();
+    for index in 0..20 {
+        ids.push(insert(&state, browser_exchange(project_id, index)).await);
+    }
+
+    let mut returned_counts = Vec::new();
+    for extra in [
+        json!({}),
+        json!({"headers": "full"}),
+        json!({"headers": "compact"}),
+        json!({"headers": "none"}),
+    ] {
+        let (bytes, returned, not_returned) = read_batch(&state, project_id, &ids, extra).await;
+        assert!(bytes <= BUDGET);
+        assert_eq!([returned.clone(), not_returned].concat(), ids);
+        assert_eq!(returned, ids[..returned.len()], "request order is kept");
+        returned_counts.push(returned.len());
+    }
+    let (default, full, compact, none) = (
+        returned_counts[0],
+        returned_counts[1],
+        returned_counts[2],
+        returned_counts[3],
+    );
+    assert_eq!(default, full);
+    assert!(
+        full < 20,
+        "the full headers of 20 browser exchanges do not fit"
+    );
+    assert!(compact > full, "compact {compact} vs full {full}");
+    assert!(none > compact, "none {none} vs compact {compact}");
+
+    // Headers-only reads (the usual body_bytes 0) gain the same way.
+    let mut counts = Vec::new();
+    for headers in ["full", "compact", "none"] {
+        let (_, returned, _) = read_batch(
+            &state,
+            project_id,
+            &ids,
+            json!({"headers": headers, "body_bytes": 0}),
+        )
+        .await;
+        counts.push(returned.len());
+    }
+    assert!(counts[0] < counts[1] && counts[1] < counts[2], "{counts:?}");
+    assert_eq!(counts[2], 20, "rows without headers or bodies are small");
+}
+
+#[tokio::test]
+async fn exchange_get_validates_headers_and_treats_null_like_absent() {
+    let (_directory, state, project_id) = test_state().await;
+    let id = insert(&state, exchange(project_id, "/api")).await;
+    let project = project_id.get();
+
+    for bad in [
+        json!("all"),
+        json!(""),
+        json!("Compact"),
+        json!(true),
+        json!(1),
+    ] {
+        let error = call_err(
+            &state,
+            "exchange_get",
+            json!({"project_id": project, "exchange_id": id, "headers": bad}),
+        )
+        .await;
+        assert_eq!(error.code(), ErrorCode::InvalidArgument, "{bad}");
+        assert!(error.to_string().contains("full|compact|none"));
+    }
+    let error = call_err(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_ids": [id], "headers": "wide"}),
+    )
+    .await;
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+
+    // A client that sends every property, null for the unused ones.
+    let single = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": id}),
+    )
+    .await;
+    let nulls = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": id, "exchange_ids": null,
+               "body_bytes": null, "headers": null}),
+    )
+    .await;
+    assert_eq!(nulls, single);
+    let batch = call(
+        &state,
+        "exchange_get",
+        json!({"project_id": project, "exchange_id": null, "exchange_ids": [id],
+               "body_bytes": null, "headers": null}),
+    )
+    .await;
+    assert_eq!(batch["exchanges"], json!([single]));
+}
+
 #[tokio::test]
 async fn exchange_get_is_compact_and_inlines_small_bodies() {
     let (_directory, state, project_id) = test_state().await;
